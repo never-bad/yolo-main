@@ -1,0 +1,102 @@
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+from src.services.sam_service import SAMService
+
+router = APIRouter(prefix="/sam", tags=["sam"])
+sam_service = SAMService()
+
+
+class ConfigRequest(BaseModel):
+    detector: Optional[str] = None            # yolo_world | none
+    detector_weights: Optional[str] = None
+    sam_enabled: Optional[bool] = None
+    sam_weights: Optional[str] = None
+    imgsz: Optional[int] = None
+    sam_imgsz: Optional[int] = None
+    conf: Optional[float] = None
+    half: Optional[bool] = None
+    device: Optional[str] = None              # auto | cpu | GPU 索引
+
+
+class AutoLabelRequest(BaseModel):
+    task_id: str
+    image_id: str
+    classes: List[str]
+    conf: Optional[float] = None
+    prompts: Optional[List[str]] = None  # 与 classes 一一对应的英文提示词，提升中文识别率
+
+
+class BatchStartRequest(BaseModel):
+    task_id: str
+    classes: List[str]
+    conf: Optional[float] = None
+    prompts: Optional[List[str]] = None  # 与 classes 一一对应的英文提示词
+
+
+@router.get("/available")
+async def sam_available():
+    """检查 SAM 预标注可用性（需模型可加载）"""
+    return await sam_service.is_available()
+
+
+@router.get("/config")
+async def get_config():
+    """读取 SAM 配置"""
+    return sam_service.get_config()
+
+
+@router.post("/config")
+async def update_config(request: ConfigRequest):
+    """更新 SAM 配置"""
+    return sam_service.update_config(request)
+
+
+@router.post("/validate")
+async def validate():
+    """验证模型有效性"""
+    return await sam_service.validate_model()
+
+
+@router.post("/auto-label")
+async def auto_label(request: AutoLabelRequest):
+    """单图预标注：按类别名自动生成目标框"""
+    try:
+        return await sam_service.auto_label(
+            request.task_id, request.image_id, request.classes, request.conf, request.prompts
+        )
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.post("/batch/start")
+async def batch_start(request: BatchStartRequest):
+    """启动异步批量预标注"""
+    try:
+        return await sam_service.batch_auto_label(
+            request.task_id, request.classes, request.conf, request.prompts
+        )
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.get("/batch/{batch_id}")
+async def batch_status(batch_id: str):
+    """查询批量预标注进度"""
+    result = await sam_service.get_batch_status(batch_id)
+    if not result:
+        raise HTTPException(404, "Batch task not found")
+    return result
+
+
+@router.post("/batch/{batch_id}/stop")
+async def batch_stop(batch_id: str):
+    """取消批量预标注"""
+    result = await sam_service.stop_batch(batch_id)
+    if not result:
+        raise HTTPException(404, "Batch task not found")
+    return result
