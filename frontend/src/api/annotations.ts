@@ -27,15 +27,22 @@ export const getImageAnnotation = async (taskId: string, imageId: string) => {
   return data
 }
 
-export const saveAnnotation = async (taskId: string, imageId: string, boxes: BBox[]) => {
+export const saveAnnotation = async (taskId: string, imageId: string, boxes: BBox[], ai_annotated = false) => {
   const { data } = await api.post(`/annotations/tasks/${taskId}/items/${imageId}`, {
-    boxes
+    boxes,
+    ai_annotated
   })
   return data
 }
 
 export const exportAnnotations = async (taskId: string) => {
   const { data } = await api.get(`/annotations/tasks/${taskId}/export?format=yolo`)
+  return data
+}
+
+// 导出为YOLO格式，并按比例自动划分训练/验证/测试集
+export const exportAnnotationsSplit = async (taskId: string, train: number, val: number, test: number) => {
+  const { data } = await api.post(`/annotations/tasks/${taskId}/export-split`, { train, val, test })
   return data
 }
 
@@ -49,14 +56,36 @@ export const getSamAvailable = async () => {
   return data
 }
 
-export const autoLabelImage = async (taskId: string, imageId: string, classes: string[], conf?: number, prompts?: string[]) => {
+export const getSamConfig = async () => {
+  const { data } = await api.get('/sam/config')
+  return data
+}
+
+export const updateSamConfig = async (payload: any) => {
+  const { data } = await api.post('/sam/config', payload)
+  return data
+}
+
+export const getSamModels = async () => {
+  const { data } = await api.get('/sam/models')
+  return data
+}
+
+export const uploadSamModel = async (file: File) => {
+  const form = new FormData()
+  form.append('file', file)
+  const { data } = await api.post('/sam/models', form)
+  return data
+}
+
+export const autoLabelImage = async (taskId: string, imageId: string, classes: string[], conf?: number, prompts?: string[], signal?: AbortSignal) => {
   const { data } = await api.post('/sam/auto-label', {
     task_id: taskId,
     image_id: imageId,
     classes,
     conf: conf ?? undefined,
     prompts
-  })
+  }, { signal })
   return data
 }
 

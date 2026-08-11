@@ -20,6 +20,12 @@ class BBox(BaseModel):
 
 class SaveAnnotationRequest(BaseModel):
     boxes: List[BBox]
+    ai_annotated: bool = False
+
+class ExportSplitRequest(BaseModel):
+    train: float = 0.7
+    val: float = 0.2
+    test: float = 0.1
 
 @router.post("/tasks")
 async def create_annotation_task(request: CreateTaskRequest):
@@ -45,7 +51,8 @@ async def save_annotation(task_id: str, image_id: str, request: SaveAnnotationRe
     result = await annotation_service.save_annotation(
         task_id,
         image_id,
-        request.boxes
+        request.boxes,
+        request.ai_annotated
     )
     return result
 
@@ -64,6 +71,16 @@ async def export_annotations(task_id: str, format: str = "yolo"):
         raise HTTPException(400, "Only yolo format is supported")
     
     result = await annotation_service.export_to_yolo(task_id)
+    if not result.get("ok", False):
+        raise HTTPException(500, result.get("error", "Export failed"))
+    return result
+
+@router.post("/tasks/{task_id}/export-split")
+async def export_annotations_split(task_id: str, request: ExportSplitRequest):
+    """导出标注为YOLO格式，并按比例自动划分训练/验证/测试集"""
+    result = await annotation_service.export_to_yolo_split(
+        task_id, request.train, request.val, request.test
+    )
     if not result.get("ok", False):
         raise HTTPException(500, result.get("error", "Export failed"))
     return result

@@ -52,6 +52,11 @@
                 {{ preparingDataset === dataset.dataset_id ? '准备中...' : '准备' }}
               </button>
               <button 
+                @click="viewDataset(dataset)" 
+                class="secondary"
+                title="查看数据集图片"
+              >查看</button>
+              <button 
                 @click="editDataset(dataset)" 
                 class="secondary"
                 :disabled="editingDataset === dataset.dataset_id"
@@ -101,12 +106,71 @@
         </div>
       </div>
     </div>
+
+    <!-- 数据集查看弹窗（统计信息 + 图片预览） -->
+    <div v-if="viewingDataset" class="viewer-mask" @click.self="closeViewer">
+      <div class="viewer-dialog">
+        <div class="viewer-header">
+          <h3>{{ viewingDataset.dataset_id }}</h3>
+          <button class="secondary viewer-close" @click="closeViewer">关闭</button>
+        </div>
+        <div v-if="viewerLoading" class="loading-state">
+          <span class="loading-spinner large"></span>
+          <span>加载数据集详情...</span>
+        </div>
+        <template v-else>
+          <!-- 统计信息 -->
+          <div class="viewer-stats">
+            <div class="stat-item">
+              <span class="stat-label">状态</span>
+              <span class="stat-value">{{ viewerDetail?.status || viewingDataset.status }}</span>
+            </div>
+            <div class="stat-item" v-if="viewerDetail?.image_count || viewingDataset.image_count">
+              <span class="stat-label">图片数</span>
+              <span class="stat-value">{{ viewerDetail?.image_count || viewingDataset.image_count }}</span>
+            </div>
+            <div class="stat-item" v-if="viewerDetail?.label_count || viewingDataset.label_count">
+              <span class="stat-label">标注数</span>
+              <span class="stat-value">{{ viewerDetail?.label_count || viewingDataset.label_count }}</span>
+            </div>
+            <div class="stat-item" v-if="viewerDetail?.images">
+              <span class="stat-label">预览图</span>
+              <span class="stat-value">{{ viewerDetail.images.length }} 张</span>
+            </div>
+            <div class="stat-item" v-if="viewerDetail?.prepared_at">
+              <span class="stat-label">准备时间</span>
+              <span class="stat-value">{{ formatTime(viewerDetail.prepared_at) }}</span>
+            </div>
+          </div>
+          <div class="viewer-classes" v-if="viewerDetail?.classes?.length || viewingDataset.classes?.length">
+            <span class="stat-label">类别:</span>
+            <span class="viewer-class-tags">
+              <span v-for="(c, i) in (viewerDetail?.classes || viewingDataset.classes)" :key="i" class="class-tag">{{ c }}</span>
+            </span>
+          </div>
+          <div class="viewer-description" v-if="viewerDetail?.description || viewingDataset.description">
+            {{ viewerDetail?.description || viewingDataset.description }}
+          </div>
+
+          <!-- 图片预览 -->
+          <div class="viewer-section-title">图片预览</div>
+          <div v-if="viewerImages.length === 0" class="empty-state">
+            该数据集尚无图片（或未执行"准备"操作）
+          </div>
+          <div class="viewer-grid" v-else>
+            <div v-for="img in viewerImages" :key="img" class="viewer-thumb">
+              <img :src="'/static/' + img" loading="lazy" @error="handleImgError" />
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { uploadDataset, prepareDataset as prepareDst, listDatasets, updateDataset, deleteDataset, exportAnnotatedDataset, exportOriginalDataset } from '@/api/datasets'
+import { uploadDataset, prepareDataset as prepareDst, listDatasets, getDataset, updateDataset, deleteDataset, exportAnnotatedDataset, exportOriginalDataset } from '@/api/datasets'
 import { downloadFile } from '@/utils/download'
 import { showConfirm, showPrompt } from '@/composables/useDialog'
 
@@ -120,6 +184,52 @@ const preparingNew = ref(false)  // 正在准备新上传的数据集
 const editingDataset = ref<string | null>(null)  // 正在编辑的数据集ID
 const deletingDataset = ref<string | null>(null)  // 正在删除的数据集ID
 const exportingDataset = ref<string | null>(null)  // 正在导出的数据集ID
+const viewingDataset = ref<any | null>(null)  // 正在预览的数据集
+const viewerImages = ref<string[]>([])  // 预览图片列表
+const viewerLoading = ref(false)  // 预览加载状态
+const viewerDetail = ref<any | null>(null)  // 数据集详情（统计信息）
+
+// 打开数据集查看（统计信息 + 图片预览）
+const viewDataset = async (dataset: any) => {
+  if (dataset.status !== 'prepared') {
+    alert('该数据集尚未"准备"，无法查看。请先执行"准备"操作。')
+    return
+  }
+  viewingDataset.value = dataset
+  viewerLoading.value = true
+  viewerImages.value = []
+  viewerDetail.value = null
+  try {
+    const result = await getDataset(dataset.dataset_id)
+    viewerDetail.value = result
+    viewerImages.value = result.images || []
+  } catch (e: any) {
+    alert('加载数据集详情失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    viewerLoading.value = false
+  }
+}
+
+// 关闭预览
+const closeViewer = () => {
+  viewingDataset.value = null
+  viewerImages.value = []
+  viewerDetail.value = null
+}
+
+// 图片加载失败时的兜底（隐藏占位）
+const handleImgError = (e: any) => {
+  const el = e.target as HTMLImageElement
+  el.style.display = 'none'
+}
+
+// 时间格式化
+const formatTime = (t: any) => {
+  if (!t) return ''
+  const d = new Date(t)
+  if (isNaN(d.getTime())) return String(t).slice(0, 19).replace('T', ' ')
+  return d.toLocaleString('zh-CN')
+}
 
 const handleFileSelect = (event: Event) => {
   const target = event.target as HTMLInputElement
@@ -272,7 +382,8 @@ onMounted(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 0.5rem 1rem;
+  height: 38px;
+  padding: 0 1rem;
   background: #eef0f3;
   border: 1px solid #d0d3d8;
   border-radius: 4px;
@@ -290,7 +401,8 @@ onMounted(() => {
   background: #8e44ad;
   color: white;
   border: none;
-  padding: 0.5rem 1.2rem;
+  height: 38px;
+  padding: 0 1.2rem;
   border-radius: 4px;
   cursor: pointer;
   font-weight: bold;
@@ -410,5 +522,129 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
+}
+
+/* 图片预览弹窗 */
+.viewer-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 1.5rem;
+}
+
+.viewer-dialog {
+  background: white;
+  border-radius: 8px;
+  width: 90%;
+  max-width: 1100px;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.viewer-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid #eee;
+}
+
+.viewer-header h3 {
+  margin: 0;
+  color: #2c3e50;
+}
+
+.viewer-close {
+  padding: 0.35rem 0.9rem;
+  font-size: 0.875rem;
+}
+
+.viewer-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 0.75rem 1.25rem;
+  padding: 1rem 1.25rem 0.5rem;
+}
+
+.stat-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.stat-label {
+  font-size: 0.75rem;
+  color: #95a5a6;
+}
+
+.stat-value {
+  font-size: 0.95rem;
+  color: #2c3e50;
+  font-weight: 600;
+}
+
+.viewer-classes {
+  padding: 0.5rem 1.25rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.viewer-class-tags {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.class-tag {
+  background: #eef4fb;
+  color: #2c6fbb;
+  border-radius: 12px;
+  padding: 0.15rem 0.6rem;
+  font-size: 0.8rem;
+}
+
+.viewer-description {
+  padding: 0.25rem 1.25rem;
+  color: #7f8c8d;
+  font-size: 0.85rem;
+}
+
+.viewer-section-title {
+  padding: 0.75rem 1.25rem 0.25rem;
+  font-weight: 600;
+  color: #2c3e50;
+  border-top: 1px solid #f0f0f0;
+  margin-top: 0.5rem;
+}
+
+.viewer-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 0.75rem;
+  padding: 0.75rem 1.25rem 1.25rem;
+  overflow-y: auto;
+}
+
+.viewer-thumb {
+  aspect-ratio: 1;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid #e0e0e0;
+  background: #f5f5f5;
+}
+
+.viewer-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 </style>

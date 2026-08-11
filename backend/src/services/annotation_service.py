@@ -31,6 +31,12 @@ def _write_text(path: Path, content: str):
         f.write(content)
 
 
+def _save_yaml(path: Path, data: dict):
+    """同步保存 YAML 文件"""
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+
 class AnnotationService:
     def __init__(self):
         self.annotations_dir = settings.ANNOTATIONS_DIR
@@ -295,7 +301,9 @@ class AnnotationService:
             
             # 更新标注状态
             for item in task_meta["items"]:
+                ann = annotations.get(item["image_id"], {})
                 item["annotated"] = item["image_id"] in annotations
+                item["ai_annotated"] = bool(ann.get("ai_annotated", False))
             
             return {
                 "items": task_meta["items"],
@@ -346,7 +354,7 @@ class AnnotationService:
         
         return await asyncio.to_thread(_get_image_annotation_sync)
     
-    async def save_annotation(self, task_id: str, image_id: str, boxes: list):
+    async def save_annotation(self, task_id: str, image_id: str, boxes: list, ai_annotated: bool = False):
         """保存图片标注"""
         task_dir = self.annotations_dir / task_id
         annotations_file = task_dir / "annotations.json"
@@ -358,10 +366,15 @@ class AnnotationService:
             # 读取现有标注
             annotations = _load_json(annotations_file)
             
+            # 保留该图已有的 AI 标注标记（人工保存不应清掉标记）
+            existing = annotations.get(image_id, {})
+            prev_ai = existing.get("ai_annotated", False)
+            
             # 保存新标注
             annotations[image_id] = {
                 "boxes": [box.dict() if hasattr(box, 'dict') else box for box in boxes],
-                "updated_at": datetime.now().isoformat()
+                "updated_at": datetime.now().isoformat(),
+                "ai_annotated": ai_annotated or prev_ai
             }
             
             _save_json(annotations_file, annotations)
@@ -458,7 +471,137 @@ class AnnotationService:
                 return {"ok": False, "error": error_msg}
         
         return await asyncio.to_thread(_export_to_yolo_sync)
-    
+
+    async def export_to_yolo_split(self, task_id: str, train_ratio: float, val_ratio: float, test_ratio: float):
+        """导出标注为YOLO格式，并按比例自动划分训练/验证/测试集。
+
+        会将已标注图片复制到 images/{train,val,test}，标签写入 labels/{train,val,test}，
+        并重写 data.yaml 指向划分后的目录。
+        """
+        def _export_split_sync():
+            import random
+            import shutil
+            total_ratio = train_ratio + val_ratio + test_ratio
+            if total_ratio <= 0:
+                return {"ok": False, "error": "比例之和必须大于0"}
+            tr = train_ratio / total_ratio
+            vr = val_ratio / total_ratio
+            te = test_ratio / total_ratio
+
+            task_dir = self.annotations_dir / task_id
+            task_file = task_dir / "task.json"
+            annotations_file = task_dir / "annotations.json"
+            if not task_file.exists() or not annotations_file.exists():
+                return {"ok": False, "error": "Task not found"}
+
+            task_meta = _load_json(task_file)
+            annotations = _load_json(annotations_file)
+
+            dataset_dir = self.datasets_dir / task_meta["dataset_id"] / task_meta["version"]
+            if not dataset_dir.exists():
+                return {"ok": False, "error": f"Dataset directory not found: {dataset_dir}"}
+
+            # 收集所有已标注图片
+            annotated = []
+            for item in task_meta["items"]:
+                image_id = item.get("image_id")
+                if image_id not in annotations:
+                    continue
+                boxes = annotations[image_id].get("boxes") or []
+                if not boxes:
+                    continue
+                img_abs = settings.DATA_DIR / item["image_path"]
+                if not img_abs.exists():
+                    continue
+                annotated.append({
+                    "item": item,
+                    "img_abs": img_abs,
+                    "boxes": boxes,
+                    "width": item.get("width", 1),
+                    "height": item.get("height", 1),
+                })
+
+            if not annotated:
+                return {"ok": False, "error": "没有已标注的图片可导出"}
+
+            # 确定性打乱，保证可复现
+            random.Random(42).shuffle(annotated)
+
+            # 按比例分配
+            n = len(annotated)
+            n_train = int(round(n * tr))
+            n_val = int(round(n * vr))
+            if n_train + n_val > n:
+                n_train = n - n_val
+            n_test = n - n_train - n_val
+
+            splits = {"train": [], "val": [], "test": []}
+            for i, rec in enumerate(annotated):
+                if i < n_train:
+                    splits["train"].append(rec)
+                elif i < n_train + n_val:
+                    splits["val"].append(rec)
+                else:
+                    splits["test"].append(rec)
+
+            # 创建目录
+            images_dir = dataset_dir / "images"
+            labels_dir = dataset_dir / "labels"
+            for split in ["train", "val", "test"]:
+                (images_dir / split).mkdir(parents=True, exist_ok=True)
+                (labels_dir / split).mkdir(parents=True, exist_ok=True)
+
+            # 导出图片与标签
+            counts = {"train": 0, "val": 0, "test": 0}
+            errors = []
+            for split, recs in splits.items():
+                for rec in recs:
+                    item = rec["item"]
+                    image_id = item["image_id"]
+                    try:
+                        ext = rec["img_abs"].suffix or ".jpg"
+                        dst_img = images_dir / split / f"{image_id}{ext}"
+                        shutil.copy2(rec["img_abs"], dst_img)
+
+                        w = rec["width"]
+                        h = rec["height"]
+                        yolo_lines = []
+                        for box in rec["boxes"]:
+                            x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
+                            cx = (x1 + x2) / 2 / w
+                            cy = (y1 + y2) / 2 / h
+                            bw = (x2 - x1) / w
+                            bh = (y2 - y1) / h
+                            yolo_lines.append(f"{box['class_id']} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+                        _write_text(labels_dir / split / f"{image_id}.txt", "\n".join(yolo_lines))
+                        counts[split] += 1
+                    except Exception as e:
+                        errors.append(f"{image_id}: {e}")
+                        continue
+
+            # 重写 data.yaml
+            classes = task_meta.get("classes") or []
+            _save_yaml(dataset_dir / "data.yaml", {
+                "path": str(dataset_dir.absolute()),
+                "train": "images/train",
+                "val": "images/val",
+                "test": "images/test",
+                "nc": len(classes),
+                "names": classes,
+            })
+
+            result = {
+                "ok": True,
+                "total": n,
+                "counts": counts,
+                "ratios": {"train": round(tr, 3), "val": round(vr, 3), "test": round(te, 3)},
+            }
+            if errors:
+                result["errors"] = errors
+            return result
+
+        return await asyncio.to_thread(_export_split_sync)
+
     def _determine_label_path(self, item: dict, images_dir: Path, labels_dir: Path, image_id: str) -> Path:
         """确定标签文件路径"""
         image_path_str = item.get("image_path", "")

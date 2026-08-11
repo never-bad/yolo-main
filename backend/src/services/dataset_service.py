@@ -354,19 +354,29 @@ class DatasetService:
         
         meta = await asyncio.to_thread(_load_json, meta_path)
         
-        # 添加样例图片（在线程中执行）
-        def _get_sample_images():
+        # 添加图片列表（在线程中执行）
+        def _get_images():
             version = meta.get("version", "v1")
             version_dir = dataset_dir / version
             images_dir = self._find_images_dir(version_dir)
             
-            sample_images = []
+            images = []
             if images_dir:
-                image_files = list(images_dir.rglob("*.jpg"))[:5] + list(images_dir.rglob("*.png"))[:5]
-                sample_images = [str(img.relative_to(settings.BASE_DIR)) for img in image_files[:5]]
-            return sample_images
+                # 相对 DATA_DIR 的路径，前端用 /static/{path} 即可访问
+                image_files = (
+                    list(images_dir.rglob("*.jpg")) +
+                    list(images_dir.rglob("*.jpeg")) +
+                    list(images_dir.rglob("*.png"))
+                )
+                for img in sorted(image_files)[:12]:  # 预览图片不宜过多，最多 12 张避免杂乱
+                    try:
+                        rel = img.relative_to(settings.DATA_DIR)
+                        images.append(str(rel).replace("\\", "/"))
+                    except ValueError:
+                        continue
+            return images
         
-        meta["sample_images"] = await asyncio.to_thread(_get_sample_images)
+        meta["images"] = await asyncio.to_thread(_get_images)
         return meta
     
     async def update_dataset(self, dataset_id: str, request):
@@ -422,22 +432,41 @@ class DatasetService:
             temp_zip.close()
             
             with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                # 添加images目录
                 images_dir = self._find_images_dir(version_dir)
-                if images_dir:
-                    for img_file in images_dir.rglob("*"):
-                        if img_file.is_file():
-                            arcname = img_file.relative_to(version_dir)
-                            zipf.write(img_file, arcname)
-                
-                # 添加labels目录
                 labels_dir = self._find_labels_dir(version_dir)
-                if labels_dir:
-                    for label_file in labels_dir.rglob("*"):
-                        if label_file.is_file():
-                            arcname = label_file.relative_to(version_dir)
-                            zipf.write(label_file, arcname)
-                
+
+                # 判断是否已有 train/val/test 划分结构
+                split_dirs = ["train", "val", "test"] if images_dir else []
+                has_split = images_dir is not None and any(
+                    (images_dir / s).exists() for s in split_dirs
+                )
+
+                if has_split:
+                    # 已划分：只打包 images/{train,val,test} 与 labels/{train,val,test}
+                    for split in split_dirs:
+                        split_img = images_dir / split
+                        if split_img.exists():
+                            for f in sorted(split_img.rglob("*")):
+                                if f.is_file():
+                                    zipf.write(f, f"images/{split}/{f.name}")
+                        split_lbl = labels_dir / split if labels_dir else None
+                        if split_lbl is not None and split_lbl.exists():
+                            for f in sorted(split_lbl.rglob("*")):
+                                if f.is_file():
+                                    zipf.write(f, f"labels/{split}/{f.name}")
+                else:
+                    # 未划分：平铺打包 images/ 与 labels/
+                    if images_dir:
+                        for img_file in images_dir.rglob("*"):
+                            if img_file.is_file():
+                                arcname = img_file.relative_to(version_dir)
+                                zipf.write(img_file, arcname)
+                    if labels_dir:
+                        for label_file in labels_dir.rglob("*"):
+                            if label_file.is_file():
+                                arcname = label_file.relative_to(version_dir)
+                                zipf.write(label_file, arcname)
+
                 # 添加data.yaml
                 data_yaml = version_dir / "data.yaml"
                 if data_yaml.exists():

@@ -618,3 +618,176 @@ class ModelService:
         
         chart_paths = await asyncio.to_thread(_generate_charts)
         return chart_paths
+
+
+    # ------------------------------------------------------------------
+    # 检测模型自动升级（离线微调 → 热切换为预标注模型）
+    # ------------------------------------------------------------------
+    def promote_to_detector(self, model_id: str) -> dict:
+        """将训练好的模型升级为 AI 预标注的检测模型。
+
+        - 以 mAP50-95 为核心验收指标，Precision/Recall 为辅助指标，在相同验证集上对比
+        - 仅当新模型 mAP50-95 显著优于当前检测模型时，才自动切换
+        """
+        model_dir = self.registry_dir / model_id
+        model_file = model_dir / "model.json"
+        if not model_file.exists():
+            raise ValueError("模型不存在")
+        model_meta = _load_json(model_file)
+
+        weights_path = model_meta.get("weights_path")
+        if not weights_path or not Path(weights_path).exists():
+            raise ValueError("模型权重文件不存在")
+
+        classes = model_meta.get("classes") or []
+
+        # 当前检测模型配置
+        sam_cfg = self._read_sam_config()
+        old_weights = sam_cfg.get("detector_weights", "yolov8s-world.pt")
+
+        # 定位该模型训练所用数据集的 data.yaml（用于在相同验证集上对比）
+        data_yaml = self._find_model_data_yaml(model_meta)
+        if not data_yaml:
+            raise ValueError("无法定位该模型的训练数据集 data.yaml，无法进行对比验证")
+
+        # 新模型指标（取自训练 final_metrics，与旧模型在同一验证集上对比）
+        new_metrics = self._get_trained_final_metrics(model_meta)
+
+        # 旧（当前）检测模型指标：在相同验证集上重新评估
+        old_metrics = self._validate_detector(old_weights, data_yaml, classes)
+
+        # 标注速度（推理耗时，毫秒/张）：越小越快。作为升级的参考标准之一
+        new_speed = self._measure_speed(weights_path, data_yaml, classes)
+        old_speed = self._measure_speed(old_weights, data_yaml, classes)
+
+        # 比较并决定是否切换
+        new_map = new_metrics.get("mAP50_95")
+        old_map = old_metrics.get("mAP50_95")
+        switched = False
+        if new_map is not None and old_map is not None:
+            # 核心：mAP50-95 显著更优
+            if new_map > old_map + 0.01:
+                switched = True
+            # 参考：mAP50-95 差异不大时，标注速度更快（推理耗时更短）则切换
+            elif abs(new_map - old_map) <= 0.01 and new_speed is not None and old_speed is not None and new_speed < old_speed:
+                switched = True
+        else:
+            switched = False
+
+        if switched:
+            sam_cfg["detector_weights"] = weights_path
+            self._save_sam_config(sam_cfg)
+
+        return {
+            "switched": switched,
+            "new_model": {"weights_path": weights_path, "speed_ms": new_speed, **new_metrics},
+            "old_model": {"detector_weights": old_weights, "speed_ms": old_speed, **old_metrics},
+        }
+
+    def _read_sam_config(self) -> dict:
+        cfg = {"detector_weights": "yolov8s-world.pt", "conf": 0.15}
+        p = settings.SAM_CONFIG_FILE
+        if p.exists():
+            try:
+                cfg.update(_load_json(p))
+            except Exception:
+                pass
+        return cfg
+
+    def _save_sam_config(self, cfg: dict) -> None:
+        p = settings.SAM_CONFIG_FILE
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+    def _find_model_data_yaml(self, model_meta: dict):
+        """通过 job_id → dataset_id 定位数据集中的 data.yaml"""
+        job_id = model_meta.get("job_id")
+        if not job_id:
+            return None
+        job_file = self.jobs_dir / f"{job_id}.json"
+        if not job_file.exists():
+            return None
+        job_meta = _load_json(job_file)
+        dataset_id = job_meta.get("dataset_id")
+        if not dataset_id:
+            return None
+        dataset_dir = settings.DATA_DIR / "datasets" / dataset_id
+        if not dataset_dir.exists():
+            return None
+        for yaml_file in dataset_dir.rglob("data.yaml"):
+            return yaml_file
+        return None
+
+    def _get_trained_final_metrics(self, model_meta: dict) -> dict:
+        """读取训练结果的 final_metrics（mAP50-95、precision、recall）"""
+        job_id = model_meta.get("job_id")
+        if job_id:
+            try:
+                metrics = self._load_training_metrics(job_id)
+                if metrics and metrics.get("final_metrics"):
+                    return metrics["final_metrics"]
+            except Exception:
+                pass
+        return {}
+
+    def _validate_detector(self, weights: str, data_yaml: Path, classes: list) -> dict:
+        """在给定验证集上评估检测模型，返回 mAP50 / mAP50-95 / precision / recall"""
+        from ultralytics import YOLO
+        try:
+            weights_path = self._resolve_detector_weights(weights)
+            model = YOLO(weights_path)
+            # YOLO-World 等文本驱动模型需要先 set_classes 才能按数据集类别评估
+            try:
+                if hasattr(model.model, "set_classes") and classes:
+                    model.set_classes(classes)
+            except Exception:
+                pass
+            res = model.val(data=str(data_yaml), split="val", verbose=False)
+            m = res.box
+            speed_ms = None
+            speed = getattr(res, "speed", None) or {}
+            if isinstance(speed, dict):
+                inf = speed.get("inference")
+                if inf is not None:
+                    speed_ms = round(float(inf), 2)
+            return {
+                "mAP50": None if m.map50 is None else round(float(m.map50), 4),
+                "mAP50_95": None if m.map is None else round(float(m.map), 4),
+                "precision": None if m.mp is None else round(float(m.mp), 4),
+                "recall": None if m.mr is None else round(float(m.mr), 4),
+                "speed_ms": speed_ms,
+            }
+        except Exception as e:
+            return {"mAP50": None, "mAP50_95": None, "precision": None, "recall": None, "speed_ms": None, "error": str(e)}
+
+    def _measure_speed(self, weights: str, data_yaml: Path, classes: list) -> float | None:
+        """测量模型在验证集上的平均推理耗时（毫秒/张），作为标注速度参考"""
+        from ultralytics import YOLO
+        try:
+            weights_path = self._resolve_detector_weights(weights)
+            model = YOLO(weights_path)
+            try:
+                if hasattr(model.model, "set_classes") and classes:
+                    model.set_classes(classes)
+            except Exception:
+                pass
+            res = model.val(data=str(data_yaml), split="val", verbose=False)
+            speed = getattr(res, "speed", None) or {}
+            if isinstance(speed, dict):
+                inf = speed.get("inference")
+                if inf is not None:
+                    return round(float(inf), 2)
+            return None
+        except Exception:
+            return None
+
+    def _resolve_detector_weights(self, weights: str) -> str:
+        p = Path(weights)
+        if p.is_absolute() and p.exists():
+            return str(p)
+        for d in [settings.SAM_MODELS_DIR, settings.BASE_DIR]:
+            cand = d / weights
+            if cand.exists():
+                return str(cand)
+        return weights

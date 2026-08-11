@@ -113,33 +113,6 @@
       </button>
     </div>
 
-    <div v-if="currentJobId" class="card">
-      <h2>训练进度</h2>
-      <div class="train-progress">
-        <div class="progress-bar">
-          <div class="progress-fill" :style="{ width: trainProgress.percent + '%' }"></div>
-        </div>
-        <div class="progress-meta">
-          <span v-if="trainProgress.has">Epoch {{ trainProgress.current }} / {{ trainProgress.total }}</span>
-          <span v-else>等待训练启动...</span>
-          <span class="progress-percent" v-if="trainProgress.has">{{ trainProgress.percent }}%</span>
-        </div>
-        <div v-if="latestLossLine" class="loss-line">{{ latestLossLine }}</div>
-      </div>
-      <button class="secondary" @click="showTrainDetail = !showTrainDetail">
-        {{ showTrainDetail ? '收起详细日志' : '展开详细日志' }}
-      </button>
-      <LogPanel 
-        v-show="showTrainDetail"
-        :has-job-id="!!currentJobId"
-        :log-info="logInfo"
-        :loading-history="loadingHistory"
-        @load-history="loadHistoryLogs"
-        @lines-change="onLinesChange"
-        style="margin-top: 0.75rem;"
-      />
-    </div>
-
     <div class="card">
       <h2>训练任务列表</h2>
       <button @click="loadJobs" :disabled="loadingJobs" class="secondary">
@@ -157,6 +130,19 @@
           <p>模型: {{ job.model_name }}</p>
           <p>轮数: {{ job.epochs }} | 图片尺寸: {{ job.imgsz }} | 批次: {{ job.batch }}</p>
           <p>状态: <span :class="'status-badge status-' + job.status">{{ job.status }}</span></p>
+          <div v-if="job.status === 'running'" class="job-progress">
+            <div class="progress-bar">
+              <div class="progress-fill" :style="{ width: jobProgress[job.job_id]?.percent + '%' }"></div>
+            </div>
+            <div class="progress-meta">
+              <span v-if="jobProgress[job.job_id]?.has">
+                Epoch {{ jobProgress[job.job_id].current }} / {{ jobProgress[job.job_id].total }}
+              </span>
+              <span v-else>等待训练启动...</span>
+              <span class="progress-percent" v-if="jobProgress[job.job_id]?.has">{{ jobProgress[job.job_id].percent }}%</span>
+            </div>
+            <div v-if="jobProgress[job.job_id]?.lossLine" class="loss-line">{{ jobProgress[job.job_id].lossLine }}</div>
+          </div>
           <p v-if="job.model_id">模型ID: {{ job.model_id }}</p>
           <p v-if="job.base_model_id">基础模型: {{ job.base_model_id }}</p>
           <p v-if="job.resume_count">续训次数: {{ job.resume_count }}</p>
@@ -165,7 +151,14 @@
           <p v-if="job.crashed_at">崩溃时间: {{ new Date(job.crashed_at).toLocaleString() }}</p>
           <p v-if="job.can_resume" style="color: #2ecc71; font-weight: bold;">✓ 可恢复训练</p>
           <div class="job-actions">
-            <button v-if="job.status === 'running'" @click="viewLogs(job.job_id)">查看日志</button>
+            <!-- 失败原因（任务卡左边） -->
+            <button 
+              v-if="job.status === 'failed' || job.status === 'crashed'" 
+              @click="showFailureDialog(job)" 
+              class="danger-outline"
+            >
+              失败原因
+            </button>
             <button 
               v-if="job.status === 'running'" 
               @click="stopJob(job.job_id)" 
@@ -204,13 +197,14 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { createTrainJob, listTrainJobs, deleteTrainJob, resumeTrainJob, type TrainJobRequest } from '@/api/train'
 import { listModels, uploadPretrainedPt, listCustomModels } from '@/api/models'
 import { listDatasets } from '@/api/datasets'
 import { subscribeLogsSSE, pollLogsTail, getLogLines } from '@/api/logs'
 import { useLogStore } from '@/store/logs'
 import LogPanel from '@/components/Logs/LogPanel.vue'
-import { showConfirm } from '@/composables/useDialog'
+import { showAlert, showConfirm } from '@/composables/useDialog'
 
 const logStore = useLogStore()
 
@@ -409,11 +403,19 @@ const onSelectCustomModel = () => {
   }
 }
 
+const router = useRouter()
 const training = ref(false)
 const currentJobId = ref<string | null>(null)
 const jobs = ref<any[]>([])
 let eventSource: EventSource | null = null
 let pollInterval: any = null
+
+// 每个任务的独立进度（key: job_id）
+const jobProgress = ref<Record<string, { current: number; total: number; percent: number; has: boolean; lossLine: string }>>({})
+// 每个任务独立的轮询定时器
+const jobPollers = new Map<string, any>()
+// 每个任务独立的日志偏移量
+const jobOffsets = new Map<string, number>()
 
 // 日志历史加载相关
 const loadingHistory = ref(false)
@@ -423,40 +425,6 @@ const showTrainDetail = ref(false)
 
 // 去除 ANSI 转义码
 const stripAnsi = (text: string): string => text.replace(/\x1B\[[0-9;]*[mK]/g, '')
-
-// 从日志中解析训练进度（epoch 当前/总数）
-const trainProgress = computed(() => {
-  const logs = logStore.logs
-  let current = 0
-  let total = 0
-  for (let i = logs.length - 1; i >= 0; i--) {
-    const clean = stripAnsi(logs[i]).trim()
-    const m = clean.match(/^(\d+)\/(\d+)\s/)
-    if (m) {
-      current = parseInt(m[1])
-      total = parseInt(m[2])
-      break
-    }
-  }
-  return {
-    current,
-    total,
-    percent: total > 0 ? Math.round((current / total) * 100) : 0,
-    has: total > 0
-  }
-})
-
-// 从日志中提取最新的 epoch 损失指标行
-const latestLossLine = computed(() => {
-  const logs = logStore.logs
-  for (let i = logs.length - 1; i >= 0; i--) {
-    const clean = stripAnsi(logs[i]).trim()
-    if (clean.match(/^(\d+)\/(\d+)\s/) && clean.includes('loss')) {
-      return clean
-    }
-  }
-  return ''
-})
 
 const startTraining = async () => {
   if (!trainForm.value.dataset_id) {
@@ -516,6 +484,7 @@ const stopJob = async (jobId: string) => {
   
   stoppingJob.value = jobId
   try {
+    stopJobPolling(jobId)
     const { stopTrainJob } = await import('@/api/train')
     await stopTrainJob(jobId)
     alert('任务已停止')
@@ -532,6 +501,7 @@ const resumeJob = async (jobId: string) => {
   
   resumingJob.value = jobId
   try {
+    stopJobPolling(jobId)
     await resumeTrainJob(jobId)
     alert('训练已恢复!')
     
@@ -562,6 +532,7 @@ const deleteJobItem = async (jobId: string) => {
   
   deletingJob.value = jobId
   try {
+    stopJobPolling(jobId)
     await deleteTrainJob(jobId)
     alert('删除成功!')
     loadJobs()
@@ -623,6 +594,90 @@ const startPolling = (jobId: string) => {
   }, 2000)
 }
 
+// 从单条日志解析进度（返回 null 表示非进度行）
+const parseProgressLine = (cleanLine: string): { current: number; total: number } | null => {
+  const m = cleanLine.match(/^(\d+)\/(\d+)\s/)
+  if (m) {
+    return { current: parseInt(m[1]), total: parseInt(m[2]) }
+  }
+  return null
+}
+
+// 更新单个任务的进度
+const updateJobProgress = (jobId: string, lines: string[]) => {
+  let cur = jobProgress.value[jobId]?.current || 0
+  let total = jobProgress.value[jobId]?.total || 0
+  let lossLine = jobProgress.value[jobId]?.lossLine || ''
+  for (const raw of lines) {
+    const clean = stripAnsi(raw).trim()
+    const p = parseProgressLine(clean)
+    if (p) {
+      cur = p.current
+      total = p.total
+      if (clean.includes('loss')) {
+        lossLine = clean
+      }
+    }
+  }
+  jobProgress.value[jobId] = {
+    current: cur,
+    total,
+    percent: total > 0 ? Math.round((cur / total) * 100) : 0,
+    has: total > 0,
+    lossLine
+  }
+}
+
+// 为某个任务启动独立日志轮询（用于任务卡牌进度）
+const startJobPolling = async (jobId: string) => {
+  if (jobPollers.has(jobId)) return
+  if (!jobOffsets.has(jobId)) jobOffsets.set(jobId, 0)
+
+  // 先读取历史日志，初始化进度
+  try {
+    const result = await getLogLines(jobId, 0)
+    if (result.lines && !result.error) {
+      updateJobProgress(jobId, result.lines)
+      jobOffsets.set(jobId, result.total || result.lines.length)
+    }
+  } catch (e) {
+    // 忽略历史读取失败
+  }
+
+  const timer = setInterval(async () => {
+    try {
+      const off = jobOffsets.get(jobId) || 0
+      const result = await pollLogsTail(jobId, off)
+      if (result.lines && result.lines.length) {
+        updateJobProgress(jobId, result.lines)
+        jobOffsets.set(jobId, result.offset)
+      }
+    } catch (error) {
+      console.error('Job polling error', jobId, error)
+    }
+  }, 2000)
+  jobPollers.set(jobId, timer)
+}
+
+// 停止某个任务的独立轮询
+const stopJobPolling = (jobId: string) => {
+  const timer = jobPollers.get(jobId)
+  if (timer) {
+    clearInterval(timer)
+    jobPollers.delete(jobId)
+  }
+  jobOffsets.delete(jobId)
+}
+
+// 为所有运行中的任务启动独立轮询
+const startAllJobPolling = () => {
+  jobs.value.forEach((job) => {
+    if (job.status === 'running') {
+      startJobPolling(job.job_id)
+    }
+  })
+}
+
 const viewLogs = async (jobId: string) => {
   currentJobId.value = jobId
   logStore.clearLogs()
@@ -667,11 +722,95 @@ const onLinesChange = (n: number) => {
   selectedLogLines.value = n
 }
 
+// 训练失败操作建议：根据错误信息匹配常见原因并给出建议
+const getFailureAdvice = (error: string = ''): { reason: string; advice: string } => {
+  const e = error.toLowerCase()
+  if (e.includes('out of memory') || e.includes('cuda out of memory') || e.includes('cublas')) {
+    return {
+      reason: '显存不足（CUDA out of memory）',
+      advice: '建议减小"批次大小 batch"（如 16→8→4），或降低"图片尺寸 imgsz"，或关闭其他占用显存的程序。'
+    }
+  }
+  if (e.includes('1455') || e.includes('page file') || e.includes('i/o error')) {
+    return {
+      reason: '系统内存/页面文件不足（错误 1455）',
+      advice: '建议减小批次大小，关闭其他程序释放内存，或增大系统的虚拟内存（页面文件）。'
+    }
+  }
+  if (e.includes('arial.ttf') || e.includes('font') || e.includes('download failure')) {
+    return {
+      reason: '绘制图表所需字体（Arial.ttf）缺失或下载失败',
+      advice: '请将系统字体 arial.ttf 复制到用户目录下的 Ultralytics 字体目录，或检查网络后重试。'
+    }
+  }
+  if (e.includes('pytorchstreamreader') || e.includes('zip archive') || e.includes('central directory')) {
+    return {
+      reason: '预训练权重文件（.pt）损坏',
+      advice: '请删除损坏的 .pt 文件后重新下载一个完整的预训练权重，再开始训练。'
+    }
+  }
+  if (e.includes('filenotfound') || e.includes('no such file')) {
+    return {
+      reason: '文件不存在（数据集、权重或输出路径有误）',
+      advice: '请检查数据集是否已"准备"、预训练权重路径与输出目录是否存在。'
+    }
+  }
+  if (e.includes('permission') || e.includes('access is denied')) {
+    return {
+      reason: '文件被占用或权限不足',
+      advice: '请关闭占用相关文件的程序（尤其是训练输出目录），以管理员身份运行后重试。'
+    }
+  }
+  if (e.includes('dataset') || e.includes('labels') || e.includes('images') && e.includes('empty')) {
+    return {
+      reason: '数据集为空或标注文件缺失',
+      advice: '请检查数据集的图片与标注文件是否完整，必要时重新上传并"准备"数据集。'
+    }
+  }
+  return {
+    reason: error || '未知错误',
+    advice: '请查看"训练日志"中的详细报错信息，排查数据集、权重与环境配置后重试。'
+  }
+}
+
+// 弹窗展示训练失败原因与操作建议
+const showFailureDialog = (job: any) => {
+  const { reason, advice } = getFailureAdvice(job.error || job.message || '')
+  const failedAt = job.failed_at || job.crashed_at
+  showAlert(
+    `【训练失败】${reason}\n\n` +
+    (failedAt ? `失败时间: ${new Date(failedAt).toLocaleString()}\n\n` : '') +
+    `💡 操作建议:\n${advice}\n\n` +
+    `（可点击"删除"移除该任务，或修复后重新训练）`,
+    '训练失败'
+  )
+}
+
+// 已自动弹窗提示过的失败任务（避免重复提示）
+const failedJobsAlerted = ref<Set<string>>(new Set())
+
+// 监听任务状态变化，训练失败时先提醒，再询问是否跳转训练页面
+watch(
+  jobs,
+  (list) => {
+    list.forEach((job) => {
+      if ((job.status === 'failed' || job.status === 'crashed') && !failedJobsAlerted.value.has(job.job_id)) {
+        failedJobsAlerted.value.add(job.job_id)
+        showConfirm('训练失败，是否跳转到训练页面？', '训练失败').then((ok) => {
+          if (ok) router.push({ name: 'Train' })
+        })
+      }
+    })
+  },
+  { deep: true }
+)
+
 const loadJobs = async () => {
   loadingJobs.value = true
   try {
     const result = await listTrainJobs()
     jobs.value = result.jobs
+    startAllJobPolling()
   } catch (error: any) {
     alert('加载失败: ' + (error.response?.data?.detail || error.message))
   } finally {
@@ -693,6 +832,10 @@ onUnmounted(() => {
   if (pollInterval) {
     clearInterval(pollInterval)
   }
+  // 清理所有任务卡牌的独立轮询
+  jobPollers.forEach((timer) => clearInterval(timer))
+  jobPollers.clear()
+  jobOffsets.clear()
   logStore.setStreaming(false)
 })
 </script>
@@ -778,6 +921,17 @@ onUnmounted(() => {
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
+}
+
+/* 失败原因按钮（红色描边） */
+.job-item .job-actions button.danger-outline {
+  background: #fff5f5;
+  border: 1px solid #e74c3c;
+  color: #e74c3c;
+}
+
+.job-item .job-actions button.danger-outline:hover {
+  background: #fdecea;
 }
 
 .select-with-refresh {

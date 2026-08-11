@@ -81,6 +81,12 @@ export const deleteModel = async (modelId: string) => {
   return data
 }
 
+// 将训练好的模型升级为 AI 预标注的检测模型（热切换）
+export const promoteToDetector = async (modelId: string) => {
+  const { data } = await api.post(`/models/${modelId}/promote-to-detector`)
+  return data
+}
+
 export const uploadModel = async (file: File) => {
   const formData = new FormData()
   formData.append('file', file)

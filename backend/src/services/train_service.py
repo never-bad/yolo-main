@@ -6,6 +6,7 @@ import shutil
 import asyncio
 from pathlib import Path
 from datetime import datetime
+import psutil
 from src.core.settings import settings
 
 
@@ -31,6 +32,37 @@ def _delete_directory(path: Path):
     """同步删除目录"""
     if path.exists():
         shutil.rmtree(path)
+
+
+class _RecoveredProcess:
+    """后端重启后，为仍在运行的孤儿训练进程提供的轻量句柄适配器"""
+    def __init__(self, pid: int):
+        self.pid = pid
+        self._proc = psutil.Process(pid)
+
+    def poll(self):
+        try:
+            return self._proc.poll()
+        except psutil.NoSuchProcess:
+            return 0
+
+    def wait(self, timeout=None):
+        try:
+            self._proc.wait(timeout=timeout)
+        except psutil.NoSuchProcess:
+            return
+
+    def send_signal(self, sig):
+        try:
+            self._proc.send_signal(sig)
+        except psutil.NoSuchProcess:
+            pass
+
+    def kill(self):
+        try:
+            self._proc.kill()
+        except psutil.NoSuchProcess:
+            pass
 
 
 class TrainService:
@@ -143,10 +175,23 @@ class TrainService:
             )
         
         self.running_processes[job_id] = process
+
+        # 持久化 PID，便于后端重启后重新接管仍在运行的训练进程
+        try:
+            job_file_path = self.jobs_dir / f"{job_id}.json"
+            if job_file_path.exists():
+                meta = _load_json(job_file_path)
+                meta["pid"] = process.pid
+                _save_json(job_file_path, meta)
+        except Exception:
+            pass
     
     async def list_jobs(self):
         """列出所有训练任务（自动检测崩溃的任务）"""
         def _list_jobs_sync():
+            # 后端重启后，先重新接管仍在运行的训练进程，避免误判为崩溃
+            self._recover_running_processes()
+
             jobs = []
             
             if not self.jobs_dir.exists():
@@ -200,7 +245,32 @@ class TrainService:
         
         jobs = await asyncio.to_thread(_list_jobs_sync)
         return {"jobs": sorted(jobs, key=lambda x: x.get("created_at", ""), reverse=True)}
-    
+
+    def _recover_running_processes(self):
+        """后端重启后，重新接管仍在运行但句柄已丢失的训练进程"""
+        if not self.jobs_dir.exists():
+            return
+        for job_file in self.jobs_dir.glob("*.json"):
+            try:
+                meta = _load_json(job_file)
+            except Exception:
+                continue
+            job_id = meta.get("job_id")
+            if not job_id or meta.get("status") != "running":
+                continue
+            if job_id in self.running_processes:
+                continue
+            pid = meta.get("pid")
+            if not pid:
+                continue
+            try:
+                proc = psutil.Process(pid)
+                # 进程仍在运行 → 重新接管
+                if proc.poll() is None:
+                    self.running_processes[job_id] = _RecoveredProcess(pid)
+            except psutil.NoSuchProcess:
+                pass
+
     async def get_job(self, job_id: str):
         """获取训练任务详情"""
         job_file = self.jobs_dir / f"{job_id}.json"

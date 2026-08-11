@@ -3,11 +3,23 @@
     <div class="card">
       <h2>创建标注任务</h2>
       <div class="info-box">
-        ⚠️ 请确保数据集已完成准备（prepare）操作，否则无法创建标注任务
+        ⚠ 请确保数据集已完成准备（prepare）操作，否则无法创建标注任务
       </div>
       <div class="form-group">
         <label>选择数据集</label>
-        <div class="ds-selectbar">
+        <div class="select-with-refresh">
+          <select v-model="newTask.datasetId" :disabled="loadingDatasets || creatingTask">
+            <option value="">-- 请选择数据集 --</option>
+            <option 
+              v-for="ds in datasets" 
+              :key="ds.dataset_id" 
+              :value="ds.dataset_id"
+              :disabled="!isDatasetPrepared(ds)"
+            >
+              {{ ds.dataset_id }} ({{ getDatasetStatus(ds) }}) 
+              {{ ds.image_count ? `- ${ds.image_count}张图片` : '' }}
+            </option>
+          </select>
           <button type="button" @click="loadDatasets" class="refresh-btn" :disabled="loadingDatasets">
             <span v-if="loadingDatasets" class="loading-spinner"></span>
             {{ loadingDatasets ? '加载中...' : '刷新' }}
@@ -52,18 +64,62 @@
         <div v-if="importedCount > 0" class="import-info">
           已导入 {{ importedCount }} 个标注
         </div>
+        <div class="image-filter">
+          <div class="filter-dropdown" @click.stop>
+            <button class="filter-trigger" @click="filterOpen = !filterOpen">
+              <span>{{ currentFilterLabel }}</span>
+              <span class="filter-caret">{{ filterOpen ? '▲' : '▼' }}</span>
+            </button>
+            <div v-if="filterOpen" class="filter-menu">
+              <div
+                class="filter-menu-item"
+                :class="{ active: imageFilter === 'all' }"
+                @click="setFilter('all')"
+              >全部（{{ counts.total }}）</div>
+              <div class="filter-menu-group">
+                <div
+                  class="filter-menu-item group-header"
+                  :class="{ active: imageFilter === 'annotated' }"
+                  @click="setFilter('annotated')"
+                >📂 已标注（{{ counts.annotated }}）</div>
+                <div
+                  class="filter-menu-item sub"
+                  :class="{ active: imageFilter === 'manual' }"
+                  @click="setFilter('manual')"
+                >↳ 人工标注（{{ counts.manual }}）</div>
+                <div
+                  class="filter-menu-item sub"
+                  :class="{ active: imageFilter === 'ai' }"
+                  @click="setFilter('ai')"
+                >↳ AI标注（{{ counts.ai }}）</div>
+              </div>
+              <div
+                class="filter-menu-item"
+                :class="{ active: imageFilter === 'unannotated' }"
+                @click="setFilter('unannotated')"
+              >未标注（{{ counts.unannotated }}）</div>
+            </div>
+          </div>
+        </div>
         <div v-if="loadingItems" class="loading-state">
           <span class="loading-spinner"></span>
           <span>加载图片列表...</span>
         </div>
         <div v-else class="image-list">
           <div
-            v-for="(item, idx) in items"
+            v-for="(item, idx) in filteredItems"
             :key="item.image_id"
-            :class="['image-item', { active: currentIndex === idx, annotated: item.annotated }]"
-            @click="selectImage(idx)"
+            :class="['image-item', { active: currentImage?.image_id === item.image_id, annotated: item.annotated }]"
+            @click="selectImageByItem(item)"
           >
-            {{ item.image_id }} {{ item.annotated ? '✓' : '' }}
+            <span class="image-item-name">{{ item.image_id }}</span>
+            <span class="image-item-badges">
+              <span v-if="item.annotated" class="img-badge ok" title="已有标注">✓</span>
+              <span v-if="item.ai_annotated" class="img-badge ai" title="AI 预标注，建议人工审核">AI</span>
+            </span>
+          </div>
+          <div v-if="filteredItems.length === 0" class="empty-filter">
+            该类目下没有图片
           </div>
         </div>
         <div class="nav-buttons">
@@ -80,10 +136,18 @@
           </span>
         </h3>
         <div class="ai-toolbar">
-          <button class="ai-btn" @click="runAutoLabel" :disabled="aiLabeling || !currentImage">
+          <button class="ai-btn" @click="runAutoLabel" :disabled="!currentImage">
             <span v-if="aiLabeling" class="loading-spinner"></span>
-            {{ aiLabeling ? 'AI标注中...' : 'AI 预标注' }}
+            {{ aiLabeling ? 'AI标注中(点击取消)...' : 'AI 预标注' }}
           </button>
+          <label class="ai-conf-label">检测模型:</label>
+          <select v-model="samConfig.detector_weights" class="model-select" @change="applyDetectorModel">
+            <option v-for="m in samModels" :key="m.name" :value="m.name">{{ m.name }}</option>
+          </select>
+          <label class="ai-conf-label model-add-label">
+            <input type="file" accept=".pt" class="model-add-input" @change="onSamModelFile" />
+            添加
+          </label>
           <label class="ai-conf-label">置信度:</label>
           <input type="number" v-model.number="aiConf" min="0" max="1" step="0.05" class="conf-input" />
           <div v-if="batchId" class="batch-progress">
@@ -114,6 +178,7 @@
         <div class="controls">
           <label>当前类别:</label>
           <select v-model="currentClass">
+            <option value="-1">全部标签</option>
             <option v-for="(cls, idx) in classes" :key="idx" :value="idx">{{ cls }}</option>
           </select>
         </div>
@@ -127,6 +192,9 @@
             <button class="danger small" @click="removeBox(idx)">删除</button>
           </div>
         </div>
+        <button class="danger" @click="clearCurrentBoxes" :disabled="!currentBoxes.length">
+          清空本图标注
+        </button>
         <button @click="runBatchLabel" :disabled="batchRunning || !items.length">
           <span v-if="batchRunning" class="loading-spinner"></span>
           {{ batchRunning ? '批量预标注中...' : '批量预标注' }}
@@ -135,9 +203,15 @@
           <span v-if="savingAnnotation" class="loading-spinner"></span>
           {{ savingAnnotation ? '保存中...' : '保存' }}
         </button>
+        <div class="split-config">
+          <span class="split-label">划分比例</span>
+          <label>训练 <input type="number" v-model.number="ratioTrain" min="0" max="1" step="0.05" class="ratio-input" /></label>
+          <label>验证 <input type="number" v-model.number="ratioVal" min="0" max="1" step="0.05" class="ratio-input" /></label>
+          <label>测试 <input type="number" v-model.number="ratioTest" min="0" max="1" step="0.05" class="ratio-input" /></label>
+        </div>
         <button @click="exportTask" :disabled="exporting">
           <span v-if="exporting" class="loading-spinner"></span>
-          {{ exporting ? '导出中...' : '导出YOLO' }}
+          {{ exporting ? '导出中...' : '导出YOLO(自动划分)' }}
         </button>
       </div>
     </div>
@@ -145,9 +219,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import type { BBox } from '@/api/annotations'
-import { createAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotations, autoLabelImage, startBatchLabel, getBatchProgress, stopBatchLabel } from '@/api/annotations'
+import { createAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotationsSplit, autoLabelImage, startBatchLabel, getBatchProgress, stopBatchLabel, getSamConfig, updateSamConfig, getSamModels, uploadSamModel } from '@/api/annotations'
 import { listDatasets } from '@/api/datasets'
 import { showConfirm } from '@/composables/useDialog'
 
@@ -158,6 +232,12 @@ const creatingTask = ref(false)
 const loadingItems = ref(false)
 const savingAnnotation = ref(false)
 const exporting = ref(false)
+// 标注任务持久化 key，用于中途离开页面后返回时恢复
+const ANNOTATE_STORE_KEY = 'annotate_task_resume'
+// 数据集划分比例（默认 7:2:1）
+const ratioTrain = ref(0.7)
+const ratioVal = ref(0.2)
+const ratioTest = ref(0.1)
 
 const loadDatasets = async () => {
   loadingDatasets.value = true
@@ -198,7 +278,7 @@ const currentTask = ref<string | null>(null)
 const items = ref<any[]>([])
 const currentIndex = ref(0)
 const currentImage = ref<any>(null)
-const currentClass = ref(0)
+const currentClass = ref(-1)  // -1 表示"全部标签"，显示所有类别的框
 const currentBoxes = ref<BBox[]>([])
 const importedCount = ref(0)  // 导入的标注数量
 const loadingAnnotation = ref(false)  // 加载标注状态
@@ -212,7 +292,11 @@ const currentPos = ref({ x: 0, y: 0 })
 
 // SAM 大模型预标注状态
 const aiLabeling = ref(false)
+const aiAbortCtrl = ref<AbortController | null>(null)
 const aiConf = ref(0.25)
+const currentImageHasAi = ref(false)  // 当前图片是否由 AI 生成了标注框（用于保存时标记 AI 来源）
+const samConfig = ref<any>({ detector_weights: 'yolov8s-world.pt', conf: 0.15 })
+const samModels = ref<any[]>([])
 const batchId = ref<string | null>(null)
 const batchProgress = ref<any>(null)
 const batchTimer = ref<any>(null)
@@ -271,6 +355,48 @@ const batchPercent = computed(() => {
   return Math.round((batchProgress.value.done / batchProgress.value.total) * 100)
 })
 
+// ===== 图片列表分类过滤（级联下拉菜单） =====
+const imageFilter = ref('all')  // all | annotated | ai | manual | unannotated
+const filterOpen = ref(false)
+const counts = computed(() => {
+  const total = items.value.length
+  const annotated = items.value.filter(i => i.annotated).length
+  const ai = items.value.filter(i => i.ai_annotated).length
+  const manual = items.value.filter(i => i.annotated && !i.ai_annotated).length
+  const unannotated = items.value.filter(i => !i.annotated).length
+  return { total, annotated, ai, manual, unannotated }
+})
+const filterLabels: Record<string, string> = {
+  all: '全部',
+  annotated: '已标注',
+  ai: 'AI标注',
+  manual: '人工标注',
+  unannotated: '未标注',
+}
+const currentFilterLabel = computed(() => {
+  const label = filterLabels[imageFilter.value] || '全部'
+  const count = counts.value[imageFilter.value === 'all' ? 'total' : imageFilter.value]
+  return `${label}（${count}）`
+})
+const setFilter = (val: string) => {
+  imageFilter.value = val
+  filterOpen.value = false
+}
+const filteredItems = computed(() => {
+  switch (imageFilter.value) {
+    case 'annotated': return items.value.filter(i => i.annotated)
+    case 'ai': return items.value.filter(i => i.ai_annotated)
+    case 'manual': return items.value.filter(i => i.annotated && !i.ai_annotated)
+    case 'unannotated': return items.value.filter(i => !i.annotated)
+    default: return items.value
+  }
+})
+// 点击过滤后的图片，定位到原始 items 索引
+const selectImageByItem = (item: any) => {
+  const idx = items.value.findIndex(i => i.image_id === item.image_id)
+  if (idx >= 0) selectImage(idx)
+}
+
 const createTask = async () => {
   if (!newTask.value.datasetId) {
     alert('请选择数据集')
@@ -309,6 +435,7 @@ const createTask = async () => {
     }
     
     await loadTaskItems()
+    saveAnnotateState()
   } catch (error: any) {
     alert('创建任务失败: ' + (error.response?.data?.detail || error.message))
   } finally {
@@ -347,10 +474,71 @@ const loadTaskItems = async () => {
   }
 }
 
+// 持久化当前标注任务，便于中途离开页面后返回继续标注
+const saveAnnotateState = () => {
+  try {
+    localStorage.setItem(ANNOTATE_STORE_KEY, JSON.stringify({
+      taskId: currentTask.value,
+      imageId: currentImage.value?.image_id || null,
+      index: currentIndex.value,
+      batchId: batchId.value,  // 恢复批量预标注轮询
+    }))
+  } catch (e) {
+    console.error('保存标注状态失败:', e)
+  }
+}
+
+// 清空持久化的标注任务（任务删除或完成后）
+const clearAnnotateState = () => {
+  try {
+    localStorage.removeItem(ANNOTATE_STORE_KEY)
+  } catch (e) {
+    console.error('清空标注状态失败:', e)
+  }
+}
+
+// 恢复上次未完成的标注任务
+const restoreAnnotateState = async () => {
+  let saved: any = null
+  try {
+    const raw = localStorage.getItem(ANNOTATE_STORE_KEY)
+    if (raw) saved = JSON.parse(raw)
+  } catch (e) {
+    return
+  }
+  if (!saved?.taskId) return
+  currentTask.value = saved.taskId
+  try {
+    const result = await getTaskItems(currentTask.value)
+    items.value = result.items
+    if (result.classes && result.classes.length > 0) {
+      classes.value = result.classes
+      classesInput.value = result.classes.join(', ')
+    }
+    if (result.imported_annotations) {
+      importedCount.value = result.imported_annotations
+    }
+    if (items.value.length > 0) {
+      const targetIdx = (saved.index && saved.index < items.value.length) ? saved.index : 0
+      await selectImage(targetIdx)
+    }
+    // 若上次有未完成的批量预标注，恢复轮询（后端任务仍在后台运行）
+    if (saved.batchId) {
+      batchId.value = saved.batchId
+      batchProgress.value = { status: 'running', total: 1, done: 0, boxes_written: 0, current_image: '' }
+      pollBatch()
+    }
+  } catch (e: any) {
+    clearAnnotateState()
+    alert('恢复标注任务失败，已清空记录: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
 const selectImage = async (index: number) => {
   currentIndex.value = index
   currentImage.value = items.value[index]
   currentBoxes.value = []
+  currentImageHasAi.value = false
   
   await nextTick()
   
@@ -360,6 +548,7 @@ const selectImage = async (index: number) => {
   }
   
   loadImageToCanvas()
+  saveAnnotateState()
 }
 
 // 加载已有标注
@@ -464,8 +653,11 @@ const drawing = (e: MouseEvent) => {
   ctx.value.clearRect(0, 0, canvasRef.value.width, canvasRef.value.height)
   ctx.value.drawImage(img.value, 0, 0)
   
-  // 绘制已有框
-  currentBoxes.value.forEach(box => {
+  // 绘制已有框（按当前类别过滤）
+  const visible = String(currentClass.value) === '-1'
+    ? currentBoxes.value
+    : currentBoxes.value.filter(box => box.class_id === Number(currentClass.value))
+  visible.forEach(box => {
     drawBox(box.x1, box.y1, box.x2, box.y2, classes.value[box.class_id])
   })
   
@@ -490,8 +682,11 @@ const endDrawing = () => {
   const y2 = Math.max(startPos.value.y, currentPos.value.y)
   
   if (x2 - x1 > 5 && y2 - y1 > 5) {
+    // 用当前类别绘制；若为"全部标签"(-1)，默认取第一个类别
+    let drawClass = Number(currentClass.value)
+    if (Number.isNaN(drawClass) || drawClass < 0) drawClass = 0
     currentBoxes.value.push({
-      class_id: currentClass.value,
+      class_id: drawClass,
       x1, y1, x2, y2
     })
   }
@@ -513,7 +708,11 @@ const redrawCanvas = () => {
   if (!ctx.value || !canvasRef.value || !img.value) return
   ctx.value.clearRect(0, 0, canvasRef.value.width, canvasRef.value.height)
   ctx.value.drawImage(img.value, 0, 0)
-  currentBoxes.value.forEach(box => {
+  // 按当前类别过滤：-1 全部显示，其他只显示对应类别
+  const visible = currentClass.value === -1
+    ? currentBoxes.value
+    : currentBoxes.value.filter(box => box.class_id === currentClass.value)
+  visible.forEach(box => {
     drawBox(box.x1, box.y1, box.x2, box.y2, classes.value[box.class_id])
   })
 }
@@ -523,21 +722,95 @@ const removeBox = (index: number) => {
   redrawCanvas()
 }
 
+// 切换"当前类别"时重绘画布，实现按类别过滤显示框
+watch(currentClass, () => {
+  redrawCanvas()
+})
+
+// 一键清空当前图片的所有标注（针对误把置信度调成0导致标注过多的情况）
+const clearCurrentBoxes = async () => {
+  if (!currentBoxes.value.length) return
+  if (!(await showConfirm(`确定清空当前图片的 ${currentBoxes.value.length} 个标注框吗？\n\n清空后需点击"保存"才会写入文件。`))) return
+  currentBoxes.value = []
+  redrawCanvas()
+}
+
 // ===== SAM 大模型预标注 =====
+const loadSamConfigAndModels = async () => {
+  try {
+    const [cfg, models] = await Promise.all([getSamConfig(), getSamModels()])
+    samConfig.value = cfg
+    samModels.value = models
+    if (typeof cfg.conf === 'number') aiConf.value = cfg.conf
+  } catch (e: any) {
+    console.error('加载 SAM 配置/模型失败:', e)
+  }
+}
+
+const applyDetectorModel = async () => {
+  const name = samConfig.value.detector_weights
+  if (!name) return
+  try {
+    await updateSamConfig({ detector_weights: name })
+    alert(`已切换到检测模型: ${name}\n（对单张图生效，批量任务会重新加载）`)
+  } catch (e: any) {
+    alert('切换模型失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+const onSamModelFile = async (e: any) => {
+  const file = e.target.files?.[0]
+  e.target.value = ''
+  if (!file) return
+  try {
+    alert(`正在上传模型 ${file.name}（${(file.size / 1e6).toFixed(1)} MB）...`)
+    const res = await uploadSamModel(file)
+    await loadSamConfigAndModels()
+    samConfig.value.detector_weights = res.name
+    await updateSamConfig({ detector_weights: res.name })
+    alert(`模型 ${res.name} 上传成功并已启用`)
+  } catch (err: any) {
+    alert('上传模型失败: ' + (err.response?.data?.detail || err.message))
+  }
+}
+
+// 计算两个框的 IoU（交并比），用于去重
+const iou = (a: any, b: any) => {
+  const x1 = Math.max(a.x1, b.x1)
+  const y1 = Math.max(a.y1, b.y1)
+  const x2 = Math.min(a.x2, b.x2)
+  const y2 = Math.min(a.y2, b.y2)
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1)
+  const areaA = (a.x2 - a.x1) * (a.y2 - a.y1)
+  const areaB = (b.x2 - b.x1) * (b.y2 - b.y1)
+  const union = areaA + areaB - inter
+  return union > 0 ? inter / union : 0
+}
+
 const runAutoLabel = async () => {
   if (!currentTask.value || !currentImage.value) return
+  // 若正在标注中，再次点击则询问是否取消
+  if (aiLabeling.value) {
+    if (!(await showConfirm('是否取消当前 AI 标注？'))) return
+    aiAbortCtrl.value?.abort()
+    aiLabeling.value = false
+    aiAbortCtrl.value = null
+    return
+  }
   if (!classes.value.length) {
     alert('请先设置类别')
     return
   }
   aiLabeling.value = true
+  aiAbortCtrl.value = new AbortController()
   try {
     const result = await autoLabelImage(
       currentTask.value,
       currentImage.value.image_id,
       classes.value,
       aiConf.value,
-      buildPrompts(classes.value.map((c: any) => (typeof c === 'string' ? c : c.name)))
+      buildPrompts(classes.value.map((c: any) => (typeof c === 'string' ? c : c.name))),
+      aiAbortCtrl.value.signal
     )
     if (result.error) {
       alert('AI 预标注失败: ' + result.error)
@@ -550,15 +823,29 @@ const runAutoLabel = async () => {
       x2: b.x2,
       y2: b.y2
     }))
-    currentBoxes.value.push(...aiBoxes)
+    // 按 IoU 去重：与已有同类框重叠 >=0.5 的视为同一目标，避免重复标注
+    const newAiBoxes = aiBoxes.filter(
+      (ab: any) => !currentBoxes.value.some((cb: any) => cb.class_id === ab.class_id && iou(cb, ab) >= 0.5)
+    )
+    currentBoxes.value.push(...newAiBoxes)
+    if (newAiBoxes.length > 0) {
+      currentImageHasAi.value = true
+    }
     redrawCanvas()
     if (!aiBoxes.length) {
       alert('未检测到目标，可调低置信度重试')
+    } else if (!newAiBoxes.length) {
+      alert(`检测到 ${aiBoxes.length} 个目标，但均与已有标注重复，未新增`)
     }
   } catch (e: any) {
-    alert('AI 预标注失败: ' + (e.response?.data?.detail || e.message))
+    if (e?.code === 'ERR_CANCELED' || e?.message === 'canceled') {
+      alert('已取消 AI 标注')
+    } else {
+      alert('AI 预标注失败: ' + (e.response?.data?.detail || e.message))
+    }
   } finally {
     aiLabeling.value = false
+    aiAbortCtrl.value = null
   }
 }
 
@@ -593,18 +880,29 @@ const pollBatch = async () => {
     batchTimer.value = setTimeout(pollBatch, 2000)
     return
   }
+  if (!res) {
+    // 批量任务不存在（例如后端重启），停止轮询并清理
+    batchId.value = null
+    batchProgress.value = null
+    saveAnnotateState()
+    return
+  }
   batchProgress.value = res
   if (res.status === 'done') {
     batchId.value = null
+    saveAnnotateState()
     alert(`批量预标注完成！共标注 ${res.summary?.annotated ?? res.boxes_written} 张图片`)
     await loadTaskItems()
   } else if (res.status === 'cancelled') {
     batchId.value = null
+    saveAnnotateState()
     alert('批量预标注已取消')
   } else if (res.status === 'error') {
     batchId.value = null
+    saveAnnotateState()
     alert('批量预标注出错: ' + (res.error || '未知错误'))
   } else {
+    saveAnnotateState()
     batchTimer.value = setTimeout(pollBatch, 1500)
   }
 }
@@ -629,8 +927,12 @@ const saveAnnotation = async () => {
   
   savingAnnotation.value = true
   try {
-    await saveAnn(currentTask.value, currentImage.value.image_id, currentBoxes.value)
+    const aiFlag = currentImageHasAi.value || !!currentImage.value.ai_annotated
+    await saveAnn(currentTask.value, currentImage.value.image_id, currentBoxes.value, aiFlag)
     items.value[currentIndex.value].annotated = true
+    if (aiFlag) {
+      items.value[currentIndex.value].ai_annotated = true
+    }
     alert('保存成功!')
   } catch (error: any) {
     alert('保存失败: ' + (error.response?.data?.detail || error.message))
@@ -642,10 +944,30 @@ const saveAnnotation = async () => {
 const exportTask = async () => {
   if (!currentTask.value) return
   
+  // 校验比例
+  const sum = ratioTrain.value + ratioVal.value + ratioTest.value
+  if (sum <= 0) {
+    alert('划分比例之和必须大于0')
+    return
+  }
+  if (!(await showConfirm(`确认导出并自动划分数据集？\n\n训练:验证:测试 = ${ratioTrain.value} : ${ratioVal.value} : ${ratioTest.value}\n已标注图片将复制到 images/ 和 labels/ 对应的 train/val/test 目录。` ))) return
+
   exporting.value = true
   try {
-    const result = await exportAnnotations(currentTask.value)
-    alert(`导出成功! 共导出 ${result.exported_count} 个标注`)
+    const result = await exportAnnotationsSplit(
+      currentTask.value,
+      ratioTrain.value,
+      ratioVal.value,
+      ratioTest.value
+    )
+    const c = result.counts || {}
+    alert(
+      `导出并划分成功！共 ${result.total} 张已标注图片\n\n` +
+      `  训练集: ${c.train} 张\n` +
+      `  验证集: ${c.val} 张\n` +
+      `  测试集: ${c.test} 张\n` +
+      `data.yaml 已更新，可直接用于训练。`
+    )
   } catch (error: any) {
     alert('导出失败: ' + (error.response?.data?.detail || error.message))
   } finally {
@@ -678,13 +1000,23 @@ const handleKeydown = (e: KeyboardEvent) => {
   }
 }
 
+// 点击页面其他区域时关闭筛选下拉菜单
+const handleDocClick = () => {
+  filterOpen.value = false
+}
+
 onMounted(() => {
   loadDatasets()
+  loadSamConfigAndModels()
   window.addEventListener('keydown', handleKeydown)
+  document.addEventListener('click', handleDocClick)
+  restoreAnnotateState()
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeydown)
+  document.removeEventListener('click', handleDocClick)
+  saveAnnotateState()
 })
 </script>
 
@@ -718,10 +1050,132 @@ onUnmounted(() => {
   padding: 1rem;
 }
 
+.split-config {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.4rem 0;
+  font-size: 0.85rem;
+  color: #555;
+}
+
+.split-label {
+  font-weight: 600;
+  color: #333;
+}
+
+.ratio-input {
+  width: 60px;
+  padding: 0.3rem;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  margin-left: 0.2rem;
+}
+
 .image-list {
   max-height: 400px;
   overflow-y: auto;
   margin: 1rem 0;
+}
+
+.image-filter {
+  position: relative;
+  margin: 0.75rem 0 0.25rem;
+}
+
+.filter-dropdown {
+  position: relative;
+}
+
+.filter-trigger {
+  width: 100%;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.85rem;
+  border-radius: 6px;
+  border: 1px solid #ddd;
+  background: #fff;
+  color: #333;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.filter-trigger:hover {
+  border-color: #3498db;
+}
+
+.filter-caret {
+  font-size: 0.7rem;
+  color: #95a5a6;
+}
+
+.filter-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  z-index: 20;
+  padding: 0.25rem 0;
+}
+
+.filter-menu-item {
+  padding: 0.4rem 0.75rem;
+  font-size: 0.85rem;
+  color: #333;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.filter-menu-item:hover {
+  background: #f0f6ff;
+}
+
+.filter-menu-item.active {
+  background: #3498db;
+  color: #fff;
+}
+
+.filter-menu-item.sub {
+  padding-left: 1.5rem;
+  color: #555;
+}
+
+.filter-menu-group {
+  border-top: 1px solid #f0f0f0;
+  border-bottom: 1px solid #f0f0f0;
+  margin: 0.15rem 0;
+}
+
+.filter-menu-item.group-header {
+  font-weight: 600;
+}
+
+.filter-count {
+  font-size: 0.7rem;
+  background: rgba(0, 0, 0, 0.08);
+  border-radius: 8px;
+  padding: 0 0.35rem;
+  line-height: 1.3;
+  flex-shrink: 0;
+}
+
+.filter-menu-item.active .filter-count {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+.empty-filter {
+  padding: 1rem;
+  color: #95a5a6;
+  text-align: center;
+  font-size: 0.85rem;
 }
 
 .image-item {
@@ -729,6 +1183,41 @@ onUnmounted(() => {
   cursor: pointer;
   border-radius: 4px;
   margin-bottom: 0.25rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.image-item-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.image-item-badges {
+  display: flex;
+  gap: 0.25rem;
+  flex-shrink: 0;
+}
+
+.img-badge {
+  font-size: 0.7rem;
+  line-height: 1;
+  padding: 0.2rem 0.35rem;
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+.img-badge.ok {
+  color: #2ecc71;
+  background: rgba(46, 204, 113, 0.12);
+}
+
+.img-badge.ai {
+  color: #fff;
+  background: #e67e22;
 }
 
 .image-item:hover {
@@ -738,6 +1227,16 @@ onUnmounted(() => {
 .image-item.active {
   background: #3498db;
   color: white;
+}
+
+.image-item.active .img-badge.ok {
+  color: #fff;
+  background: transparent;
+}
+
+.image-item.active .img-badge.ai {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.35);
 }
 
 .image-item.annotated {
@@ -1049,6 +1548,33 @@ button.small {
   padding: 0.35rem;
   border: 1px solid #ddd;
   border-radius: 4px;
+}
+
+.model-select {
+  padding: 0.35rem;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  max-width: 180px;
+  background: white;
+}
+
+.model-add-label {
+  cursor: pointer;
+  background: #eef0f3;
+  border: 1px solid #d0d3d8;
+  border-radius: 4px;
+  padding: 0.35rem 0.7rem;
+  color: #333;
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+
+.model-add-label:hover {
+  background: #e2e5ea;
+}
+
+.model-add-input {
+  display: none;
 }
 
 .batch-progress {

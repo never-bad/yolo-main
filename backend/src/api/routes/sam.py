@@ -1,6 +1,7 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from typing import List, Optional
+import traceback
 from src.services.sam_service import SAMService
 
 router = APIRouter(prefix="/sam", tags=["sam"])
@@ -52,6 +53,30 @@ async def update_config(request: ConfigRequest):
     return sam_service.update_config(request)
 
 
+@router.get("/models")
+async def list_models():
+    """列出可用的检测模型（.pt 文件）"""
+    return sam_service.list_models()
+
+
+@router.post("/models")
+async def upload_model(file: UploadFile = File(...)):
+    """上传一个检测模型（.pt）到统一目录"""
+    try:
+        filename = file.filename.replace("\\", "/").split("/")[-1]
+        if not filename.endswith(".pt"):
+            raise HTTPException(400, "仅支持 .pt 模型文件")
+        data = await file.read()
+        if not data:
+            raise HTTPException(400, "文件内容为空")
+        sam_service.save_model(filename, data)
+        return {"ok": True, "name": filename}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @router.post("/validate")
 async def validate():
     """验证模型有效性"""
@@ -68,6 +93,7 @@ async def auto_label(request: AutoLabelRequest):
     except ValueError as e:
         raise HTTPException(404, str(e))
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(500, str(e))
 
 

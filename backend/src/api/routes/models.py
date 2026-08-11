@@ -166,3 +166,21 @@ async def generate_training_charts(
         raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(500, str(e))
+
+@router.post("/{model_id}/promote-to-detector")
+async def promote_to_detector(model_id: str):
+    """将训练好的模型升级为 AI 预标注的检测模型（热切换）。
+
+    在相同验证集上对比 mAP50-95（核心）、Precision/Recall（辅助），
+    仅当新模型显著优于当前检测模型时才自动切换。
+    """
+    import asyncio
+    try:
+        result = await asyncio.to_thread(model_service.promote_to_detector, model_id)
+        return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, str(e))

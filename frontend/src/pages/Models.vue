@@ -9,13 +9,22 @@
         <h3>上传模型</h3>
         <div class="form-group">
           <label>选择 .zip 文件（格式与导出格式相同）</label>
-          <input type="file" accept=".zip" @change="handleModelFileSelect" :disabled="uploadingModel" />
+          <div v-if="selectedModelFile" class="selected-file">
+            <span class="selected-file-icon">📦</span>
+            <span class="selected-file-name">{{ selectedModelFile.name }}</span>
+            <span class="selected-file-size">({{ (selectedModelFile.size / 1024 / 1024).toFixed(2) }} MB)</span>
+          </div>
+          <div v-else class="selected-file empty">尚未选择文件</div>
+          <div class="upload-row">
+            <input type="file" accept=".zip" id="modelZip" @change="handleModelFileSelect" :disabled="uploadingModel" class="file-input" />
+            <label for="modelZip" class="file-btn" :disabled="uploadingModel">选择文件</label>
+            <button class="upload-btn" @click="uploadModelFile" :disabled="!selectedModelFile || uploadingModel">
+              <span v-if="uploadingModel" class="loading-spinner"></span>
+              {{ uploadingModel ? '上传中...' : '上传' }}
+            </button>
+          </div>
           <p class="form-hint">ZIP文件应包含 model.json 和 weights 目录</p>
         </div>
-        <button @click="uploadModelFile" :disabled="!selectedModelFile || uploadingModel">
-          <span v-if="uploadingModel" class="loading-spinner"></span>
-          {{ uploadingModel ? '上传中...' : '上传模型' }}
-        </button>
       </div>
 
       <div v-if="loadingModels" class="loading-state">
@@ -43,6 +52,15 @@
               >
                 <span v-if="exportingModel === model.model_id" class="loading-spinner"></span>
                 {{ exportingModel === model.model_id ? '导出中...' : '导出' }}
+              </button>
+              <button 
+                @click="promoteModel(model.model_id)" 
+                class="primary"
+                :disabled="promotingModel === model.model_id"
+                title="在相同验证集上对比 mAP50-95 与标注速度，确认更优后自动切换为 AI 预标注检测模型"
+              >
+                <span v-if="promotingModel === model.model_id" class="loading-spinner"></span>
+                {{ promotingModel === model.model_id ? '评估对比中...' : '升级为预标注模型' }}
               </button>
               <button 
                 @click="deleteModelItem(model.model_id)" 
@@ -95,140 +113,161 @@
                 <tr v-if="detailModel?.file_size_mb"><td>模型大小</td><td>{{ detailModel.file_size_mb }} MB</td></tr>
               </table>
             </div>
-            
-            <!-- 模型参数信息 -->
-            <div v-if="detailModel?.model_info" class="detail-section">
-              <h4>模型参数</h4>
+
+            <!-- 关键参数表 -->
+            <div v-if="modelKeyParams.length" class="detail-section">
+              <h4>关键参数</h4>
               <table class="detail-table">
-                <tr v-if="detailModel.model_info.total_params_m">
-                  <td>参数数量</td>
-                  <td>{{ detailModel.model_info.total_params_m }}M ({{ detailModel.model_info.total_params?.toLocaleString() }})</td>
-                </tr>
-                <tr v-if="detailModel.model_info.task">
-                  <td>任务类型</td>
-                  <td>{{ detailModel.model_info.task }}</td>
+                <tr v-for="row in modelKeyParams" :key="row.label">
+                  <td>{{ row.label }}</td>
+                  <td>{{ row.value }}</td>
                 </tr>
               </table>
             </div>
-            
-            <!-- 训练配置 -->
-            <div v-if="detailModel?.training_metrics?.job_config" class="detail-section">
-              <h4>训练配置</h4>
-              <table class="detail-table">
-                <tr><td>数据集</td><td>{{ detailModel.training_metrics.job_config.dataset_id || '-' }}</td></tr>
-                <tr><td>训练轮数</td><td>{{ detailModel.training_metrics.job_config.epochs || '-' }}</td></tr>
-                <tr><td>批次大小</td><td>{{ detailModel.training_metrics.job_config.batch || '-' }}</td></tr>
-                <tr><td>训练状态</td><td>{{ detailModel.training_metrics.job_config.status || '-' }}</td></tr>
-                <tr v-if="detailModel.training_metrics.job_config.completed_at">
-                  <td>完成时间</td>
-                  <td>{{ detailModel.training_metrics.job_config.completed_at }}</td>
-                </tr>
-              </table>
-            </div>
-            
-            <!-- 下载训练图表 -->
-            <div v-if="detailModel?.job_id" class="detail-section">
-              <h4>下载训练图表</h4>
-              <div class="chart-download-buttons">
-                <button 
-                  @click="downloadTrainingChart(detailModel.model_id, 'loss')" 
-                  class="secondary"
-                  :disabled="downloadingChart !== null"
-                >
-                  <span v-if="downloadingChart === 'loss'" class="loading-spinner"></span>
-                  {{ downloadingChart === 'loss' ? '下载中...' : '下载损失曲线' }}
-                </button>
-                <button 
-                  @click="downloadTrainingChart(detailModel.model_id, 'metrics')" 
-                  class="secondary"
-                  :disabled="downloadingChart !== null"
-                >
-                  <span v-if="downloadingChart === 'metrics'" class="loading-spinner"></span>
-                  {{ downloadingChart === 'metrics' ? '下载中...' : '下载指标曲线' }}
-                </button>
+
+            <!-- 模型报告（点击打开弹窗） -->
+            <div class="detail-section">
+              <div class="report-header">
+                <h4>模型报告</h4>
+                <button class="primary" @click="openModelReport">查看模型报告</button>
               </div>
-            </div>
-            
-            <!-- 最终指标图表 -->
-            <div v-if="finalMetricsOption" class="detail-section">
-              <h4>最终训练指标</h4>
-              <div class="chart-container">
-                <v-chart :option="finalMetricsOption" autoresize />
-              </div>
-            </div>
-            
-            <!-- 训练损失曲线 -->
-            <div v-if="lossChartOption" class="detail-section">
-              <h4>训练损失曲线</h4>
-              <div class="chart-container">
-                <v-chart :option="lossChartOption" autoresize />
-              </div>
-            </div>
-            
-            <!-- mAP 曲线 -->
-            <div v-if="mapChartOption" class="detail-section">
-              <h4>训练指标曲线</h4>
-              <div class="chart-container">
-                <v-chart :option="mapChartOption" autoresize />
-              </div>
-            </div>
-            
-            <!-- 雷达图 - 多维指标对比 -->
-            <div v-if="radarChartOption" class="detail-section">
-              <h4>指标雷达图</h4>
-              <div class="chart-container">
-                <v-chart :option="radarChartOption" autoresize />
-              </div>
-            </div>
-            
-            <!-- 仪表盘图 - mAP分数 -->
-            <div v-if="gaugeChartOption" class="detail-section">
-              <h4>mAP50 评分仪表</h4>
-              <div class="chart-container chart-gauge">
-                <v-chart :option="gaugeChartOption" autoresize />
-              </div>
-            </div>
-            
-            <!-- 损失面积图 -->
-            <div v-if="lossAreaOption" class="detail-section">
-              <h4>训练损失面积图</h4>
-              <div class="chart-container">
-                <v-chart :option="lossAreaOption" autoresize />
-              </div>
-            </div>
-            
-            <!-- 损失散点图 -->
-            <div v-if="lossScatterOption" class="detail-section">
-              <h4>损失分布散点图</h4>
-              <div class="chart-container">
-                <v-chart :option="lossScatterOption" autoresize />
-              </div>
-            </div>
-            
-            <!-- 热力图 -->
-            <div v-if="heatmapChartOption" class="detail-section">
-              <h4>训练指标热力图</h4>
-              <div class="chart-container chart-large">
-                <v-chart :option="heatmapChartOption" autoresize />
-              </div>
-            </div>
-            
-            <!-- 类别列表 -->
-            <div v-if="detailModel?.classes" class="detail-section">
-              <h4>类别列表 ({{ detailModel.classes.length }})</h4>
-              <div class="class-tags">
-                <span v-for="(cls, idx) in detailModel.classes" :key="idx" class="class-tag">
-                  {{ idx }}: {{ cls }}
-                </span>
-              </div>
-            </div>
-            
-            <!-- 描述 -->
-            <div v-if="detailModel?.description" class="detail-section">
-              <h4>描述</h4>
-              <p>{{ detailModel.description }}</p>
+              <p class="form-hint">包含性能总结、诊断报告、训练配置与全部训练图表</p>
             </div>
           </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- 模型报告弹窗 -->
+    <div v-if="showModelReport" class="modal-overlay" @click.self="closeModelReport">
+      <div class="modal-content modal-large report-modal">
+        <div class="modal-header">
+          <h3>模型报告: {{ detailModel?.model_id }}</h3>
+          <button @click="closeModelReport" class="close-btn">×</button>
+        </div>
+        <!-- 顶部固定下载栏（滚动时不移动） -->
+        <div class="report-download-bar">
+          <span class="report-bar-title">📄 模型诊断报告</span>
+          <button class="primary" @click="downloadModelReport" :disabled="!modelReportText">
+            <span v-if="downloadingChart === 'report'" class="loading-spinner"></span>
+            ⬇ 下载报告
+          </button>
+        </div>
+        <div class="modal-body">
+          <!-- 性能总结 -->
+          <div v-if="modelSummary" class="detail-section">
+            <h4>性能总结</h4>
+            <div class="summary-box">
+              <div class="summary-verdict" :class="'verdict-' + modelSummary.level">
+                <span class="verdict-badge">{{ modelSummary.verdict }}</span>
+                <span class="verdict-desc">{{ modelSummary.overall }}</span>
+              </div>
+              <ul class="summary-list">
+                <li v-for="(item, i) in modelSummary.items" :key="i" :class="'summary-'+item.type">
+                  <span class="summary-icon">{{ item.icon }}</span>
+                  <span>{{ item.text }}</span>
+                </li>
+              </ul>
+            </div>
+          </div>
+
+          <!-- 诊断报告 -->
+          <div class="detail-section">
+            <h4>诊断报告</h4>
+            <pre v-if="modelReportText" class="report-pre">{{ modelReportText }}</pre>
+            <p v-else class="empty-state">暂无训练指标，无法生成报告</p>
+            <div class="report-exec-bar">
+              <button class="primary" @click="onOneClickExecute">一键执行</button>
+            </div>
+          </div>
+
+          <!-- 训练配置 -->
+          <div v-if="detailModel?.training_metrics?.job_config" class="detail-section">
+            <h4>训练配置</h4>
+            <table class="detail-table">
+              <tr><td>数据集</td><td>{{ detailModel.training_metrics.job_config.dataset_id || '-' }}</td></tr>
+              <tr><td>训练轮数</td><td>{{ detailModel.training_metrics.job_config.epochs || '-' }}</td></tr>
+              <tr><td>批次大小</td><td>{{ detailModel.training_metrics.job_config.batch || '-' }}</td></tr>
+              <tr><td>训练状态</td><td>{{ detailModel.training_metrics.job_config.status || '-' }}</td></tr>
+              <tr v-if="detailModel.training_metrics.job_config.completed_at">
+                <td>完成时间</td>
+                <td>{{ detailModel.training_metrics.job_config.completed_at }}</td>
+              </tr>
+            </table>
+          </div>
+
+          <!-- 训练图表 -->
+          <div v-if="finalMetricsOption" class="detail-section">
+            <h4>最终训练指标</h4>
+            <div class="chart-container">
+              <v-chart :option="finalMetricsOption" autoresize />
+            </div>
+          </div>
+          
+          <div v-if="lossChartOption" class="detail-section">
+            <h4>训练损失曲线</h4>
+            <div class="chart-container">
+              <v-chart :option="lossChartOption" autoresize />
+            </div>
+          </div>
+          
+          <div v-if="mapChartOption" class="detail-section">
+            <h4>训练指标曲线</h4>
+            <div class="chart-container">
+              <v-chart :option="mapChartOption" autoresize />
+            </div>
+          </div>
+          
+          <div v-if="radarChartOption" class="detail-section">
+            <h4>指标雷达图</h4>
+            <div class="chart-container">
+              <v-chart :option="radarChartOption" autoresize />
+            </div>
+          </div>
+          
+          <div v-if="gaugeChartOption" class="detail-section">
+            <h4>mAP50 评分仪表</h4>
+            <div class="chart-container chart-gauge">
+              <v-chart :option="gaugeChartOption" autoresize />
+            </div>
+          </div>
+          
+          <div v-if="lossAreaOption" class="detail-section">
+            <h4>训练损失面积图</h4>
+            <div class="chart-container">
+              <v-chart :option="lossAreaOption" autoresize />
+            </div>
+          </div>
+          
+          <div v-if="lossScatterOption" class="detail-section">
+            <h4>损失分布散点图</h4>
+            <div class="chart-container">
+              <v-chart :option="lossScatterOption" autoresize />
+            </div>
+          </div>
+          
+          <div v-if="heatmapChartOption" class="detail-section">
+            <h4>训练指标热力图</h4>
+            <div class="chart-container chart-large">
+              <v-chart :option="heatmapChartOption" autoresize />
+            </div>
+          </div>
+
+          <!-- 类别列表 -->
+          <div v-if="detailModel?.classes" class="detail-section">
+            <h4>类别列表 ({{ detailModel.classes.length }})</h4>
+            <div class="class-tags">
+              <span v-for="(cls, idx) in detailModel.classes" :key="idx" class="class-tag">
+                {{ idx }}: {{ cls }}
+              </span>
+            </div>
+          </div>
+
+          <!-- 描述 -->
+          <div v-if="detailModel?.description" class="detail-section">
+            <h4>描述</h4>
+            <p>{{ detailModel.description }}</p>
+          </div>
         </div>
       </div>
     </div>
@@ -237,9 +276,9 @@
 
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
-import { listModels, updateModel, deleteModel, getModel, uploadModel, exportModel, generateTrainingCharts, type ModelDetails } from '@/api/models'
+import { listModels, updateModel, deleteModel, getModel, uploadModel, exportModel, generateTrainingCharts, promoteToDetector, type ModelDetails } from '@/api/models'
 import { downloadFile } from '@/utils/download'
-import { showConfirm, showPrompt } from '@/composables/useDialog'
+import { showAlert, showConfirm, showPrompt } from '@/composables/useDialog'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -285,6 +324,7 @@ const editingModel = ref<string | null>(null)
 const deletingModel = ref<string | null>(null)
 const exportingModel = ref<string | null>(null)
 const downloadingChart = ref<string | null>(null)
+const promotingModel = ref<string | null>(null)
 
 // 模型上传
 const selectedModelFile = ref<File | null>(null)
@@ -321,6 +361,193 @@ const viewModelDetails = async (model: any) => {
 const closeModelDetails = () => {
   showModelDetails.value = false
   detailModel.value = null
+}
+
+// 打开/关闭模型报告弹窗
+const openModelReport = () => {
+  showModelReport.value = true
+}
+const closeModelReport = () => {
+  showModelReport.value = false
+}
+
+// 一键执行（暂只添加按钮，动作待后续实现）
+const onOneClickExecute = () => {
+  showAlert('"一键执行"功能开发中，敬请期待。', '一键执行')
+}
+
+// 性能总结：根据最终指标生成自然语言评估（性能 + 可用度）
+const modelSummary = computed(() => {
+  const metrics = detailModel.value?.training_metrics?.training_history?.final_metrics
+  if (!metrics) return null
+  const mAP50 = metrics.mAP50
+  const mAP50_95 = metrics.mAP50_95
+  const precision = metrics.precision
+  const recall = metrics.recall
+  if (mAP50 == null || mAP50_95 == null) return null
+
+  const items: { type: 'good' | 'warn' | 'bad'; icon: string; text: string }[] = []
+  let level: 'good' | 'warn' | 'bad' = 'good'
+  let verdict = '性能良好'
+
+  // 规则1: mAP50 整体水平
+  if (mAP50 < 0.3) {
+    level = 'bad'
+    verdict = '性能较差'
+    items.push({ type: 'bad', icon: '⚠️', text: `mAP50 仅 ${(mAP50 * 100).toFixed(1)}%，整体偏低，建议增加数据量或数据增强，或延长训练。` })
+  } else if (mAP50 < 0.5) {
+    level = 'warn'
+    verdict = '性能一般'
+    items.push({ type: 'warn', icon: '⚠️', text: `mAP50 为 ${(mAP50 * 100).toFixed(1)}%，中等偏低，可考虑更多训练或数据增强。` })
+  } else {
+    items.push({ type: 'good', icon: '✅', text: `mAP50 为 ${(mAP50 * 100).toFixed(1)}%，目标定位能力良好。` })
+  }
+
+  // 规则2/3: 精确-召回平衡
+  if (precision != null && recall != null) {
+    if (precision < 0.5 && recall > 0.8) {
+      level = 'warn'
+      items.push({ type: 'warn', icon: '⚖️', text: `高召回(${(recall * 100).toFixed(1)}%)低精确(${(precision * 100).toFixed(1)}%)，模型过于激进，误报频繁。` })
+    } else if (precision > 0.8 && recall < 0.5) {
+      level = 'warn'
+      items.push({ type: 'warn', icon: '⚖️', text: `高精确(${(precision * 100).toFixed(1)}%)低召回(${(recall * 100).toFixed(1)}%)，模型过于保守，漏检严重。` })
+    } else {
+      items.push({ type: 'good', icon: '⚖️', text: `Precision ${(precision * 100).toFixed(1)}% / Recall ${(recall * 100).toFixed(1)}%，精确与召回较为均衡。` })
+    }
+  }
+
+  // mAP50-95 严格阈值表现
+  items.push({
+    type: mAP50_95 >= 0.5 ? 'good' : 'warn',
+    icon: '📈',
+    text: `mAP50-95 为 ${(mAP50_95 * 100).toFixed(1)}%，${mAP50_95 >= 0.5 ? '在严格 IoU 阈值下表现稳定。' : '在严格 IoU 阈值下表现一般，定位精度有待提升。'}`
+  })
+
+  // 可用度评估
+  let overall = ''
+  if (level === 'good') {
+    overall = '该模型性能良好，可用度高，可直接用于 AI 预标注或生产环境。'
+  } else if (level === 'warn') {
+    overall = '该模型性能一般，可用度中等，建议优化数据或继续训练后再投入使用。'
+  } else {
+    overall = '该模型性能较差，可用度低，不建议直接用于预标注，建议扩充数据并重新训练。'
+  }
+
+  return { level, verdict, items, overall }
+})
+
+// 关键参数表格数据
+const modelKeyParams = computed(() => {
+  const metrics = detailModel.value?.training_metrics?.training_history?.final_metrics
+  const info = detailModel.value?.model_info
+  const rows: { label: string; value: string }[] = []
+
+  if (metrics?.mAP50 != null) rows.push({ label: 'mAP50', value: (metrics.mAP50 * 100).toFixed(1) + '%' })
+  if (metrics?.mAP50_95 != null) rows.push({ label: 'mAP50-95', value: (metrics.mAP50_95 * 100).toFixed(1) + '%' })
+  if (metrics?.precision != null) rows.push({ label: 'Precision', value: (metrics.precision * 100).toFixed(1) + '%' })
+  if (metrics?.recall != null) rows.push({ label: 'Recall', value: (metrics.recall * 100).toFixed(1) + '%' })
+  if (metrics?.precision != null && metrics?.recall != null) {
+    const p = metrics.precision, r = metrics.recall
+    const f1 = (p + r) === 0 ? 0 : (2 * p * r) / (p + r)
+    rows.push({ label: 'F1', value: (f1 * 100).toFixed(1) + '%' })
+  }
+  if (info?.total_params_m) rows.push({ label: '参数数量', value: info.total_params_m + 'M' })
+  if (info?.task) rows.push({ label: '任务类型', value: info.task })
+  return rows
+})
+
+// 模型报告：参照 ModelDiagnosticAdvisor 逻辑生成可读的诊断报告
+const showModelReport = ref(false)
+const modelReportText = computed(() => {
+  const history = detailModel.value?.training_metrics?.training_history
+  const metrics = history?.final_metrics
+  if (!metrics) return ''
+
+  // 统一转为百分比（0-1 自动放大为 0-100）
+  const toPct = (v: any) => (v == null ? 0 : (v <= 1 && v >= -1 ? v * 100 : v))
+  const map50 = toPct(metrics.mAP50)
+  const precision = toPct(metrics.precision)
+  const recall = toPct(metrics.recall)
+  const f1 = (precision + recall) > 0 ? 2 * (precision * recall) / (precision + recall) : 0
+
+  // 损失取最后一个 epoch
+  const train_loss = history.train_box_loss?.[history.train_box_loss.length - 1] ?? 0
+  const val_loss = history.val_box_loss?.[history.val_box_loss.length - 1] ?? 0
+
+  const diagnosis: string[] = []
+  const suggestions: string[] = []
+
+  // 1. 总体评价
+  let status_level = '🔴 较差'
+  if (map50 >= 80) status_level = '🟢 优秀'
+  else if (map50 >= 60) status_level = '🔵 良好'
+  else if (map50 >= 40) status_level = '🟠 一般'
+
+  // 2. P-R 平衡诊断
+  if (precision > 85 && recall < 30) {
+    diagnosis.push('模型过于保守（高精准，低召回）。')
+    diagnosis.push('模型非常有把握时才敢画框，导致大量目标被漏检。')
+    suggestions.push('📉 降低推理阈值：尝试将部署时的 Confidence Threshold 从 0.5 降至 0.25-0.3。')
+    suggestions.push('🔄 数据增强：增加 Mosaic 或 Mixup 增强比例，强迫模型学习局部特征。')
+  } else if (precision < 40 && recall > 70) {
+    diagnosis.push('模型过于敏感（低精准，高召回）。')
+    diagnosis.push('模型存在大量误检（把背景当目标），或者框画得不准。')
+    suggestions.push('📈 提高推理阈值：尝试提高 Confidence Threshold 至 0.6-0.7。')
+    suggestions.push('🚫 增加负样本：在训练集中加入一些不包含目标的背景图片（Empty images）。')
+    suggestions.push('🏷️ 检查标注：检查是否有标注框过大或包含过多背景的情况。')
+  } else if (precision < 40 && recall < 40) {
+    diagnosis.push('模型尚未收敛或学习能力不足。')
+    diagnosis.push('精确率和召回率双低，说明模型还没学会特征。')
+    suggestions.push('📚 增加数据量：当前数据可能不足以支撑模型学习。')
+    suggestions.push('⏳ 增加训练轮数：目前的 Epochs 可能不够，建议继续训练。')
+    suggestions.push('🔍 检查标注质量：排查是否存在大量标注错误或标签混淆。')
+  } else {
+    diagnosis.push('模型的精确率与召回率较为均衡，无明显偏差。')
+    suggestions.push('✔️ 若追求更高精度，可在更高 IoU 阈值下评估并微调。')
+  }
+
+  // 3. 过拟合/欠拟合检测（基于 Loss）
+  if (train_loss > 0 && val_loss > 0) {
+    const loss_gap = val_loss - train_loss
+    if (loss_gap > train_loss * 0.5) {
+      diagnosis.push('⚠️ 检测到过拟合风险。')
+      suggestions.push('💊 正则化：增加 Weight Decay 或 Dropout。')
+      suggestions.push('🛑 早停机制：建议在验证集 Loss 开始上升时停止训练。')
+    }
+  }
+
+  const map50_95 = toPct(metrics.mAP50_95)
+
+  let report = `### 📊 模型诊断报告\n\n`
+  report += `**综合评分**: ${status_level} (mAP50: ${map50.toFixed(1)}%, F1-Score: ${f1.toFixed(1)}%)\n\n`
+  if (map50_95 > 0) {
+    report += `**⚡ 综合性能**: mAP50-95 为 ${map50_95.toFixed(1)}%\n\n`
+  }
+  report += `**🩺 现象解读**:\n`
+  if (diagnosis.length === 0) {
+    report += `- 模型各项指标表现均衡，未发现明显问题。\n`
+  } else {
+    diagnosis.forEach((d) => { report += `- ${d}\n` })
+  }
+  report += `\n**💡 推荐操作方案**:\n`
+  if (suggestions.length === 0) {
+    report += `1. 保持当前训练配置；若有更高精度需求，可增加训练轮数或数据量后继续训练。\n`
+  } else {
+    suggestions.forEach((s, i) => { report += `${i + 1}. ${s}\n` })
+  }
+  return report
+})
+
+// 下载模型报告为 Markdown 文件
+const downloadModelReport = async () => {
+  if (!modelReportText.value) return
+  downloadingChart.value = 'report'
+  try {
+    const blob = new Blob([modelReportText.value], { type: 'text/markdown;charset=utf-8' })
+    await downloadFile(blob, `${detailModel.value?.model_id || 'model'}_report.md`)
+  } finally {
+    downloadingChart.value = null
+  }
 }
 
 // 训练损失图表配置
@@ -893,6 +1120,51 @@ const deleteModelItem = async (modelId: string) => {
   }
 }
 
+// 升级为预标注检测模型（热切换）
+const promoteModel = async (modelId: string) => {
+  if (!(await showConfirm(`确定将模型 ${modelId} 升级为 AI 预标注检测模型吗？\n\n将在相同验证集上对比 mAP50-95 与标注速度，确认更优后才会自动切换。`))) return
+
+  promotingModel.value = modelId
+  try {
+    const res = await promoteToDetector(modelId)
+    const nm = res.new_model || {}
+    const om = res.old_model || {}
+    const fmt = (v: any) => (v == null ? '—' : (v * 100).toFixed(1) + '%')
+    const fmtSpeed = (v: any) => (v == null ? '—' : v + ' ms/张')
+    const speedNote = nm.speed_ms != null && om.speed_ms != null
+      ? (nm.speed_ms < om.speed_ms ? '（新模型标注速度更快）' : '（新模型标注速度更慢）')
+      : ''
+    if (res.switched) {
+      alert(
+        `✅ 已自动切换为预标注模型！${speedNote}\n\n` +
+        `对比结果（同一验证集）：\n` +
+        `  新模型  mAP50-95: ${fmt(nm.mAP50_95)}  P: ${fmt(nm.precision)}  R: ${fmt(nm.recall)}\n` +
+        `  新模型  标注速度: ${fmtSpeed(nm.speed_ms)}\n` +
+        `  旧模型  mAP50-95: ${fmt(om.mAP50_95)}  P: ${fmt(om.precision)}  R: ${fmt(om.recall)}\n` +
+        `  旧模型  标注速度: ${fmtSpeed(om.speed_ms)}\n` +
+        `AI 预标注将使用新模型。`
+      )
+    } else {
+      const reason = (nm.mAP50_95 != null && om.mAP50_95 != null && nm.mAP50_95 <= om.mAP50_95 + 0.01 &&
+        !(nm.speed_ms != null && om.speed_ms != null && nm.speed_ms < om.speed_ms))
+        ? '新模型在 mAP50-95 与标注速度上均未显著优于当前检测模型'
+        : '新模型 mAP50-95 未显著超过当前检测模型'
+      alert(
+        `未切换。${reason}。\n\n` +
+        `  新模型  mAP50-95: ${fmt(nm.mAP50_95)}  P: ${fmt(nm.precision)}  R: ${fmt(nm.recall)}\n` +
+        `  新模型  标注速度: ${fmtSpeed(nm.speed_ms)}\n` +
+        `  旧模型  mAP50-95: ${fmt(om.mAP50_95)}  P: ${fmt(om.precision)}  R: ${fmt(om.recall)}\n` +
+        `  旧模型  标注速度: ${fmtSpeed(om.speed_ms)}\n` +
+        (om.error ? `\n旧模型评估提示：${om.error}` : '')
+      )
+    }
+  } catch (error: any) {
+    alert('升级失败: ' + (error.response?.data?.detail || error.message))
+  } finally {
+    promotingModel.value = null
+  }
+}
+
 // 模型上传功能
 const handleModelFileSelect = (event: Event) => {
   const target = event.target as HTMLInputElement
@@ -1104,6 +1376,38 @@ onMounted(() => {
   max-height: 90vh;
 }
 
+/* 模型报告弹窗 */
+.report-modal .modal-body {
+  max-height: calc(90vh - 120px);
+}
+
+.report-download-bar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.6rem 1rem;
+  background: #f0f4ff;
+  border-bottom: 1px solid #d8e0f0;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
+}
+
+.report-bar-title {
+  font-weight: bold;
+  color: #2c3e50;
+  font-size: 0.95rem;
+}
+
+/* 诊断报告右下角的一键执行按钮 */
+.report-exec-bar {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.75rem;
+}
+
 .loading-state {
   display: flex;
   flex-direction: column;
@@ -1112,6 +1416,116 @@ onMounted(() => {
   gap: 0.5rem;
   padding: 2rem;
   color: #7f8c8d;
+}
+
+/* 性能总结 */
+.summary-box {
+  border: 1px solid #e0e3e8;
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  background: #fafbfc;
+}
+
+.summary-verdict {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  margin-bottom: 0.6rem;
+  font-size: 0.95rem;
+}
+
+.summary-verdict.verdict-good {
+  background: #d5f4e6;
+  color: #1e8449;
+}
+
+.summary-verdict.verdict-warn {
+  background: #fdf2d9;
+  color: #b9770e;
+}
+
+.summary-verdict.verdict-bad {
+  background: #fdeaea;
+  color: #c0392b;
+}
+
+.verdict-badge {
+  font-weight: bold;
+  padding: 0.15rem 0.6rem;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.08);
+  white-space: nowrap;
+}
+
+.verdict-desc {
+  line-height: 1.5;
+}
+
+.summary-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.summary-list li {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: #2c3e50;
+}
+
+.summary-icon {
+  flex-shrink: 0;
+}
+
+.summary-list li.summary-bad {
+  color: #c0392b;
+}
+
+.summary-list li.summary-warn {
+  color: #b9770e;
+}
+
+/* 模型报告 */
+.report-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.report-header h4 {
+  margin: 0;
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.report-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.report-pre {
+  background: #f6f8fa;
+  border: 1px solid #e0e3e8;
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  font-family: ui-monospace, 'Courier New', monospace;
+  font-size: 0.85rem;
+  line-height: 1.6;
+  color: #24292f;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 360px;
+  overflow-y: auto;
 }
 
 .chart-container {
@@ -1163,6 +1577,92 @@ button {
   font-size: 0.875rem;
   color: #7f8c8d;
   margin-top: 0.25rem;
+}
+
+/* 上传行（选择文件 + 上传按钮 齐平） */
+.upload-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.25rem;
+}
+
+.file-input {
+  display: none;
+}
+
+.file-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 38px;
+  padding: 0 1rem;
+  background: #eef0f3;
+  border: 1px solid #d0d3d8;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.95rem;
+  color: #333;
+  white-space: nowrap;
+}
+
+.file-btn:hover {
+  background: #e2e5ea;
+}
+
+.upload-btn {
+  background: #8e44ad;
+  color: white;
+  border: none;
+  height: 38px;
+  padding: 0 1.2rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: bold;
+  font-size: 0.95rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  box-shadow: 0 2px 4px rgba(142, 68, 173, 0.3);
+}
+
+.upload-btn:disabled {
+  background: #b9a0c9;
+  cursor: not-allowed;
+}
+
+.selected-file {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+  padding: 0.75rem 1rem;
+  background: #eaf4fb;
+  border: 1px solid #3498db;
+  border-radius: 6px;
+  font-size: 1rem;
+  color: #1a5276;
+}
+
+.selected-file.empty {
+  background: #f8f9fa;
+  border: 1px dashed #c0c4cc;
+  color: #9aa0a6;
+}
+
+.selected-file-icon {
+  font-size: 1.25rem;
+}
+
+.selected-file-name {
+  font-weight: bold;
+  color: #2c3e50;
+  word-break: break-all;
+}
+
+.selected-file-size {
+  color: #7f8c8d;
+  white-space: nowrap;
 }
 
 /* 图表下载按钮 */

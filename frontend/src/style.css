@@ -35,11 +35,11 @@ button:disabled {
 }
 
 button.secondary {
-  background: #95a5a6;
+  background: #3498db;
 }
 
 button.secondary:hover {
-  background: #7f8c8d;
+  background: #2980b9;
 }
 
 button.danger {

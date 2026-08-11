@@ -28,7 +28,8 @@ DEFAULT_CONFIG = {
     "sam_weights": "sam_b.pt",
     "imgsz": 640,                    # 检测器输入尺寸
     "sam_imgsz": 1024,               # SAM 输入尺寸
-    "conf": 0.25,                    # 默认置信度阈值
+    "conf": 0.10,                    # 默认置信度阈值（调低以提升召回）
+    "iou": 0.40,                     # NMS IoU 阈值（调低以合并遮挡/重叠产生的重复框）
     "half": False,                   # 半精度，省显存
     "device": "auto",                # auto | cpu | GPU 索引字符串
 }
@@ -52,6 +53,7 @@ class BatchTask:
         self.done = 0
         self.boxes_written = 0
         self.current_image: Optional[str] = None
+        self.annotated_images: List[str] = []  # 本次批量预标注实际写入过框的图片ID
         self.cancelled = False
         self.status = "running"  # running | done | cancelled | error
         self.error: Optional[str] = None
@@ -64,6 +66,8 @@ class SAMService:
         self._detector_name = None
         self._sam = None
         self._sam_name = None
+        # 缓存最后一次传给 YOLO-World 的提示词列表，避免多类别时每张图重复重新编码
+        self._detector_prompts: Optional[List[str]] = None
         self._lock = asyncio.Lock()
         self.batch_tasks: Dict[str, BatchTask] = {}
         self.annotation_service = AnnotationService()
@@ -103,6 +107,45 @@ class SAMService:
         return cfg
 
     # ------------------------------------------------------------------
+    # 检测模型管理
+    # ------------------------------------------------------------------
+    def _model_locations(self) -> List[Path]:
+        """检测模型可能存放的位置：统一目录 + 项目 backend 根目录（兼容旧文件）"""
+        return [settings.SAM_MODELS_DIR, settings.BASE_DIR]
+
+    def _find_model_file(self, weights: str) -> str:
+        """将配置里的权重名解析为实际文件路径；找不到则原样返回交给 ultralytics 处理"""
+        p = Path(weights)
+        if p.is_absolute() and p.exists():
+            return str(p)
+        for d in self._model_locations():
+            cand = d / weights
+            if cand.exists():
+                return str(cand)
+        return weights
+
+    def list_models(self) -> List[dict]:
+        """列出可用的检测模型（.pt 文件）"""
+        found = {}
+        for d in self._model_locations():
+            if not d.exists():
+                continue
+            for f in d.glob("*.pt"):
+                found.setdefault(f.name, {
+                    "name": f.name,
+                    "size_mb": round(f.stat().st_size / 1e6, 1),
+                    "path": str(f),
+                })
+        return sorted(found.values(), key=lambda x: x["name"])
+
+    def save_model(self, filename: str, data: bytes) -> Path:
+        """保存上传的检测模型到统一目录"""
+        settings.SAM_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        dest = settings.SAM_MODELS_DIR / filename
+        dest.write_bytes(data)
+        return dest
+
+    # ------------------------------------------------------------------
     # 设备解析
     # ------------------------------------------------------------------
     def _resolve_device(self, cfg: dict) -> str:
@@ -121,7 +164,7 @@ class SAMService:
             return None
         weights = cfg.get("detector_weights", "yolov8s-world.pt")
         from ultralytics import YOLO
-        self._detector = YOLO(weights)
+        self._detector = YOLO(self._find_model_file(weights))
         self._detector_name = weights
         return self._detector
 
@@ -206,7 +249,9 @@ class SAMService:
         if not img_abs.exists():
             raise ValueError(f"Image file not found: {img_abs}")
 
-        boxes = await asyncio.to_thread(self._run_auto_label_sync, img_abs, classes, conf, cfg, prompts)
+        # 模型推理非线程安全，加锁串行化，避免并发访问导致模型状态损坏
+        async with self._lock:
+            boxes = await asyncio.to_thread(self._run_auto_label_sync, img_abs, classes, conf, cfg, prompts)
         return {
             "image_id": image_id,
             "width": item["width"],
@@ -215,11 +260,76 @@ class SAMService:
         }
 
     def _run_auto_label_sync(self, img_abs: Path, classes: List[str], conf: float, cfg: dict, prompts=None) -> list:
-        """同步执行：检测 → (可选)SAM 精修 → 返回 BBox 列表"""
+        """同步执行：检测 → 合并被遮挡分裂的同类框 → (可选) SAM 精修 → 返回 BBox 列表"""
         det_boxes = self._detect(img_abs, classes, conf, cfg, prompts)
+        # 合并被遮挡物（如电线杆）分裂成多个的同类框，避免同一物体被识别成两个
+        det_boxes = self._merge_same_class_boxes(det_boxes)
         if cfg.get("sam_enabled", True):
             return self._refine_with_sam(img_abs, det_boxes, cfg)
         return det_boxes
+
+    def _merge_same_class_boxes(self, boxes: list, iou_thr: float = 0.15, dist_thr: float = 0.6) -> list:
+        """合并同类且高度重叠/紧邻的框，解决遮挡导致的同一物体被识别成多个框的问题。
+
+        同一物体被遮挡物（如电线杆）隔开时，YOLO-World 常输出多个相邻/重叠的同类框。
+        这里对同类别、IoU 高于阈值或中心距离较近的框取并集合并为一个外接框。
+        """
+        if not boxes:
+            return boxes
+
+        def _iou(a, b):
+            ix1, iy1 = max(a["x1"], b["x1"]), max(a["y1"], b["y1"])
+            ix2, iy2 = min(a["x2"], b["x2"]), min(a["y2"], b["y2"])
+            iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+            inter = iw * ih
+            if inter <= 0:
+                return 0.0
+            a_area = (a["x2"] - a["x1"]) * (a["y2"] - a["y1"])
+            b_area = (b["x2"] - b["x1"]) * (b["y2"] - b["y1"])
+            return inter / (a_area + b_area - inter)
+
+        def _center_dist(a, b):
+            ca = ((a["x1"] + a["x2"]) / 2, (a["y1"] + a["y2"]) / 2)
+            cb = ((b["x1"] + b["x2"]) / 2, (b["y1"] + b["y2"]) / 2)
+            return ((ca[0] - cb[0]) ** 2 + (ca[1] - cb[1]) ** 2) ** 0.5
+
+        # 按类别分组，逐组合并
+        by_class: Dict[int, list] = {}
+        for b in boxes:
+            by_class.setdefault(b["class_id"], []).append(b)
+
+        merged: list = []
+        for cid, group in by_class.items():
+            group = sorted(group, key=lambda b: b.get("score", 0.0), reverse=True)
+            used = [False] * len(group)
+            for i in range(len(group)):
+                if used[i]:
+                    continue
+                # 以当前框为基准，合并所有与之重叠/紧邻的同类框
+                base = dict(group[i])
+                base_diag = ((base["x2"] - base["x1"]) ** 2 + (base["y2"] - base["y1"]) ** 2) ** 0.5 or 1.0
+                for j in range(i + 1, len(group)):
+                    if used[j]:
+                        continue
+                    other = group[j]
+                    if _iou(base, other) >= iou_thr:
+                        # 合并取外接矩形，保留更高 score
+                        base["x1"] = min(base["x1"], other["x1"])
+                        base["y1"] = min(base["y1"], other["y1"])
+                        base["x2"] = max(base["x2"], other["x2"])
+                        base["y2"] = max(base["y2"], other["y2"])
+                        base["score"] = max(base.get("score", 0.0), other.get("score", 0.0))
+                        used[j] = True
+                    elif _center_dist(base, other) <= dist_thr * base_diag:
+                        # 中心距离很近的同类框（遮挡分裂但几乎不重叠）也合并
+                        base["x1"] = min(base["x1"], other["x1"])
+                        base["y1"] = min(base["y1"], other["y1"])
+                        base["x2"] = max(base["x2"], other["x2"])
+                        base["y2"] = max(base["y2"], other["y2"])
+                        base["score"] = max(base.get("score", 0.0), other.get("score", 0.0))
+                        used[j] = True
+                merged.append(base)
+        return merged
 
     def _detect(self, img_abs, classes, conf, cfg, prompts=None) -> list:
         det = self._load_detector(cfg)
@@ -228,13 +338,17 @@ class SAMService:
         # 用英文提示词（prompts）做文本驱动检测，中文类别识别率更高。
         # prompts 与 classes 一一对应，因此检测结果的 class_id 仍对应 classes 索引。
         text_prompts = prompts if prompts else classes
-        try:
-            det.set_classes(text_prompts)
-        except Exception as e:
-            print(f"Warning: set_classes failed: {e}")
+        # 类别提示词未变化时复用已编码的检测头，避免多类别时每张图重复 set_classes（耗时且易超时）
+        if self._detector_prompts != text_prompts:
+            try:
+                det.set_classes(text_prompts)
+                self._detector_prompts = list(text_prompts)
+            except Exception as e:
+                print(f"Warning: set_classes failed: {e}")
         results = det.predict(
             img_abs,
             conf=conf,
+            iou=cfg.get("iou", 0.40),
             imgsz=cfg.get("imgsz", 640),
             verbose=False,
             device=self._resolve_device(cfg),
@@ -340,39 +454,48 @@ class SAMService:
                 bt.current_image = image_id
                 img_abs = settings.DATA_DIR / item["image_path"]
 
-                # 读取该图已有标注，按“缺失类别”增量标注，避免覆盖人工标注
-                existing = await self.annotation_service.get_image_annotation(bt.task_id, image_id)
-                existing_boxes = existing.get("boxes") or [] if existing else []
-                existing_class_ids = {b.get("class_id") for b in existing_boxes if b.get("class_id") is not None}
-                # 本次要标注的全部类别中，该图尚未标注的类别索引
-                missing_indices = [i for i in range(len(bt.classes)) if i not in existing_class_ids]
-                # 所有类别都已标注过，跳过该图
-                if not missing_indices:
+                # 单张图异常（如坏图、显存波动）只跳过该图，不中断整个批次
+                try:
+                    # 读取该图已有标注，按“缺失类别”增量标注，避免覆盖人工标注
+                    existing = await self.annotation_service.get_image_annotation(bt.task_id, image_id)
+                    existing_boxes = existing.get("boxes") or [] if existing else []
+                    existing_class_ids = {b.get("class_id") for b in existing_boxes if b.get("class_id") is not None}
+                    # 本次要标注的全部类别中，该图尚未标注的类别索引
+                    missing_indices = [i for i in range(len(bt.classes)) if i not in existing_class_ids]
+                    # 所有类别都已标注过，跳过该图
+                    if not missing_indices:
+                        bt.done += 1
+                        continue
+
+                    boxes = []
+                    if img_abs.exists():
+                        # 加锁串行化推理，避免与单图标注并发访问模型
+                        async with self._lock:
+                            boxes = await asyncio.to_thread(
+                                self._run_auto_label_sync, img_abs, bt.classes, bt.conf, cfg, bt.prompts
+                            )
+                    # 只保留缺失类别的检测框（class_id 为全局索引，与 bt.classes 对齐）
+                    missing_set = set(missing_indices)
+                    new_boxes = [b for b in boxes if b["class_id"] in missing_set]
+                    if new_boxes:
+                        clean_existing = [
+                            {"class_id": b.get("class_id"), "x1": b.get("x1"), "y1": b.get("y1"),
+                             "x2": b.get("x2"), "y2": b.get("y2")}
+                            for b in existing_boxes if b.get("x1") is not None
+                        ]
+                        clean_new = [
+                            {"class_id": b["class_id"], "x1": b["x1"], "y1": b["y1"],
+                             "x2": b["x2"], "y2": b["y2"]}
+                            for b in new_boxes
+                        ]
+                        await self.annotation_service.save_annotation(bt.task_id, image_id, clean_existing + clean_new, ai_annotated=True)
+                        bt.boxes_written += 1
+                        bt.annotated_images.append(image_id)
+                    bt.done += 1
+                except Exception as e:
+                    print(f"批量预标注跳过图片 {image_id}: {e}")
                     bt.done += 1
                     continue
-
-                boxes = []
-                if img_abs.exists():
-                    boxes = await asyncio.to_thread(
-                        self._run_auto_label_sync, img_abs, bt.classes, bt.conf, cfg, bt.prompts
-                    )
-                # 只保留缺失类别的检测框（class_id 为全局索引，与 bt.classes 对齐）
-                missing_set = set(missing_indices)
-                new_boxes = [b for b in boxes if b["class_id"] in missing_set]
-                if new_boxes:
-                    clean_existing = [
-                        {"class_id": b.get("class_id"), "x1": b.get("x1"), "y1": b.get("y1"),
-                         "x2": b.get("x2"), "y2": b.get("y2")}
-                        for b in existing_boxes if b.get("x1") is not None
-                    ]
-                    clean_new = [
-                        {"class_id": b["class_id"], "x1": b["x1"], "y1": b["y1"],
-                         "x2": b["x2"], "y2": b["y2"]}
-                        for b in new_boxes
-                    ]
-                    await self.annotation_service.save_annotation(bt.task_id, image_id, clean_existing + clean_new)
-                    bt.boxes_written += 1
-                bt.done += 1
 
             bt.status = "done"
             bt.result_summary = {"total": bt.total, "annotated": bt.boxes_written}
@@ -391,6 +514,7 @@ class SAMService:
             "total": bt.total,
             "done": bt.done,
             "boxes_written": bt.boxes_written,
+            "annotated_images": bt.annotated_images,
             "current_image": bt.current_image,
             "error": bt.error,
             "summary": bt.result_summary,
