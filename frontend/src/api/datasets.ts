@@ -30,6 +30,11 @@ export const getDataset = async (datasetId: string) => {
   return data
 }
 
+export const getDatasetTree = async (datasetId: string) => {
+  const { data } = await api.get(`/datasets/${datasetId}/tree`)
+  return data
+}
+
 export const updateDataset = async (datasetId: string, request: UpdateDatasetRequest) => {
   const { data } = await api.put(`/datasets/${datasetId}`, request)
   return data

@@ -1,6 +1,6 @@
 <template>
   <teleport to="body">
-    <transition name="dialog-fade">
+    <transition name="dialog-fade" @after-leave="onAfterLeave">
       <div v-if="state.visible" class="dialog-overlay" @mousedown.self="handleOverlay">
         <div class="dialog-box">
           <div class="dialog-title">{{ state.title }}</div>
@@ -40,13 +40,33 @@ import { useDialog } from '@/composables/useDialog'
 const { state, resolveDialog } = useDialog()
 const inputRef = ref<HTMLInputElement | null>(null)
 
+// 弹窗打开前的滚动位置：弹窗关闭（淡出动画结束、DOM 移除）时焦点回退到 body
+// 会导致浏览器滚回页面顶部，这里在动画结束后恢复原位置
+let savedScrollY = 0
+let needRestore = false
+
+function onAfterLeave() {
+  if (needRestore) {
+    needRestore = false
+    if (window.scrollY !== savedScrollY) {
+      window.scrollTo(0, savedScrollY)
+    }
+  }
+}
+
+function restoreScroll() {
+  needRestore = true
+}
+
 function confirm() {
   const value = state.type === 'confirm' ? true : state.type === 'prompt' ? state.value : null
   resolveDialog(value)
+  restoreScroll()
 }
 
 function cancel() {
   resolveDialog(state.type === 'confirm' ? false : null)
+  restoreScroll()
 }
 
 function handleOverlay() {
@@ -56,8 +76,14 @@ function handleOverlay() {
 watch(
   () => state.visible,
   (visible) => {
-    if (visible && state.type === 'prompt') {
-      nextTick(() => inputRef.value?.focus())
+    if (visible) {
+      savedScrollY = window.scrollY
+      if (state.type === 'prompt') {
+        nextTick(() => inputRef.value?.focus())
+      }
+    } else {
+      // visible 直接变为 false 时（如组件卸载），兜底恢复
+      needRestore = true
     }
   }
 )

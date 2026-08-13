@@ -25,6 +25,11 @@ export const getTrainJob = async (jobId: string) => {
   return data
 }
 
+export const getTrainJobTree = async (jobId: string) => {
+  const { data } = await api.get(`/train/jobs/${jobId}/tree`)
+  return data
+}
+
 export const stopTrainJob = async (jobId: string) => {
   const { data } = await api.post(`/train/jobs/${jobId}/stop`)
   return data

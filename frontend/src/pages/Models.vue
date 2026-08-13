@@ -150,7 +150,7 @@
           <span class="report-bar-title">📄 模型诊断报告</span>
           <button class="primary" @click="downloadModelReport" :disabled="!modelReportText">
             <span v-if="downloadingChart === 'report'" class="loading-spinner"></span>
-            ⬇ 下载报告
+            ⬇ 下载完整报告（.html）
           </button>
         </div>
         <div class="modal-body">
@@ -538,13 +538,104 @@ const modelReportText = computed(() => {
   return report
 })
 
-// 下载模型报告为 Markdown 文件
+// 将 Blob 转为 base64 字符串（用于内嵌到 HTML 报告）
+const blobToBase64 = (blob: Blob): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const result = reader.result as string
+      const idx = result.indexOf(',')
+      resolve(idx >= 0 ? result.slice(idx + 1) : result)
+    }
+    reader.onerror = reject
+    reader.readAsDataURL(blob)
+  })
+
+// 简单 Markdown → HTML（覆盖报告用到的标题、加粗、列表、段落）
+const mdToHtml = (md: string): string => {
+  const esc = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/\n/g, '<br>')
+  const inline = (s: string) =>
+    esc(s).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+  const lines = md.split('\n')
+  let html = ''
+  let inList = false
+  const closeList = () => {
+    if (inList) { html += '</ul>\n'; inList = false }
+  }
+  for (const raw of lines) {
+    const line = raw.trimEnd()
+    if (line.startsWith('### ')) { closeList(); html += `<h3>${inline(line.slice(4))}</h3>\n` }
+    else if (line.startsWith('## ')) { closeList(); html += `<h2>${inline(line.slice(3))}</h2>\n` }
+    else if (line.match(/^[-*]\s/)) {
+      if (!inList) { html += '<ul>\n'; inList = true }
+      html += `<li>${inline(line.replace(/^[-*]\s/, ''))}</li>\n`
+    } else if (line.match(/^\d+\.\s/)) {
+      if (!inList) { html += '<ul>\n'; inList = true }
+      html += `<li>${inline(line.replace(/^\d+\.\s/, ''))}</li>\n`
+    } else if (line.trim() === '') { closeList(); html += '<br>\n' }
+    else { closeList(); html += `<p>${inline(line)}</p>\n` }
+  }
+  closeList()
+  return html
+}
+
+// 组装完整的 HTML 模型报告（诊断文字 + 训练图表，图表内嵌 base64）
+const buildReportHtml = (md: string, lossBase64: string, metricsBase64: string, model: any): string => {
+  const title = `模型报告: ${model?.model_id || 'model'}`
+  const lossImg = lossBase64
+    ? `<div class="chart"><h3>训练损失曲线</h3><img src="data:image/png;base64,${lossBase64}" alt="损失曲线"></div>`
+    : ''
+  const metricsImg = metricsBase64
+    ? `<div class="chart"><h3>训练指标曲线</h3><img src="data:image/png;base64,${metricsBase64}" alt="指标曲线"></div>`
+    : ''
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>${title}</title>
+<style>
+  body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;color:#24292f;margin:32px auto;max-width:900px;padding:0 20px;line-height:1.8}
+  h1{font-size:24px;border-bottom:2px solid #0969da;padding-bottom:10px}
+  h2{font-size:20px;margin-top:28px;color:#0969da}
+  h3{font-size:17px;margin-top:20px}
+  p{margin:8px 0}
+  ul{margin:8px 0 12px;padding-left:22px}
+  li{margin:4px 0}
+  .chart{margin:24px 0}
+  .chart img{width:100%;max-width:860px;border:1px solid #e0e3e8;border-radius:6px}
+  strong{color:#111}
+</style>
+</head>
+<body>
+<h1>${title}</h1>
+${mdToHtml(md)}
+${lossImg}
+${metricsImg}
+</body>
+</html>`
+}
+
+// 下载模型报告为完整 HTML 文件（含诊断文字与训练图表）
 const downloadModelReport = async () => {
   if (!modelReportText.value) return
+  const modelId = detailModel.value?.model_id || 'model'
   downloadingChart.value = 'report'
   try {
-    const blob = new Blob([modelReportText.value], { type: 'text/markdown;charset=utf-8' })
-    await downloadFile(blob, `${detailModel.value?.model_id || 'model'}_report.md`)
+    // 获取训练图表并内嵌到报告中，保证下载内容完整
+    let lossBase64 = '', metricsBase64 = ''
+    try {
+      const [lossBlob, metricsBlob] = await Promise.all([
+        generateTrainingCharts(modelId, 'loss'),
+        generateTrainingCharts(modelId, 'metrics')
+      ])
+      ;[lossBase64, metricsBase64] = [await blobToBase64(lossBlob), await blobToBase64(metricsBlob)]
+    } catch (e) {
+      console.warn('获取训练图表失败，报告将仅包含诊断文字:', e)
+    }
+    const html = buildReportHtml(modelReportText.value, lossBase64, metricsBase64, detailModel.value)
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' })
+    await downloadFile(blob, `${modelId}_report.html`)
   } finally {
     downloadingChart.value = null
   }
@@ -1517,14 +1608,14 @@ onMounted(() => {
   background: #f6f8fa;
   border: 1px solid #e0e3e8;
   border-radius: 6px;
-  padding: 0.75rem 1rem;
+  padding: 1rem 1.25rem;
   font-family: ui-monospace, 'Courier New', monospace;
-  font-size: 0.85rem;
-  line-height: 1.6;
+  font-size: 1rem;
+  line-height: 1.9;
   color: #24292f;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 360px;
+  max-height: 480px;
   overflow-y: auto;
 }
 

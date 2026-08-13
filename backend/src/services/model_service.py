@@ -88,17 +88,31 @@ class ModelService:
             model_meta["file_size"] = file_size
             model_meta["file_size_mb"] = round(file_size / (1024 * 1024), 2)
         
-        # 尝试加载训练指标
+        # 并行加载训练指标与模型参数信息（避免串行阻塞，加快模型详情打开速度）
         job_id = model_meta.get("job_id")
-        if job_id:
-            training_metrics = await self._load_training_metrics(job_id)
-            if training_metrics:
-                model_meta["training_metrics"] = training_metrics
         
-        # 尝试获取模型参数信息
-        model_info = await self._get_model_info(model_meta.get("weights_path"))
-        if model_info:
-            model_meta["model_info"] = model_info
+        async def _load_metrics_async():
+            if job_id:
+                return await self._load_training_metrics(job_id)
+            return None
+        
+        async def _load_info_async():
+            # 已缓存在 model.json 则直接使用，避免每次重新加载权重
+            if not model_meta.get("model_info") and model_meta.get("weights_path"):
+                model_info = await self._get_model_info(model_meta.get("weights_path"))
+                if model_info:
+                    model_meta["model_info"] = model_info
+                    try:
+                        save_meta = _load_json(model_file)
+                        save_meta["model_info"] = model_info
+                        await asyncio.to_thread(_save_json, model_file, save_meta)
+                    except Exception as e:
+                        print(f"Error caching model_info: {e}")
+            return model_meta.get("model_info")
+        
+        training_metrics, _ = await asyncio.gather(_load_metrics_async(), _load_info_async())
+        if training_metrics:
+            model_meta["training_metrics"] = training_metrics
         
         return model_meta
     
@@ -113,10 +127,17 @@ class ModelService:
             metrics = {}
             
             # 尝试读取 results.csv（YOLO 训练输出）
-            # 查找 train 目录下的 results.csv
-            results_files = list(job_dir.rglob("results.csv"))
-            if results_files:
-                results_csv = results_files[0]
+            # 优先精确路径，避免 rglob 全目录遍历（任务目录可能包含大量预测图片，遍历很慢）
+            results_csv = None
+            for candidate in [job_dir / "train" / "results.csv", job_dir / "results.csv"]:
+                if candidate.exists():
+                    results_csv = candidate
+                    break
+            if results_csv is None:
+                results_files = list(job_dir.rglob("results.csv"))
+                if results_files:
+                    results_csv = results_files[0]
+            if results_csv is not None:
                 try:
                     metrics["training_history"] = self._parse_results_csv(results_csv)
                 except Exception as e:

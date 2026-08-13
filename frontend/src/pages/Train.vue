@@ -28,9 +28,9 @@
             </div>
             <div v-if="!isDatasetPrepared(ds)" class="ds-card-warn">需先"准备"</div>
           </div>
-          <div v-if="!loadingDatasets && datasets.length === 0" class="empty-state">暂无数据集，请先上传</div>
+          <div v-if="!loadingDatasets && datasets.length === 0" class="empty-state">暂无已标注导出的数据集，请先在标注页完成标注并导出</div>
         </div>
-        <small>提示：点击卡片选择数据集，需为"已准备"状态</small>
+        <small>提示：仅显示在标注页执行过"导出YOLO(自动划分)"的数据集；点击卡片选择</small>
       </div>
       <div class="form-group">
         <label>
@@ -41,7 +41,7 @@
       <div v-if="!useFineTune" class="form-group">
         <label class="model-label">
           预训练模型
-          <button type="button" class="add-model-btn" @click="$refs.ptFile.click()" :disabled="uploadingPt">
+          <button type="button" class="add-model-btn" @click="ptFile?.click()" :disabled="uploadingPt">
             <span v-if="uploadingPt" class="loading-spinner"></span>
             {{ uploadingPt ? '导入中...' : '添加' }}
           </button>
@@ -125,7 +125,7 @@
       </div>
       <div v-else class="jobs-list">
         <div v-for="job in jobs" :key="job.job_id" class="job-item">
-          <h3>{{ job.job_id }}</h3>
+          <h3 class="job-name" @click="openJobFiles(job.job_id)" title="点击查看任务文件">{{ job.job_id }}</h3>
           <p>数据集: {{ job.dataset_id }}</p>
           <p>模型: {{ job.model_name }}</p>
           <p>轮数: {{ job.epochs }} | 图片尺寸: {{ job.imgsz }} | 批次: {{ job.batch }}</p>
@@ -141,6 +141,11 @@
               <span v-else>等待训练启动...</span>
               <span class="progress-percent" v-if="jobProgress[job.job_id]?.has">{{ jobProgress[job.job_id].percent }}%</span>
             </div>
+            <div class="progress-meta">
+              <span class="progress-last" :class="{ warn: isStale(job.job_id) }">
+                {{ lastActivityText(job.job_id) }}
+              </span>
+            </div>
             <div v-if="jobProgress[job.job_id]?.lossLine" class="loss-line">{{ jobProgress[job.job_id].lossLine }}</div>
           </div>
           <p v-if="job.model_id">模型ID: {{ job.model_id }}</p>
@@ -149,12 +154,14 @@
           <p v-if="job.stopped_at">中断时间: {{ new Date(job.stopped_at).toLocaleString() }}</p>
           <p v-if="job.failed_at">失败时间: {{ new Date(job.failed_at).toLocaleString() }}</p>
           <p v-if="job.crashed_at">崩溃时间: {{ new Date(job.crashed_at).toLocaleString() }}</p>
-          <p v-if="job.can_resume" style="color: #2ecc71; font-weight: bold;">✓ 可恢复训练</p>
+          <p v-if="job.status === 'stopped'" style="color: #2ecc71; font-weight: bold;">✓ 可恢复训练</p>
+          <p v-else-if="job.resume_count > 0" style="color: #2ecc71; font-weight: bold;">✓ 已恢复训练</p>
           <div class="job-actions">
             <!-- 失败原因（任务卡左边） -->
             <button 
               v-if="job.status === 'failed' || job.status === 'crashed'" 
               @click="showFailureDialog(job)" 
+              type="button"
               class="danger-outline"
             >
               失败原因
@@ -162,6 +169,7 @@
             <button 
               v-if="job.status === 'running'" 
               @click="stopJob(job.job_id)" 
+              type="button"
               class="secondary"
               :disabled="stoppingJob === job.job_id"
             >
@@ -169,8 +177,9 @@
               {{ stoppingJob === job.job_id ? '停止中...' : '停止' }}
             </button>
             <button 
-              v-if="job.status === 'stopped' || job.status === 'failed' || job.status === 'crashed' || job.can_resume" 
+              v-if="job.status !== 'running' && (job.status === 'stopped' || job.status === 'failed' || job.status === 'crashed' || job.can_resume)" 
               @click="resumeJob(job.job_id)" 
+              type="button"
               class="secondary"
               :disabled="resumingJob === job.job_id"
             >
@@ -179,6 +188,7 @@
             </button>
             <button 
               @click="deleteJobItem(job.job_id)" 
+              type="button"
               class="danger"
               :disabled="deletingJob === job.job_id"
             >
@@ -192,18 +202,62 @@
         </div>
       </div>
     </div>
+
+    <!-- 任务文件浏览器弹窗 -->
+    <div v-if="jobFiles" class="job-files-mask" @click.self="closeJobFiles">
+      <div class="job-files-dialog">
+        <div class="viewer-header">
+          <h3>任务文件 - {{ jobFiles.job_id }}</h3>
+          <button class="secondary viewer-close" @click="closeJobFiles">关闭</button>
+        </div>
+        <div class="viewer-section-title">文件夹结构</div>
+        <div v-if="jobFilesLoading" class="loading-state">
+          <span class="loading-spinner large"></span>
+          <span>加载任务文件...</span>
+        </div>
+        <div v-else-if="jobTree" class="viewer-tree">
+          <FolderTree
+            :nodes="jobTree.children"
+            :depth="0"
+            :expanded="jobTreeExpanded"
+            @toggle-dir="toggleJobDir"
+            @open-file="openJobFile"
+          />
+        </div>
+        <div v-else class="empty-state">暂无输出文件</div>
+        <div v-if="jobFiles?.log_file" class="job-log-link">
+          <button class="secondary" @click="openJobFile({ name: '训练日志', path: jobFiles.log_file, ext: '.log', type: 'file' })">
+            📄 查看训练日志
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 文件内容预览弹窗 -->
+    <div v-if="jobFilePreview" class="file-preview-mask" @click.self="closeJobFilePreview">
+      <div class="file-preview-dialog">
+        <div class="viewer-header">
+          <h3>{{ jobFilePreview.name }}</h3>
+          <button class="secondary viewer-close" @click="closeJobFilePreview">关闭</button>
+        </div>
+        <div v-if="jobFilePreviewIsImage" class="file-preview-img-wrap">
+          <img :src="'/static/' + jobFilePreview.path" @error="handleFileImgError" />
+        </div>
+        <pre v-else class="file-preview-text">{{ jobFilePreviewContent || '加载中...' }}</pre>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { createTrainJob, listTrainJobs, deleteTrainJob, resumeTrainJob, type TrainJobRequest } from '@/api/train'
+import { createTrainJob, listTrainJobs, deleteTrainJob, resumeTrainJob, getTrainJobTree, type TrainJobRequest } from '@/api/train'
 import { listModels, uploadPretrainedPt, listCustomModels } from '@/api/models'
 import { listDatasets } from '@/api/datasets'
 import { subscribeLogsSSE, pollLogsTail, getLogLines } from '@/api/logs'
+import FolderTree from '@/components/FolderTree.vue'
 import { useLogStore } from '@/store/logs'
-import LogPanel from '@/components/Logs/LogPanel.vue'
 import { showAlert, showConfirm } from '@/composables/useDialog'
 
 const logStore = useLogStore()
@@ -290,6 +344,7 @@ const selectedModelSize = ref('n')
 const customModels = ref<any[]>([])
 const customSelectedPath = ref('')
 const uploadingPt = ref(false)
+const ptFile = ref<HTMLInputElement | null>(null)
 
 // 当前版本的模型列表
 const currentVersionModels = computed(() => {
@@ -325,7 +380,8 @@ const loadDatasets = async () => {
   loadingDatasets.value = true
   try {
     const result = await listDatasets()
-    datasets.value = result.datasets || []
+    // 只显示已标注导出的数据集（在标注页执行过"导出YOLO(自动划分)"）
+    datasets.value = (result.datasets || []).filter(d => d.annotated)
   } catch (error: any) {
     console.error('加载数据集失败:', error)
     alert('加载数据集失败: ' + (error.response?.data?.detail || error.message))
@@ -411,17 +467,14 @@ let eventSource: EventSource | null = null
 let pollInterval: any = null
 
 // 每个任务的独立进度（key: job_id）
-const jobProgress = ref<Record<string, { current: number; total: number; percent: number; has: boolean; lossLine: string }>>({})
+const jobProgress = ref<Record<string, { current: number; total: number; percent: number; has: boolean; lossLine: string; lastActivity: number }>>({})
 // 每个任务独立的轮询定时器
 const jobPollers = new Map<string, any>()
 // 每个任务独立的日志偏移量
 const jobOffsets = new Map<string, number>()
-
-// 日志历史加载相关
-const loadingHistory = ref(false)
-const logInfo = ref('')
-const selectedLogLines = ref(100)
-const showTrainDetail = ref(false)
+// 每秒跳动一次，用于实时显示"最后更新 X 秒前"（判断训练是否卡住）
+const nowTick = ref(Date.now())
+let nowTimer: any = null
 
 // 去除 ANSI 转义码
 const stripAnsi = (text: string): string => text.replace(/\x1B\[[0-9;]*[mK]/g, '')
@@ -479,7 +532,15 @@ const startTraining = async () => {
   }
 }
 
+// 恢复页面滚动位置（原生 alert 弹出/关闭可能引起页面跳动）
+const restoreScroll = (y: number) => {
+  requestAnimationFrame(() => {
+    if (window.scrollY !== y) window.scrollTo(0, y)
+  })
+}
+
 const stopJob = async (jobId: string) => {
+  const prevScrollY = window.scrollY
   if (!(await showConfirm('确定要停止此训练任务吗？'))) return
   
   stoppingJob.value = jobId
@@ -488,15 +549,18 @@ const stopJob = async (jobId: string) => {
     const { stopTrainJob } = await import('@/api/train')
     await stopTrainJob(jobId)
     alert('任务已停止')
+    restoreScroll(prevScrollY)
     loadJobs()
   } catch (error: any) {
     alert('停止失败: ' + (error.response?.data?.detail || error.message))
+    restoreScroll(prevScrollY)
   } finally {
     stoppingJob.value = null
   }
 }
 
 const resumeJob = async (jobId: string) => {
+  const prevScrollY = window.scrollY
   if (!(await showConfirm('确定要继续训练此任务吗？\n如果有 checkpoint 将从 checkpoint 恢复，否则从原始模型重新开始。'))) return
   
   resumingJob.value = jobId
@@ -504,6 +568,7 @@ const resumeJob = async (jobId: string) => {
     stopJobPolling(jobId)
     await resumeTrainJob(jobId)
     alert('训练已恢复!')
+    restoreScroll(prevScrollY)
     
     // 开始订阅日志
     logStore.clearLogs()
@@ -528,6 +593,7 @@ const resumeJob = async (jobId: string) => {
 }
 
 const deleteJobItem = async (jobId: string) => {
+  const prevScrollY = window.scrollY
   if (!(await showConfirm(`确定要删除任务 ${jobId} 吗？此操作不可恢复！`))) return
   
   deletingJob.value = jobId
@@ -535,9 +601,11 @@ const deleteJobItem = async (jobId: string) => {
     stopJobPolling(jobId)
     await deleteTrainJob(jobId)
     alert('删除成功!')
+    restoreScroll(prevScrollY)
     loadJobs()
   } catch (error: any) {
     alert('删除失败: ' + (error.response?.data?.detail || error.message))
+    restoreScroll(prevScrollY)
   } finally {
     deletingJob.value = null
   }
@@ -595,15 +663,17 @@ const startPolling = (jobId: string) => {
 }
 
 // 从单条日志解析进度（返回 null 表示非进度行）
-const parseProgressLine = (cleanLine: string): { current: number; total: number } | null => {
-  const m = cleanLine.match(/^(\d+)\/(\d+)\s/)
-  if (m) {
-    return { current: parseInt(m[1]), total: parseInt(m[2]) }
-  }
-  return null
+// 兼容 YOLO 日志格式：epoch 进度 "1/10 ..." + tqdm 批次百分比 "640: 57% ━ 4/7"
+const parseProgressLine = (cleanLine: string): { epoch: number; totalEpochs: number; batchPct: number } | null => {
+  const m = cleanLine.match(/^(\d+)\/(\d+)\s+/)
+  if (!m) return null
+  // 取行内最后一个 tqdm 百分比 NN%（epoch 内批次进度，0~100）
+  const pcts = [...cleanLine.matchAll(/(\d+)%/g)].map((x) => parseInt(x[1]))
+  const batchPct = pcts.length ? pcts[pcts.length - 1] : 100
+  return { epoch: parseInt(m[1]), totalEpochs: parseInt(m[2]), batchPct }
 }
 
-// 更新单个任务的进度
+// 更新单个任务的进度（细粒度：epoch + 批次百分比）
 const updateJobProgress = (jobId: string, lines: string[]) => {
   let cur = jobProgress.value[jobId]?.current || 0
   let total = jobProgress.value[jobId]?.total || 0
@@ -612,8 +682,9 @@ const updateJobProgress = (jobId: string, lines: string[]) => {
     const clean = stripAnsi(raw).trim()
     const p = parseProgressLine(clean)
     if (p) {
-      cur = p.current
-      total = p.total
+      // 细粒度进度：epoch 内按批次百分比推进，避免长时间停留在同一百分比
+      cur = (p.epoch - 1) + p.batchPct / 100
+      total = p.totalEpochs
       if (clean.includes('loss')) {
         lossLine = clean
       }
@@ -622,9 +693,10 @@ const updateJobProgress = (jobId: string, lines: string[]) => {
   jobProgress.value[jobId] = {
     current: cur,
     total,
-    percent: total > 0 ? Math.round((cur / total) * 100) : 0,
+    percent: total > 0 ? Math.min(100, Math.round((cur / total) * 100)) : 0,
     has: total > 0,
-    lossLine
+    lossLine,
+    lastActivity: Date.now()
   }
 }
 
@@ -669,6 +741,22 @@ const stopJobPolling = (jobId: string) => {
   jobOffsets.delete(jobId)
 }
 
+// 判断某任务是否长时间无新日志（可能卡住，而非正在训练）
+const isStale = (jobId: string): boolean => {
+  const la = jobProgress.value[jobId]?.lastActivity || 0
+  return la > 0 && (nowTick.value - la) > 60_000
+}
+
+// 显示"最后更新 X 秒/分钟前"
+const lastActivityText = (jobId: string): string => {
+  const la = jobProgress.value[jobId]?.lastActivity || 0
+  if (!la) return '等待训练启动...'
+  const sec = Math.max(0, Math.round((nowTick.value - la) / 1000))
+  if (sec < 5) return '更新中...'
+  if (sec < 60) return `最后更新 ${sec} 秒前`
+  return `最后更新 ${Math.floor(sec / 60)} 分钟前`
+}
+
 // 为所有运行中的任务启动独立轮询
 const startAllJobPolling = () => {
   jobs.value.forEach((job) => {
@@ -676,50 +764,6 @@ const startAllJobPolling = () => {
       startJobPolling(job.job_id)
     }
   })
-}
-
-const viewLogs = async (jobId: string) => {
-  currentJobId.value = jobId
-  logStore.clearLogs()
-  
-  // 先加载历史日志（默认最后100条）
-  await loadHistoryLogs(selectedLogLines.value)
-  
-  // 然后开始订阅实时日志
-  subscribeToLogs(jobId)
-}
-
-const loadHistoryLogs = async (n: number) => {
-  if (!currentJobId.value) return
-  
-  loadingHistory.value = true
-  logInfo.value = ''
-  
-  try {
-    const result = await getLogLines(currentJobId.value, n)
-    
-    if (result.error) {
-      logInfo.value = `错误: ${result.error}`
-      return
-    }
-    
-    // 清空当前日志并加载历史日志
-    logStore.clearLogs()
-    result.lines.forEach((line: string) => {
-      logStore.addLog(line)
-    })
-    
-    logInfo.value = `显示 ${result.returned}/${result.total} 条`
-  } catch (error: any) {
-    console.error('加载历史日志失败:', error)
-    logInfo.value = '加载失败'
-  } finally {
-    loadingHistory.value = false
-  }
-}
-
-const onLinesChange = (n: number) => {
-  selectedLogLines.value = n
 }
 
 // 训练失败操作建议：根据错误信息匹配常见原因并给出建议
@@ -773,6 +817,72 @@ const getFailureAdvice = (error: string = ''): { reason: string; advice: string 
   }
 }
 
+// ===== 任务文件浏览器 =====
+const jobFiles = ref<any | null>(null)  // 正在浏览文件的任务
+const jobFilesLoading = ref(false)
+const jobTree = ref<any | null>(null)  // 任务目录树
+const jobTreeExpanded = reactive(new Set<string>())
+const jobFilePreview = ref<any | null>(null)
+const jobFilePreviewIsImage = ref(false)
+const jobFilePreviewContent = ref('')
+
+// 打开任务文件浏览器
+const openJobFiles = async (jobId: string) => {
+  jobFiles.value = { job_id: jobId, log_file: null }
+  jobFilesLoading.value = true
+  jobTree.value = null
+  jobTreeExpanded.clear()
+  try {
+    const result = await getTrainJobTree(jobId)
+    jobTree.value = result.tree
+    jobFiles.value.log_file = result.log_file
+  } catch (e: any) {
+    jobTree.value = null
+    showAlert('加载任务文件失败: ' + (e.response?.data?.detail || e.message), '错误')
+  } finally {
+    jobFilesLoading.value = false
+  }
+}
+
+const closeJobFiles = () => {
+  jobFiles.value = null
+  jobTree.value = null
+  jobTreeExpanded.clear()
+  closeJobFilePreview()
+}
+
+const toggleJobDir = (node: any) => {
+  if (jobTreeExpanded.has(node.path)) jobTreeExpanded.delete(node.path)
+  else jobTreeExpanded.add(node.path)
+}
+
+const JOB_IMG_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp']
+
+// 点击文件：图片直接预览，文本读取内容
+const openJobFile = async (node: any) => {
+  jobFilePreview.value = node
+  jobFilePreviewContent.value = ''
+  jobFilePreviewIsImage.value = JOB_IMG_EXTS.includes((node.ext || '').toLowerCase())
+  if (jobFilePreviewIsImage.value) return
+  try {
+    const res = await fetch('/static/' + node.path)
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    jobFilePreviewContent.value = await res.text()
+  } catch (e: any) {
+    jobFilePreviewContent.value = '无法读取该文件：' + (e.message || e)
+  }
+}
+
+const closeJobFilePreview = () => {
+  jobFilePreview.value = null
+  jobFilePreviewContent.value = ''
+}
+
+const handleFileImgError = (e: any) => {
+  const el = e.target as HTMLImageElement
+  el.style.display = 'none'
+}
+
 // 弹窗展示训练失败原因与操作建议
 const showFailureDialog = (job: any) => {
   const { reason, advice } = getFailureAdvice(job.error || job.message || '')
@@ -786,8 +896,11 @@ const showFailureDialog = (job: any) => {
   )
 }
 
-// 已自动弹窗提示过的失败任务（避免重复提示）
-const failedJobsAlerted = ref<Set<string>>(new Set())
+// 已自动弹窗提示过的失败任务（避免重复提示），持久化到 localStorage 只提示一次
+const FAIL_ALERT_KEY = 'yolo_train_failed_alerted'
+const failedJobsAlerted = ref<Set<string>>(
+  new Set(JSON.parse(localStorage.getItem(FAIL_ALERT_KEY) || '[]'))
+)
 
 // 监听任务状态变化，训练失败时先提醒，再询问是否跳转训练页面
 watch(
@@ -796,6 +909,7 @@ watch(
     list.forEach((job) => {
       if ((job.status === 'failed' || job.status === 'crashed') && !failedJobsAlerted.value.has(job.job_id)) {
         failedJobsAlerted.value.add(job.job_id)
+        localStorage.setItem(FAIL_ALERT_KEY, JSON.stringify([...failedJobsAlerted.value]))
         showConfirm('训练失败，是否跳转到训练页面？', '训练失败').then((ok) => {
           if (ok) router.push({ name: 'Train' })
         })
@@ -823,6 +937,8 @@ onMounted(() => {
   loadModels()
   loadDatasets()
   loadCustomModels()
+  // 每秒跳动，刷新"最后更新 X 秒前"提示
+  nowTimer = setInterval(() => { nowTick.value = Date.now() }, 1000)
 })
 
 onUnmounted(() => {
@@ -831,6 +947,9 @@ onUnmounted(() => {
   }
   if (pollInterval) {
     clearInterval(pollInterval)
+  }
+  if (nowTimer) {
+    clearInterval(nowTimer)
   }
   // 清理所有任务卡牌的独立轮询
   jobPollers.forEach((timer) => clearInterval(timer))
@@ -873,6 +992,17 @@ onUnmounted(() => {
 .progress-percent {
   font-weight: bold;
   color: #8e44ad;
+}
+
+/* 最后更新提示：正常灰色，长时间无新日志变橙色警告 */
+.progress-last {
+  font-size: 0.8rem;
+  color: #999;
+}
+
+.progress-last.warn {
+  color: #e67e22;
+  font-weight: bold;
 }
 
 .loss-line {
@@ -1136,5 +1266,126 @@ button {
   align-items: center;
   justify-content: center;
   gap: 0.25rem;
+}
+
+/* 任务名称可点击 */
+.job-name {
+  cursor: pointer;
+}
+.job-name:hover {
+  color: #2c6fbb;
+  text-decoration: underline;
+}
+
+/* 任务文件浏览器弹窗 */
+.job-files-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 1.5rem;
+}
+
+.job-files-dialog {
+  background: white;
+  border-radius: 8px;
+  width: 90%;
+  max-width: 900px;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.viewer-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid #eee;
+}
+
+.viewer-header h3 {
+  margin: 0;
+  color: #2c3e50;
+}
+
+.viewer-close {
+  padding: 0.35rem 0.9rem;
+  font-size: 0.875rem;
+}
+
+.viewer-section-title {
+  padding: 0.75rem 1.25rem 0.25rem;
+  font-weight: 600;
+  color: #2c3e50;
+  border-top: 1px solid #f0f0f0;
+  margin-top: 0.5rem;
+}
+
+.viewer-tree {
+  max-height: 50vh;
+  overflow-y: auto;
+  padding: 0.5rem 1.25rem 0.75rem;
+}
+
+.job-log-link {
+  padding: 0.5rem 1.25rem 1rem;
+  border-top: 1px solid #f0f0f0;
+}
+
+/* 文件内容预览弹窗 */
+.file-preview-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+  padding: 1.5rem;
+}
+
+.file-preview-dialog {
+  background: white;
+  border-radius: 8px;
+  width: 80%;
+  max-width: 900px;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.file-preview-img-wrap {
+  flex: 1;
+  overflow: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f5f5f5;
+  padding: 1rem;
+}
+
+.file-preview-img-wrap img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.file-preview-text {
+  flex: 1;
+  overflow: auto;
+  margin: 0;
+  padding: 1rem 1.25rem;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  background: #fafbfc;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #2c3e50;
 }
 </style>

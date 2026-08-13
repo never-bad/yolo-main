@@ -15,13 +15,16 @@
 ### 功能特性
 
 - ✅ **数据集上传与准备** - 支持 ZIP 格式数据集上传，自动解压和组织
-- ✅ **可视化 BBox 标注** - Canvas 画布交互式标注工具
-- ✅ **YOLOv8 模型训练** - 后台异步训练任务，支持 GPU 加速
+- ✅ **可视化 BBox 标注** - Canvas 画布交互式标注工具，支持矩形框、多边形等
+- ✅ **交互式标注** - 基于 Grounding-DINO 的文本驱动检测，输入文本提示词自动生成预选框
+- ✅ **批量预标注** - 检测模型可在 YOLO-World / GroundingDINO 间切换，可选 SAM 分割精修，一键为整批图片生成标注
+- ✅ **YOLOv8 模型训练** - 后台异步训练任务，支持 GPU 加速，可恢复中断的训练
+- ✅ **训练并发控制** - 限制同时训练的任务数量，避免显存不足
 - ✅ **实时日志流** - SSE 实时日志推送，断线自动降级到轮询
 - ✅ **模型推理** - 支持图片和视频推理，可视化检测结果
 - ✅ **高性能训练** - 自动 Batch Size、混合精度训练、磁盘缓存优化
 - ✅ **模型上传与导出** - 支持上传已有模型，导出训练后的模型为ZIP
-- ✅ **数据集导出** - 支持导出标注前后的数据集（YOLO格式）
+- ✅ **数据集导出** - 支持导出标注前后的数据集（YOLO格式），支持自动划分 train/val/test
 - ✅ **推理结果导出** - 推理结果自动生成UUID，支持CSV和图片导出
 - ✅ **训练图表生成** - 使用matplotlib生成训练指标可视化图表
 
@@ -29,15 +32,18 @@
 
 ```
 yolo-platform/
-├── backend/              # FastAPI 后端
+├── .dockerignore        # Docker 构建上下文排除（大数据目录/依赖）
+├── backend/             # FastAPI 后端
 │   ├── src/
 │   │   ├── api/routes/  # 路由层
-│   │   ├── services/    # 业务逻辑层
+│   │   ├── services/    # 业务逻辑层（含 SAM 交互式标注服务）
 │   │   ├── yolo/        # YOLO 封装
 │   │   ├── core/        # 配置
 │   │   └── main.py      # 入口
-│   ├── data/            # 数据存储
-│   ├── models/          # 模型注册表
+│   ├── data/            # 数据存储（上传/数据集/训练任务）
+│   ├── models/          # 模型注册表 + 预置模型
+│   │   ├── registry/    # 训练产出的模型
+│   │   └── sam/         # Grounding-DINO 交互式标注模型
 │   └── requirements.txt
 ├── frontend/            # Vue3 前端
 │   ├── src/
@@ -46,7 +52,7 @@ yolo-platform/
 │   │   ├── api/         # 接口封装
 │   │   └── store/       # Pinia 状态
 │   └── package.json
-└── docker/              # Docker 配置
+└── docker/              # Docker 配置（前后端分离双服务）
     ├── backend/
     ├── frontend/
     └── docker-compose.yml
@@ -105,70 +111,55 @@ npm run dev
 
 ### 方式二：Docker 部署（推荐用于生产环境）
 
-本项目提供了统一的 Docker 镜像，将前端页面（Nginx）与深度学习后端（Python/FastAPI）集成在同一个容器中。
+本项目使用 **docker-compose 多容器方案**，前端（Nginx）与后端（Python/FastAPI）为两个独立服务，通过内部网络通信。部署目录位于 `docker/docker-compose.yml`。
 
-#### 镜像拉取
+#### 1. 准备部署文件
 
-**国内用户（推荐使用 CNB 镜像）：**
+将项目部署到服务器后，确认以下事项：
 
-```bash
-# 从 CNB 镜像仓库拉取（需要替换为实际的 CNB 镜像地址）
-docker pull docker.cnb.cool/xiaoclab/vegetable/yolo:latest
-```
+- **模型目录** `backend/models/`（含 Grounding-DINO 交互式标注模型、YOLO 预训练权重）随项目上传，或由卷挂载提供
+- **数据目录** `backend/data/` 可为空，首次部署后在平台内上传数据即可
+- 根目录 `.dockerignore` 已排除 `node_modules`、`backend/models`、`backend/data` 等大数据目录，**构建上下文仅几 MB**，不会因本地体积庞大而拖慢构建
 
-**海外用户（使用 Docker Hub）：**
-
-```bash
-# 从 Docker Hub 拉取（需要替换为实际的 Docker Hub 用户名）
-docker pull xiaoclovemoney/yolo-training-platform:latest
-```
-
-#### 启动方式
-
-##### 方案 A：GPU 模式（训练推荐）🚀
-
-如果您进行模型训练，强烈建议使用此命令以启用 GPU 加速。
-*前提：宿主机需安装 NVIDIA 驱动及 NVIDIA Container Toolkit。*
+#### 2. 启动服务
 
 ```bash
-docker run -d \
-  --name yolo-platform \
-  -p 3000:80 \
-  -p 8000:8000 \
-  --gpus all \
-  --shm-size=24gb \
-  -e NVIDIA_VISIBLE_DEVICES=all \
-  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-  docker.cnb.cool/xiaoclab/vegetable/yolo:latest
+cd docker
+docker-compose up -d --build
 ```
 
-##### 方案 B：CPU 模式（仅推理/测试）
+> 依赖完整安装并含 `transformers`（交互式标注所需的 Grounding-DINO 由 Transformers 加载）。
 
-如果您没有 GPU，或者仅需浏览界面和进行简单的代码调试。
-
-```bash
-docker run -d \
-  --name yolo-platform \
-  -p 3000:80 \
-  -p 8000:8000 \
-  docker.cnb.cool/xiaoclab/vegetable/yolo:latest
-```
-
-#### 访问服务
+#### 3. 访问服务
 
 - **Web 界面**: 浏览器访问 `http://localhost:3000`
 - **API 文档**: 浏览器访问 `http://localhost:8000/docs`
 
-#### Docker 参数说明
+#### 服务与参数说明
 
-| 参数 | 说明 |
-| --- | --- |
-| `-p 3000:80` | 将宿主机的 3000 端口映射到容器的 Web 服务端口。 |
-| `-p 8000:8000` | 将宿主机的 8000 端口映射到容器的 API 服务端口。 |
-| `--gpus all` | 允许容器使用宿主机上的所有 GPU。 |
-| `--shm-size=24gb` | **重要**：增加共享内存大小。YOLO/PyTorch 在处理多进程数据加载时需要较大的共享内存，否则可能报错。 |
-| `-e NVIDIA_VISIBLE_DEVICES=all` | 显式指定容器可见的 GPU 设备。 |
-| `-e NVIDIA_DRIVER_CAPABILITIES...` | 赋予容器调用宿主机 GPU 驱动计算能力的权限。 |
+| 服务 | 端口 | 说明 |
+| --- | --- | --- |
+| `backend` | 8000:8000 | FastAPI 后端，自动应用 GPU（`deploy` 保留 nvidia 驱动），shm 24gb |
+| `frontend` | 3000:80 | Nginx 托管前端构建产物，`/prod-api/` 反向代理到 backend:8000 |
+
+**数据持久化**：通过卷挂载将宿主机 `backend/data`、`backend/models` 映射进容器，重建容器数据不丢失。
+
+```yaml
+volumes:
+  - ../backend/data:/app/data
+  - ../backend/models:/app/models
+```
+
+**GPU 支持**：backend 服务使用 `deploy.resources.reservations` 保留全部 NVIDIA GPU，并继承宿主机 NVIDIA Container Toolkit；若宿主机无 GPU，移除该段落即可仅运行 CPU 推理。
+
+**常用运维命令**：
+
+```bash
+docker-compose up -d --build   # 构建并启动
+docker-compose ps              # 查看状态
+docker-compose logs -f backend # 查看后端日志
+docker-compose down            # 停止并移除容器（卷数据保留）
+```
 
 ---
 
@@ -216,15 +207,23 @@ dataset.zip
 
 访问 http://localhost:3000/annotate
 
-1. 复制数据集页面中已准备好的数据集 ID（如 `ds_20260115_212121`）
-2. 粘贴到"数据集ID"输入框
-3. 输入类别（如 `person,car,dog`）
-4. 点击"创建任务"
-5. 在画布上拖动鼠标绘制边界框
-6. 右侧选择类别并查看当前标注
-7. 点击"保存"保存当前图片标注
-8. 使用"上一张/下一张"切换图片
-9. 完成后点击"导出YOLO"生成 YOLO 格式标签
+1. 从数据集卡片中选择一个已准备（`prepared`）的数据集
+2. 在"类别"输入框中输入类别名称（如 `person,car,dog`）
+3. 点击"创建任务"——系统会**自动读取所选数据集的类别文件并覆盖输入框内容**，确保使用数据集的真实类别名
+4. 进入标注画布，在画布上拖动鼠标绘制边界框
+5. 右侧选择类别并查看当前标注
+6. 点击"保存"保存当前图片标注
+7. 使用"上一张/下一张"切换图片
+8. 全部完成后点击**"导出YOLO(自动划分)"**，生成 YOLO 格式标签并自动划分为 train/val/test
+
+**💡 交互式标注（Grounding-DINO）**：
+
+- 点击画布侧边栏的"交互式标注"入口，输入文本提示词（如 `a person. a car.`），系统基于 Grounding-DINO 自动生成预选框，再人工微调确认
+
+**💡 批量预标注（AI 智能预标注）**：
+
+- 检测模型可在 **GroundingDINO** 与 **YOLO-World**（可上传自定义 .pt）间切换，可选 **SAM** 分割精修，一键为整批图片批量生成标注，大幅提升标注效率
+- 批量任务后台异步执行，可实时查看进度、随时停止，中途取消会提示已标注的图片数
 
 **⚠️ 常见错误**：
 - 如果提示 "数据集中未找到图片目录"，说明没有执行 prepare 操作
@@ -234,12 +233,14 @@ dataset.zip
 
 访问 http://localhost:3000/train
 
-1. 输入已准备好的数据集 ID
+1. 从数据集卡片中选择数据集
+   - **仅显示在标注页执行过"导出YOLO(自动划分)"的数据集**，未导出的数据集不会出现在列表中
 2. 选择模型（建议首次测试用 YOLOv8n）
 3. 设置参数（建议首次测试：epochs=2, batch=8）
 4. 点击"开始训练"
-5. 实时查看训练日志
-6. 训练完成后在任务列表查看模型 ID
+5. 实时查看训练日志（同一时间最多并行训练的任务数受系统并发限制）
+6. 训练可随时**停止并恢复**：停止后任务显示"可恢复训练"，点击恢复继续训练；恢复后状态更新为"已恢复训练"
+7. 训练完成后在任务列表查看模型 ID
 
 #### 4️⃣ 模型推理
 
@@ -280,8 +281,6 @@ dataset.zip
 
 - **优化前**：~70%
 - **优化后**：~90-95%
-
-详细优化说明请参考 [TRAINING_OPTIMIZATION.md](TRAINING_OPTIMIZATION.md)
 
 ---
 
@@ -389,6 +388,10 @@ curl -X POST http://localhost:8000/infer/model_20240115_123456 \
 
 5. **GPU 训练**: 需要 NVIDIA GPU 和 CUDA 支持，建议使用 GPU 模式进行训练
 
+6. **训练并发限制**: 系统默认限制同时训练的任务数，超出时需要等待已有任务完成；并发数可通过环境变量 `MAX_CONCURRENT_TRAIN_JOBS` 调整
+
+7. **中断恢复**: 停止的训练任务支持恢复（`resume`），恢复后从已保存的检查点继续训练
+
 ---
 
 ## 🔍 故障排查
@@ -427,8 +430,8 @@ curl -X POST http://localhost:8000/infer/model_20240115_123456 \
 
 ## 📚 相关文档
 
-- [快速开始指南](QUICK_START.md) - 详细的快速开始教程
-- [训练优化说明](TRAINING_OPTIMIZATION.md) - 训练性能优化详解
+- [API 文档](API_DOCUMENTATION.md) - 接口详细说明
+- [AI 预标注说明](README_AI.md) - YOLO-World + SAM 智能预标注详解
 
 ---
 
@@ -449,13 +452,16 @@ A YOLO training platform based on YOLOv8 + FastAPI + Vue3. Provides complete dat
 ### Features
 
 - ✅ **Dataset Upload & Preparation** - Support ZIP format dataset upload with automatic extraction and organization
-- ✅ **Visual BBox Annotation** - Interactive Canvas annotation tool
-- ✅ **YOLOv8 Model Training** - Background asynchronous training tasks with GPU acceleration
+- ✅ **Visual BBox Annotation** - Interactive Canvas annotation tool with rectangles and polygons
+- ✅ **Interactive Annotation** - Grounding-DINO powered text-driven detection with prompts for auto-generated proposals
+- ✅ **Batch Pre-Annotation** - Switchable detector (YOLO-World / GroundingDINO) with optional SAM segmentation refinement for one-click full-batch labeling
+- ✅ **YOLOv8 Model Training** - Background asynchronous training tasks with GPU acceleration and resumable support
+- ✅ **Concurrent Training Control** - Limits simultaneous training jobs to prevent VRAM exhaustion
 - ✅ **Real-time Log Streaming** - SSE real-time log push with automatic fallback to polling
 - ✅ **Model Inference** - Support image and video inference with visualization
 - ✅ **High-performance Training** - Auto Batch Size, mixed precision training, disk cache optimization
 - ✅ **Model Upload & Export** - Upload existing models, export trained models as ZIP
-- ✅ **Dataset Export** - Export datasets before/after annotation (YOLO format)
+- ✅ **Dataset Export** - Export datasets before/after annotation (YOLO format) with automatic train/val/test split
 - ✅ **Inference Results Export** - Auto-generate UUID for inference results, support CSV and image export
 - ✅ **Training Charts Generation** - Generate training metrics visualization charts using matplotlib
 
@@ -463,15 +469,18 @@ A YOLO training platform based on YOLOv8 + FastAPI + Vue3. Provides complete dat
 
 ```
 yolo-platform/
-├── backend/              # FastAPI Backend
+├── .dockerignore        # Docker build context exclusions (big data dirs/deps)
+├── backend/             # FastAPI Backend
 │   ├── src/
 │   │   ├── api/routes/  # Route layer
-│   │   ├── services/    # Business logic layer
+│   │   ├── services/    # Business logic layer (incl. SAM annotation service)
 │   │   ├── yolo/        # YOLO wrapper
 │   │   ├── core/        # Configuration
 │   │   └── main.py      # Entry point
-│   ├── data/            # Data storage
-│   ├── models/          # Model registry
+│   ├── data/            # Data storage (uploads/datasets/jobs)
+│   ├── models/          # Model registry + built-in models
+│   │   ├── registry/    # Trained models
+│   │   └── sam/         # Grounding-DINO interactive annotation model
 │   └── requirements.txt
 ├── frontend/            # Vue3 Frontend
 │   ├── src/
@@ -480,7 +489,7 @@ yolo-platform/
 │   │   ├── api/         # API wrapper
 │   │   └── store/       # Pinia state
 │   └── package.json
-└── docker/              # Docker configuration
+└── docker/              # Docker configuration (separate frontend/backend services)
     ├── backend/
     ├── frontend/
     └── docker-compose.yml
@@ -539,70 +548,55 @@ Frontend will run at http://localhost:3000
 
 ### Option 2: Docker Deployment (Recommended for Production)
 
-This project provides a unified Docker image that integrates the frontend (Nginx) and backend (Python/FastAPI) into a single container.
+This project uses a **docker-compose multi-container setup**: the frontend (Nginx) and backend (Python/FastAPI) are two independent services communicating over an internal network. The deployment file is at `docker/docker-compose.yml`.
 
-#### Pull Image
+#### 1. Prepare Deployment Files
 
-**For Chinese Users (Recommended: CNB Registry):**
+After copying the project to the server, confirm the following:
 
-```bash
-# Pull from CNB registry (replace with actual CNB image address)
-docker pull <cnb-registry>/<repo-name>/yolo:latest
-```
+- **Models directory** `backend/models/` (Grounding-DINO interactive annotation model + YOLO pretrained weights) is uploaded, or provided via volume mount
+- **Data directory** `backend/data/` may be empty — upload data through the platform after the first launch
+- The root `.dockerignore` excludes `node_modules`, `backend/models`, `backend/data` and other large directories, keeping the **build context to only a few MB**
 
-**For Overseas Users (Docker Hub):**
-
-```bash
-# Pull from Docker Hub (replace with actual Docker Hub username)
-docker pull xiaoclovemoney/yolo-training-platform:latest
-```
-
-#### Startup Methods
-
-##### Option A: GPU Mode (Recommended for Training) 🚀
-
-If you are training models, it is strongly recommended to use this command to enable GPU acceleration.
-*Prerequisite: Host machine must have NVIDIA drivers and NVIDIA Container Toolkit installed.*
+#### 2. Start Services
 
 ```bash
-docker run -d \
-  --name yolo-platform \
-  -p 3000:80 \
-  -p 8000:8000 \
-  --gpus all \
-  --shm-size=24gb \
-  -e NVIDIA_VISIBLE_DEVICES=all \
-  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-  docker.cnb.cool/xiaoclab/vegetable/yolo:latest
+cd docker
+docker-compose up -d --build
 ```
 
-##### Option B: CPU Mode (Inference/Testing Only)
+> Dependencies are fully installed including `transformers` (Grounding-DINO for interactive annotation is loaded via Transformers).
 
-If you don't have a GPU, or only need to browse the interface and perform simple debugging.
-
-```bash
-docker run -d \
-  --name yolo-platform \
-  -p 3000:80 \
-  -p 8000:8000 \
-  docker.cnb.cool/xiaoclab/vegetable/yolo:latest
-```
-
-#### Access Services
+#### 3. Access Services
 
 - **Web UI**: Open browser and visit `http://localhost:3000`
 - **API Docs**: Visit `http://localhost:8000/docs`
 
-#### Docker Parameter Explanation
+#### Services & Parameters
 
-| Flag | Description |
-| --- | --- |
-| `-p 3000:80` | Maps host port 3000 to container port 80 (Frontend UI). |
-| `-p 8000:8000` | Maps host port 8000 to container port 8000 (Backend API). |
-| `--gpus all` | Enables access to all available NVIDIA GPUs. |
-| `--shm-size=24gb` | **Important**: Increases shared memory to prevent PyTorch `DataLoader` crashes. |
-| `-e NVIDIA_VISIBLE_DEVICES=all` | Explicitly exposes all GPU devices to the container. |
-| `-e NVIDIA_DRIVER_CAPABILITIES...` | Ensures the container can use compute and utility drivers. |
+| Service | Port | Description |
+| --- | --- | --- |
+| `backend` | 8000:8000 | FastAPI backend, automatically enables GPU (`deploy` reservations), 24gb shm |
+| `frontend` | 3000:80 | Nginx serving the built frontend, `/prod-api/` proxied to backend:8000 |
+
+**Data persistence**: host `backend/data` and `backend/models` are bind-mounted into the backend container, so rebuilds do not lose data.
+
+```yaml
+volumes:
+  - ../backend/data:/app/data
+  - ../backend/models:/app/models
+```
+
+**GPU support**: the backend service reserves all NVIDIA GPUs via `deploy.resources.reservations` and inherits the host's NVIDIA Container Toolkit. Without a GPU host, remove that block to run CPU inference only.
+
+**Common operations**:
+
+```bash
+docker-compose up -d --build   # build & start
+docker-compose ps              # check status
+docker-compose logs -f backend # view backend logs
+docker-compose down            # stop & remove containers (volumes persist)
+```
 
 ---
 
@@ -650,15 +644,23 @@ dataset.zip
 
 Visit http://localhost:3000/annotate
 
-1. Copy the prepared dataset ID from the dataset page (e.g., `ds_20260115_212121`)
-2. Paste into "Dataset ID" input field
-3. Enter classes (e.g., `person,car,dog`)
-4. Click "Create Task"
-5. Draw bounding boxes on canvas by dragging mouse
-6. Select class on the right and view current annotations
-7. Click "Save" to save current image annotation
-8. Use "Previous/Next" to switch images
-9. After completion, click "Export YOLO" to generate YOLO format labels
+1. Select a prepared (`prepared`) dataset from the dataset cards
+2. Enter classes in the "Classes" input field (e.g., `person,car,dog`)
+3. Click "Create Task" — the system **automatically reads the dataset's class file and overrides the input**, ensuring the real class names are used
+4. Draw bounding boxes on the canvas by dragging the mouse
+5. Select a class on the right and review current annotations
+6. Click "Save" to save the current image annotation
+7. Use "Previous/Next" to switch images
+8. After finishing, click **"Export YOLO (Auto Split)"** to generate YOLO-format labels with automatic train/val/test split
+
+**💡 Interactive Annotation (Grounding-DINO)**:
+
+- Enter "Interactive Annotation" mode from the canvas sidebar, type a text prompt (e.g., `a person. a car.`), and Grounding-DINO auto-generates proposal boxes for manual confirmation and fine-tuning
+
+**💡 Batch Pre-Annotation (AI Smart Pre-Annotation)**:
+
+- Switch the detector between **GroundingDINO** and **YOLO-World** (custom .pt uploads supported), with optional **SAM** segmentation refinement for one-click labeling of an entire batch of images
+- Batch jobs run asynchronously in the background with live progress and stop-on-demand; cancelling mid-run reports how many images were annotated
 
 **⚠️ Common Error**:
 - If prompted "Image directory not found in dataset", it means prepare operation was not executed
@@ -668,12 +670,14 @@ Visit http://localhost:3000/annotate
 
 Visit http://localhost:3000/train
 
-1. Enter prepared dataset ID
+1. Select a dataset from the dataset cards
+   - **Only datasets that have been exported via "Export YOLO (Auto Split)" on the annotation page are shown**; unexported datasets do not appear
 2. Select model (recommend YOLOv8n for first test)
 3. Set parameters (recommend for first test: epochs=2, batch=8)
 4. Click "Start Training"
-5. View real-time training logs
-6. After training completes, check model ID in task list
+5. View real-time training logs (the number of concurrently running jobs is limited by the system)
+6. Training can be **stopped and resumed**: after stopping, the job shows "Resumable" — click resume to continue training; once resumed, the status changes to "Resumed"
+7. After training completes, check model ID in task list
 
 #### 4️⃣ Model Inference
 
@@ -714,8 +718,6 @@ The system automatically calculates optimal batch size based on GPU VRAM:
 
 - **Before optimization**: ~70%
 - **After optimization**: ~90-95%
-
-For detailed optimization instructions, see [TRAINING_OPTIMIZATION.md](TRAINING_OPTIMIZATION.md)
 
 ---
 
@@ -823,6 +825,10 @@ curl -X POST http://localhost:8000/infer/model_20240115_123456 \
 
 5. **GPU Training**: Requires NVIDIA GPU and CUDA support, recommend using GPU mode for training
 
+6. **Concurrent Training Limit**: The system limits the number of simultaneously running jobs by default; additional jobs wait until existing ones finish. The concurrency can be adjusted via the environment variable `MAX_CONCURRENT_TRAIN_JOBS`
+
+7. **Resume Support**: Stopped training jobs can be resumed (`resume`) and continue from the saved checkpoint
+
 ---
 
 ## 🔍 Troubleshooting
@@ -861,8 +867,8 @@ curl -X POST http://localhost:8000/infer/model_20240115_123456 \
 
 ## 📚 Related Documentation
 
-- [Quick Start Guide](QUICK_START.md) - Detailed quick start tutorial
-- [Training Optimization Guide](TRAINING_OPTIMIZATION.md) - Training performance optimization details
+- [API Documentation](API_DOCUMENTATION.md) - Detailed API reference
+- [AI Pre-Annotation Guide](README_AI.md) - YOLO-World + SAM smart pre-annotation details
 
 ---
 

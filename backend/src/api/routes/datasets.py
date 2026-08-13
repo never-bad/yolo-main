@@ -47,6 +47,14 @@ async def get_dataset(dataset_id: str):
         raise HTTPException(404, "Dataset not found")
     return result
 
+@router.get("/{dataset_id}/tree")
+async def get_dataset_tree(dataset_id: str):
+    """获取数据集目录树（文件夹结构）"""
+    result = await dataset_service.get_dataset_tree(dataset_id)
+    if not result or not result.get("tree"):
+        raise HTTPException(404, "Dataset directory not found")
+    return result
+
 @router.put("/{dataset_id}")
 async def update_dataset(dataset_id: str, request: UpdateDatasetRequest):
     """更新数据集信息"""

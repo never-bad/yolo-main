@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     API_PREFIX: str = ""
     HOST: str = "0.0.0.0"
     PORT: int = 8000
+
+    # 训练并发限制：同时最多运行几个训练任务（可通过环境变量 MAX_CONCURRENT_TRAIN_JOBS 覆盖）
+    # A10(24GB) 建议 3；若服务器 CPU 核数多可适当调高
+    MAX_CONCURRENT_TRAIN_JOBS: int = 3
     
     class Config:
         env_file = ".env"

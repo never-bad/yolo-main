@@ -1,6 +1,9 @@
 import json
 import yaml
 import asyncio
+import shutil
+import zipfile
+import re
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
@@ -69,13 +72,32 @@ class AnnotationService:
             task_classes = classes if classes else self._load_classes_from_yaml(dataset_dir)
             
             # 收集所有图片
-            image_files = list(images_dir.rglob("*.jpg")) + list(images_dir.rglob("*.png")) + list(images_dir.rglob("*.jpeg"))
+            # 若 images 目录下已有 train/val/test 划分，只遍历划分目录，避免平铺图与划分子目录重复收集
+            split_dirs = ["train", "val", "test"]
+            has_split = any((images_dir / s).exists() for s in split_dirs)
+            if has_split:
+                image_files = []
+                for s in split_dirs:
+                    sd = images_dir / s
+                    if sd.exists():
+                        image_files += (
+                            list(sd.rglob("*.jpg"))
+                            + list(sd.rglob("*.png"))
+                            + list(sd.rglob("*.jpeg"))
+                        )
+            else:
+                image_files = list(images_dir.rglob("*.jpg")) + list(images_dir.rglob("*.png")) + list(images_dir.rglob("*.jpeg"))
             
             items = []
             annotations = {}  # 用于存储已有标注
             loaded_count = 0
             
+            # 按 image_id(stem) 去重，同一张图重复收集时只保留一个（图片列表按 image_id 展示，需保持一致）
+            seen_stems = set()
             for img_path in image_files:
+                if img_path.stem in seen_stems:
+                    continue
+                seen_stems.add(img_path.stem)
                 try:
                     with Image.open(img_path) as img:
                         width, height = img.size
@@ -188,6 +210,7 @@ class AnnotationService:
             # 构建标签文件路径
             label_path = labels_dir / relative_path.with_suffix('.txt')
             return label_path
+
         except ValueError:
             # 如果无法获取相对路径，尝试直接在 labels 目录下查找
             return labels_dir / (img_path.stem + '.txt')
@@ -235,26 +258,42 @@ class AnnotationService:
         逻辑：按后缀名判断解析方式
           - .yaml / .yml：读取 names 字段
           - .txt / .names：按行读取
+
+        优先级与数据集检测一致：真实类别文件（classes.txt 等）优先于 data.yaml，
+        并跳过 data.yaml 中历史遗留的占位名（class_0 等）。
         """
+        def is_placeholder(names):
+            return bool(names) and all(re.fullmatch(r"class_\d+", str(c)) for c in names)
+
         candidates = [
-            dataset_dir / "data.yaml",
-            dataset_dir / "dataset.yaml",
             dataset_dir / "classes.txt",
             dataset_dir / "coco.names",
             dataset_dir / "names.txt",
+            dataset_dir / "dataset.yaml",
+            dataset_dir / "config.yaml",
+            dataset_dir / "data.yaml",
         ]
-        # 1) 优先查找根目录
+        # 1) 优先查找根目录（跳过占位名）
         for path in candidates:
             if path.exists():
                 try:
                     classes = self._parse_classes_file(path)
-                    if classes:
+                    if classes and not is_placeholder(classes):
                         return classes
                 except Exception as e:
                     print(f"Error loading classes from {path}: {e}")
         # 2) 递归查找（类别文件可能在子目录中）
-        for name in ["data.yaml", "dataset.yaml", "classes.txt", "coco.names", "names.txt"]:
+        for name in ["classes.txt", "coco.names", "names.txt", "dataset.yaml", "config.yaml", "data.yaml"]:
             for path in dataset_dir.rglob(name):
+                try:
+                    classes = self._parse_classes_file(path)
+                    if classes and not is_placeholder(classes):
+                        return classes
+                except Exception:
+                    continue
+        # 3) 兜底：都没有真实名时，返回第一个非空结果（可能是占位名）
+        for path in candidates:
+            if path.exists():
                 try:
                     classes = self._parse_classes_file(path)
                     if classes:
@@ -268,7 +307,11 @@ class AnnotationService:
         suffix = path.suffix.lower()
         if suffix in (".yaml", ".yml"):
             data = _load_yaml(path)
-            return data.get('names', [])
+            names = data.get('names', [])
+            # YOLO 也支持 names: {0: 'a', 1: 'b'} 的字典形式，转为按 id 排序的列表
+            if isinstance(names, dict):
+                return [str(names[k]) for k in sorted(names)]
+            return names
         # 纯文本（.txt / .names）：按行读取，忽略空行
         with open(path, "r", encoding="utf-8") as f:
             lines = [line.strip() for line in f if line.strip()]
@@ -295,18 +338,27 @@ class AnnotationService:
         def _get_task_items_sync():
             task_meta = _load_json(task_file)
             
-            # 读取标注状态
+            # 读取标注状态（文件可能被批量预标注并发写入，缺失/损坏时按空处理，避免整个列表加载失败）
             annotations_file = task_dir / "annotations.json"
-            annotations = _load_json(annotations_file)
+            try:
+                annotations = _load_json(annotations_file)
+            except Exception:
+                annotations = {}
             
-            # 更新标注状态
+            # 更新标注状态（按 image_id 去重，避免历史任务中平铺图与划分目录重复收集导致的重复条目）
+            seen = set()
+            unique_items = []
             for item in task_meta["items"]:
+                if item["image_id"] in seen:
+                    continue
+                seen.add(item["image_id"])
                 ann = annotations.get(item["image_id"], {})
                 item["annotated"] = item["image_id"] in annotations
                 item["ai_annotated"] = bool(ann.get("ai_annotated", False))
+                unique_items.append(item)
             
             return {
-                "items": task_meta["items"],
+                "items": unique_items,
                 "classes": task_meta.get("classes", []),
                 "imported_annotations": task_meta.get("imported_annotations", 0)
             }
@@ -381,7 +433,29 @@ class AnnotationService:
             return {"ok": True}
         
         return await asyncio.to_thread(_save_annotation_sync)
-    
+
+    async def clear_ai_annotations(self, task_id: str):
+        """清除该任务所有 AI 预标注（批量误标过多时一键清理，便于重新标注）。
+
+        删除所有被 AI 预标注过的图片的标注（含其后手工修改，不可恢复）。
+        返回被清理的图片数 removed。
+        """
+        annotations_file = self.annotations_dir / task_id / "annotations.json"
+        if not await asyncio.to_thread(lambda: annotations_file.exists()):
+            return {"ok": False, "error": "Task not found"}
+
+        def _clear_sync():
+            annotations = _load_json(annotations_file)
+            removed = 0
+            for image_id, ann in list(annotations.items()):
+                if ann.get("ai_annotated"):
+                    del annotations[image_id]
+                    removed += 1
+            _save_json(annotations_file, annotations)
+            return {"ok": True, "removed": removed}
+
+        return await asyncio.to_thread(_clear_sync)
+
     async def export_to_yolo(self, task_id: str):
         """导出标注为YOLO格式"""
         def _export_to_yolo_sync():
@@ -645,3 +719,71 @@ class AnnotationService:
                 label_path = labels_dir / f"{image_id}.txt"
         
         return label_path
+
+    async def import_yolo_labels(self, task_id: str, zip_path: Path) -> dict:
+        """导入 YOLO 格式标注（zip 包内含 labels/*.txt，YOLO 归一化格式：class cx cy w h）。
+
+        按 .txt 文件名（stem）与任务图片匹配，转成像素坐标写入 annotations.json。
+        同名图片已有标注会被导入的标注覆盖（以外部工具标注为准）。
+        配合 X-AnyLabeling 等外部工具完成"专业工具标注 → 平台闭环"的衔接。
+        """
+        task_dir = self.annotations_dir / task_id
+        task_file = task_dir / "task.json"
+
+        if not await asyncio.to_thread(lambda: task_file.exists()):
+            return {"ok": False, "error": "Task not found"}
+
+        def _import_sync():
+            task_meta = _load_json(task_file)
+            items = task_meta["items"]
+            classes = task_meta.get("classes", [])
+            annotations_file = task_dir / "annotations.json"
+            annotations = _load_json(annotations_file) if annotations_file.exists() else {}
+
+            # 解压 zip 到临时目录
+            tmp_dir = task_dir / "import_tmp"
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(tmp_dir)
+
+            # 优先取 labels 目录下的 txt，其次临时目录内所有 txt
+            labels_dir = tmp_dir / "labels"
+            label_files = list(labels_dir.rglob("*.txt")) if labels_dir.exists() else list(tmp_dir.rglob("*.txt"))
+
+            # 建立文件名 stem → item 映射（image_id 与图片文件名一般一致）
+            by_id = {item["image_id"]: item for item in items}
+            by_stem = {}
+            for item in items:
+                by_stem.setdefault(Path(item["image_path"]).stem, item)
+
+            imported = 0
+            skipped = []
+            for tf in label_files:
+                stem = tf.stem
+                item = by_id.get(stem) or by_stem.get(stem)
+                if not item:
+                    skipped.append(stem)
+                    continue
+                try:
+                    boxes = self._load_yolo_labels(tf, item["width"], item["height"])
+                except ValueError as e:
+                    skipped.append(f"{stem} ({e})")
+                    continue
+                # 过滤类别越界的框（避免与任务类别数不一致时写入脏数据）
+                valid = [b for b in boxes if 0 <= b["class_id"] < len(classes)]
+                if len(valid) != len(boxes):
+                    skipped.append(f"{stem} (越界类别已忽略)")
+                annotations[item["image_id"]] = {
+                    "boxes": valid,
+                    "updated_at": datetime.now().isoformat(),
+                    "ai_annotated": False,
+                }
+                imported += 1
+
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            _save_json(annotations_file, annotations)
+            return {"ok": True, "imported": imported, "skipped": skipped}
+
+        return await asyncio.to_thread(_import_sync)

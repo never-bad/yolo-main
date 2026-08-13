@@ -41,7 +41,7 @@
       <div v-else class="dataset-list">
         <div v-for="dataset in datasets" :key="dataset.dataset_id" class="dataset-item">
           <div class="dataset-header">
-            <h3>{{ dataset.dataset_id }}</h3>
+            <h3 class="dataset-name" @click="viewDataset(dataset)" title="点击查看数据集文件夹结构">{{ dataset.dataset_id }}</h3>
             <div class="dataset-actions">
               <button 
                 v-if="dataset.status === 'uploaded'" 
@@ -152,6 +152,23 @@
             {{ viewerDetail?.description || viewingDataset.description }}
           </div>
 
+          <!-- 文件夹结构 -->
+          <div class="viewer-section-title">文件夹结构</div>
+          <div v-if="treeLoading" class="loading-state">
+            <span class="loading-spinner large"></span>
+            <span>加载文件夹结构...</span>
+          </div>
+          <div v-else-if="treeData" class="viewer-tree">
+            <FolderTree
+              :nodes="treeData.children"
+              :depth="0"
+              :expanded="treeExpanded"
+              @toggle-dir="toggleDir"
+              @open-file="openFile"
+            />
+          </div>
+          <div v-else class="empty-state">暂无文件夹信息</div>
+
           <!-- 图片预览 -->
           <div class="viewer-section-title">图片预览</div>
           <div v-if="viewerImages.length === 0" class="empty-state">
@@ -165,14 +182,29 @@
         </template>
       </div>
     </div>
+
+    <!-- 文件内容预览弹窗 -->
+    <div v-if="filePreview" class="file-preview-mask" @click.self="closeFilePreview">
+      <div class="file-preview-dialog">
+        <div class="viewer-header">
+          <h3>{{ filePreview.name }}</h3>
+          <button class="secondary viewer-close" @click="closeFilePreview">关闭</button>
+        </div>
+        <div v-if="filePreviewIsImage" class="file-preview-img-wrap">
+          <img :src="'/static/' + filePreview.path" @error="handleImgError" />
+        </div>
+        <pre v-else class="file-preview-text">{{ filePreviewContent || '加载中...' }}</pre>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import { uploadDataset, prepareDataset as prepareDst, listDatasets, getDataset, updateDataset, deleteDataset, exportAnnotatedDataset, exportOriginalDataset } from '@/api/datasets'
+import { ref, reactive, onMounted } from 'vue'
+import { uploadDataset, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, exportAnnotatedDataset, exportOriginalDataset } from '@/api/datasets'
 import { downloadFile } from '@/utils/download'
 import { showConfirm, showPrompt } from '@/composables/useDialog'
+import FolderTree from '@/components/FolderTree.vue'
 
 const selectedFile = ref<File | null>(null)
 const uploading = ref(false)
@@ -188,6 +220,12 @@ const viewingDataset = ref<any | null>(null)  // 正在预览的数据集
 const viewerImages = ref<string[]>([])  // 预览图片列表
 const viewerLoading = ref(false)  // 预览加载状态
 const viewerDetail = ref<any | null>(null)  // 数据集详情（统计信息）
+const treeData = ref<any | null>(null)  // 文件夹结构树
+const treeLoading = ref(false)  // 文件夹结构加载状态
+const treeExpanded = reactive(new Set<string>())  // 已展开的目录节点
+const filePreview = ref<any | null>(null)  // 正在预览的文件
+const filePreviewIsImage = ref(false)  // 预览的是否为图片
+const filePreviewContent = ref('')  // 文本文件内容
 
 // 打开数据集查看（统计信息 + 图片预览）
 const viewDataset = async (dataset: any) => {
@@ -208,6 +246,7 @@ const viewDataset = async (dataset: any) => {
   } finally {
     viewerLoading.value = false
   }
+  loadTree(dataset.dataset_id)
 }
 
 // 关闭预览
@@ -215,6 +254,53 @@ const closeViewer = () => {
   viewingDataset.value = null
   viewerImages.value = []
   viewerDetail.value = null
+  treeData.value = null
+  treeExpanded.clear()
+  closeFilePreview()
+}
+
+// 加载数据集文件夹结构
+const loadTree = async (datasetId: string) => {
+  treeLoading.value = true
+  treeData.value = null
+  treeExpanded.clear()
+  try {
+    const result = await getDatasetTree(datasetId)
+    treeData.value = result.tree
+  } catch (e) {
+    treeData.value = null
+  } finally {
+    treeLoading.value = false
+  }
+}
+
+// 展开/折叠目录
+const toggleDir = (node: any) => {
+  if (treeExpanded.has(node.path)) treeExpanded.delete(node.path)
+  else treeExpanded.add(node.path)
+}
+
+const FILE_IMG_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp']
+
+// 点击文件：图片直接预览，文本读取内容
+const openFile = async (node: any) => {
+  filePreview.value = node
+  filePreviewContent.value = ''
+  filePreviewIsImage.value = FILE_IMG_EXTS.includes((node.ext || '').toLowerCase())
+  if (filePreviewIsImage.value) return
+  try {
+    const res = await fetch('/static/' + node.path)
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    filePreviewContent.value = await res.text()
+  } catch (e: any) {
+    filePreviewContent.value = '无法读取该文件：' + (e.message || e)
+  }
+}
+
+// 关闭文件预览
+const closeFilePreview = () => {
+  filePreview.value = null
+  filePreviewContent.value = ''
 }
 
 // 图片加载失败时的兜底（隐藏占位）
@@ -646,5 +732,74 @@ button {
   height: 100%;
   object-fit: cover;
   display: block;
+}
+
+/* 数据集名称可点击 */
+.dataset-name {
+  cursor: pointer;
+}
+.dataset-name:hover {
+  color: #2c6fbb;
+  text-decoration: underline;
+}
+
+/* 文件夹结构树 */
+.viewer-tree {
+  max-height: 400px;
+  overflow-y: auto;
+  padding: 0.5rem 1.25rem 0.75rem;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+/* 文件内容预览弹窗 */
+.file-preview-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1100;
+  padding: 1.5rem;
+}
+
+.file-preview-dialog {
+  background: white;
+  border-radius: 8px;
+  width: 80%;
+  max-width: 900px;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.file-preview-img-wrap {
+  flex: 1;
+  overflow: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f5f5f5;
+  padding: 1rem;
+}
+
+.file-preview-img-wrap img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.file-preview-text {
+  flex: 1;
+  overflow: auto;
+  margin: 0;
+  padding: 1rem 1.25rem;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  background: #fafbfc;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #2c3e50;
 }
 </style>

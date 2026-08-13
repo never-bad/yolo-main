@@ -39,7 +39,9 @@
             <div class="ds-card-info">
               <span v-if="ds.filename">文件: {{ ds.filename }}</span>
               <span v-if="ds.image_count">{{ ds.image_count }} 张图片</span>
-              <span v-if="ds.classes && ds.classes.length">{{ ds.classes.length }} 类</span>
+              <span v-if="ds.classes && ds.classes.length" class="ds-classes" :title="ds.classes.join(', ')">
+                {{ ds.classes.length }} 类: {{ ds.classes.slice(0, 3).join(', ') }}<template v-if="ds.classes.length > 3"> 等</template>
+              </span>
             </div>
             <div v-if="!isDatasetPrepared(ds)" class="ds-card-warn">需先"准备"</div>
           </div>
@@ -81,7 +83,7 @@
                   class="filter-menu-item group-header"
                   :class="{ active: imageFilter === 'annotated' }"
                   @click="setFilter('annotated')"
-                >📂 已标注（{{ counts.annotated }}）</div>
+                >已标注（{{ counts.annotated }}）</div>
                 <div
                   class="filter-menu-item sub"
                   :class="{ active: imageFilter === 'manual' }"
@@ -107,7 +109,7 @@
         </div>
         <div v-else class="image-list">
           <div
-            v-for="(item, idx) in filteredItems"
+            v-for="item in filteredItems"
             :key="item.image_id"
             :class="['image-item', { active: currentImage?.image_id === item.image_id, annotated: item.annotated }]"
             @click="selectImageByItem(item)"
@@ -141,7 +143,8 @@
             {{ aiLabeling ? 'AI标注中(点击取消)...' : 'AI 预标注' }}
           </button>
           <label class="ai-conf-label">检测模型:</label>
-          <select v-model="samConfig.detector_weights" class="model-select" @change="applyDetectorModel">
+          <select v-model="selectedDetector" class="model-select" @change="applyDetectorModel">
+            <option value="__grounding_dino__">grounding-dino-tiny (GroundingDINO)</option>
             <option v-for="m in samModels" :key="m.name" :value="m.name">{{ m.name }}</option>
           </select>
           <label class="ai-conf-label model-add-label">
@@ -150,6 +153,9 @@
           </label>
           <label class="ai-conf-label">置信度:</label>
           <input type="number" v-model.number="aiConf" min="0" max="1" step="0.05" class="conf-input" />
+          <label class="ai-conf-label">IoU:</label>
+          <input type="number" v-model.number="aiIou" min="0" max="1" step="0.05" class="conf-input" />
+          <button class="ai-btn small" @click="onThreshChange" title="保存置信度/IoU 阈值，AI 标注即用">保存阈值</button>
           <div v-if="batchId" class="batch-progress">
             <span>批量预标注: {{ batchProgress?.done || 0 }}/{{ batchProgress?.total || 0 }}</span>
             <div class="progress-bar">
@@ -158,27 +164,34 @@
             <button class="danger small" @click="stopBatch" :disabled="!batchRunning">停止</button>
           </div>
         </div>
-        <div class="canvas-container" @mousedown="startDrawing" @mousemove="drawing" @mouseup="endDrawing">
+        <div class="canvas-container" @mousedown="startDrawing" @mousemove="drawing" @mouseup="endDrawing" @wheel="onWheel" @mouseleave="onCanvasLeave">
           <button
             class="img-nav-btn prev"
             @click.stop="prevImage"
             @mousedown.stop
             :disabled="currentIndex === 0 || loadingAnnotation"
-            title="上一张（←）"
+            title="上一张（← / A）"
           >‹</button>
-          <canvas ref="canvasRef"></canvas>
+          <canvas ref="canvasRef" @click="onCanvasClick" @dblclick="fitView"></canvas>
           <button
             class="img-nav-btn next"
             @click.stop="nextImage"
             @mousedown.stop
             :disabled="currentIndex === items.length - 1 || loadingAnnotation"
-            title="下一张（→）"
+            title="下一张（→ / D）"
           >›</button>
+          <div class="view-toolbar">
+            <span class="view-hint">滚轮缩放 · 空格+拖拽平移 · 双击复位 · 拖框移动/角点缩放</span>
+            <span>缩放 {{ Math.round(viewScale * 100) }}%</span>
+            <button class="small" @click.stop="zoomBy(1.2)" title="放大">+</button>
+            <button class="small" @click.stop="zoomBy(1 / 1.2)" title="缩小">−</button>
+            <button class="small" @click.stop="fitView" title="适应窗口">适应窗口</button>
+          </div>
         </div>
         <div class="controls">
           <label>当前类别:</label>
           <select v-model="currentClass">
-            <option value="-1">全部标签</option>
+            <option :value="-1">全部标签</option>
             <option v-for="(cls, idx) in classes" :key="idx" :value="idx">{{ cls }}</option>
           </select>
         </div>
@@ -187,10 +200,21 @@
       <div class="annotations-panel">
         <h3>当前标注</h3>
         <div class="box-list">
-          <div v-for="(box, idx) in currentBoxes" :key="idx" class="box-item">
-            <span>{{ classes[box.class_id] }}</span>
-            <button class="danger small" @click="removeBox(idx)">删除</button>
+          <div
+            v-for="(box, idx) in currentBoxes"
+            :key="idx"
+            class="box-item"
+            :class="{ 'box-item-selected': idx === selectedBoxIndex }"
+            @click="selectBoxFromPanel(idx)"
+          >
+            <span class="box-color" :style="{ background: classColors[box.class_id] || '#999' }"></span>
+            <span class="box-class-name" :title="classes[box.class_id] || ('类别' + box.class_id)">{{ classes[box.class_id] || ('类别' + box.class_id) }}</span>
+            <select :value="box.class_id" class="box-class-select" :title="classes[box.class_id] || ''" @click.stop @change="onBoxClassChange($event, idx)">
+              <option v-for="(cls, cIdx) in classes" :key="cIdx" :value="cIdx">{{ cls }}</option>
+            </select>
+            <button class="danger small" @click.stop="removeBox(idx)">删除</button>
           </div>
+          <div v-if="!currentBoxes.length" class="box-empty">暂无标注框，可手动绘制或使用 AI 预标注</div>
         </div>
         <button class="danger" @click="clearCurrentBoxes" :disabled="!currentBoxes.length">
           清空本图标注
@@ -198,6 +222,26 @@
         <button @click="runBatchLabel" :disabled="batchRunning || !items.length">
           <span v-if="batchRunning" class="loading-spinner"></span>
           {{ batchRunning ? '批量预标注中...' : '批量预标注' }}
+        </button>
+        <button
+          @click="toggleInteractiveMode"
+          :disabled="interactiveBusy || !items.length"
+          :class="{ active: interactiveMode }"
+          title="框选局部区域 + 文本提示（当前类别）检测，避免全图盲扫误标"
+        >
+          {{ interactiveMode ? '退出交互式标注' : '交互式标注' }}
+        </button>
+        <div v-if="interactiveMode && !interactiveBusy" class="interactive-hint">
+          在图上拖拽框选要标注的区域（建议先选好"当前类别"），Esc 退出
+        </div>
+        <div v-if="interactiveBusy" class="interactive-hint">
+          <span class="loading-spinner"></span> 正在解析所选区域...
+        </div>
+        <button class="danger" @click="clearAllAiLabels" :disabled="counts.ai === 0" title="误标过多时一键清除，重新标注">
+          清除全部AI标注（{{ counts.ai }}）
+        </button>
+        <button class="danger" @click="cleanOverlaps" :disabled="counts.annotated === 0" title="清理历史遗留的高度重合标注框（跨类别/同类重复）">
+          清理重叠框
         </button>
         <button @click="saveAnnotation" :disabled="savingAnnotation">
           <span v-if="savingAnnotation" class="loading-spinner"></span>
@@ -213,6 +257,11 @@
           <span v-if="exporting" class="loading-spinner"></span>
           {{ exporting ? '导出中...' : '导出YOLO(自动划分)' }}
         </button>
+        <label class="import-label" title="导入 X-AnyLabeling 等外部工具导出的 YOLO 标注（zip 内含 labels/*.txt）">
+          <input type="file" accept=".zip" class="import-input" @change="onImportYolo" />
+          <span v-if="importing" class="loading-spinner"></span>
+          {{ importing ? '导入中...' : '导入YOLO标注' }}
+        </label>
       </div>
     </div>
   </div>
@@ -221,7 +270,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import type { BBox } from '@/api/annotations'
-import { createAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotationsSplit, autoLabelImage, startBatchLabel, getBatchProgress, stopBatchLabel, getSamConfig, updateSamConfig, getSamModels, uploadSamModel } from '@/api/annotations'
+import { createAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotationsSplit, autoLabelImage, interactiveLabelImage, startBatchLabel, getBatchProgress, stopBatchLabel, getSamConfig, updateSamConfig, getSamModels, uploadSamModel, clearAiAnnotations, cleanTaskOverlaps, importYoloLabels } from '@/api/annotations'
 import { listDatasets } from '@/api/datasets'
 import { showConfirm } from '@/composables/useDialog'
 
@@ -231,6 +280,11 @@ const loadingDatasets = ref(false)
 const creatingTask = ref(false)
 const loadingItems = ref(false)
 const savingAnnotation = ref(false)
+// 自动保存（防抖）
+const autoSaveTimer = ref<any>(null)
+const dirty = ref(false)
+// 导入 YOLO 标注
+const importing = ref(false)
 const exporting = ref(false)
 // 标注任务持久化 key，用于中途离开页面后返回时恢复
 const ANNOTATE_STORE_KEY = 'annotate_task_resume'
@@ -280,6 +334,7 @@ const currentIndex = ref(0)
 const currentImage = ref<any>(null)
 const currentClass = ref(-1)  // -1 表示"全部标签"，显示所有类别的框
 const currentBoxes = ref<BBox[]>([])
+const selectedBoxIndex = ref(-1)  // 当前选中的标注框索引（点击画布或左侧列表时更新）
 const importedCount = ref(0)  // 导入的标注数量
 const loadingAnnotation = ref(false)  // 加载标注状态
 
@@ -290,13 +345,40 @@ const isDrawing = ref(false)
 const startPos = ref({ x: 0, y: 0 })
 const currentPos = ref({ x: 0, y: 0 })
 
+// 画布视图变换（缩放/平移）
+const viewScale = ref(1)
+const viewOffset = ref({ x: 0, y: 0 })
+const isPanning = ref(false)
+const panStart = ref({ x: 0, y: 0 })
+const spaceDown = ref(false)
+
+// 交互/编辑状态
+const editMode = ref<'idle' | 'draw' | 'move' | 'resize'>('idle')
+const resizeHandle = ref(-1)  // 控制点索引 0-3 角 / 4-7 边
+const moveStartPt = ref<{ x: number; y: number } | null>(null)
+const origBox = ref<BBox | null>(null)
+
+// 撤销/重做
+const undoStack = ref<BBox[][]>([])
+const redoStack = ref<BBox[][]>([])
+
+// 类别颜色（渲染时自动分配）
+const classColors = ref<string[]>([])
+
 // SAM 大模型预标注状态
 const aiLabeling = ref(false)
 const aiAbortCtrl = ref<AbortController | null>(null)
 const aiConf = ref(0.25)
+const aiIou = ref(0.4)
+// 交互式标注状态（框选局部区域 + 文本提示，避免全图盲扫误标）
+const interactiveMode = ref(false)
+const interactiveBusy = ref(false)
+const interactiveRegion = ref<{ x1: number; y1: number; x2: number; y2: number } | null>(null)
 const currentImageHasAi = ref(false)  // 当前图片是否由 AI 生成了标注框（用于保存时标记 AI 来源）
 const samConfig = ref<any>({ detector_weights: 'yolov8s-world.pt', conf: 0.15 })
 const samModels = ref<any[]>([])
+// 检测模型下拉当前选中项：__grounding_dino__ 表示 GroundingDINO，其余为 YOLO-World .pt 文件名
+const selectedDetector = ref('__grounding_dino__')
 const batchId = ref<string | null>(null)
 const batchProgress = ref<any>(null)
 const batchTimer = ref<any>(null)
@@ -317,7 +399,7 @@ const CLASS_EN_MAP: Record<string, string> = {
   '剪刀': 'scissors', '香蕉': 'banana', '苹果': 'apple', '橙子': 'orange',
   '胡萝卜': 'carrot', '披萨': 'pizza', '蛋糕': 'cake', '面包': 'bread',
   '安全帽': 'helmet', '头盔': 'helmet', '帽子': 'hat',
-  '头盔': 'helmet', '背心': 'vest', '手套': 'glove', '口罩': 'mask',
+  '背心': 'vest', '手套': 'glove', '口罩': 'mask',
   '消防栓': 'fire hydrant', '斑马线': 'zebra crossing', '交通灯': 'traffic light',
   '红绿灯': 'traffic light', '停靠牌': 'stop sign', '停车标志': 'stop sign',
   '限速牌': 'speed limit sign', '路标': 'traffic sign', '指示牌': 'signboard',
@@ -336,9 +418,9 @@ const CLASS_EN_MAP: Record<string, string> = {
   '领带': 'tie', '围巾': 'scarf', '外套': 'coat', '裤子': 'pants',
   '裙子': 'skirt', '鞋': 'shoe', '衬衫': 'shirt', '短裤': 'shorts',
   '袜子': 'socks', '蝴蝶结': 'tie', '领结': 'tie',
-  '火车头': 'train', '地铁': 'train', '头盔': 'helmet',
+  '火车头': 'train', '地铁': 'train',
   '车牌': 'license plate', '车门': 'car door', '车窗': 'car window',
-  '人': 'person', '运动员': 'person', '工人': 'person',
+  '运动员': 'person', '工人': 'person',
   '油桶': 'bucket', '桶': 'bucket', '灭火器': 'fire extinguisher',
 }
 
@@ -356,7 +438,8 @@ const batchPercent = computed(() => {
 })
 
 // ===== 图片列表分类过滤（级联下拉菜单） =====
-const imageFilter = ref('all')  // all | annotated | ai | manual | unannotated
+type FilterKey = 'all' | 'annotated' | 'ai' | 'manual' | 'unannotated'
+const imageFilter = ref<FilterKey>('all')
 const filterOpen = ref(false)
 const counts = computed(() => {
   const total = items.value.length
@@ -378,7 +461,7 @@ const currentFilterLabel = computed(() => {
   const count = counts.value[imageFilter.value === 'all' ? 'total' : imageFilter.value]
   return `${label}（${count}）`
 })
-const setFilter = (val: string) => {
+const setFilter = (val: FilterKey) => {
   imageFilter.value = val
   filterOpen.value = false
 }
@@ -410,22 +493,18 @@ const createTask = async () => {
     return
   }
   
-  // 如果用户输入了类别，使用用户输入的；否则传 undefined 让后端从 data.yaml 读取
-  const inputClasses = classesInput.value.trim() 
-    ? classesInput.value.split(',').map(c => c.trim()).filter(c => c)
-    : undefined
+  // 始终让后端读取所选数据集的类别文件（覆盖输入框已有内容），确保使用真实类别名
+  const inputClasses = undefined
   
   creatingTask.value = true
   try {
     const result = await createAnnotationTask(newTask.value.datasetId, newTask.value.version, inputClasses)
     currentTask.value = result.task_id
     
-    // 使用返回的类别（可能是从 data.yaml 读取的）
+    // 使用返回的类别（从数据集类别文件读取，覆盖输入框内容）
     if (result.classes && result.classes.length > 0) {
       classes.value = result.classes
       classesInput.value = result.classes.join(', ')
-    } else if (inputClasses) {
-      classes.value = inputClasses
     }
     
     // 显示导入信息
@@ -507,7 +586,14 @@ const restoreAnnotateState = async () => {
     return
   }
   if (!saved?.taskId) return
+  // 优先恢复批量预标注轮询：不因下面的任务/图片加载失败而中断（批量任务在后端后台仍在运行）
+  if (saved.batchId) {
+    batchId.value = saved.batchId
+    batchProgress.value = { status: 'running', total: 1, done: 0, boxes_written: 0, current_image: '' }
+    pollBatch()
+  }
   currentTask.value = saved.taskId
+  if (!currentTask.value) return
   try {
     const result = await getTaskItems(currentTask.value)
     items.value = result.items
@@ -522,15 +608,12 @@ const restoreAnnotateState = async () => {
       const targetIdx = (saved.index && saved.index < items.value.length) ? saved.index : 0
       await selectImage(targetIdx)
     }
-    // 若上次有未完成的批量预标注，恢复轮询（后端任务仍在后台运行）
-    if (saved.batchId) {
-      batchId.value = saved.batchId
-      batchProgress.value = { status: 'running', total: 1, done: 0, boxes_written: 0, current_image: '' }
-      pollBatch()
-    }
   } catch (e: any) {
+    // 任务已不存在或加载失败：清空本地恢复记录，避免每次刷新都重复失败而清空图片列表
+    currentTask.value = null
+    items.value = []
     clearAnnotateState()
-    alert('恢复标注任务失败，已清空记录: ' + (e.response?.data?.detail || e.message))
+    alert('恢复标注任务失败，已清空记录，请重新创建任务: ' + (e.response?.data?.detail || e.message))
   }
 }
 
@@ -538,8 +621,21 @@ const selectImage = async (index: number) => {
   currentIndex.value = index
   currentImage.value = items.value[index]
   currentBoxes.value = []
+  selectedBoxIndex.value = -1
   currentImageHasAi.value = false
-  
+  // 切换图片：取消上一张的待保存状态（未保存的改动在离页时统一处理）
+  dirty.value = false
+  clearTimeout(autoSaveTimer.value)
+  // 切换图片时重置编辑/撤销状态与视图
+  editMode.value = 'idle'
+  isDrawing.value = false
+  isPanning.value = false
+  moveStartPt.value = null
+  origBox.value = null
+  resizeHandle.value = -1
+  undoStack.value = []
+  redoStack.value = []
+
   await nextTick()
   
   // 如果图片已有标注，先加载标注
@@ -607,9 +703,11 @@ const loadImageToCanvas = () => {
     if (!img.value || !ctx.value) return
     canvas.width = img.value.width
     canvas.height = img.value.height
-    ctx.value.drawImage(img.value, 0, 0)
     console.log('Image loaded:', img.value.width, 'x', img.value.height)
-    
+
+    // 新图片加载后重置视图并居中
+    fitView()
+
     // 绘制已有标注
     if (currentBoxes.value.length > 0) {
       redrawCanvas()
@@ -630,96 +728,412 @@ const loadImageToCanvas = () => {
   img.value.src = imageUrl
 }
 
-const startDrawing = (e: MouseEvent) => {
-  if (!canvasRef.value) return
-  const rect = canvasRef.value.getBoundingClientRect()
-  startPos.value = {
-    x: e.clientX - rect.left,
-    y: e.clientY - rect.top
+const screenToImg = (e: MouseEvent) => {
+  const rect = canvasRef.value!.getBoundingClientRect()
+  return {
+    x: (e.clientX - rect.left - viewOffset.value.x) / viewScale.value,
+    y: (e.clientY - rect.top - viewOffset.value.y) / viewScale.value
   }
-  isDrawing.value = true
 }
 
-const drawing = (e: MouseEvent) => {
-  if (!isDrawing.value || !canvasRef.value || !ctx.value || !img.value) return
-  
-  const rect = canvasRef.value.getBoundingClientRect()
-  currentPos.value = {
-    x: e.clientX - rect.left,
-    y: e.clientY - rect.top
-  }
-  
-  // 重绘
-  ctx.value.clearRect(0, 0, canvasRef.value.width, canvasRef.value.height)
-  ctx.value.drawImage(img.value, 0, 0)
-  
-  // 绘制已有框（按当前类别过滤）
-  const visible = String(currentClass.value) === '-1'
-    ? currentBoxes.value
-    : currentBoxes.value.filter(box => box.class_id === Number(currentClass.value))
-  visible.forEach(box => {
-    drawBox(box.x1, box.y1, box.x2, box.y2, classes.value[box.class_id])
-  })
-  
-  // 绘制当前框
-  ctx.value.strokeStyle = 'red'
-  ctx.value.lineWidth = 2
-  ctx.value.strokeRect(
-    startPos.value.x,
-    startPos.value.y,
-    currentPos.value.x - startPos.value.x,
-    currentPos.value.y - startPos.value.y
-  )
+const getContainerSize = () => {
+  const el = canvasRef.value?.parentElement
+  return el ? { w: el.clientWidth, h: el.clientHeight } : { w: 800, h: 600 }
 }
 
-const endDrawing = () => {
-  if (!isDrawing.value) return
-  isDrawing.value = false
-  
-  const x1 = Math.min(startPos.value.x, currentPos.value.x)
-  const y1 = Math.min(startPos.value.y, currentPos.value.y)
-  const x2 = Math.max(startPos.value.x, currentPos.value.x)
-  const y2 = Math.max(startPos.value.y, currentPos.value.y)
-  
-  if (x2 - x1 > 5 && y2 - y1 > 5) {
-    // 用当前类别绘制；若为"全部标签"(-1)，默认取第一个类别
-    let drawClass = Number(currentClass.value)
-    if (Number.isNaN(drawClass) || drawClass < 0) drawClass = 0
-    currentBoxes.value.push({
-      class_id: drawClass,
-      x1, y1, x2, y2
-    })
+// 视图适应窗口（图片居中显示）
+const fitView = () => {
+  if (!img.value || !canvasRef.value) return
+  const { w, h } = getContainerSize()
+  canvasRef.value.width = Math.max(w, 1)
+  canvasRef.value.height = Math.max(h, 1)
+  if (!img.value.width) return
+  const s = Math.min(w / img.value.width, h / img.value.height, 1)
+  viewScale.value = s
+  viewOffset.value = {
+    x: Math.max((w - img.value.width * s) / 2, 0),
+    y: Math.max((h - img.value.height * s) / 2, 0)
   }
-  
   redrawCanvas()
 }
 
-const drawBox = (x1: number, y1: number, x2: number, y2: number, label: string) => {
+const zoomBy = (factor: number) => {
+  if (!img.value || !canvasRef.value) return
+  const { w, h } = getContainerSize()
+  const cx = w / 2
+  const cy = h / 2
+  const ns = Math.min(Math.max(viewScale.value * factor, 0.05), 20)
+  viewOffset.value = {
+    x: cx - (cx - viewOffset.value.x) * (ns / viewScale.value),
+    y: cy - (cy - viewOffset.value.y) * (ns / viewScale.value)
+  }
+  viewScale.value = ns
+  redrawCanvas()
+}
+
+// 滚轮缩放（以鼠标为中心）
+const onWheel = (e: WheelEvent) => {
+  e.preventDefault()
+  if (!img.value || !canvasRef.value) return
+  const rect = canvasRef.value.getBoundingClientRect()
+  const mx = e.clientX - rect.left
+  const my = e.clientY - rect.top
+  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15
+  const ns = Math.min(Math.max(viewScale.value * factor, 0.05), 20)
+  viewOffset.value = {
+    x: mx - (mx - viewOffset.value.x) * (ns / viewScale.value),
+    y: my - (my - viewOffset.value.y) * (ns / viewScale.value)
+  }
+  viewScale.value = ns
+  redrawCanvas()
+}
+
+const onCanvasLeave = () => {
+  if (isDrawing.value) {
+    isDrawing.value = false
+    editMode.value = 'idle'
+  }
+  isPanning.value = false
+}
+
+// 命中点 p 是否在某个可见框内（从后往前，后画的在上层）
+const hitBox = (p: { x: number; y: number }) => {
+  const cur = currentClass.value
+  for (let i = currentBoxes.value.length - 1; i >= 0; i--) {
+    const b = currentBoxes.value[i]
+    if (String(cur) !== '-1' && b.class_id !== Number(cur)) continue
+    if (p.x >= b.x1 && p.x <= b.x2 && p.y >= b.y1 && p.y <= b.y2) return i
+  }
+  return -1
+}
+
+// 命中选中框的控制点（0-3 角，4-7 边中点），未命中返回 -1
+const hitHandle = (idx: number, p: { x: number; y: number }) => {
+  const b = currentBoxes.value[idx]
+  const hw = 10 / viewScale.value
+  const pts = [
+    { x: b.x1, y: b.y1 }, { x: (b.x1 + b.x2) / 2, y: b.y1 }, { x: b.x2, y: b.y1 },
+    { x: b.x2, y: (b.y1 + b.y2) / 2 }, { x: b.x2, y: b.y2 }, { x: (b.x1 + b.x2) / 2, y: b.y2 },
+    { x: b.x1, y: b.y2 }, { x: b.x1, y: (b.y1 + b.y2) / 2 }
+  ]
+  for (let i = 0; i < 8; i++) {
+    if (Math.abs(p.x - pts[i].x) <= hw && Math.abs(p.y - pts[i].y) <= hw) return i
+  }
+  return -1
+}
+
+// 根据控制点缩放选中框
+const applyResize = (p: { x: number; y: number }) => {
+  const b = origBox.value
+  const idx = selectedBoxIndex.value
+  if (!b || idx < 0) return
+  const h = resizeHandle.value
+  let x1 = b.x1, y1 = b.y1, x2 = b.x2, y2 = b.y2
+  if (h === 0 || h === 6 || h === 7) x1 = p.x
+  if (h === 2 || h === 4 || h === 3) x2 = p.x
+  if (h === 0 || h === 1 || h === 2) y1 = p.y
+  if (h === 4 || h === 5 || h === 6) y2 = p.y
+  if (x1 > x2) [x1, x2] = [x2, x1]
+  if (y1 > y2) [y1, y2] = [y2, y1]
+  const box = currentBoxes.value[idx]
+  if (box) { box.x1 = x1; box.y1 = y1; box.x2 = x2; box.y2 = y2 }
+}
+
+// 画框/移动/缩放交互入口
+const startDrawing = (e: MouseEvent) => {
+  if (!canvasRef.value || !img.value) return
+  // 按住空格 + 左键 = 平移
+  if (spaceDown.value) {
+    isPanning.value = true
+    panStart.value = { x: e.clientX, y: e.clientY }
+    return
+  }
+  const p = screenToImg(e)
+  // 交互式标注模式：拖拽框选局部提示区域（不生成类别框）
+  if (interactiveMode.value) {
+    if (interactiveBusy.value) return
+    selectedBoxIndex.value = -1
+    editMode.value = 'draw'
+    startPos.value = p
+    currentPos.value = p
+    isDrawing.value = true
+    redrawCanvas()
+    return
+  }
+  // 1) 命中选中框的控制点 → 缩放
+  if (selectedBoxIndex.value >= 0) {
+    const h = hitHandle(selectedBoxIndex.value, p)
+    if (h >= 0) {
+      editMode.value = 'resize'
+      resizeHandle.value = h
+      origBox.value = { ...currentBoxes.value[selectedBoxIndex.value] }
+      pushUndo()
+      return
+    }
+  }
+  // 2) 命中某个框内部 → 选中并移动
+  const hit = hitBox(p)
+  if (hit >= 0) {
+    selectedBoxIndex.value = hit
+    editMode.value = 'move'
+    moveStartPt.value = p
+    origBox.value = { ...currentBoxes.value[hit] }
+    pushUndo()
+    redrawCanvas()
+    return
+  }
+  // 3) 空白处 → 画新框
+  selectedBoxIndex.value = -1
+  editMode.value = 'draw'
+  startPos.value = p
+  currentPos.value = p
+  isDrawing.value = true
+  redrawCanvas()
+}
+
+const drawing = (e: MouseEvent) => {
+  if (!canvasRef.value) return
+  if (isPanning.value) {
+    viewOffset.value = {
+      x: viewOffset.value.x + (e.clientX - panStart.value.x),
+      y: viewOffset.value.y + (e.clientY - panStart.value.y)
+    }
+    panStart.value = { x: e.clientX, y: e.clientY }
+    redrawCanvas()
+    return
+  }
+  if (editMode.value === 'draw' && isDrawing.value) {
+    currentPos.value = screenToImg(e)
+    redrawCanvas()
+    return
+  }
+  if (editMode.value === 'move' && selectedBoxIndex.value >= 0 && moveStartPt.value && origBox.value) {
+    const p = screenToImg(e)
+    const dx = p.x - moveStartPt.value.x
+    const dy = p.y - moveStartPt.value.y
+    const box = currentBoxes.value[selectedBoxIndex.value]
+    box.x1 = origBox.value.x1 + dx
+    box.y1 = origBox.value.y1 + dy
+    box.x2 = origBox.value.x2 + dx
+    box.y2 = origBox.value.y2 + dy
+    redrawCanvas()
+    return
+  }
+  if (editMode.value === 'resize' && selectedBoxIndex.value >= 0) {
+    applyResize(screenToImg(e))
+    redrawCanvas()
+  }
+}
+
+const endDrawing = (e: MouseEvent) => {
+  if (isPanning.value) {
+    isPanning.value = false
+    return
+  }
+  if (editMode.value === 'draw' && isDrawing.value) {
+    isDrawing.value = false
+    currentPos.value = screenToImg(e)
+    const x1 = Math.min(startPos.value.x, currentPos.value.x)
+    const y1 = Math.min(startPos.value.y, currentPos.value.y)
+    const x2 = Math.max(startPos.value.x, currentPos.value.x)
+    const y2 = Math.max(startPos.value.y, currentPos.value.y)
+    editMode.value = 'idle'
+    // 交互式标注：框选完成 → 调接口在该区域内检测
+    if (interactiveMode.value) {
+      if (x2 - x1 > 5 && y2 - y1 > 5) {
+        interactiveRegion.value = { x1, y1, x2, y2 }
+        runInteractiveLabel()
+      }
+      redrawCanvas()
+      return
+    }
+    if (x2 - x1 > 5 && y2 - y1 > 5) {
+      let drawClass = Number(currentClass.value)
+      if (Number.isNaN(drawClass) || drawClass < 0) drawClass = 0
+      pushUndo()
+      currentBoxes.value.push({ class_id: drawClass, x1, y1, x2, y2 })
+      selectedBoxIndex.value = currentBoxes.value.length - 1
+    }
+    redrawCanvas()
+    return
+  }
+  if (editMode.value === 'move' || editMode.value === 'resize') {
+    editMode.value = 'idle'
+    moveStartPt.value = null
+    origBox.value = null
+    resizeHandle.value = -1
+  }
+}
+
+const onCanvasClick = (e: MouseEvent) => {
+  if (!canvasRef.value || !img.value) return
+  if (editMode.value !== 'idle') return
+  if (interactiveMode.value) return
+  const p = screenToImg(e)
+  selectedBoxIndex.value = hitBox(p)
+  redrawCanvas()
+}
+
+// 交互式标注：在用户框选的局部区域内按文本提示检测目标，追加到当前标注
+const runInteractiveLabel = async () => {
+  if (!interactiveRegion.value || !currentTask.value || !currentImage.value) return
+  if (!classes.value.length) {
+    alert('当前任务没有类别，无法进行交互式标注')
+    return
+  }
+  interactiveBusy.value = true
+  try {
+    // 当前类别 >=0 时只标该类别（文本提示），返回的 class_id 是子集索引需映射回全局
+    const single = currentClass.value >= 0 && currentClass.value < classes.value.length
+    const cls = single ? [classes.value[currentClass.value]] : classes.value
+    const res = await interactiveLabelImage(
+      currentTask.value,
+      currentImage.value.image_id,
+      cls,
+      aiConf.value,
+      buildPrompts(cls),
+      interactiveRegion.value
+    )
+    const base = single ? currentClass.value : 0
+    const newBoxes: BBox[] = (res.boxes || []).map((b: any) => ({
+      class_id: base + (b.class_id ?? 0),
+      x1: b.x1,
+      y1: b.y1,
+      x2: b.x2,
+      y2: b.y2
+    }))
+    if (newBoxes.length) {
+      pushUndo()
+      currentBoxes.value.push(...newBoxes)
+      alert(`已在所选区域标注 ${newBoxes.length} 个目标`)
+    } else {
+      alert('该区域未检测到目标，可调整区域范围或类别后重试')
+    }
+    redrawCanvas()
+  } catch (e: any) {
+    alert('交互式标注失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    interactiveBusy.value = false
+    interactiveRegion.value = null
+  }
+}
+
+// 启用/退出交互式标注模式
+const toggleInteractiveMode = () => {
+  interactiveMode.value = !interactiveMode.value
+  if (!interactiveMode.value) {
+    interactiveRegion.value = null
+  }
+  redrawCanvas()
+}
+
+// 点击左侧列表：选中该标注框并在画布高亮
+const selectBoxFromPanel = (index: number) => {
+  selectedBoxIndex.value = index
+  redrawCanvas()
+}
+
+const drawBox = (box: BBox, index = -1) => {
   if (!ctx.value) return
-  ctx.value.strokeStyle = 'lime'
-  ctx.value.lineWidth = 2
-  ctx.value.strokeRect(x1, y1, x2 - x1, y2 - y1)
-  ctx.value.fillStyle = 'lime'
+  const selected = index === selectedBoxIndex.value
+  const color = classColors.value[box.class_id] || 'lime'
+  ctx.value.strokeStyle = selected ? 'orange' : color
+  ctx.value.lineWidth = selected ? 3 : 2
+  ctx.value.strokeRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1)
+  ctx.value.fillStyle = selected ? 'orange' : color
   ctx.value.font = '14px Arial'
-  ctx.value.fillText(label, x1, y1 - 5)
+  ctx.value.fillText(classes.value[box.class_id] || '', box.x1, Math.max(box.y1 - 5, 12))
+  if (selected) {
+    const s = 8 / viewScale.value
+    const pts = [
+      { x: box.x1, y: box.y1 }, { x: (box.x1 + box.x2) / 2, y: box.y1 }, { x: box.x2, y: box.y1 },
+      { x: box.x2, y: (box.y1 + box.y2) / 2 }, { x: box.x2, y: box.y2 }, { x: (box.x1 + box.x2) / 2, y: box.y2 },
+      { x: box.x1, y: box.y2 }, { x: box.x1, y: (box.y1 + box.y2) / 2 }
+    ]
+    ctx.value.fillStyle = '#fff'
+    ctx.value.strokeStyle = 'orange'
+    ctx.value.lineWidth = 1.5
+    pts.forEach(pt => {
+      ctx.value!.fillRect(pt.x - s / 2, pt.y - s / 2, s, s)
+      ctx.value!.strokeRect(pt.x - s / 2, pt.y - s / 2, s, s)
+    })
+  }
 }
 
 const redrawCanvas = () => {
   if (!ctx.value || !canvasRef.value || !img.value) return
-  ctx.value.clearRect(0, 0, canvasRef.value.width, canvasRef.value.height)
+  const c = canvasRef.value
+  ctx.value.clearRect(0, 0, c.width, c.height)
+  ctx.value.save()
+  ctx.value.translate(viewOffset.value.x, viewOffset.value.y)
+  ctx.value.scale(viewScale.value, viewScale.value)
   ctx.value.drawImage(img.value, 0, 0)
-  // 按当前类别过滤：-1 全部显示，其他只显示对应类别
-  const visible = currentClass.value === -1
-    ? currentBoxes.value
-    : currentBoxes.value.filter(box => box.class_id === currentClass.value)
-  visible.forEach(box => {
-    drawBox(box.x1, box.y1, box.x2, box.y2, classes.value[box.class_id])
+  const cur = currentClass.value
+  currentBoxes.value.forEach((box, idx) => {
+    if (String(cur) === '-1' || box.class_id === Number(cur)) {
+      drawBox(box, idx)
+    }
   })
+  // 正在画的新框
+  if (isDrawing.value && editMode.value === 'draw') {
+    ctx.value.strokeStyle = 'red'
+    ctx.value.lineWidth = 2
+    ctx.value.strokeRect(
+      startPos.value.x, startPos.value.y,
+      currentPos.value.x - startPos.value.x, currentPos.value.y - startPos.value.y
+    )
+  }
+  ctx.value.restore()
 }
 
 const removeBox = (index: number) => {
+  pushUndo()
   currentBoxes.value.splice(index, 1)
+  if (selectedBoxIndex.value === index) selectedBoxIndex.value = -1
   redrawCanvas()
+}
+
+// 撤销/重做
+const pushUndo = () => {
+  undoStack.value.push(JSON.parse(JSON.stringify(currentBoxes.value)))
+  if (undoStack.value.length > 50) undoStack.value.shift()
+  redoStack.value = []
+  markDirty()
+}
+
+const undo = () => {
+  if (!undoStack.value.length) return
+  redoStack.value.push(JSON.parse(JSON.stringify(currentBoxes.value)))
+  currentBoxes.value = undoStack.value.pop()!
+  selectedBoxIndex.value = -1
+  redrawCanvas()
+}
+
+const redo = () => {
+  if (!redoStack.value.length) return
+  undoStack.value.push(JSON.parse(JSON.stringify(currentBoxes.value)))
+  currentBoxes.value = redoStack.value.pop()!
+  selectedBoxIndex.value = -1
+  redrawCanvas()
+}
+
+// 修改标注框类别（支持撤销）
+const onBoxClassChange = (e: Event, idx: number) => {
+  const old = currentBoxes.value[idx].class_id
+  const val = Number((e.target as HTMLSelectElement).value)
+  if (val === old) return
+  pushUndo()
+  currentBoxes.value[idx].class_id = val
+  redrawCanvas()
+}
+
+// 类别颜色：按黄金角在 HSL 色环上均匀分配，肉眼可区分
+const assignClassColors = (count: number) => {
+  const colors: string[] = []
+  for (let i = 0; i < count; i++) {
+    colors.push(`hsl(${(i * 137.508) % 360}, 70%, 50%)`)
+  }
+  return colors
 }
 
 // 切换"当前类别"时重绘画布，实现按类别过滤显示框
@@ -727,10 +1141,16 @@ watch(currentClass, () => {
   redrawCanvas()
 })
 
+// 类别列表变化时重新生成颜色
+watch(classes, (val) => {
+  classColors.value = assignClassColors(val.length)
+}, { immediate: true })
+
 // 一键清空当前图片的所有标注（针对误把置信度调成0导致标注过多的情况）
 const clearCurrentBoxes = async () => {
   if (!currentBoxes.value.length) return
   if (!(await showConfirm(`确定清空当前图片的 ${currentBoxes.value.length} 个标注框吗？\n\n清空后需点击"保存"才会写入文件。`))) return
+  pushUndo()
   currentBoxes.value = []
   redrawCanvas()
 }
@@ -742,17 +1162,30 @@ const loadSamConfigAndModels = async () => {
     samConfig.value = cfg
     samModels.value = models
     if (typeof cfg.conf === 'number') aiConf.value = cfg.conf
+    if (typeof cfg.iou === 'number') aiIou.value = cfg.iou
+    // 初始化检测模型下拉选中项
+    if (cfg.detector === 'grounding_dino') {
+      selectedDetector.value = '__grounding_dino__'
+    } else {
+      selectedDetector.value = cfg.detector_weights ||
+        ((models as any[])?.find?.((m: any) => m.name)?.name ?? 'yolov8s-world.pt')
+    }
   } catch (e: any) {
     console.error('加载 SAM 配置/模型失败:', e)
   }
 }
 
 const applyDetectorModel = async () => {
-  const name = samConfig.value.detector_weights
+  const name = selectedDetector.value
   if (!name) return
   try {
-    await updateSamConfig({ detector_weights: name })
-    alert(`已切换到检测模型: ${name}\n（对单张图生效，批量任务会重新加载）`)
+    if (name === '__grounding_dino__') {
+      await updateSamConfig({ detector: 'grounding_dino', detector_weights: 'IDEA-Research/grounding-dino-tiny' })
+      alert('已切换到 GroundingDINO（grounding-dino-tiny）\n（对单张图生效，批量任务会重新加载）')
+    } else {
+      await updateSamConfig({ detector: 'yolo_world', detector_weights: name })
+      alert(`已切换到检测模型: ${name}\n（对单张图生效，批量任务会重新加载）`)
+    }
   } catch (e: any) {
     alert('切换模型失败: ' + (e.response?.data?.detail || e.message))
   }
@@ -766,8 +1199,10 @@ const onSamModelFile = async (e: any) => {
     alert(`正在上传模型 ${file.name}（${(file.size / 1e6).toFixed(1)} MB）...`)
     const res = await uploadSamModel(file)
     await loadSamConfigAndModels()
+    samConfig.value.detector = 'yolo_world'
     samConfig.value.detector_weights = res.name
-    await updateSamConfig({ detector_weights: res.name })
+    selectedDetector.value = res.name
+    await updateSamConfig({ detector: 'yolo_world', detector_weights: res.name })
     alert(`模型 ${res.name} 上传成功并已启用`)
   } catch (err: any) {
     alert('上传模型失败: ' + (err.response?.data?.detail || err.message))
@@ -823,13 +1258,14 @@ const runAutoLabel = async () => {
       x2: b.x2,
       y2: b.y2
     }))
-    // 按 IoU 去重：与已有同类框重叠 >=0.5 的视为同一目标，避免重复标注
+    // 按 IoU 去重：与已有任意类别框重叠 >=0.5 的视为同一目标，避免重复标注（含跨类别）
     const newAiBoxes = aiBoxes.filter(
-      (ab: any) => !currentBoxes.value.some((cb: any) => cb.class_id === ab.class_id && iou(cb, ab) >= 0.5)
+      (ab: any) => !currentBoxes.value.some((cb: any) => iou(cb, ab) >= 0.5)
     )
     currentBoxes.value.push(...newAiBoxes)
     if (newAiBoxes.length > 0) {
       currentImageHasAi.value = true
+      markDirty()
     }
     redrawCanvas()
     if (!aiBoxes.length) {
@@ -881,10 +1317,12 @@ const pollBatch = async () => {
     return
   }
   if (!res) {
-    // 批量任务不存在（例如后端重启），停止轮询并清理
+    // 批量任务不存在（例如后端重启导致内存任务丢失），已标注的图片已保存，不丢数据
     batchId.value = null
     batchProgress.value = null
     saveAnnotateState()
+    alert('批量预标注任务已中断（可能因后端重启），之前已完成图片的标注已保存。')
+    await loadTaskItems()
     return
   }
   batchProgress.value = res
@@ -896,7 +1334,10 @@ const pollBatch = async () => {
   } else if (res.status === 'cancelled') {
     batchId.value = null
     saveAnnotateState()
-    alert('批量预标注已取消')
+    const done = res.done || 0
+    const annotated = res.annotated_images ?? done
+    alert(`批量预标注已取消，已标注 ${annotated} 张图片`)
+    await loadTaskItems()
   } else if (res.status === 'error') {
     batchId.value = null
     saveAnnotateState()
@@ -907,11 +1348,72 @@ const pollBatch = async () => {
   }
 }
 
+// 一键清除本任务所有 AI 预标注（误标过多时清理重标）
+const clearAllAiLabels = async () => {
+  if (!currentTask.value) return
+  if (!confirm(`确定清除本任务全部 ${counts.value.ai} 张 AI 预标注图片吗？\n将删除这些图片的标注（含之后人工修改），不可恢复。`)) return
+  try {
+    const res = await clearAiAnnotations(currentTask.value)
+    alert(`已清除 ${res.removed ?? 0} 张图片的 AI 标注，可重新标注`)
+    await loadTaskItems()
+    if (currentImage.value?.annotated) {
+      await loadExistingAnnotation()
+    } else {
+      currentBoxes.value = []
+      currentImageHasAi.value = false
+      loadImageToCanvas()
+    }
+  } catch (e: any) {
+    alert('清除失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+// 一键清理本任务全部图片的高度重合标注框（历史遗留重叠框统一根治，对所有检测模型生效）
+const cleanOverlaps = async () => {
+  if (!currentTask.value) return
+  if (!confirm(
+    '将对本任务全部图片执行重叠框清理：\n' +
+    '1. 跨类别高度重合（IoU≥0.5）只保留一个\n' +
+    '2. 同类高度重叠/紧邻的框合并\n\n' +
+    '此操作会覆盖图片标注，不可恢复，是否继续？'
+  )) return
+  try {
+    const res = await cleanTaskOverlaps(currentTask.value)
+    alert(`清理完成：${res.images_cleaned ?? 0} 张图片、${res.boxes_removed ?? 0} 个重叠框被清理`)
+    await loadTaskItems()
+    if (currentImage.value?.annotated) {
+      await loadExistingAnnotation()
+    } else {
+      currentBoxes.value = []
+      currentImageHasAi.value = false
+      loadImageToCanvas()
+    }
+  } catch (e: any) {
+    alert('清理失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
 const stopBatch = async () => {
   if (!batchId.value) return
   try {
     await stopBatchLabel(batchId.value)
+    // 提示已标注的图片数量后清理本地状态
+    const done = batchProgress.value?.done || 0
+    const annotated = batchProgress.value?.annotated_images ?? done
+    batchId.value = null
+    batchProgress.value = null
+    saveAnnotateState()
+    alert(`批量预标注已取消，已标注 ${annotated} 张图片`)
+    await loadTaskItems()
   } catch (e: any) {
+    // 任务不存在（例如后端重启后内存任务清空），清理本地状态并友好提示
+    if (e.response?.status === 404) {
+      batchId.value = null
+      batchProgress.value = null
+      saveAnnotateState()
+      alert('预标注任务已不存在（可能已重启），已停止')
+      return
+    }
     alert('停止失败: ' + (e.response?.data?.detail || e.message))
   }
 }
@@ -922,9 +1424,10 @@ onUnmounted(() => {
   }
 })
 
-const saveAnnotation = async () => {
-  if (!currentTask.value || !currentImage.value) return
-  
+// 保存标注（silent=true 用于自动保存，不弹提示打扰）
+const persistAnnotation = async (silent = false): Promise<boolean> => {
+  if (!currentTask.value || !currentImage.value) return false
+  if (savingAnnotation.value) return false
   savingAnnotation.value = true
   try {
     const aiFlag = currentImageHasAi.value || !!currentImage.value.ai_annotated
@@ -933,11 +1436,60 @@ const saveAnnotation = async () => {
     if (aiFlag) {
       items.value[currentIndex.value].ai_annotated = true
     }
-    alert('保存成功!')
+    dirty.value = false
+    if (!silent) alert('保存成功!')
+    return true
   } catch (error: any) {
-    alert('保存失败: ' + (error.response?.data?.detail || error.message))
+    if (!silent) alert('保存失败: ' + (error.response?.data?.detail || error.message))
+    return false
   } finally {
     savingAnnotation.value = false
+  }
+}
+
+const saveAnnotation = () => persistAnnotation(false)
+
+// 标记脏状态并防抖自动保存（所有编辑操作经 pushUndo 触发）
+const markDirty = () => {
+  dirty.value = true
+  clearTimeout(autoSaveTimer.value)
+  autoSaveTimer.value = setTimeout(() => persistAnnotation(true), 1500)
+}
+
+// 在线调置信度/IoU 阈值：保存到后端配置，AI 标注与交互式标注立即生效
+const onThreshChange = async () => {
+  try {
+    await updateSamConfig({ conf: aiConf.value, iou: aiIou.value })
+    alert(`已保存阈值：置信度 ${aiConf.value}，IoU ${aiIou.value}`)
+  } catch (e: any) {
+    alert('保存阈值失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+// 导入 YOLO 标注（zip 内含 labels/*.txt）
+const onImportYolo = async (e: any) => {
+  const file = e.target.files?.[0]
+  e.target.value = ''
+  if (!file || !currentTask.value) return
+  if (!(await showConfirm(
+    `导入 ${file.name}？\n\n` +
+    `将按文件名匹配任务图片，写入 YOLO 标注。\n` +
+    `同名图片的现有标注会被导入内容覆盖，是否继续？`
+  ))) return
+  importing.value = true
+  try {
+    const res = await importYoloLabels(currentTask.value, file)
+    const msg = `导入完成：${res.imported ?? 0} 张图片`
+    const skipped = (res.skipped || []).slice(0, 5).join('、')
+    alert(skipped ? `${msg}\n跳过未匹配: ${skipped}${res.skipped.length > 5 ? ' ...' : ''}` : msg)
+    await loadTaskItems()
+    if (currentImage.value?.annotated) {
+      await loadExistingAnnotation()
+    }
+  } catch (err: any) {
+    alert('导入失败: ' + (err.response?.data?.detail || err.message))
+  } finally {
+    importing.value = false
   }
 }
 
@@ -950,7 +1502,16 @@ const exportTask = async () => {
     alert('划分比例之和必须大于0')
     return
   }
-  if (!(await showConfirm(`确认导出并自动划分数据集？\n\n训练:验证:测试 = ${ratioTrain.value} : ${ratioVal.value} : ${ratioTest.value}\n已标注图片将复制到 images/ 和 labels/ 对应的 train/val/test 目录。` ))) return
+  if (!(await showConfirm(
+    `确认导出并自动划分数据集？\n\n` +
+    `训练:验证:测试 = ${ratioTrain.value} : ${ratioVal.value} : ${ratioTest.value}\n\n` +
+    `导出结构：\n` +
+    `  train/images + train/labels\n` +
+    `  val/images + val/labels\n` +
+    `  test/images + test/labels\n` +
+    `  data.yaml（根目录）\n\n` +
+    `点击确定后将写入数据集目录。`
+  ))) return
 
   exporting.value = true
   try {
@@ -991,12 +1552,69 @@ const handleKeydown = (e: KeyboardEvent) => {
   const tag = (e.target as HTMLElement)?.tagName
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
   if (!currentTask.value || loadingAnnotation.value) return
-  if (e.key === 'ArrowRight') {
+
+  // Ctrl/Cmd 组合键
+  if (e.ctrlKey || e.metaKey) {
+    const k = e.key.toLowerCase()
+    if (k === 's') {
+      e.preventDefault()
+      saveAnnotation()
+    } else if (k === 'z') {
+      e.preventDefault()
+      if (e.shiftKey) redo()
+      else undo()
+    } else if (k === 'y') {
+      e.preventDefault()
+      redo()
+    }
+    return
+  }
+
+  // 空格：按住平移（只在画布未被聚焦交互时启用）
+  if (e.code === 'Space') {
     e.preventDefault()
-    nextImage()
-  } else if (e.key === 'ArrowLeft') {
-    e.preventDefault()
-    prevImage()
+    spaceDown.value = true
+    return
+  }
+
+  switch (e.key) {
+    case 'Escape':
+      if (interactiveMode.value) {
+        interactiveMode.value = false
+        interactiveRegion.value = null
+        redrawCanvas()
+      }
+      break
+    case 'ArrowRight':
+    case 'd':
+    case 'D':
+      e.preventDefault()
+      nextImage()
+      break
+    case 'ArrowLeft':
+    case 'a':
+    case 'A':
+      e.preventDefault()
+      prevImage()
+      break
+    case 'Delete':
+    case 'Backspace':
+      if (selectedBoxIndex.value >= 0) {
+        e.preventDefault()
+        removeBox(selectedBoxIndex.value)
+      }
+      break
+  }
+}
+
+// 松开空格等按键时复位状态
+const handleKeyup = (e: KeyboardEvent) => {
+  if (e.code === 'Space') {
+    spaceDown.value = false
+    if (isPanning.value) {
+      isPanning.value = false
+      redrawCanvas()
+    }
   }
 }
 
@@ -1009,13 +1627,19 @@ onMounted(() => {
   loadDatasets()
   loadSamConfigAndModels()
   window.addEventListener('keydown', handleKeydown)
+  window.addEventListener('keyup', handleKeyup)
+  window.addEventListener('resize', fitView)
   document.addEventListener('click', handleDocClick)
   restoreAnnotateState()
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeydown)
+  window.removeEventListener('keyup', handleKeyup)
+  window.removeEventListener('resize', fitView)
   document.removeEventListener('click', handleDocClick)
+  // 离页时若有未保存改动，尝试立即保存
+  if (dirty.value) persistAnnotation(true)
   saveAnnotateState()
 })
 </script>
@@ -1259,9 +1883,97 @@ onUnmounted(() => {
 .canvas-container {
   position: relative;
   border: 2px solid #ddd;
-  overflow: auto;
+  overflow: hidden;
   max-height: 600px;
   cursor: crosshair;
+  /* 图片小于显示框时居中；图片过大溢出时 margin 自动归零，从左上滚动不受影响 */
+  display: flex;
+}
+
+/* 画布缩放/平移工具条 */
+.view-toolbar {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 0.8rem;
+  z-index: 6;
+}
+
+.view-hint {
+  color: #ccc;
+  font-size: 0.75rem;
+  margin-right: 0.5rem;
+}
+
+.view-toolbar .small {
+  min-width: 26px;
+  height: 26px;
+  padding: 0;
+  line-height: 1;
+}
+
+/* 左侧标注框条目标签前的颜色块 */
+.box-color {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  margin-right: 0.5rem;
+  flex: none;
+}
+
+/* 交互式标注提示条与激活按钮 */
+.interactive-hint {
+  font-size: 0.8rem;
+  color: #e67e22;
+  background: #fdf3e7;
+  border: 1px solid #f5c6a0;
+  border-radius: 4px;
+  padding: 0.4rem 0.6rem;
+  margin-bottom: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.annotations-panel button.active {
+  background: #e67e22;
+  color: #fff;
+  border-color: #e67e22;
+}
+
+/* 导入 YOLO 标注按钮（label 包裹 file input） */
+.import-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.45rem 0.8rem;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.import-label:hover {
+  border-color: #42b983;
+  color: #42b983;
+}
+
+.import-input {
+  display: none;
+}
+
+.ai-btn.small {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.8rem;
 }
 
 .img-nav-btn {
@@ -1306,6 +2018,7 @@ onUnmounted(() => {
 
 canvas {
   display: block;
+  margin: auto;
 }
 
 .controls {
@@ -1327,12 +2040,49 @@ canvas {
 
 .box-item {
   display: flex;
-  justify-content: space-between;
+  flex-wrap: wrap;
   align-items: center;
   padding: 0.5rem;
   border: 1px solid #ddd;
   border-radius: 4px;
   margin-bottom: 0.5rem;
+  cursor: pointer;
+  transition: border-color 0.15s, background-color 0.15s;
+}
+
+.box-item:hover {
+  border-color: #aaa;
+}
+
+.box-item-selected {
+  border-color: orange;
+  background: rgba(255, 165, 0, 0.12);
+}
+
+.box-class-select {
+  flex: 1;
+  margin-right: 0.5rem;
+  padding: 0.25rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  min-width: 0;
+}
+
+.box-class-name {
+  font-size: 0.85rem;
+  color: #333;
+  margin-right: 0.5rem;
+  white-space: normal;
+  word-break: break-all;
+  flex: 1 1 100%;
+  min-width: 0;
+}
+
+.box-empty {
+  color: #999;
+  font-size: 0.85rem;
+  padding: 0.5rem 0;
+  text-align: center;
 }
 
 .annotations-panel button {

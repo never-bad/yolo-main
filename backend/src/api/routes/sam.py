@@ -9,13 +9,15 @@ sam_service = SAMService()
 
 
 class ConfigRequest(BaseModel):
-    detector: Optional[str] = None            # yolo_world | none
+    detector: Optional[str] = None            # yolo_world | grounding_dino | none
     detector_weights: Optional[str] = None
+    grounding_dino_model: Optional[str] = None  # Transformers 集成的 GD 模型名（如 IDEA-Research/grounding-dino-tiny）
     sam_enabled: Optional[bool] = None
     sam_weights: Optional[str] = None
     imgsz: Optional[int] = None
     sam_imgsz: Optional[int] = None
     conf: Optional[float] = None
+    iou: Optional[float] = None              # NMS IoU 阈值（在线可调）
     half: Optional[bool] = None
     device: Optional[str] = None              # auto | cpu | GPU 索引
 
@@ -33,6 +35,15 @@ class BatchStartRequest(BaseModel):
     classes: List[str]
     conf: Optional[float] = None
     prompts: Optional[List[str]] = None  # 与 classes 一一对应的英文提示词
+
+
+class InteractiveLabelRequest(BaseModel):
+    task_id: str
+    image_id: str
+    classes: List[str]
+    conf: Optional[float] = None
+    prompts: Optional[List[str]] = None  # 与 classes 一一对应的英文提示词
+    region: Optional[dict] = None        # 用户框选的局部区域（图像坐标）{"x1","y1","x2","y2"}，缺省全图
 
 
 @router.get("/available")
@@ -89,6 +100,21 @@ async def auto_label(request: AutoLabelRequest):
     try:
         return await sam_service.auto_label(
             request.task_id, request.image_id, request.classes, request.conf, request.prompts
+        )
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+@router.post("/interactive-label")
+async def interactive_label(request: InteractiveLabelRequest):
+    """交互式标注：在用户框选的局部区域内按文本提示检测目标框"""
+    try:
+        return await sam_service.interactive_label(
+            request.task_id, request.image_id, request.classes,
+            request.conf, request.prompts, request.region
         )
     except ValueError as e:
         raise HTTPException(404, str(e))

@@ -4,12 +4,14 @@ import shutil
 import asyncio
 import yaml
 import os
+import re
 import logging
 import tempfile
 from pathlib import Path
 from datetime import datetime
 from fastapi import UploadFile
 from src.core.settings import settings
+from src.utils.fs_tree import build_tree
 
 logger = logging.getLogger(__name__)
 
@@ -209,18 +211,24 @@ class DatasetService:
                 def read_names(path):
                     if path.suffix.lower() in (".yaml", ".yml"):
                         data = _load_yaml(path)
-                        return data.get('names', [])
+                        names = data.get('names', [])
+                        # YOLO 支持 names: {0: 'a', 1: 'b'} 的字典形式，转为按 id 排序的列表
+                        if isinstance(names, dict):
+                            return [str(names[k]) for k in sorted(names)]
+                        return names
                     with open(path, "r", encoding="utf-8") as f:
                         return [line.strip() for line in f if line.strip()]
 
                 # 1) 优先查找根目录下的类别文件
+                # 纯文本类别文件（classes.txt 等）是真实类别名，优先级高于 data.yaml
+                # （data.yaml 可能保存的是上一次 prepare 生成的占位名 class_N，会覆盖真实名）
                 candidates = [
-                    version_dir / "data.yaml",
-                    version_dir / "dataset.yaml",
-                    version_dir / "config.yaml",
                     version_dir / "classes.txt",
                     version_dir / "coco.names",
                     version_dir / "names.txt",
+                    version_dir / "dataset.yaml",
+                    version_dir / "config.yaml",
+                    version_dir / "data.yaml",
                 ]
                 for path in candidates:
                     if path.exists():
@@ -233,7 +241,7 @@ class DatasetService:
                             logger.warning(f"Failed to load classes from {path}: {e}")
 
                 # 2) 递归查找（类别文件可能在 zip 的子目录中）
-                for name in ["data.yaml", "dataset.yaml", "config.yaml", "classes.txt", "coco.names", "names.txt"]:
+                for name in ["classes.txt", "coco.names", "names.txt", "dataset.yaml", "config.yaml", "data.yaml"]:
                     for path in version_dir.rglob(name):
                         try:
                             names = read_names(path)
@@ -324,6 +332,49 @@ class DatasetService:
         max_id = max(class_ids) if class_ids else 0
         return [f"class_{i}" for i in range(max_id + 1)]
     
+    def _resolve_real_classes(self, dataset_dir: Path, meta: dict) -> list:
+        """将占位类别名（class_N）回填为真实类别名
+
+        历史数据 prepare 时可能因未读到类别文件而生成了 class_0/class_1 等占位名。
+        若目录中存在真实类别文件（classes.txt / coco.names / names.txt），则按行读取并回填。
+        """
+        classes = meta.get("classes") or []
+        if not classes:
+            return classes
+        # 仅当全部是占位名时才回填（避免覆盖用户自定义的真实类别名）
+        if not all(re.fullmatch(r"class_\d+", str(c)) for c in classes):
+            return classes
+        version_dir = dataset_dir / meta.get("version", "v1")
+        for name in ["classes.txt", "coco.names", "names.txt"]:
+            for path in version_dir.rglob(name):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        names = [line.strip() for line in f if line.strip()]
+                    if names and len(names) == len(classes):
+                        return names
+                except Exception:
+                    continue
+        return classes
+
+    def _is_annotated_exported(self, dataset_dir: Path, version: str) -> bool:
+        """判断数据集是否已在标注页执行过"导出YOLO(自动划分)"
+
+        标注导出会生成 labels/{train,val,test} 划分结构（含 .txt 标签），
+        这是标注导出独有的标志，可用于区分仅上传/准备的数据集。
+        """
+        version_dir = dataset_dir / version
+        if not version_dir.exists():
+            return False
+        # 标注导出固定写入 version_dir/labels/{train,val,test}
+        labels = version_dir / "labels"
+        train_labels = labels / "train"
+        if not train_labels.is_dir():
+            return False
+        try:
+            return any(train_labels.iterdir())
+        except Exception:
+            return False
+
     async def list_datasets(self):
         """列出所有数据集"""
         def _list_datasets_sync():
@@ -336,6 +387,14 @@ class DatasetService:
                     if meta_path.exists():
                         try:
                             meta = _load_json(meta_path)
+                            # 占位类别名回填为真实名（修复历史遗留的 class_N 占位）
+                            real_classes = self._resolve_real_classes(dataset_dir, meta)
+                            if real_classes != meta.get("classes"):
+                                meta["classes"] = real_classes
+                            # 标记是否为标注导出的数据集（是否有可用的训练标签）
+                            meta["annotated"] = self._is_annotated_exported(
+                                dataset_dir, meta.get("version", "v1")
+                            )
                             datasets.append(meta)
                         except Exception:
                             continue
@@ -354,6 +413,11 @@ class DatasetService:
         
         meta = await asyncio.to_thread(_load_json, meta_path)
         
+        # 占位类别名回填为真实名（与 list_datasets 保持一致）
+        real_classes = self._resolve_real_classes(dataset_dir, meta)
+        if real_classes != meta.get("classes"):
+            meta["classes"] = real_classes
+        
         # 添加图片列表（在线程中执行）
         def _get_images():
             version = meta.get("version", "v1")
@@ -368,7 +432,7 @@ class DatasetService:
                     list(images_dir.rglob("*.jpeg")) +
                     list(images_dir.rglob("*.png"))
                 )
-                for img in sorted(image_files)[:12]:  # 预览图片不宜过多，最多 12 张避免杂乱
+                for img in sorted(image_files)[:6]:  # 预览图片不宜过多，最多 6 张避免杂乱
                     try:
                         rel = img.relative_to(settings.DATA_DIR)
                         images.append(str(rel).replace("\\", "/"))
@@ -378,6 +442,16 @@ class DatasetService:
         
         meta["images"] = await asyncio.to_thread(_get_images)
         return meta
+    
+    async def get_dataset_tree(self, dataset_id: str):
+        """获取数据集目录树（用于前端展示文件夹结构）"""
+        dataset_dir = self.datasets_dir / dataset_id
+        if not await asyncio.to_thread(lambda: dataset_dir.exists()):
+            return None
+        tree = await asyncio.to_thread(
+            build_tree, dataset_dir, settings.DATA_DIR, 6, 300, True
+        )
+        return {"tree": tree, "dataset_id": dataset_id}
     
     async def update_dataset(self, dataset_id: str, request):
         """更新数据集信息"""
@@ -442,18 +516,33 @@ class DatasetService:
                 )
 
                 if has_split:
-                    # 已划分：只打包 images/{train,val,test} 与 labels/{train,val,test}
+                    # 已划分：打包为 {split}/images 与 {split}/labels 结构
                     for split in split_dirs:
                         split_img = images_dir / split
                         if split_img.exists():
                             for f in sorted(split_img.rglob("*")):
                                 if f.is_file():
-                                    zipf.write(f, f"images/{split}/{f.name}")
+                                    zipf.write(f, f"{split}/images/{f.name}")
                         split_lbl = labels_dir / split if labels_dir else None
                         if split_lbl is not None and split_lbl.exists():
                             for f in sorted(split_lbl.rglob("*")):
                                 if f.is_file():
-                                    zipf.write(f, f"labels/{split}/{f.name}")
+                                    zipf.write(f, f"{split}/labels/{f.name}")
+                    # 生成匹配 zip 结构的 data.yaml（train/val/test 下都有 images 和 labels）
+                    zip_yaml = {"path": ""}
+                    for split in split_dirs:
+                        if (images_dir / split).exists():
+                            zip_yaml[split] = f"{split}/images"
+                    src_yaml = version_dir / "data.yaml"
+                    if src_yaml.exists():
+                        try:
+                            with open(src_yaml, "r", encoding="utf-8") as _f:
+                                src = yaml.safe_load(_f) or {}
+                            zip_yaml["nc"] = src.get("nc", 0)
+                            zip_yaml["names"] = src.get("names", [])
+                        except Exception:
+                            pass
+                    zipf.writestr("data.yaml", yaml.dump(zip_yaml, allow_unicode=True))
                 else:
                     # 未划分：平铺打包 images/ 与 labels/
                     if images_dir:
@@ -466,11 +555,10 @@ class DatasetService:
                             if label_file.is_file():
                                 arcname = label_file.relative_to(version_dir)
                                 zipf.write(label_file, arcname)
-
-                # 添加data.yaml
-                data_yaml = version_dir / "data.yaml"
-                if data_yaml.exists():
-                    zipf.write(data_yaml, "data.yaml")
+                    # 未划分时 data.yaml 保持原样
+                    data_yaml = version_dir / "data.yaml"
+                    if data_yaml.exists():
+                        zipf.write(data_yaml, "data.yaml")
             
             return temp_zip_path
         

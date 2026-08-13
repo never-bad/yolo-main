@@ -10,3 +10,5 @@ aiofiles==23.2.1
 psutil==5.9.8
 matplotlib>=3.7.0
 opencv-python>=4.8.0
+# Grounding-DINO 交互式标注（Transformers 集成）
+transformers>=4.40.0

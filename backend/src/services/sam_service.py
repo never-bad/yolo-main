@@ -22,8 +22,11 @@ from src.services.annotation_service import AnnotationService
 
 
 DEFAULT_CONFIG = {
-    "detector": "yolo_world",        # yolo_world | none
+    "detector": "yolo_world",        # yolo_world | grounding_dino | none
     "detector_weights": "yolov8s-world.pt",
+    "grounding_dino_model": "IDEA-Research/grounding-dino-tiny",  # Transformers 集成的 GD 模型名
+    "grounding_dino_size": 640,      # GroundingDINO 推理分辨率（越小越快，默认 800）
+    "grounding_dino_min_conf": 0.25, # GD 置信度下限（GD 分数尺度与 YOLO 不同，过低会大量误检）
     "sam_enabled": True,             # 是否启用 SAM 分割精修
     "sam_weights": "sam_b.pt",
     "imgsz": 640,                    # 检测器输入尺寸
@@ -38,6 +41,11 @@ DEFAULT_CONFIG = {
 def _load_json(path: Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _save_json(path: Path, data: dict):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 class BatchTask:
@@ -66,6 +74,10 @@ class SAMService:
         self._detector_name = None
         self._sam = None
         self._sam_name = None
+        # GroundingDINO（Transformers 集成）缓存
+        self._gd_processor = None
+        self._gd_model = None
+        self._gd_name = None
         # 缓存最后一次传给 YOLO-World 的提示词列表，避免多类别时每张图重复重新编码
         self._detector_prompts: Optional[List[str]] = None
         self._lock = asyncio.Lock()
@@ -110,8 +122,8 @@ class SAMService:
     # 检测模型管理
     # ------------------------------------------------------------------
     def _model_locations(self) -> List[Path]:
-        """检测模型可能存放的位置：统一目录 + 项目 backend 根目录（兼容旧文件）"""
-        return [settings.SAM_MODELS_DIR, settings.BASE_DIR]
+        """检测模型可能存放的位置：统一目录 + 用户上传的自定义模型目录 + 项目 backend 根目录（兼容旧文件）"""
+        return [settings.SAM_MODELS_DIR, settings.CUSTOM_MODELS_DIR, settings.BASE_DIR]
 
     def _find_model_file(self, weights: str) -> str:
         """将配置里的权重名解析为实际文件路径；找不到则原样返回交给 ultralytics 处理"""
@@ -158,15 +170,42 @@ class SAMService:
     # 模型加载（单例缓存）
     # ------------------------------------------------------------------
     def _load_detector(self, cfg: dict):
+        det_type = cfg.get("detector", "yolo_world")
+        if det_type == "none":
+            return None
+        if det_type == "grounding_dino":
+            # GroundingDINO 走 Transformers 集成，加载后返回占位标记表示已就绪
+            self._load_grounding_dino(cfg)
+            return True
+        # 默认 yolo_world
         if self._detector is not None:
             return self._detector
-        if cfg.get("detector") == "none":
-            return None
         weights = cfg.get("detector_weights", "yolov8s-world.pt")
         from ultralytics import YOLO
         self._detector = YOLO(self._find_model_file(weights))
         self._detector_name = weights
         return self._detector
+
+    def _resolve_gd_model_name(self, model_name: str) -> str:
+        """本地优先解析 GroundingDINO 模型：若已下载到 SAM_MODELS_DIR/<名称> 则用本地路径，避免联网"""
+        tail = model_name.rstrip("/").rsplit("/", 1)[-1]
+        local_dir = settings.SAM_MODELS_DIR / tail
+        if local_dir.exists() and (local_dir / "config.json").exists():
+            return str(local_dir)
+        return model_name
+
+    def _load_grounding_dino(self, cfg: dict):
+        """加载 Transformers 集成的 GroundingDINO（模型 + 处理器）"""
+        if self._gd_model is not None:
+            return self._gd_processor, self._gd_model
+        model_name = self._resolve_gd_model_name(cfg.get("grounding_dino_model", "IDEA-Research/grounding-dino-tiny"))
+        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+        self._gd_processor = AutoProcessor.from_pretrained(model_name)
+        self._gd_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_name)
+        self._gd_name = model_name
+        self._gd_model.to(self._resolve_device(cfg))
+        self._gd_model.eval()
+        return self._gd_processor, self._gd_model
 
     def _load_sam(self, cfg: dict):
         if self._sam is not None:
@@ -213,16 +252,20 @@ class SAMService:
             try:
                 checks = {}
                 if cfg.get("detector") != "none":
-                    det = self._load_detector(cfg)
-                    det.set_classes(["test"])
-                    det.predict(
-                        np.zeros((64, 64, 3), dtype=np.uint8),
-                        conf=0.5,
-                        verbose=False,
-                        imgsz=64,
-                        device=self._resolve_device(cfg),
-                    )
-                    checks["detector"] = "ok"
+                    if cfg.get("detector") == "grounding_dino":
+                        self._load_grounding_dino(cfg)
+                        checks["detector"] = "ok"
+                    else:
+                        det = self._load_detector(cfg)
+                        det.set_classes(["test"])
+                        det.predict(
+                            np.zeros((64, 64, 3), dtype=np.uint8),
+                            conf=0.5,
+                            verbose=False,
+                            imgsz=64,
+                            device=self._resolve_device(cfg),
+                        )
+                        checks["detector"] = "ok"
                 if cfg.get("sam_enabled", True):
                     self._load_sam(cfg)
                     checks["sam"] = "ok"
@@ -259,11 +302,88 @@ class SAMService:
             "boxes": boxes,
         }
 
+    async def interactive_label(self, task_id: str, image_id: str,
+                                classes: List[str], conf: Optional[float] = None,
+                                prompts: Optional[List[str]] = None,
+                                region: Optional[dict] = None) -> dict:
+        """交互式标注：只在用户框选的局部区域（region，图像坐标）内做检测。
+
+        相比全图盲扫，局部检测既减少误标，又能针对感兴趣区域精细标注，
+        配合"点击/框选提示区域 + 文本提示"的交互方式，正中"误标过多"痛点。
+        region 格式：{"x1":..,"y1":..,"x2":..,"y2":..}；缺省则全图检测。
+        """
+        cfg = self._read_config()
+        conf = conf if conf is not None else cfg.get("conf", 0.25)
+
+        item = await self._get_item(task_id, image_id)
+        if not item:
+            raise ValueError("Image not found in task")
+
+        img_abs = settings.DATA_DIR / item["image_path"]
+        if not img_abs.exists():
+            raise ValueError(f"Image file not found: {img_abs}")
+
+        # 模型推理非线程安全，加锁串行化
+        async with self._lock:
+            boxes = await asyncio.to_thread(
+                self._run_interactive_label_sync, img_abs, classes, conf, cfg, prompts, region
+            )
+        return {
+            "image_id": image_id,
+            "width": item["width"],
+            "height": item["height"],
+            "boxes": boxes,
+        }
+
+    def _run_interactive_label_sync(self, img_abs: Path, classes: List[str], conf: float,
+                                    cfg: dict, prompts=None, region: Optional[dict] = None) -> list:
+        """交互式标注同步执行：裁剪到区域 → 区域检测 → 坐标映射回原图 → 合并 → (可选)SAM 精修"""
+        import os
+        from tempfile import NamedTemporaryFile
+        from PIL import Image
+
+        if region:
+            image = Image.open(img_abs).convert("RGB")
+            w, h = image.size
+            x1 = max(0, int(round(region.get("x1", 0))))
+            y1 = max(0, int(round(region.get("y1", 0))))
+            x2 = min(w, int(round(region.get("x2", w))))
+            y2 = min(h, int(round(region.get("y2", h))))
+            if x2 - x1 < 5 or y2 - y1 < 5:
+                raise ValueError("Region too small")
+            crop = image.crop((x1, y1, x2, y2))
+            tmp = NamedTemporaryFile(suffix=".jpg", delete=False)
+            tmp.close()
+            tmp_path = Path(tmp.name)
+            try:
+                crop.save(tmp_path)
+                det_boxes = self._detect(tmp_path, classes, conf, cfg, prompts)
+                # 把裁剪图坐标映射回原图坐标
+                for b in det_boxes:
+                    b["x1"] += x1
+                    b["y1"] += y1
+                    b["x2"] += x1
+                    b["y2"] += y1
+            finally:
+                if tmp_path.exists():
+                    os.unlink(tmp_path)
+        else:
+            det_boxes = self._detect(img_abs, classes, conf, cfg, prompts)
+
+        det_boxes = self._merge_same_class_boxes(det_boxes)
+        det_boxes = self._merge_cross_class_boxes(det_boxes)
+        if cfg.get("sam_enabled", True):
+            # SAM 在原图上按映射回原图的框做分割精修
+            return self._refine_with_sam(img_abs, det_boxes, cfg)
+        return det_boxes
+
     def _run_auto_label_sync(self, img_abs: Path, classes: List[str], conf: float, cfg: dict, prompts=None) -> list:
         """同步执行：检测 → 合并被遮挡分裂的同类框 → (可选) SAM 精修 → 返回 BBox 列表"""
         det_boxes = self._detect(img_abs, classes, conf, cfg, prompts)
         # 合并被遮挡物（如电线杆）分裂成多个的同类框，避免同一物体被识别成两个
         det_boxes = self._merge_same_class_boxes(det_boxes)
+        # 跨类别高度重合合并（GD 常把同一目标误标成不同类别，导致高度重合框残留）
+        det_boxes = self._merge_cross_class_boxes(det_boxes)
         if cfg.get("sam_enabled", True):
             return self._refine_with_sam(img_abs, det_boxes, cfg)
         return det_boxes
@@ -331,7 +451,81 @@ class SAMService:
                 merged.append(base)
         return merged
 
+    def _merge_cross_class_boxes(self, boxes: list, iou_thr: float = 0.5) -> list:
+        """合并不同类别但高度重合的框（GD 常把同一目标误标成不同类别）。
+
+        不同类别两个框 IoU ≥ 0.5 时几乎可判定为同一目标的重复检测，只保留 score 更高者。
+        """
+        if not boxes:
+            return boxes
+
+        def _iou(a, b):
+            ix1, iy1 = max(a["x1"], b["x1"]), max(a["y1"], b["y1"])
+            ix2, iy2 = min(a["x2"], b["x2"]), min(a["y2"], b["y2"])
+            iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+            inter = iw * ih
+            if inter <= 0:
+                return 0.0
+            aa = (a["x2"] - a["x1"]) * (a["y2"] - a["y1"])
+            bb = (b["x2"] - b["x1"]) * (b["y2"] - b["y1"])
+            return inter / (aa + bb - inter)
+
+        # 按 score 降序，保留高置信度框，丢弃与已保留框高度重合的任意类别框
+        boxes = sorted(boxes, key=lambda b: b.get("score", 0.0), reverse=True)
+        out = []
+        for b in boxes:
+            if any(_iou(kept, b) >= iou_thr for kept in out):
+                continue
+            out.append(b)
+        return out
+
+    async def clean_task_annotations(self, task_id: str) -> dict:
+        """清洗一个标注任务中所有图片的高度重合标注框（跨类别 IoU≥0.5、同类高度重叠/紧邻）。
+
+        复用与检测时完全相同的合并逻辑（_merge_same_class_boxes + _merge_cross_class_boxes），
+        一次性根治历史遗留的重叠标注——无论之前用的是哪个检测模型，都统一清理，无需按模型分别处理。
+        """
+        task_dir = settings.ANNOTATIONS_DIR / task_id
+        annotations_file = task_dir / "annotations.json"
+        if not annotations_file.exists():
+            return {"ok": False, "error": "Task not found"}
+        return await asyncio.to_thread(self._clean_task_annotations_sync, annotations_file)
+
+    def _clean_task_annotations_sync(self, annotations_file: Path) -> dict:
+        try:
+            annotations = _load_json(annotations_file)
+        except Exception as e:
+            return {"ok": False, "error": f"读取标注文件失败: {e}"}
+
+        images_cleaned = 0
+        boxes_removed = 0
+        for image_id, ann in annotations.items():
+            boxes = ann.get("boxes") or []
+            if not boxes:
+                continue
+            orig_len = len(boxes)
+            merged = self._merge_same_class_boxes(boxes)
+            merged = self._merge_cross_class_boxes(merged)
+            if len(merged) < orig_len:
+                ann["boxes"] = merged
+                ann["updated_at"] = datetime.now().isoformat()
+                images_cleaned += 1
+                boxes_removed += orig_len - len(merged)
+
+        if images_cleaned > 0:
+            _save_json(annotations_file, annotations)
+        return {
+            "ok": True,
+            "images_cleaned": images_cleaned,
+            "boxes_removed": boxes_removed,
+        }
+
     def _detect(self, img_abs, classes, conf, cfg, prompts=None) -> list:
+        if cfg.get("detector") == "grounding_dino":
+            return self._detect_grounding_dino(img_abs, classes, conf, cfg, prompts)
+        return self._detect_yolo(img_abs, classes, conf, cfg, prompts)
+
+    def _detect_yolo(self, img_abs, classes, conf, cfg, prompts=None) -> list:
         det = self._load_detector(cfg)
         if det is None:
             return []
@@ -366,6 +560,78 @@ class SAMService:
                     "score": float(boxes.conf[i]),
                 })
         return out
+
+    def _detect_grounding_dino(self, img_abs, classes, conf, cfg, prompts=None) -> list:
+        """GroundingDINO（Transformers 集成）文本驱动检测。
+
+        caption 用 prompts（英文提示词，提升识别率），与 classes 一一对应；
+        通过 phrases -> prompt 文本匹配映射回 classes 索引得到 class_id。
+        """
+        processor, model = self._load_grounding_dino(cfg)
+        text_prompts = prompts if prompts else classes
+        if not text_prompts:
+            return []
+        caption = " . ".join(text_prompts)
+        device = self._resolve_device(cfg)
+        try:
+            import torch
+            from PIL import Image
+            image = Image.open(img_abs).convert("RGB")
+            gd_size = int(cfg.get("grounding_dino_size", 640) or 640)
+            # GD processor 的 size 需同时给定长短边（int 会被解析成仅含 shortest_edge 的非法字典）
+            inputs = processor(
+                images=image, text=caption,
+                size={"shortest_edge": gd_size, "longest_edge": gd_size},
+                return_tensors="pt",
+            ).to(device)
+            with torch.no_grad():
+                outputs = model(**inputs)
+            # GD 分数尺度与 YOLO 不同：过低阈值会产生大量误检框，加上限下限保护
+            gd_conf = max(float(conf), float(cfg.get("grounding_dino_min_conf", 0.25)))
+            results = processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                box_threshold=gd_conf,
+                text_threshold=gd_conf,
+                target_sizes=[(image.height, image.width)],
+            )[0]
+        except Exception as e:
+            print(f"Warning: GroundingDINO detect failed: {e}")
+            return []
+
+        out = []
+        boxes = results.get("boxes")
+        scores = results.get("scores")
+        labels = results.get("labels")
+        if boxes is None or scores is None or labels is None:
+            return out
+        for box, score, label in zip(boxes, scores, labels):
+            class_id = self._match_phrase(text_prompts, label)
+            if class_id is None:
+                continue
+            x1, y1, x2, y2 = box.tolist()
+            out.append({
+                "class_id": class_id,
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "score": float(score),
+            })
+        return out
+
+    def _match_phrase(self, prompts: List[str], label: str) -> Optional[int]:
+        """将 GroundingDINO 返回的短语标签匹配回 prompts 索引（class_id）"""
+        if label is None:
+            return None
+        norm_label = label.strip().lower().replace(".", "").strip()
+        for i, p in enumerate(prompts):
+            norm_p = str(p).strip().lower().replace(".", "").strip()
+            if norm_p and (norm_p == norm_label or norm_label == norm_p):
+                return i
+        # 兜底：标签包含某个 prompt 的完整词
+        for i, p in enumerate(prompts):
+            norm_p = str(p).strip().lower().replace(".", "").strip()
+            if norm_p and (norm_p in norm_label or norm_label in norm_p):
+                return i
+        return None
 
     def _refine_with_sam(self, img_abs, det_boxes, cfg) -> list:
         if not det_boxes:
@@ -424,7 +690,14 @@ class SAMService:
         meta = await self._load_task_meta(task_id)
         if not meta:
             raise ValueError("Task not found")
-        items = meta.get("items", [])
+        # 按 image_id 去重，与图片列表一致（历史任务可能因平铺图+划分目录重复收集同一张图）
+        seen = set()
+        items = []
+        for it in meta.get("items", []):
+            if it.get("image_id") in seen:
+                continue
+            seen.add(it.get("image_id"))
+            items.append(it)
         if not items:
             raise ValueError("Task has no images")
 
@@ -441,10 +714,17 @@ class SAMService:
         bt = self.batch_tasks[batch_id]
         cfg = self._read_config()
         try:
-            # 预加载模型，避免逐张重复实例化
+            # 预加载模型，避免逐张重复实例化（CPU 上模型加载较慢，提前检查取消）
+            if bt.cancelled:
+                bt.status = "cancelled"
+                return
             await asyncio.to_thread(self._load_detector, cfg)
             if cfg.get("sam_enabled", True):
                 await asyncio.to_thread(self._load_sam, cfg)
+            # 模型加载完成后再次检查取消，避免加载期间点停止无效
+            if bt.cancelled:
+                bt.status = "cancelled"
+                return
 
             for item in items:
                 if bt.cancelled:

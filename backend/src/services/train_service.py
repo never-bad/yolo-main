@@ -8,6 +8,7 @@ from pathlib import Path
 from datetime import datetime
 import psutil
 from src.core.settings import settings
+from src.utils.fs_tree import build_tree
 
 
 def _load_json(path: Path):
@@ -101,6 +102,14 @@ class TrainService:
             actual_model_path = str(weights_path)
             model_name = f"{base_model_id}_fine_tuned"
         
+        # 并发训练数限制：防止 CPU/GPU 资源被过多训练任务占满
+        max_concurrent = settings.MAX_CONCURRENT_TRAIN_JOBS
+        active = await asyncio.to_thread(self._active_training_count)
+        if active >= max_concurrent:
+            raise ValueError(
+                f"训练任务已达上限（{active}/{max_concurrent}），请等待某个训练完成后再试"
+            )
+        
         # 创建job元数据
         job_meta = {
             "job_id": job_id,
@@ -126,6 +135,13 @@ class TrainService:
         )
         
         return {"job_id": job_id, "status": "running"}
+    
+    def _active_training_count(self) -> int:
+        """当前活跃训练进程数（先清理已结束的进程，避免残留计数）"""
+        dead = [jid for jid, p in self.running_processes.items() if p.poll() is not None]
+        for jid in dead:
+            del self.running_processes[jid]
+        return len(self.running_processes)
     
     def _start_training(self, job_id: str, data_yaml: Path, model_name: str,
                        epochs: int, imgsz: int, batch: int, resume: bool = False):
@@ -245,6 +261,24 @@ class TrainService:
         
         jobs = await asyncio.to_thread(_list_jobs_sync)
         return {"jobs": sorted(jobs, key=lambda x: x.get("created_at", ""), reverse=True)}
+
+    async def get_job_tree(self, job_id: str):
+        """获取训练任务输出目录树（权重/图表/日志等文件）"""
+        job_file = self.jobs_dir / f"{job_id}.json"
+        if not await asyncio.to_thread(lambda: job_file.exists()):
+            return None
+        job_dir = self.jobs_dir / job_id
+        tree = await asyncio.to_thread(
+            build_tree, job_dir, settings.DATA_DIR, 6, 300, True
+        )
+        log_path = self.jobs_dir / f"{job_id}.log"
+        log_rel = None
+        if await asyncio.to_thread(lambda: log_path.exists()):
+            try:
+                log_rel = log_path.relative_to(settings.DATA_DIR).as_posix()
+            except ValueError:
+                pass
+        return {"tree": tree, "job_id": job_id, "log_file": log_rel}
 
     def _recover_running_processes(self):
         """后端重启后，重新接管仍在运行但句柄已丢失的训练进程"""

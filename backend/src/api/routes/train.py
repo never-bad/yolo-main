@@ -18,16 +18,19 @@ class TrainJobRequest(BaseModel):
 @router.post("/jobs")
 async def create_train_job(request: TrainJobRequest):
     """创建训练任务（支持基于已有模型微调）"""
-    result = await train_service.create_job(
-        dataset_id=request.dataset_id,
-        version=request.version,
-        model_name=request.model_name,
-        epochs=request.epochs,
-        imgsz=request.imgsz,
-        batch=request.batch,
-        base_model_id=request.base_model_id
-    )
-    return result
+    try:
+        result = await train_service.create_job(
+            dataset_id=request.dataset_id,
+            version=request.version,
+            model_name=request.model_name,
+            epochs=request.epochs,
+            imgsz=request.imgsz,
+            batch=request.batch,
+            base_model_id=request.base_model_id
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 @router.get("/jobs")
 async def list_train_jobs():
@@ -38,6 +41,14 @@ async def list_train_jobs():
 async def get_train_job(job_id: str):
     """获取训练任务详情"""
     result = await train_service.get_job(job_id)
+    if not result:
+        raise HTTPException(404, "Job not found")
+    return result
+
+@router.get("/jobs/{job_id}/tree")
+async def get_train_job_tree(job_id: str):
+    """获取训练任务输出目录树（文件夹结构）"""
+    result = await train_service.get_job_tree(job_id)
     if not result:
         raise HTTPException(404, "Job not found")
     return result
