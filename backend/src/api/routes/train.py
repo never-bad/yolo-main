@@ -14,6 +14,28 @@ class TrainJobRequest(BaseModel):
     imgsz: int = 640
     batch: int = -1
     base_model_id: Optional[str] = None  # 用于微调的已有模型ID
+    business: Optional[str] = None       # 业务/算法类型：传空则系统按数据集类别名自动分配（守门员按此隔离对比）
+    # 高级训练参数（可选，缺省则由系统默认）
+    lr0: Optional[float] = None          # 初始学习率
+    optimizer: Optional[str] = None      # auto / SGD / Adam / AdamW
+    weight_decay: Optional[float] = None # 权重衰减
+    patience: Optional[int] = None       # 早停轮数（0 = 关闭）
+    gpu_index: Optional[int] = None      # 训练节点：指定 GPU 索引（多卡环境；缺省自动）
+
+@router.get("/gpus")
+async def list_gpus():
+    """列出当前服务器可用的 GPU（训练节点），用于创建任务时选择"""
+    return await train_service.list_gpus()
+
+@router.get("/suggest")
+async def suggest_train_params(dataset_id: str, version: str = "v1", base_model_id: str = None):
+    """自动推荐训练参数（基础 + 高级），根据硬件与数据集规模"""
+    return await train_service.suggest_params(dataset_id, version, base_model_id)
+
+@router.get("/business")
+async def infer_business(dataset_id: str, version: str = "v1"):
+    """根据数据集类别名自动推断业务/算法类型（选中数据集后系统自动分配，无需手动选择）"""
+    return await train_service.infer_dataset_business(dataset_id, version)
 
 @router.post("/jobs")
 async def create_train_job(request: TrainJobRequest):
@@ -26,7 +48,13 @@ async def create_train_job(request: TrainJobRequest):
             epochs=request.epochs,
             imgsz=request.imgsz,
             batch=request.batch,
-            base_model_id=request.base_model_id
+            base_model_id=request.base_model_id,
+            business=request.business,
+            lr0=request.lr0,
+            optimizer=request.optimizer,
+            weight_decay=request.weight_decay,
+            patience=request.patience,
+            gpu_index=request.gpu_index
         )
         return result
     except ValueError as e:

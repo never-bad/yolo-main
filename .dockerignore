@@ -13,8 +13,8 @@
 debug.log
 
 # ============ 大数据目录 ============
-# 运行时通过 docker-compose volumes 挂载，无需进入镜像（避免构建上下文巨大）
-backend/models
+# backend/models: 模型需打进镜像（构建参考 docker/Dockerfile），不排除
+# backend/data、backend/runs: 运行时卷挂载/生成，无需进入镜像
 backend/data
 backend/runs
 

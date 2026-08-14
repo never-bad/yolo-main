@@ -4,11 +4,13 @@ import subprocess
 import signal
 import shutil
 import asyncio
+import yaml
 from pathlib import Path
 from datetime import datetime
 import psutil
 from src.core.settings import settings
 from src.utils.fs_tree import build_tree
+from src.yolo.gatekeeper import infer_business, _normalize_classes
 
 
 def _load_json(path: Path):
@@ -27,6 +29,29 @@ def _delete_file(path: Path):
     """同步删除文件"""
     if path.exists():
         path.unlink()
+
+
+def resolve_registry_weights(meta: dict, registry_dir: Path) -> Path | None:
+    """解析模型权重路径：绝对路径失效时按 model_id 在仓库内重定位。
+
+    model.json 的 weights_path 记录的是模型生成机器的绝对路径；换机器/容器部署后
+    该路径失效，但权重本身仍随仓库迁移在 registry/<model_id>/weights/ 下（best.pt 优先）。
+    """
+    weights_path = meta.get("weights_path")
+    if weights_path and os.path.exists(weights_path):
+        return Path(weights_path)
+    model_id = meta.get("model_id")
+    if model_id:
+        wdir = registry_dir / model_id / "weights"
+        if wdir.exists():
+            best = wdir / "best.pt"
+            if best.exists():
+                return best
+            for wf in wdir.glob("*.pt"):
+                return wf
+        for cand in registry_dir.glob(f"{model_id}/**/best.pt"):
+            return cand
+    return Path(weights_path) if weights_path else None
 
 
 def _delete_directory(path: Path):
@@ -72,10 +97,243 @@ class TrainService:
         self.datasets_dir = settings.DATASETS_DIR
         self.registry_dir = settings.REGISTRY_DIR
         self.running_processes = {}
+
+    @staticmethod
+    def _count_images(path: Path) -> int:
+        """统计目录下图片数量（jpg/jpeg/png/bmp/webp）"""
+        if not path.exists():
+            return 0
+        exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        return sum(
+            1 for f in path.rglob("*") if f.is_file() and f.suffix.lower() in exts
+        )
+
+    @staticmethod
+    def _default_batch() -> int:
+        """按当前 GPU 显存返回安全批次大小（避免 -1 自动校准在容器内触发 [Errno 22]）"""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                if vram_gb >= 40:
+                    return 32
+                if vram_gb >= 20:
+                    return 16
+                return 8
+            return 4
+        except Exception:
+            return 16
+
+    async def suggest_params(self, dataset_id: str, version: str = "v1",
+                             base_model_id: str = None) -> dict:
+        """根据当前硬件（GPU显存）与数据集规模，自动推荐训练参数。
+
+        推荐范围：epochs / imgsz / batch（基础）+ lr0 / optimizer / weight_decay / patience（高级）。
+        - 新手可直接使用推荐值；专家可在此基础上手动微调。
+        - 微调模式（base_model_id）会自动降低学习率、缩短早停轮数。
+        """
+        # ---------- 1. 硬件信息 ----------
+        device_info = {"type": "cpu", "name": "CPU", "vram_gb": 0}
+        cuda_ok = False
+        try:
+            import torch
+            if torch.cuda.is_available():
+                cuda_ok = True
+                props = torch.cuda.get_device_properties(0)
+                vram_gb = round(props.total_memory / (1024 ** 3), 1)
+                device_info = {
+                    "type": "cuda",
+                    "name": torch.cuda.get_device_name(0),
+                    "vram_gb": vram_gb,
+                }
+        except Exception:
+            cuda_ok = False
+
+        # ---------- 2. 数据集统计 ----------
+        image_count = 0
+        class_count = 0
+        yaml_path = self.datasets_dir / dataset_id / version / "data.yaml"
+        if yaml_path.exists():
+            try:
+                data_cfg = await asyncio.to_thread(self._load_yaml, yaml_path)
+                names = data_cfg.get("names", {})
+                class_count = len(names) if isinstance(names, (list, dict)) else 0
+                base = yaml_path.parent
+                # 统计 train/val 图片数
+                for split_key in ("train", "val"):
+                    rel = data_cfg.get(split_key)
+                    if not rel:
+                        continue
+                    p = Path(rel)
+                    if not p.is_absolute():
+                        p = base / p
+                    image_count += await asyncio.to_thread(self._count_images, p)
+            except Exception:
+                pass
+
+        # ---------- 3. 推荐规则 ----------
+        # 批次大小按显存档位估算（CPU 保守给最小档）
+        if cuda_ok:
+            vram = device_info.get("vram_gb", 0)
+            if vram >= 40:
+                batch, imgsz = 32, 640     # A100 / 4090 / 5090 等大显存
+            elif vram >= 20:
+                batch, imgsz = 16, 640
+            elif vram >= 10:
+                batch, imgsz = 8, 640
+            else:
+                batch, imgsz = 4, 512
+        else:
+            batch, imgsz = 4, 512
+
+        # 训练轮数随数据量反比：数据少多轮、数据多少轮
+        if image_count > 0:
+            if image_count < 300:
+                epochs = 200
+            elif image_count < 1200:
+                epochs = 120
+            elif image_count < 3000:
+                epochs = 80
+            else:
+                epochs = 50
+        else:
+            epochs = 100
+
+        # 高级参数默认值（YOLO 推荐起点）
+        lr0 = 0.01
+        optimizer = "auto"
+        weight_decay = 0.0005
+        patience = 50
+
+        mode = "全新训练"
+        if base_model_id:
+            # 微调模式：更小的学习率 → 更稳；早停更早避免过拟合；轮数减半
+            mode = "基于已有模型微调"
+            lr0 = 0.001
+            optimizer = "AdamW"
+            patience = max(20, patience // 2)
+            epochs = max(30, epochs // 2)
+
+        params = {
+            "epochs": epochs,
+            "imgsz": imgsz,
+            "batch": batch,
+            "lr0": lr0,
+            "optimizer": optimizer,
+            "weight_decay": weight_decay,
+            "patience": patience,
+        }
+
+        # ---------- 4. 说明文案 ----------
+        reason = (
+            f"检测到 {device_info['name']}"
+            f"（{'CUDA 显存 ' + str(device_info['vram_gb']) + 'GB' if cuda_ok else 'CPU'}），"
+            f"数据集约 {image_count} 张图 / {class_count} 类，"
+            f"已按{mode}场景推荐参数（可手动修改）。"
+        )
+
+        return {
+            "device": device_info,
+            "dataset": {"image_count": image_count, "class_count": class_count},
+            "mode": mode,
+            "params": params,
+            "reason": reason,
+        }
+
+    def _load_yaml(self, path: Path) -> dict:
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+
+    async def infer_dataset_business(self, dataset_id: str, version: str = "v1") -> dict:
+        """根据数据集类别名（data.yaml names）自动推断业务/算法类型。
+
+        供前端选中数据集后自动分配业务场景使用；识别不出返回 general（通用）。
+        """
+        yaml_path = self.datasets_dir / dataset_id / version / "data.yaml"
+        if not await asyncio.to_thread(lambda: yaml_path.exists()):
+            return {"business": "general", "names": [], "error": "data.yaml 不存在"}
+        try:
+            data_cfg = await asyncio.to_thread(self._load_yaml, yaml_path)
+        except Exception as e:
+            return {"business": "general", "names": [], "error": str(e)}
+        names = data_cfg.get("names", [])
+        business = infer_business(names)
+        return {
+            "business": business,
+            "names": _normalize_classes(names),
+            "dataset_id": dataset_id,
+            "version": version,
+        }
+
+    async def list_gpus(self) -> dict:
+        """列出当前服务器的可用 GPU（训练节点），含显存总量/已用/剩余"""
+        result = {"cuda_available": False, "gpus": []}
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return result
+            result["cuda_available"] = True
+            for i in range(torch.cuda.device_count()):
+                free_b, total_b = torch.cuda.mem_get_info(i)
+                used_b = max(0, total_b - free_b)
+                g = {
+                    "index": i,
+                    "name": torch.cuda.get_device_name(i),
+                    "total_gb": round(total_b / (1024 ** 3), 1),
+                    "used_gb": round(used_b / (1024 ** 3), 1),
+                    "free_gb": round(free_b / (1024 ** 3), 1),
+                }
+                result["gpus"].append(g)
+        except Exception as e:
+            print(f"[list_gpus] 检测 GPU 失败: {e}")
+        return result
     
+    @staticmethod
+    def _parse_version(ver) -> float:
+        """解析 'v1.0' 形式的版本号为数值，无法解析返回 None（None 不可比）"""
+        if not ver or not str(ver).startswith("v"):
+            return None
+        try:
+            return float(str(ver)[1:])
+        except (TypeError, ValueError):
+            return None
+
+    def _pick_baseline(self, business: str):
+        """模型守门员：自动选择同业务"上一代生产模型"作为对比基准。
+
+        扫描模型仓库中 business 相同且 status=production_ready 的模型，
+        取 version 最高者，返回 (weights_path, model_id)；无任何生产模型（首版）返回 (None, None)，
+        此时由 gatekeeper 判定 first_version 直接晋升。
+        """
+        if not self.registry_dir.exists():
+            return None, None
+        best_score, best_path, best_id = None, None, None
+        for meta_file in self.registry_dir.glob("*/model.json"):
+            try:
+                meta = _load_json(meta_file)
+            except Exception:
+                continue
+            if meta.get("business") != business or meta.get("status") != "production_ready":
+                continue
+            score = self._parse_version(meta.get("version"))
+            if score is None:
+                continue
+            w = resolve_registry_weights(meta, self.registry_dir)
+            if not w or not w.exists():
+                continue
+            if best_score is None or score > best_score:
+                best_score, best_path, best_id = score, str(w), meta.get("model_id")
+        return best_path, best_id
+
     async def create_job(self, dataset_id: str, version: str, model_name: str, 
-                         epochs: int, imgsz: int, batch: int, base_model_id: str = None):
-        """创建训练任务"""
+                         epochs: int, imgsz: int, batch: int, base_model_id: str = None,
+                         lr0: float = None, optimizer: str = None,
+                         weight_decay: float = None, patience: int = None,
+                         gpu_index: int = None, business: str = None):
+        """创建训练任务（支持高级训练参数与训练节点选择、业务/算法类型隔离）
+
+        business 为空时按数据集类别名自动推断业务/算法类型，无需用户手动选择。
+        """
         job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
         # 检查数据集
@@ -84,6 +342,15 @@ class TrainService:
         
         if not await asyncio.to_thread(lambda: data_yaml.exists()):
             raise ValueError(f"Dataset {dataset_id}/{version} not prepared")
+        
+        # 业务/算法类型：未指定时根据数据集类别名（data.yaml names）自动推断
+        if not business:
+            try:
+                data_cfg = await asyncio.to_thread(self._load_yaml, data_yaml)
+                business = infer_business(data_cfg.get("names", []))
+                print(f"[create_job] 自动识别业务/算法类型: {business}（数据集 {dataset_id}/{version}）")
+            except Exception:
+                business = "general"
         
         # 处理模型路径：如果提供了 base_model_id，使用已有模型的权重
         actual_model_path = model_name
@@ -95,9 +362,11 @@ class TrainService:
             
             base_model_meta = await asyncio.to_thread(_load_json, base_model_file)
             
-            weights_path = Path(base_model_meta["weights_path"])
-            if not await asyncio.to_thread(lambda: weights_path.exists()):
-                raise ValueError(f"Base model weights not found: {weights_path}")
+            weights_path = resolve_registry_weights(base_model_meta, self.registry_dir)
+            if not weights_path or not await asyncio.to_thread(lambda: weights_path.exists()):
+                raise ValueError(
+                    f"Base model weights not found: {base_model_meta.get('weights_path')}"
+                )
             
             actual_model_path = str(weights_path)
             model_name = f"{base_model_id}_fine_tuned"
@@ -110,6 +379,29 @@ class TrainService:
                 f"训练任务已达上限（{active}/{max_concurrent}），请等待某个训练完成后再试"
             )
         
+        # 高级参数未提供时，按训练环境/模式给默认值（ultralytics 官方推荐）
+        # 微调模式使用更保守的学习率/优化器，避免破坏已有权重
+        if base_model_id:
+            lr0 = lr0 if lr0 is not None else 0.001
+            optimizer = optimizer or "AdamW"
+            weight_decay = weight_decay if weight_decay is not None else 0.0005
+            patience = patience if patience is not None else 25
+        else:
+            lr0 = lr0 if lr0 is not None else 0.01
+            optimizer = optimizer or "auto"
+            weight_decay = weight_decay if weight_decay is not None else 0.0005
+            patience = patience if patience is not None else 50
+
+        # 批次大小归一化：-1/0(自动) 会触发 ultralytics 的 auto-batch 校准 + 多进程数据加载，
+        # 在 Docker 容器环境里极易报 [Errno 22] Invalid argument 直接失败。
+        # 这里按当前 GPU 显存给出确定的安全值，训练稳定优先。
+        if batch is None or batch < 1:
+            batch = self._default_batch()
+
+        # 模型守门员：自动选择同业务上一代生产模型作为对比基准
+        # 训练结束后 train_script 内评测新模型 vs 该基准；无生产模型（首版）由 gatekeeper 直晋
+        baseline_path, baseline_model_id = self._pick_baseline(business)
+
         # 创建job元数据
         job_meta = {
             "job_id": job_id,
@@ -121,6 +413,13 @@ class TrainService:
             "epochs": epochs,
             "imgsz": imgsz,
             "batch": batch,
+            "lr0": lr0,
+            "optimizer": optimizer,
+            "weight_decay": weight_decay,
+            "patience": patience,
+            "gpu_index": gpu_index,
+            "business": business,
+            "baseline_model_id": baseline_model_id,   # 守门员对比基准（上一代同业务生产模型）
             "status": "running",
             "created_at": datetime.now().isoformat(),
             "log_file": str(self.jobs_dir / f"{job_id}.log")
@@ -131,7 +430,9 @@ class TrainService:
         
         # 启动训练进程（在线程中执行）
         await asyncio.to_thread(
-            self._start_training, job_id, data_yaml, actual_model_path, epochs, imgsz, batch, False
+            self._start_training, job_id, data_yaml, actual_model_path, epochs, imgsz, batch, False,
+            lr0, optimizer, weight_decay, patience, gpu_index,
+            business, baseline_path, baseline_model_id
         )
         
         return {"job_id": job_id, "status": "running"}
@@ -144,7 +445,11 @@ class TrainService:
         return len(self.running_processes)
     
     def _start_training(self, job_id: str, data_yaml: Path, model_name: str,
-                       epochs: int, imgsz: int, batch: int, resume: bool = False):
+                       epochs: int, imgsz: int, batch: int, resume: bool = False,
+                       lr0: float = None, optimizer: str = None,
+                       weight_decay: float = None, patience: int = None,
+                       gpu_index: int = None, business: str = "general",
+                       baseline_path: str = None, baseline_model_id: str = None):
         """启动训练进程（同步方法，在线程中调用）"""
         log_file = self.jobs_dir / f"{job_id}.log"
         job_file = self.jobs_dir / f"{job_id}.json"
@@ -167,11 +472,32 @@ class TrainService:
             "--name", "train",
             "--job_id", job_id,
             "--job_file", str(job_file),
-            "--registry_dir", str(self.registry_dir)
+            "--registry_dir", str(self.registry_dir),
+            "--business", business
         ]
+        
+        # 模型守门员对比基准（上一代同业务生产模型），存在则传给训练脚本在训练结束后执行对比
+        if baseline_path:
+            cmd += ["--baseline", str(baseline_path)]
+        if baseline_model_id:
+            cmd += ["--baseline-model-id", str(baseline_model_id)]
         
         if resume:
             cmd.append("--resume")
+        
+        # 高级训练参数（仅非 resume 时透传；resume 使用 checkpoint 保存的参数）
+        if not resume:
+            if lr0 is not None:
+                cmd += ["--lr0", str(lr0)]
+            if optimizer:
+                cmd += ["--optimizer", str(optimizer)]
+            if weight_decay is not None:
+                cmd += ["--weight-decay", str(weight_decay)]
+            if patience is not None:
+                cmd += ["--patience", str(patience)]
+            # 训练节点：指定 GPU（多卡环境）
+            if gpu_index is not None:
+                cmd += ["--gpu", str(gpu_index)]
         
         # 如果是恢复训练，追加日志而不是覆盖
         mode = "a" if resume else "w"
@@ -509,6 +835,10 @@ class TrainService:
         
         await asyncio.to_thread(_save_json, job_file, job_meta)
         
+        # 模型守门员：恢复训练同样自动选择当前同业务生产模型作为对比基准
+        resume_business = job_meta.get("business", "general")
+        resume_baseline_path, resume_baseline_id = self._pick_baseline(resume_business)
+
         # 启动训练进程
         await asyncio.to_thread(
             self._start_training,
@@ -518,7 +848,15 @@ class TrainService:
             job_meta["epochs"],
             job_meta["imgsz"],
             job_meta["batch"],
-            use_resume
+            use_resume,
+            job_meta.get("lr0"),
+            job_meta.get("optimizer"),
+            job_meta.get("weight_decay"),
+            job_meta.get("patience"),
+            job_meta.get("gpu_index"),
+            resume_business,
+            resume_baseline_path,
+            resume_baseline_id
         )
         
         return {"job_id": job_id, "status": "running", "message": "Training resumed from checkpoint"}

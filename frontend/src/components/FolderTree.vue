@@ -4,22 +4,22 @@
       <div
         class="tree-row"
         :class="{ 'is-file': node.type === 'file' }"
-        :style="{ paddingLeft: depth * 18 + 'px' }"
+        :style="{ paddingLeft: (depth ?? 0) * 18 + 'px' }"
         :title="node.type === 'file' ? node.path : (['train','val','test','images','labels'].includes(node.name) ? '' : node.path)"
         @click="node.type === 'dir' ? toggleDir(node) : openFile(node)"
       >
         <span class="tree-caret">{{ caretText(node) }}</span>
         <span class="tree-icon">{{ iconText(node) }}</span>
         <span class="tree-name">{{ node.name }}</span>
-        <span v-if="node.type === 'dir' && node.children.length" class="tree-count">{{ node.children.length }}</span>
+        <span v-if="node.type === 'dir' && (node.children?.length ?? 0)" class="tree-count">{{ (node.children ?? []).length }}</span>
         <span v-if="node.type === 'file'" class="tree-size">{{ formatSize(node.size) }}</span>
         <span v-if="node.truncated" class="tree-truncated" title="条目过多已省略">…</span>
       </div>
       <template v-if="node.type === 'dir'">
         <FolderTree
           v-if="expanded.has(node.path)"
-          :nodes="node.children"
-          :depth="depth + 1"
+          :nodes="node.children ?? []"
+          :depth="(depth ?? 0) + 1"
           :expanded="expanded"
           @toggle-dir="toggleDir"
           @open-file="openFile"

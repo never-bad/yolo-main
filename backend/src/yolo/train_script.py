@@ -43,6 +43,61 @@ def detect_device():
         print(f"[{datetime.now().isoformat()}] 设备检测时出现错误: {e}，将使用默认设备")
         return None
 
+def resolve_model_file(weights: str) -> str:
+    """
+    将基础模型名解析为本地文件路径。
+    按顺序搜索：models/custom（自定义上传）、models/sam、backend 根目录（兼容旧文件）；
+    找不到则原样返回，交给 ultralytics 在线下载兜底。
+    """
+    p = Path(weights)
+    if p.is_absolute() and p.exists():
+        return str(p)
+    backend_dir = Path(__file__).resolve().parent.parent.parent
+    for d in [backend_dir / "models" / "custom", backend_dir / "models" / "sam", backend_dir]:
+        cand = d / weights
+        if cand.exists():
+            return str(cand)
+    return weights
+
+
+def next_model_version(registry_dir: str, business: str) -> str:
+    """计算该业务下一个模型版本号：扫描模型仓库中同业务已有版本，最大值 + 0.1；首版 v1.0"""
+    best = 0.99  # best + 0.1 = 1.0 → 首版 v1.0
+    registry = Path(registry_dir)
+    if registry.exists():
+        for model_dir in registry.iterdir():
+            if not model_dir.is_dir():
+                continue
+            model_file = model_dir / "model.json"
+            if not model_file.exists():
+                continue
+            try:
+                with open(model_file, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                if meta.get("business") != business:
+                    continue
+                ver = meta.get("version", "")
+                if isinstance(ver, str) and ver.startswith("v"):
+                    try:
+                        best = max(best, float(ver[1:]))
+                    except ValueError:
+                        pass
+            except Exception:
+                continue
+    return f"v{best + 0.1:.1f}"
+
+
+def normalize_class_names(names) -> list:
+    """将 data.yaml 的 names（list 或 dict）归一化为按类 ID 排序的类别名列表"""
+    if names is None:
+        return []
+    if isinstance(names, dict):
+        max_id = max(int(k) for k in names.keys())
+        return [str(names.get(str(i), names.get(i, f"class_{i}"))) for i in range(max_id + 1)]
+    if isinstance(names, list):
+        return [str(n) for n in names]
+    return []
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True)
@@ -56,6 +111,19 @@ def main():
     parser.add_argument("--job_file", required=True)
     parser.add_argument("--registry_dir", required=True)
     parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint")
+    # 高级训练参数（可选，缺省则由 ultralytics 使用默认值）
+    parser.add_argument("--lr0", type=float, default=None, help="Initial learning rate")
+    parser.add_argument("--optimizer", type=str, default=None, help="Optimizer: auto/SGD/Adam/AdamW")
+    parser.add_argument("--weight-decay", type=float, default=None, help="Weight decay")
+    parser.add_argument("--patience", type=int, default=None, help="Early stopping epochs (0=disabled)")
+    # 训练节点：指定使用哪块 GPU（多卡环境；缺省=自动检测）
+    parser.add_argument("--gpu", type=int, default=None, help="GPU index to use (0-based, default=auto)")
+    # 数据加载进程数：0=单进程（容器/Docker 环境最稳），为空则自动判断
+    parser.add_argument("--workers", type=int, default=None, help="Dataloader workers (0=single-process, safest in containers)")
+    # 模型守门员：业务隔离 + 与上一代同业务生产模型对比
+    parser.add_argument("--business", type=str, default="general", help="业务/算法类型（守门员按此隔离对比）")
+    parser.add_argument("--baseline", type=str, default=None, help="上一代同业务生产模型 best.pt（守门员对比基准，可空=首版）")
+    parser.add_argument("--baseline-model-id", type=str, default=None, help="上一代生产模型的 model_id（写入血缘）")
     
     args = parser.parse_args()
     
@@ -66,12 +134,29 @@ def main():
     print(f"[{datetime.now().isoformat()}] Image size: {args.imgsz}")
     print(f"[{datetime.now().isoformat()}] Batch size: {args.batch}")
     print(f"[{datetime.now().isoformat()}] Resume: {args.resume}")
+    print(f"[{datetime.now().isoformat()}] Advanced: lr0={args.lr0}, optimizer={args.optimizer}, weight_decay={args.weight_decay}, patience={args.patience}")
     
     try:
+        # 环境加载提示：torch + ultralytics 首次导入较慢，先给用户可见的进度，避免误以为任务卡死
+        print(f"[{datetime.now().isoformat()}] 正在加载深度学习环境（PyTorch / Ultralytics），"
+              f"首次运行约需 10~30 秒，请耐心等待...")
         from ultralytics import YOLO
         
-        # 自动检测并选择最佳训练设备
-        device = detect_device()
+        # 选择训练设备：优先使用用户指定的 GPU 索引；否则自动检测
+        if args.gpu is not None:
+            try:
+                import torch
+                if torch.cuda.is_available() and 0 <= args.gpu < torch.cuda.device_count():
+                    device = f"cuda:{args.gpu}"
+                    print(f"[{datetime.now().isoformat()}] 指定训练节点: GPU {args.gpu} ({torch.cuda.get_device_name(args.gpu)})")
+                else:
+                    device = detect_device()
+                    print(f"[{datetime.now().isoformat()}] 警告: 指定的 GPU {args.gpu} 不可用，将自动选择设备: {device}")
+            except ImportError:
+                device = None
+                print(f"[{datetime.now().isoformat()}] 警告: 无法导入 torch，将使用默认设备")
+        else:
+            device = detect_device()
         if device:
             print(f"[{datetime.now().isoformat()}] 选择的训练设备: {device.upper()}")
         
@@ -92,24 +177,35 @@ def main():
                     raise FileNotFoundError(f"No checkpoint found at {last_pt}. Cannot resume training.")
         else:
             print(f"[{datetime.now().isoformat()}] Loading model: {args.model}")
-            resume_path = args.model
+            # 优先使用本地已有权重（models/custom、models/sam、backend 根目录），避免重复联网下载
+            resume_path = resolve_model_file(args.model)
         
         model = YOLO(resume_path)
         
-        # 使用传入的 batch size
+        # 使用传入的 batch size；-1/0(自动) 会触发 ultralytics 的 auto-batch 校准，
+        # 在校准期多进程加载数据，容器环境下易报 [Errno 22] Invalid argument，这里兜底为确定值
         batch_size = args.batch
+        if batch_size is None or batch_size < 1:
+            batch_size = 16
         
-        # Windows 兼容性：在 Windows 上使用 workers=0 避免多进程问题
-        # Windows 上的 PyTorch multiprocessing 使用 spawn 模式，需要额外内存
-        # 如果页面文件不足，会导致错误 1455
-        workers = 0 if os.name == 'nt' else 4  # Windows 单进程，Linux/Mac 多进程
+        # 数据加载进程数：容器/Docker/Windows 使用单进程（workers=0）最稳，
+        # 避免多进程 DataLoader 在 fork + CUDA + 共享内存环境下的 [Errno 22] / 卡死 / 崩溃
+        if args.workers is not None:
+            workers = args.workers
+            print(f"[{datetime.now().isoformat()}] 数据加载进程数: workers={workers}（由用户指定）")
+        elif os.name == 'nt' or os.path.exists('/.dockerenv') or (Path(__file__).resolve().parent.parent.parent / 'app').exists():
+            workers = 0
+            print(f"[{datetime.now().isoformat()}] 数据加载进程数: workers=0（容器/单进程模式，最稳定）")
+        else:
+            workers = 4
+            print(f"[{datetime.now().isoformat()}] 数据加载进程数: workers=4")
         
         train_kwargs = {
             "data": args.data,
             "epochs": args.epochs,
             "imgsz": args.imgsz,
             "batch": batch_size,
-            # "workers": 0,  # Docker 容器中设为 0，避免共享内存不足问题
+            "workers": workers,  # 显式指定，避免默认多进程在容器内崩溃（[Errno 22]）
             "project": args.project,
             "name": args.name,
             "verbose": True,
@@ -119,16 +215,56 @@ def main():
         if device:
             train_kwargs["device"] = device
         
-        print(f"[{datetime.now().isoformat()}] Using workers=0 (single process mode) to avoid shared memory issues in Docker")
+        # 高级训练参数：仅在非 resume 场景下显式传入（resume 使用 checkpoint 中保存的参数）
+        if not args.resume:
+            advanced = [
+                ("lr0", args.lr0),
+                ("optimizer", args.optimizer),
+                ("weight_decay", args.weight_decay),
+                ("patience", args.patience),
+            ]
+            for key, val in advanced:
+                # patience=0 / weight_decay=0 是合法值（禁用早停/无衰减），不能跳过
+                if val is not None:
+                    train_kwargs[key] = val
         
-        # 开始训练
-        if args.resume:
-            print(f"[{datetime.now().isoformat()}] Resuming training from checkpoint...")
-            train_kwargs["resume"] = True
-            results = model.train(**train_kwargs)
-        else:
-            print(f"[{datetime.now().isoformat()}] Starting new training...")
-            results = model.train(**train_kwargs)
+        # 开始训练：包一层自动降级——AMP(混合精度)检查在容器环境可能失败([Errno 22])，
+        # 首次失败自动改用 FP32(amp=False) 重试，保证训练能继续跑而不是直接失败；
+        # 失败后写全局标记文件：本环境之后的训练直接 FP32，跳过 AMP 自检与重复重试，
+        # 避免每次任务都在启动阶段白白等待几十秒
+        AMP_FLAG = "/tmp/ultralytics_amp_failed"
+
+        def _run_training(kwargs):
+            if args.resume:
+                kwargs["resume"] = True
+                print(f"[{datetime.now().isoformat()}] Resuming training from checkpoint...")
+            else:
+                print(f"[{datetime.now().isoformat()}] Starting new training...")
+            return model.train(**kwargs)
+
+        if os.path.exists(AMP_FLAG):
+            train_kwargs["amp"] = False
+            print(f"[{datetime.now().isoformat()}] 检测到本环境 AMP 检查历史失败，"
+                  f"直接以 FP32 精度训练（跳过 AMP 自检，加快启动）")
+
+        try:
+            results = _run_training(dict(train_kwargs))
+        except Exception as amp_e:
+            err_text = str(amp_e).lower()
+            if ("invalid argument" in err_text or "errno 22" in err_text or "amp" in err_text
+                    or "autocast" in err_text or "c10::" in err_text):
+                # 记录本环境 AMP 检查失败，后续训练直接跳过检查以加快启动
+                try:
+                    with open(AMP_FLAG, "w") as _f:
+                        _f.write(datetime.now().isoformat())
+                except Exception:
+                    pass
+                print(f"[{datetime.now().isoformat()}] AMP 检查未通过（{amp_e}），"
+                      f"自动降级为 FP32 精度（amp=False）重新训练，避免任务直接失败...")
+                train_kwargs["amp"] = False
+                results = _run_training(train_kwargs)
+            else:
+                raise amp_e
         
         print(f"[{datetime.now().isoformat()}] Training completed!")
         
@@ -178,16 +314,71 @@ def main():
         
         # 保存模型元数据（使用绝对路径）
         weights_path_abs = (weights_dir / "best.pt").resolve()
+
+        # 读取任务元数据（血缘：数据集ID等）
+        dataset_id = None
+        try:
+            with open(args.job_file, "r") as jf:
+                _jm = json.load(jf)
+            dataset_id = _jm.get("dataset_id")
+        except Exception:
+            pass
+
+        # ----- 模型守门员：新模型 vs 同业务上一代生产模型 -----
+        # 决策：promoted（晋升）/ rejected（淘汰/经验失败实验）/ first_version（首版直晋）
+        # 无论结果如何，训练本身都视为成功；被拦截模型归档为"失败实验"，不入生产
+        gk = None
+        try:
+            try:
+                from gatekeeper import run_gatekeeper
+            except ImportError:
+                from src.yolo.gatekeeper import run_gatekeeper
+            gk = run_gatekeeper(
+                args.baseline,
+                str(weights_path_abs),
+                args.data,
+                normalize_class_names(data_config.get("names", []))
+            )
+        except Exception as gk_e:
+            import traceback as _tb
+            print(f"[{datetime.now().isoformat()}] 守门员评估异常: {gk_e}\n{_tb.format_exc()}")
+            gk = {
+                "result": "rejected",
+                "promoted": False,
+                "eval_split": "val",
+                "new_metrics": None,
+                "old_metrics": None,
+                "class_ap": {},
+                "regressed_classes": [],
+                "report": f"守门员评估异常：{gk_e}。模型已产出但未自动进入生产（可人工强制覆盖）。",
+            }
+
+        status = "production_ready" if gk.get("promoted") else "rejected"
+        version = next_model_version(args.registry_dir, args.business)
+        print(f"[{datetime.now().isoformat()}] 守门员决策: {gk.get('result')} → 状态={status}, 版本={version}")
+        print(f"[{datetime.now().isoformat()}] 守门员报告: {gk.get('report', '')}")
+
         model_meta = {
             "model_id": model_id,
             "job_id": args.job_id,
             "base_model": args.model,
             "task": "detect",
-            "classes": data_config.get("names", []),
+            "classes": normalize_class_names(data_config.get("names", [])),
             "imgsz": args.imgsz,
             "epochs": args.epochs,
             "created_at": datetime.now().isoformat(),
-            "weights_path": str(weights_path_abs)
+            "weights_path": str(weights_path_abs),
+            # 模型仓库 / 守门员字段
+            "business": args.business,
+            "status": status,
+            "version": version,
+            "lineage": {
+                "parent_model_id": args.baseline_model_id,
+                "base_model": args.model,
+                "dataset_id": dataset_id,
+                "job_id": args.job_id,
+            },
+            "gatekeeper": gk,
         }
         
         with open(model_dir / "model.json", "w", encoding="utf-8") as f:
@@ -203,13 +394,31 @@ def main():
         job_meta["completed_at"] = datetime.now().isoformat()
         job_meta["model_id"] = model_id
         
+        # 早停检测：ultralytics 触发早停时训练正常返回，这里将状态标记为“已完成（早停）”
+        # 而不是失败，便于 UI 区分展示（底层仅是提前停止训练）
+        try:
+            log_file = Path(args.job_file).parent / f"{args.job_id}.log"
+            if log_file.exists():
+                log_text = log_file.read_text(encoding="utf-8", errors="ignore").lower()
+                if ("earlystopping" in log_text
+                        or "stopped early" in log_text
+                        or "no improvement observed" in log_text):
+                    job_meta["early_stopped"] = True
+                    print(f"[{datetime.now().isoformat()}] 早停触发：模型已收敛，自动停止训练，任务状态=已完成（早停）")
+        except Exception:
+            pass
+        
         with open(args.job_file, "w") as f:
             json.dump(job_meta, f, indent=2)
         
         print(f"[{datetime.now().isoformat()}] Job status updated")
         
     except Exception as e:
+        import traceback
+        tb_text = traceback.format_exc()
+        # 打印完整堆栈，便于精确定位失败位置
         print(f"[{datetime.now().isoformat()}] ERROR: {str(e)}", file=sys.stderr)
+        print(tb_text, file=sys.stderr)
         
         # 更新job状态为失败
         try:
@@ -218,6 +427,7 @@ def main():
             
             job_meta["status"] = "failed"
             job_meta["error"] = str(e)
+            job_meta["error_traceback"] = tb_text  # 完整堆栈，供前端弹窗/技术人员排查
             job_meta["failed_at"] = datetime.now().isoformat()
             
             with open(args.job_file, "w") as f:

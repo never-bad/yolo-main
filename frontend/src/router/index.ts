@@ -25,16 +25,6 @@ const routes = [
     path: '/models',
     name: 'Models',
     component: () => import('../pages/Models.vue')
-  },
-  {
-    path: '/infer',
-    name: 'Infer',
-    component: () => import('../pages/Infer.vue')
-  },
-  {
-    path: '/video-infer',
-    name: 'VideoInfer',
-    component: () => import('../pages/VideoInfer.vue')
   }
 ]
 

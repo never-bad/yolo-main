@@ -6,6 +6,35 @@ export interface UpdateModelRequest {
   tags?: string[]
 }
 
+/** 模型守门员评估报告（训练结束后自动对比新旧模型生成） */
+export interface GatekeeperReport {
+  result?: 'promoted' | 'rejected' | 'first_version' | string
+  promoted?: boolean
+  eval_split?: string       // 评估集：test（独立测试集）或 val
+  new_metrics?: {
+    mAP50?: number | null
+    mAP50_95?: number | null
+    precision?: number | null
+    recall?: number | null
+    speed_ms?: number | null
+  }
+  old_metrics?: {
+    mAP50?: number | null
+    mAP50_95?: number | null
+    precision?: number | null
+    recall?: number | null
+    speed_ms?: number | null
+  } | null
+  class_ap?: Record<string, {
+    old_ap?: number | null
+    new_ap?: number | null
+    delta_pct?: number | null
+    regressed?: boolean
+  }>
+  regressed_classes?: string[]
+  report?: string           // 中文诊断报告
+}
+
 export interface ModelDetails {
   model_id: string
   job_id?: string
@@ -21,6 +50,23 @@ export interface ModelDetails {
   tags?: string[]
   file_size?: number
   file_size_mb?: number
+  // 模型仓库 / 守门员字段
+  business?: string                 // 业务/算法类型
+  status?: 'production_ready' | 'rejected' | 'superseded' | 'training' | 'evaluating' | string
+  version?: string                  // 版本号（同业务内递增，如 v1.0 → v1.1）
+  lineage?: {                       // 血缘关系
+    parent_model_id?: string | null
+    base_model?: string
+    dataset_id?: string
+    job_id?: string
+  }
+  gatekeeper?: GatekeeperReport
+  override?: {
+    from_status?: string
+    to_status?: string
+    operated_at?: string
+    reason?: string
+  }
   training_metrics?: {
     training_history?: {
       epochs?: number[]
@@ -78,6 +124,23 @@ export const updateModel = async (modelId: string, request: UpdateModelRequest) 
 
 export const deleteModel = async (modelId: string) => {
   const { data } = await api.delete(`/models/${modelId}`)
+  return data
+}
+
+// 列出当前在役的生产模型（可按业务/算法类型过滤）
+export const listProductionModels = async (business?: string) => {
+  const { data } = await api.get('/models/production', {
+    params: { business: business || undefined }
+  })
+  return data
+}
+
+// 人工强制覆盖（Override）：将守门员拦截的模型强制设为生产版本
+export const overrideModel = async (
+  modelId: string,
+  options?: { business?: string; reason?: string }
+) => {
+  const { data } = await api.post(`/models/${modelId}/override`, options || {})
   return data
 }
 

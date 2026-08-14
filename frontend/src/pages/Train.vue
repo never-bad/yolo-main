@@ -33,6 +33,16 @@
         <small>提示：仅显示在标注页执行过"导出YOLO(自动划分)"的数据集；点击卡片选择</small>
       </div>
       <div class="form-group">
+        <label>业务场景</label>
+        <select v-model="trainForm.business" :disabled="training">
+          <option v-for="b in businessScenes" :key="b.value" :value="b.value">{{ b.label }}</option>
+        </select>
+        <small v-if="autoAssignedBiz">
+          ✓ 已按数据类别自动分配为「{{ autoAssignedBiz }}」—— 新模型只会与同业务上一代生产模型对比；识别不准可手动调整
+        </small>
+        <small v-else>选择数据集后，系统将按类别自动分配业务场景（可分业务隔离存储与对比）</small>
+      </div>
+      <div class="form-group">
         <label>
           <input type="checkbox" v-model="useFineTune" :disabled="training" />
           基于已有模型微调
@@ -92,6 +102,17 @@
         </div>
         <small>将从所选模型开始继续训练</small>
       </div>
+      <div class="form-group">
+        <label>训练节点（GPU）</label>
+        <select v-model="trainForm.gpu_index" :disabled="training || !cudaAvailable">
+          <option :value="null">自动选择（推荐）</option>
+          <option v-for="g in gpus" :key="g.index" :value="g.index">
+            GPU {{ g.index }} — {{ g.name }}（共 {{ g.total_gb }}G，空闲 {{ g.free_gb }}G）
+          </option>
+        </select>
+        <small v-if="!cudaAvailable">当前服务器未检测到 GPU，将使用 CPU 训练</small>
+        <small v-else>选择用于训练的显卡；不确定时保持"自动选择"</small>
+      </div>
       <div class="grid" style="grid-template-columns: repeat(3, 1fr);">
         <div class="form-group">
           <label>训练轮数</label>
@@ -107,6 +128,44 @@
           <small>提示：-1 表示根据显存自动计算最佳值（推荐），或手动设置如 24、32、48</small>
         </div>
       </div>
+      <div class="form-group adv-block">
+        <label class="adv-toggle">
+          <input type="checkbox" v-model="showAdvanced" :disabled="training" />
+          高级参数（学习率 / 优化器 / 权重衰减 / 早停）
+        </label>
+        <span v-if="suggesting" class="suggest-status">
+          <span class="loading-spinner"></span> 分析环境并推荐参数...
+        </span>
+        <span v-else-if="suggestReason" class="suggest-status">✓ 已自动推荐（可手动修改）</span>
+      </div>
+      <div v-if="showAdvanced" class="grid adv-grid" style="grid-template-columns: repeat(4, 1fr);">
+        <div class="form-group">
+          <label>学习率 lr0</label>
+          <input v-model.number="trainForm.lr0" type="number" step="0.0001" :disabled="training" />
+          <small>初始学习率，越大收敛越快但易震荡</small>
+        </div>
+        <div class="form-group">
+          <label>优化器</label>
+          <select v-model="trainForm.optimizer" :disabled="training">
+            <option value="auto">auto（自动）</option>
+            <option value="SGD">SGD</option>
+            <option value="Adam">Adam</option>
+            <option value="AdamW">AdamW</option>
+          </select>
+          <small>auto 按模型规格自动选择</small>
+        </div>
+        <div class="form-group">
+          <label>权重衰减</label>
+          <input v-model.number="trainForm.weight_decay" type="number" step="0.0001" :disabled="training" />
+          <small>正则化，防止过拟合</small>
+        </div>
+        <div class="form-group">
+          <label>早停轮数 patience</label>
+          <input v-model.number="trainForm.patience" type="number" min="0" :disabled="training" />
+          <small>验证指标连续 N 轮不涨则停止（0 = 关闭）</small>
+        </div>
+      </div>
+      <div v-if="suggestReason" class="suggest-reason">{{ suggestReason }}</div>
       <button @click="startTraining" :disabled="training || !trainForm.dataset_id">
         <span v-if="training" class="loading-spinner"></span>
         {{ training ? '训练中...' : '开始训练' }}
@@ -129,10 +188,15 @@
           <p>数据集: {{ job.dataset_id }}</p>
           <p>模型: {{ job.model_name }}</p>
           <p>轮数: {{ job.epochs }} | 图片尺寸: {{ job.imgsz }} | 批次: {{ job.batch }}</p>
-          <p>状态: <span :class="'status-badge status-' + job.status">{{ job.status }}</span></p>
+          <p>节点: {{ job.gpu_index != null && job.gpu_index !== undefined ? 'GPU ' + job.gpu_index : '自动选择' }}</p>
+          <p>状态: <span :class="'status-badge status-' + job.status">{{ job.status }}</span> <span v-if="job.early_stopped" class="early-stop-badge" title="模型已收敛，系统自动提前停止训练以节省资源">✓ 已完成（早停）</span></p>
           <div v-if="job.status === 'running'" class="job-progress">
             <div class="progress-bar">
-              <div class="progress-fill" :style="{ width: jobProgress[job.job_id]?.percent + '%' }"></div>
+              <div class="progress-fill" :style="{ width: jobProgress[job.job_id]?.percent + '%' }">
+                <span v-if="jobProgress[job.job_id]?.has && jobProgress[job.job_id].percent > 0" class="progress-fill-text">
+                  {{ jobProgress[job.job_id].percent }}%
+                </span>
+              </div>
             </div>
             <div class="progress-meta">
               <span v-if="jobProgress[job.job_id]?.has">
@@ -148,7 +212,22 @@
             </div>
             <div v-if="jobProgress[job.job_id]?.lossLine" class="loss-line">{{ jobProgress[job.job_id].lossLine }}</div>
           </div>
-          <p v-if="job.model_id">模型ID: {{ job.model_id }}</p>
+          <p v-if="job.model_id">模型ID: {{ job.model_id }}
+            <span v-if="modelMetaOf(job.model_id)">
+              <span :class="'gk-badge gk-' + modelMetaOf(job.model_id).status">{{ gkStatusText(modelMetaOf(job.model_id)) }}</span>
+              <span v-if="modelMetaOf(job.model_id).business" class="gk-version">业务: {{ bizLabel(modelMetaOf(job.model_id).business) }}</span>
+              <span v-if="modelMetaOf(job.model_id).version" class="gk-version">版本: {{ modelMetaOf(job.model_id).version }}</span>
+            </span>
+          </p>
+          <details v-if="gkReportOf(job.model_id)" class="gk-report">
+            <summary>🛡️ 模型守门员评估报告</summary>
+            <div class="gk-report-body">
+              <div class="gk-report-text">{{ gkReportOf(job.model_id)!.report }}</div>
+              <div v-if="gkReportOf(job.model_id)!.regressed_classes?.length" class="gk-regressed">
+                退化类别: <span v-for="c in gkReportOf(job.model_id)!.regressed_classes" :key="c" class="gk-regressed-item">{{ c }}</span>
+              </div>
+            </div>
+          </details>
           <p v-if="job.base_model_id">基础模型: {{ job.base_model_id }}</p>
           <p v-if="job.resume_count">续训次数: {{ job.resume_count }}</p>
           <p v-if="job.stopped_at">中断时间: {{ new Date(job.stopped_at).toLocaleString() }}</p>
@@ -185,6 +264,16 @@
             >
               <span v-if="resumingJob === job.job_id" class="loading-spinner"></span>
               {{ resumingJob === job.job_id ? '恢复中...' : '继续训练' }}
+            </button>
+            <button 
+              v-if="job.status === 'failed' || job.status === 'crashed' || job.status === 'stopped'" 
+              @click="retrainJob(job)" 
+              type="button"
+              class="primary"
+              :disabled="retrainingJob === job.job_id"
+            >
+              <span v-if="retrainingJob === job.job_id" class="loading-spinner"></span>
+              {{ retrainingJob === job.job_id ? '重新训练中...' : '重新训练' }}
             </button>
             <button 
               @click="deleteJobItem(job.job_id)" 
@@ -246,13 +335,40 @@
         <pre v-else class="file-preview-text">{{ jobFilePreviewContent || '加载中...' }}</pre>
       </div>
     </div>
+
+    <!-- 训练失败原因弹窗（面向客户的可读说明 + 操作步骤） -->
+    <div v-if="failureModal" class="job-files-mask" @click.self="closeFailureDialog">
+      <div class="job-files-dialog failure-dialog">
+        <div class="viewer-header">
+          <h3>
+            <span class="fail-emoji">🛑</span> 训练未成功
+          </h3>
+          <button class="secondary viewer-close" @click="closeFailureDialog">关闭</button>
+        </div>
+        <div class="failure-body">
+          <div class="fail-title">{{ failureModal.title }}</div>
+          <div class="fail-reason">{{ failureModal.reason }}</div>
+          <div v-if="failureModal.failedAt" class="fail-time">失败时间：{{ failureModal.failedAt }}</div>
+          <div v-if="failureModal.steps && failureModal.steps.length" class="fail-steps">
+            <div class="fail-steps-title">建议这样操作：</div>
+            <ol>
+              <li v-for="(s, i) in failureModal.steps" :key="i">{{ s }}</li>
+            </ol>
+          </div>
+          <details class="fail-log">
+            <summary>查看原始错误信息（技术人员用）</summary>
+            <pre class="fail-log-text">{{ failureModal.rawError || '（无详细日志）' }}</pre>
+          </details>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { createTrainJob, listTrainJobs, deleteTrainJob, resumeTrainJob, getTrainJobTree, type TrainJobRequest } from '@/api/train'
+import { createTrainJob, listTrainJobs, deleteTrainJob, resumeTrainJob, getTrainJobTree, suggestTrainParams, inferBusiness, listGpus, type TrainJobRequest } from '@/api/train'
 import { listModels, uploadPretrainedPt, listCustomModels } from '@/api/models'
 import { listDatasets } from '@/api/datasets'
 import { subscribeLogsSSE, pollLogsTail, getLogLines } from '@/api/logs'
@@ -269,8 +385,60 @@ const trainForm = ref<TrainJobRequest>({
   epochs: 10,
   imgsz: 640,
   batch: -1,  // -1 表示根据显存自动计算最佳 batch size
-  base_model_id: undefined
+  base_model_id: undefined,
+  business: 'general',
+  gpu_index: null  // null = 自动选择 GPU
 })
+
+// 业务/算法场景：模型按业务隔离存储与守门员对比
+const businessScenes = [
+  { value: 'general', label: '通用目标检测' },
+  { value: 'pedestrian', label: '行人检测' },
+  { value: 'vehicle', label: '车辆 / 车牌' },
+  { value: 'defect', label: '工业缺陷检测' },
+  { value: 'package', label: '包裹 / 物流' }
+]
+const bizLabel = (v: string) => businessScenes.find(b => b.value === v)?.label || v
+
+// 任务卡守门员状态：通过 job.model_id 在模型列表中找到对应模型入库状态
+const modelMetaOf = (modelId: string) => {
+  return models.value.find((m: any) => m.model_id === modelId)
+}
+const gkReportOf = (modelId: string) => {
+  return modelMetaOf(modelId)?.gatekeeper
+}
+const gkStatusText = (meta: any) => {
+  switch (meta?.status) {
+    case 'production_ready': return meta.override ? '生产就绪（人工覆盖）' : '✅ 生产就绪'
+    case 'rejected': return '❌ 已淘汰（未入生产）'
+    case 'superseded': return '⚠️ 已退役（被新版本替代）'
+    case 'training': return '⏳ 训练中'
+    case 'evaluating': return '🔍 评估中'
+    default: return meta?.status || '未知状态'
+  }
+}
+
+// 训练节点：服务器 GPU 列表
+const gpus = ref<{ index: number; name: string; total_gb: number; free_gb: number }[]>([])
+const cudaAvailable = ref(true)
+
+const loadGpus = async () => {
+  try {
+    const res = await listGpus()
+    cudaAvailable.value = res.cuda_available
+    gpus.value = res.gpus || []
+  } catch (e) {
+    // 旧后端无此接口时静默降级：保持"自动选择"
+    cudaAvailable.value = true
+    gpus.value = []
+  }
+}
+
+// 高级参数：默认展开（勾选）；选中数据集+模型后会自动推荐并回填，专家可手动微调
+const showAdvanced = ref(true)
+const suggesting = ref(false)
+const suggestReason = ref('')
+let suggestTimer: any = null
 
 const useFineTune = ref(false)
 const models = ref<any[]>([])
@@ -281,6 +449,7 @@ const loadingJobs = ref(false)
 const stoppingJob = ref<string | null>(null)
 const resumingJob = ref<string | null>(null)
 const deletingJob = ref<string | null>(null)
+const retrainingJob = ref<string | null>(null)
 
 // YOLO 版本配置
 const yoloVersions = {
@@ -376,12 +545,84 @@ watch(selectedVersion, (newVersion) => {
   }
 })
 
+// ===== 自动推荐训练参数 =====
+// 根据硬件（GPU显存）与数据集规模推荐参数并回填表单；支持手动修改
+const fetchSuggest = async () => {
+  if (!trainForm.value.dataset_id) return
+  suggesting.value = true
+  try {
+    const res = await suggestTrainParams(
+      trainForm.value.dataset_id,
+      trainForm.value.version || 'v1',
+      useFineTune.value ? trainForm.value.base_model_id : undefined
+    )
+    if (res?.params) {
+      const p = res.params
+      trainForm.value.epochs = p.epochs
+      trainForm.value.imgsz = p.imgsz
+      trainForm.value.batch = p.batch
+      trainForm.value.lr0 = p.lr0
+      trainForm.value.optimizer = p.optimizer
+      trainForm.value.weight_decay = p.weight_decay
+      trainForm.value.patience = p.patience
+      suggestReason.value = res.reason || ''
+    }
+  } catch (e: any) {
+    // 推荐失败不打断用户操作，保留当前值
+    console.error('获取推荐参数失败:', e)
+    suggestReason.value = ''
+  } finally {
+    suggesting.value = false
+  }
+}
+
+// 数据集/模型/微调开关变化 → 防抖自动推荐
+watch(
+  [
+    () => trainForm.value.dataset_id,
+    () => trainForm.value.model_name,
+    () => trainForm.value.base_model_id,
+    useFineTune
+  ],
+  () => {
+    clearTimeout(suggestTimer)
+    suggestTimer = setTimeout(fetchSuggest, 400)
+  }
+)
+
+// ===== 业务场景自动分配 =====
+// 选中数据集后，按数据集类别名（data.yaml names）自动推断业务/算法类型并回填，
+// 无需手动选择；识别不准时仍可手动切换下拉。切换数据集/数据集版本会重新推断。
+const autoAssignedBiz = ref('')
+const autoAssignBusiness = async () => {
+  if (!trainForm.value.dataset_id) {
+    autoAssignedBiz.value = ''
+    return
+  }
+  try {
+    const res = await inferBusiness(trainForm.value.dataset_id, trainForm.value.version || 'v1')
+    if (res?.business) {
+      trainForm.value.business = res.business
+      autoAssignedBiz.value = bizLabel(res.business)
+    } else {
+      autoAssignedBiz.value = ''
+    }
+  } catch (e: any) {
+    console.error('自动分配业务场景失败:', e)
+    autoAssignedBiz.value = ''
+  }
+}
+watch(
+  [() => trainForm.value.dataset_id, () => trainForm.value.version],
+  () => autoAssignBusiness()
+)
+
 const loadDatasets = async () => {
   loadingDatasets.value = true
   try {
     const result = await listDatasets()
     // 只显示已标注导出的数据集（在标注页执行过"导出YOLO(自动划分)"）
-    datasets.value = (result.datasets || []).filter(d => d.annotated)
+    datasets.value = (result.datasets || []).filter((d: any) => d.annotated)
   } catch (error: any) {
     console.error('加载数据集失败:', error)
     alert('加载数据集失败: ' + (error.response?.data?.detail || error.message))
@@ -522,13 +763,51 @@ const startTraining = async () => {
       epochs: 10,
       imgsz: 640,
       batch: 16,
-      base_model_id: undefined
+      base_model_id: undefined,
+      business: trainForm.value.business || 'general',
+      gpu_index: null
     }
     useFineTune.value = false
   } catch (error: any) {
     alert('启动失败: ' + (error.response?.data?.detail || error.message))
   } finally {
     training.value = false
+  }
+}
+
+// 重新训练：复用失败/中断任务的原参数，直接重新创建训练任务（"-1 自动"会由后端归一化）
+const retrainJob = async (job: any) => {
+  const prevScrollY = window.scrollY
+  if (!(await showConfirm(`用相同参数重新创建训练任务？\n数据集: ${job.dataset_id} / 模型: ${job.model_name} / 轮数: ${job.epochs}`))) return
+
+  retrainingJob.value = job.job_id
+  try {
+    const params: TrainJobRequest = {
+      dataset_id: job.dataset_id,
+      version: job.version || 'v1',
+      model_name: job.model_name || 'yolov8n.pt',
+      epochs: job.epochs ?? 10,
+      imgsz: job.imgsz ?? 640,
+      batch: job.batch ?? 16,
+      base_model_id: job.base_model_id || undefined,
+      business: job.business || 'general',
+      lr0: job.lr0 ?? undefined,
+      optimizer: job.optimizer || undefined,
+      weight_decay: job.weight_decay ?? undefined,
+      patience: job.patience ?? undefined,
+      gpu_index: job.gpu_index ?? undefined
+    }
+    const result = await createTrainJob(params)
+    restoreScroll(prevScrollY)
+    alert('已重新创建训练任务: ' + result.job_id)
+    currentJobId.value = result.job_id
+    subscribeToLogs(result.job_id)
+    loadJobs()
+  } catch (error: any) {
+    restoreScroll(prevScrollY)
+    alert('重新训练失败: ' + (error.response?.data?.detail || error.message))
+  } finally {
+    retrainingJob.value = null
   }
 }
 
@@ -766,54 +1045,131 @@ const startAllJobPolling = () => {
   })
 }
 
-// 训练失败操作建议：根据错误信息匹配常见原因并给出建议
-const getFailureAdvice = (error: string = ''): { reason: string; advice: string } => {
+// 训练失败操作建议：匹配常见错误，返回"客户看得懂"的说明与操作步骤
+const getFailureAdvice = (error: string = ''): { title: string; reason: string; steps: string[] } => {
   const e = error.toLowerCase()
-  if (e.includes('out of memory') || e.includes('cuda out of memory') || e.includes('cublas')) {
+
+  // 1. 显存不足
+  if (e.includes('out of memory') || e.includes('cuda out of memory') || e.includes('cublas') || e.includes('cudnn')) {
     return {
-      reason: '显存不足（CUDA out of memory）',
-      advice: '建议减小"批次大小 batch"（如 16→8→4），或降低"图片尺寸 imgsz"，或关闭其他占用显存的程序。'
+      title: '显卡内存不够了',
+      reason: '训练需要占用的显存超过了当前显卡的可用空间，最常见原因是一次性塞入的图片太多。',
+      steps: [
+        '在"训练参数"里把"批次大小"调小：从 32 依次试 16、8、4',
+        '同时可把"图片尺寸"从 640 调到 512，显存占用会大幅下降',
+        '如果有多个 GPU，可在"训练节点"下拉里换一块空闲的显卡再试'
+      ]
     }
   }
-  if (e.includes('1455') || e.includes('page file') || e.includes('i/o error')) {
+
+  // 2. 系统内存不足（错误1455 / 页面文件）
+  if (e.includes('1455') || e.includes('page file') || e.includes('i/o error') || e.includes('memoryerror')) {
     return {
-      reason: '系统内存/页面文件不足（错误 1455）',
-      advice: '建议减小批次大小，关闭其他程序释放内存，或增大系统的虚拟内存（页面文件）。'
+      title: '服务器内存不够了',
+      reason: '训练时系统的运行内存（RAM）被占满，程序被系统强制终止。',
+      steps: [
+        '关闭服务器上其他占用内存的程序（尤其是之前的训练进程）',
+        '在"训练参数"里减小"批次大小"（如 16 → 8）',
+        '重启服务器释放内存后再重新训练'
+      ]
     }
   }
+
+  // 3. 字体缺失/下载失败
   if (e.includes('arial.ttf') || e.includes('font') || e.includes('download failure')) {
     return {
-      reason: '绘制图表所需字体（Arial.ttf）缺失或下载失败',
-      advice: '请将系统字体 arial.ttf 复制到用户目录下的 Ultralytics 字体目录，或检查网络后重试。'
+      title: '缺少绘图字体',
+      reason: '训练结束画图表时需要 Arial.ttf 字体，但当前环境里没有且无法联网下载。',
+      steps: [
+        '检查服务器能否访问外网（下载字体/模型文件）',
+        '联系管理员把 arial.ttf 放到字体目录后重试'
+      ]
     }
   }
-  if (e.includes('pytorchstreamreader') || e.includes('zip archive') || e.includes('central directory')) {
+
+  // 4. 权重文件损坏
+  if (e.includes('pytorchstreamreader') || e.includes('zip archive') || e.includes('central directory') || e.includes('broken')) {
     return {
-      reason: '预训练权重文件（.pt）损坏',
-      advice: '请删除损坏的 .pt 文件后重新下载一个完整的预训练权重，再开始训练。'
+      title: '模型文件损坏或下载不完整',
+      reason: '预训练权重文件损坏、被截断或格式不对，没法加载。',
+      steps: [
+        '重新上传/下载对应的 .pt 权重文件，注意文件大小要完整',
+        '换一个预训练模型版本再试（如 yolov8n.pt 换 yolov8s.pt）'
+      ]
     }
   }
+
+  // 5. 文件缺失
   if (e.includes('filenotfound') || e.includes('no such file')) {
     return {
-      reason: '文件不存在（数据集、权重或输出路径有误）',
-      advice: '请检查数据集是否已"准备"、预训练权重路径与输出目录是否存在。'
+      title: '缺少文件',
+      reason: '训练所需的某个文件（数据集、权重或输出目录）不存在。',
+      steps: [
+        '确认数据集已上传并执行过"准备数据集"',
+        '确认选择的预训练模型/权重文件存在',
+        '确认后重新创建训练任务'
+      ]
     }
   }
+
+  // 6. 权限不足/文件占用
   if (e.includes('permission') || e.includes('access is denied')) {
     return {
-      reason: '文件被占用或权限不足',
-      advice: '请关闭占用相关文件的程序（尤其是训练输出目录），以管理员身份运行后重试。'
+      title: '文件被占用或没有权限',
+      reason: '需要写入的输出文件正被其他程序占用，或没有写入权限。',
+      steps: [
+        '关闭占用训练输出目录的其他程序',
+        '检查服务器磁盘权限，或联系管理员处理后重试'
+      ]
     }
   }
-  if (e.includes('dataset') || e.includes('labels') || e.includes('images') && e.includes('empty')) {
+
+  // 7. 数据集为空/标注缺失
+  if ((e.includes('dataset') || e.includes('labels') || e.includes('images')) && e.includes('empty')) {
     return {
-      reason: '数据集为空或标注文件缺失',
-      advice: '请检查数据集的图片与标注文件是否完整，必要时重新上传并"准备"数据集。'
+      title: '数据集有问题',
+      reason: '数据集里图片或标注缺失，训练无法从空数据开始。',
+      steps: [
+        '到"数据集"页面确认图片与标注文件完整',
+        '重新执行"准备数据集"，然后回到训练页重新创建任务'
+      ]
     }
   }
+
+  // 8. GPU 驱动/深度学习依赖不匹配
+  if (e.includes('nvidia driver') || e.includes('sm_version') || e.includes('not enough compute') || e.includes('nvcc') || e.includes('undefined symbol') || e.includes('so: cannot open')) {
+    return {
+      title: 'GPU 驱动或运行环境不兼容',
+      reason: '服务器显卡驱动或深度学习组件与当前模型不兼容，编程层面无法自动修复。',
+      steps: [
+        '在服务器上执行 nvidia-smi 确认显卡驱动正常',
+        '联系管理员升级显卡驱动或重启容器环境后再训练'
+      ]
+    }
+  }
+
+  // 9. 数据加载进程相关系统错误（Docker 容器里多进程 DataLoader 的典型故障）
+  if (e.includes('errno 22') || e.includes('invalid argument') || e.includes('resource_sharer') || e.includes('sem_open') || e.includes('no space left on device')) {
+    return {
+      title: '训练环境的数据加载异常',
+      reason: '训练启动时系统底层的数据加载进程出问题（容器内多进程读图不稳定），与你的数据集本身无关。',
+      steps: [
+        '点击"重新训练"重试一次，系统会自动改用单进程加载数据（更稳定）',
+        '若仍失败，把"批次大小"改为 16 或 8（不要用 -1 自动）再试',
+        '连续失败请联系管理员查看服务器训练日志'
+      ]
+    }
+  }
+
+  // 默认：未知错误
   return {
-    reason: error || '未知错误',
-    advice: '请查看"训练日志"中的详细报错信息，排查数据集、权重与环境配置后重试。'
+    title: '训练没有成功',
+    reason: '这次失败的具体原因比较特殊，未能自动分类；原始错误信息已折叠在下方，可直接提供给技术人员。',
+    steps: [
+      '先按常见问题自查：批次大小是否过大、服务器内存/磁盘是否充足、数据集是否已准备、权重文件是否完整',
+      '点击下方"原始错误信息"，复制内容发给管理员或平台技术人员',
+      '修复后重新创建训练任务即可'
+    ]
   }
 }
 
@@ -883,17 +1239,32 @@ const handleFileImgError = (e: any) => {
   el.style.display = 'none'
 }
 
-// 弹窗展示训练失败原因与操作建议
+// 弹窗展示训练失败原因与操作建议（面向客户的结构化说明）
+const failureModal = ref<{
+  title: string
+  reason: string
+  steps: string[]
+  rawError: string
+  failedAt: string
+} | null>(null)
+
+const closeFailureDialog = () => {
+  failureModal.value = null
+}
+
 const showFailureDialog = (job: any) => {
-  const { reason, advice } = getFailureAdvice(job.error || job.message || '')
-  const failedAt = job.failed_at || job.crashed_at
-  showAlert(
-    `【训练失败】${reason}\n\n` +
-    (failedAt ? `失败时间: ${new Date(failedAt).toLocaleString()}\n\n` : '') +
-    `💡 操作建议:\n${advice}\n\n` +
-    `（可点击"删除"移除该任务，或修复后重新训练）`,
-    '训练失败'
-  )
+  const { title, reason, steps } = getFailureAdvice(job.error || job.message || '')
+  // 优先展示完整堆栈（技术人员排查用），其次展示错误摘要
+  const rawError = (job.error_traceback || job.error || job.message || '未知错误').slice(0, 4000)
+  failureModal.value = {
+    title,
+    reason,
+    steps,
+    rawError,
+    failedAt: job.failed_at || job.crashed_at
+      ? new Date(job.failed_at || job.crashed_at).toLocaleString()
+      : ''
+  }
 }
 
 // 已自动弹窗提示过的失败任务（避免重复提示），持久化到 localStorage 只提示一次
@@ -925,6 +1296,8 @@ const loadJobs = async () => {
     const result = await listTrainJobs()
     jobs.value = result.jobs
     startAllJobPolling()
+    // 同步刷新模型列表，保证任务卡的守门员状态徽章/报告最新
+    loadModels()
   } catch (error: any) {
     alert('加载失败: ' + (error.response?.data?.detail || error.message))
   } finally {
@@ -937,6 +1310,7 @@ onMounted(() => {
   loadModels()
   loadDatasets()
   loadCustomModels()
+  loadGpus()
   // 每秒跳动，刷新"最后更新 X 秒前"提示
   nowTimer = setInterval(() => { nowTick.value = Date.now() }, 1000)
 })
@@ -973,11 +1347,73 @@ onUnmounted(() => {
 }
 
 .progress-fill {
+  position: relative;
   height: 100%;
   background: linear-gradient(90deg, #8e44ad, #6c2d82);
   border-radius: 9px;
   transition: width 0.4s ease;
+  min-width: 0%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 进度条内嵌百分比文字 */
+.progress-fill-text {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: bold;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  white-space: nowrap;
+  line-height: 1;
+}
+
+/* 高级参数面板 */
+.adv-block {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.adv-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+  font-size: 0.95rem;
+  color: #2c3e50;
+}
+
+.adv-toggle input {
+  width: auto;
+}
+
+.suggest-status {
+  font-size: 0.8rem;
+  color: #27ae60;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.adv-grid .form-group {
   min-width: 0;
+}
+
+.suggest-reason {
+  margin: 0.4rem 0 0.75rem;
+  padding: 0.55rem 0.8rem;
+  background: #eefbf3;
+  border: 1px solid #c8ecd4;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  color: #1e7e46;
+  line-height: 1.5;
 }
 
 .progress-meta {
@@ -1387,5 +1823,182 @@ button {
   white-space: pre-wrap;
   word-break: break-all;
   color: #2c3e50;
+}
+
+/* 早停完成徽标 */
+.early-stop-badge {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.1rem 0.5rem;
+  background: #eafaf1;
+  border: 1px solid #82e0aa;
+  border-radius: 10px;
+  color: #1e8449;
+  font-size: 0.75rem;
+  font-weight: bold;
+  white-space: nowrap;
+}
+
+/* ===== 训练失败原因弹窗（面向客户） ===== */
+.failure-dialog {
+  max-width: 560px;
+}
+
+.failure-body {
+  padding: 1rem 1.25rem 1.25rem;
+  overflow-y: auto;
+}
+
+.fail-emoji {
+  margin-right: 0.2rem;
+}
+
+.fail-title {
+  font-size: 1.15rem;
+  font-weight: bold;
+  color: #e74c3c;
+}
+
+.fail-reason {
+  margin-top: 0.5rem;
+  line-height: 1.6;
+  color: #4a5568;
+}
+
+.fail-time {
+  margin-top: 0.4rem;
+  font-size: 0.8rem;
+  color: #999;
+}
+
+.fail-steps {
+  margin-top: 0.9rem;
+  background: #fdf3f1;
+  border: 1px solid #f5c6bc;
+  border-radius: 6px;
+  padding: 0.7rem 1rem 0.9rem;
+}
+
+.fail-steps-title {
+  font-weight: bold;
+  color: #c0392b;
+  font-size: 0.9rem;
+}
+
+.fail-steps ol {
+  margin: 0.5rem 0 0;
+  padding-left: 1.25rem;
+}
+
+.fail-steps li {
+  line-height: 1.7;
+  font-size: 0.88rem;
+  color: #34495e;
+}
+
+.fail-log {
+  margin-top: 0.9rem;
+}
+
+.fail-log summary {
+  cursor: pointer;
+  font-size: 0.82rem;
+  color: #7f8c8d;
+  user-select: none;
+}
+
+.fail-log-text {
+  margin: 0.5rem 0 0;
+  padding: 0.6rem 0.8rem;
+  background: #2d3436;
+  color: #dfe6e9;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  border-radius: 4px;
+  overflow: auto;
+  max-height: 12rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ===== 模型守门员：任务卡状态徽章与报告 ===== */
+.gk-badge {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  font-size: 0.72rem;
+  font-weight: bold;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.gk-production_ready {
+  background: #eafaf1;
+  border: 1px solid #82e0aa;
+  color: #1e8449;
+}
+
+.gk-rejected {
+  background: #fdecea;
+  border: 1px solid #f5b7b1;
+  color: #c0392b;
+}
+
+.gk-superseded {
+  background: #fef9e7;
+  border: 1px solid #f9e79f;
+  color: #b7950b;
+}
+
+.gk-version {
+  display: inline-block;
+  margin-left: 0.5rem;
+  font-size: 0.78rem;
+  color: #7f8c8d;
+  vertical-align: middle;
+}
+
+.gk-report {
+  margin-top: 0.45rem;
+  border: 1px solid #d7dde4;
+  border-radius: 6px;
+  background: #fafbfc;
+}
+
+.gk-report summary {
+  cursor: pointer;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.82rem;
+  color: #34495e;
+  user-select: none;
+}
+
+.gk-report-body {
+  padding: 0.4rem 0.7rem 0.65rem;
+  border-top: 1px dashed #dfe4ea;
+}
+
+.gk-report-text {
+  font-size: 0.8rem;
+  line-height: 1.6;
+  color: #4a5568;
+  word-break: break-word;
+}
+
+.gk-regressed {
+  margin-top: 0.45rem;
+  font-size: 0.78rem;
+  color: #c0392b;
+}
+
+.gk-regressed-item {
+  display: inline-block;
+  margin: 0.15rem 0.25rem 0 0;
+  padding: 0.05rem 0.45rem;
+  background: #fdecea;
+  border: 1px solid #f5b7b1;
+  border-radius: 8px;
+  font-weight: bold;
 }
 </style>

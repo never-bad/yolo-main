@@ -34,7 +34,11 @@
       <div v-else-if="models.length > 0" class="models-list">
         <div v-for="model in models" :key="model.model_id" class="model-item">
           <div class="model-header">
-            <h3>{{ model.model_id }}</h3>
+            <h3>
+              <span v-if="model.status" :class="'m-status m-' + model.status">{{ statusText(model) }}</span>
+              {{ model.model_id }}
+              <span v-if="model.version" class="m-version">版本 {{ model.version }}</span>
+            </h3>
             <div class="model-actions">
               <button @click="viewModelDetails(model)" class="secondary">详情</button>
               <button 
@@ -52,6 +56,16 @@
               >
                 <span v-if="exportingModel === model.model_id" class="loading-spinner"></span>
                 {{ exportingModel === model.model_id ? '导出中...' : '导出' }}
+              </button>
+              <button 
+                v-if="model.status !== 'production_ready'"
+                @click="overrideModelItem(model)" 
+                class="danger-outline"
+                :disabled="overridingModel === model.model_id"
+                title="人工强制覆盖：将被守门员拦截的模型手动设为生产版本（高级工程师操作，将记录原因）"
+              >
+                <span v-if="overridingModel === model.model_id" class="loading-spinner"></span>
+                {{ overridingModel === model.model_id ? '强制设置中...' : '强制设为生产' }}
               </button>
               <button 
                 @click="promoteModel(model.model_id)" 
@@ -72,10 +86,24 @@
               </button>
             </div>
           </div>
+          <p v-if="model.business">业务场景: {{ bizLabel(model.business) }}</p>
           <p v-if="model.classes">类别数: {{ model.classes.length }}</p>
           <p v-if="model.base_model">基础模型: {{ model.base_model }}</p>
+          <p v-if="model.lineage && (model.lineage.dataset_id || model.lineage.parent_model_id || model.lineage.base_model)">
+            血缘:
+            <span v-if="model.lineage.base_model">基座 {{ model.lineage.base_model }}</span>
+            <template v-if="model.lineage.dataset_id"> · 数据集 {{ model.lineage.dataset_id }}</template>
+            <template v-if="model.lineage.parent_model_id"> · 上一代 {{ model.lineage.parent_model_id }}</template>
+          </p>
           <p v-if="model.created_at">创建时间: {{ model.created_at }}</p>
           <p v-if="model.description">描述: {{ model.description }}</p>
+          <details v-if="model.gatekeeper && model.gatekeeper.report" class="gk-report">
+            <summary>🛡️ 模型守门员评估报告</summary>
+            <div class="gk-report-text">{{ model.gatekeeper.report }}</div>
+            <div v-if="model.gatekeeper.regressed_classes?.length" class="gk-regressed">
+              退化类别: <span v-for="c in model.gatekeeper.regressed_classes" :key="c" class="gk-regressed-item">{{ c }}</span>
+            </div>
+          </details>
         </div>
       </div>
       <div v-else class="empty-state">
@@ -105,7 +133,18 @@
               <h4>基本信息</h4>
               <table class="detail-table">
                 <tr><td>模型ID</td><td>{{ detailModel?.model_id }}</td></tr>
+                <tr v-if="detailModel?.status"><td>状态</td><td><span :class="'m-status m-' + detailModel.status">{{ statusText(detailModel) }}</span></td></tr>
+                <tr v-if="detailModel?.version"><td>版本</td><td>{{ detailModel.version }}（同业务内按 0.1 递增）</td></tr>
+                <tr v-if="detailModel?.business"><td>业务场景</td><td>{{ bizLabel(detailModel.business) }}</td></tr>
+                <tr v-if="detailModel?.override"><td>人工覆盖</td><td>{{ statusText(null, detailModel) }} <small v-if="detailModel.override.reason">（{{ detailModel.override.reason }}）</small></td></tr>
                 <tr><td>基础模型</td><td>{{ detailModel?.base_model || '-' }}</td></tr>
+                <tr v-if="detailModel?.lineage?.dataset_id || detailModel?.lineage?.parent_model_id">
+                  <td>血缘</td>
+                  <td>
+                    <span v-if="detailModel.lineage.parent_model_id">上一代: {{ detailModel.lineage.parent_model_id }}<br/></span>
+                    <span v-if="detailModel.lineage.dataset_id">数据集: {{ detailModel.lineage.dataset_id }}</span>
+                  </td>
+                </tr>
                 <tr><td>创建时间</td><td>{{ detailModel?.created_at || '-' }}</td></tr>
                 <tr><td>类别数量</td><td>{{ detailModel?.classes?.length || 0 }}</td></tr>
                 <tr><td>图片尺寸</td><td>{{ detailModel?.imgsz || '-' }}</td></tr>
@@ -113,6 +152,49 @@
                 <tr v-if="detailModel?.file_size_mb"><td>模型大小</td><td>{{ detailModel.file_size_mb }} MB</td></tr>
               </table>
             </div>
+
+            <!-- 守门员评估报告 -->
+            <div v-if="detailModel?.gatekeeper" class="detail-section">
+              <h4>🛡️ 模型守门员评估</h4>
+              <div class="gk-panel" :class="'gk-panel-' + detailModel.gatekeeper.result">
+                <div class="gk-verdict">
+                  {{ gkVerdictText(detailModel.gatekeeper) }}
+                </div>
+                <div v-if="detailModel.gatekeeper.report" class="gk-report-text">{{ detailModel.gatekeeper.report }}</div>
+                <div v-if="detailModel.gatekeeper.new_metrics?.mAP50_95 != null" class="gk-metrics">
+                  <span v-if="detailModel.gatekeeper.old_metrics?.mAP50_95 != null">
+                    新模型 mAP50-95: <b>{{ (detailModel.gatekeeper.new_metrics.mAP50_95 * 100).toFixed(1) }}%</b>
+                    vs 旧模型: <b>{{ (detailModel.gatekeeper.old_metrics.mAP50_95 * 100).toFixed(1) }}%</b>
+                  </span>
+                  <span v-else>mAP50-95: <b>{{ (detailModel.gatekeeper.new_metrics.mAP50_95 * 100).toFixed(1) }}%</b></span>
+                  <span v-if="detailModel.gatekeeper.eval_split"> · 评估集: {{ detailModel.gatekeeper.eval_split === 'test' ? '独立测试集 test' : '验证集 val' }}</span>
+                </div>
+                <details v-if="detailModel.gatekeeper.class_ap && Object.keys(detailModel.gatekeeper.class_ap).length">
+                   <summary>各类别 AP 对比（防偏科校验）</summary>
+                   <table class="detail-table class-ap-table">
+                     <tr><td>类别</td><td>旧模型 AP</td><td>新模型 AP</td><td>相对变化</td></tr>
+                     <tr v-for="(row, cls) in detailModel.gatekeeper.class_ap" :key="cls">
+                       <td>{{ cls }}</td>
+                       <td>{{ row.old_ap == null ? '—' : (row.old_ap * 100).toFixed(1) + '%' }}</td>
+                       <td>{{ row.new_ap == null ? '—' : (row.new_ap * 100).toFixed(1) + '%' }}</td>
+                       <td :class="{ 'ap-regressed': row.regressed }">
+                         {{ row.delta_pct == null ? '—' : (row.delta_pct > 0 ? '+' : '') + row.delta_pct + '%' }}
+                         <span v-if="row.regressed" class="ap-warn">⚠️ 退化</span>
+                       </td>
+                     </tr>
+                   </table>
+                 </details>
+                 <button
+                   v-if="detailModel?.status !== 'production_ready'"
+                   @click="overrideModelItem(detailModel)"
+                   class="danger-outline gk-override-btn"
+                   :disabled="overridingModel === detailModel.model_id"
+                 >
+                   <span v-if="overridingModel === detailModel.model_id" class="loading-spinner"></span>
+                   {{ overridingModel === detailModel.model_id ? '强制设置中...' : '强制设为生产（Override）' }}
+                 </button>
+               </div>
+             </div>
 
             <!-- 关键参数表 -->
             <div v-if="modelKeyParams.length" class="detail-section">
@@ -276,7 +358,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
-import { listModels, updateModel, deleteModel, getModel, uploadModel, exportModel, generateTrainingCharts, promoteToDetector, type ModelDetails } from '@/api/models'
+import { listModels, updateModel, deleteModel, getModel, uploadModel, exportModel, generateTrainingCharts, promoteToDetector, overrideModel, type ModelDetails } from '@/api/models'
 import { downloadFile } from '@/utils/download'
 import { showAlert, showConfirm, showPrompt } from '@/composables/useDialog'
 import VChart from 'vue-echarts'
@@ -312,6 +394,68 @@ use([
 ])
 
 const models = ref<any[]>([])
+
+// ===== 模型仓库 / 守门员辅助 =====
+const businessScenes: { value: string; label: string }[] = [
+  { value: 'general', label: '通用目标检测' },
+  { value: 'pedestrian', label: '行人检测' },
+  { value: 'vehicle', label: '车辆 / 车牌' },
+  { value: 'defect', label: '工业缺陷检测' },
+  { value: 'package', label: '包裹 / 物流' }
+]
+const bizLabel = (v?: string) => businessScenes.find(b => b.value === v)?.label || v || '通用目标检测'
+
+const statusText = (meta?: any, overrideInfo?: any) => {
+  const s = overrideInfo?.to_status || overrideInfo?.from_status || meta?.status
+  switch (s) {
+    case 'production_ready': return meta?.override || overrideInfo?.to_status ? '生产就绪（人工覆盖）' : '✅ 生产就绪'
+    case 'rejected': return '❌ 已淘汰'
+    case 'superseded': return '⚠️ 已退役'
+    case 'training': return '⏳ 训练中'
+    case 'evaluating': return '🔍 评估中'
+    default: return s || '未知状态'
+  }
+}
+
+const gkVerdictText = (gk: any) => {
+  switch (gk?.result) {
+    case 'promoted': return '✅ 判定结果：晋升（Promote）—— 新模型已通过守门员校验，正式成为生产版本'
+    case 'first_version': return '✅ 判定结果：首版直晋 —— 该业务首个模型，无旧基准可对比，直接设为生产版本 v1.0'
+    case 'rejected': return '❌ 判定结果：淘汰（Reject）—— 未通过守门员校验，已归档为失败实验，旧模型继续服役（可强制覆盖）'
+    default: return '🔍 判定结果：' + (gk?.result || '未知')
+  }
+}
+
+const overridingModel = ref<string | null>(null)
+// 人工强制覆盖（Override）：高级工程师手动将被守门员拦截的模型强制设为生产版本
+const overrideModelItem = async (model: any) => {
+  if (!(await showConfirm(
+    `确定将模型 ${model.model_id} 强制设为生产版本吗？\n\n` +
+    `该操作会绕过模型守门员的自动评估（仅建议在数据质量已确认、线上紧急修复等特殊情况下使用），\n` +
+    `系统会记录操作记录与原因，便于审计追溯。`
+  ))) return
+
+  const reason = await showPrompt('请填写强制覆盖原因（用于审计，可选）:', '')
+  if (reason === null) return  // 用户取消
+
+  overridingModel.value = model.model_id
+  try {
+    const res = await overrideModel(model.model_id, {
+      business: model.business || undefined,
+      reason: reason || undefined
+    })
+    const superseded = (res.superseded || []).length
+    alert(
+      `✅ 已强制设为生产就绪！\n${res.meta?.version || ''}` +
+      (superseded ? `\n同时退役了 ${superseded} 个原生产模型（已标记为"已退役"）。` : '')
+    )
+    loadModels()
+  } catch (error: any) {
+    alert('强制覆盖失败: ' + (error.response?.data?.detail || error.message))
+  } finally {
+    overridingModel.value = null
+  }
+}
 
 // 模型详情
 const showModelDetails = ref(false)
@@ -1295,19 +1439,6 @@ const exportModelFile = async (modelId: string) => {
   }
 }
 
-// 下载训练图表
-const downloadTrainingChart = async (modelId: string, chartType: 'loss' | 'metrics') => {
-  downloadingChart.value = chartType
-  try {
-    const blob = await generateTrainingCharts(modelId, chartType)
-    downloadFile(blob, `${modelId}_${chartType}_chart.png`)
-  } catch (error: any) {
-    alert('下载图表失败: ' + (error.response?.data?.detail || error.message))
-  } finally {
-    downloadingChart.value = null
-  }
-}
-
 onMounted(() => {
   loadModels()
 })
@@ -1761,5 +1892,168 @@ button {
   display: flex;
   gap: 0.5rem;
   flex-wrap: wrap;
+}
+
+/* ===== 模型仓库 / 守门员样式 ===== */
+.m-status {
+  display: inline-block;
+  margin-right: 0.4rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 10px;
+  font-size: 0.72rem;
+  font-weight: bold;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.m-production_ready {
+  background: #eafaf1;
+  border: 1px solid #82e0aa;
+  color: #1e8449;
+}
+
+.m-rejected {
+  background: #fdecea;
+  border: 1px solid #f5b7b1;
+  color: #c0392b;
+}
+
+.m-superseded {
+  background: #fef9e7;
+  border: 1px solid #f9e79f;
+  color: #b7950b;
+}
+
+.m-version {
+  display: inline-block;
+  margin-left: 0.4rem;
+  font-size: 0.78rem;
+  color: #7f8c8d;
+  vertical-align: middle;
+}
+
+.danger-outline {
+  background: #fff5f5;
+  border: 1px solid #e74c3c;
+  color: #e74c3c;
+}
+
+.danger-outline:hover {
+  background: #fdecea;
+}
+
+/* 守门员报告折叠 */
+.gk-report {
+  margin-top: 0.5rem;
+  border: 1px solid #d7dde4;
+  border-radius: 6px;
+  background: #fafbfc;
+}
+
+.gk-report summary {
+  cursor: pointer;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.82rem;
+  color: #34495e;
+  user-select: none;
+}
+
+.gk-report-text {
+  padding: 0.4rem 0.7rem 0.65rem;
+  border-top: 1px dashed #dfe4ea;
+  font-size: 0.8rem;
+  line-height: 1.6;
+  color: #4a5568;
+  word-break: break-word;
+}
+
+.gk-regressed {
+  padding: 0.4rem 0.7rem 0.65rem;
+  font-size: 0.78rem;
+  color: #c0392b;
+}
+
+.gk-regressed-item {
+  display: inline-block;
+  margin: 0.15rem 0.25rem 0 0;
+  padding: 0.05rem 0.45rem;
+  background: #fdecea;
+  border: 1px solid #f5b7b1;
+  border-radius: 8px;
+  font-weight: bold;
+}
+
+/* 详情弹窗守门员面板 */
+.gk-panel {
+  border: 1px solid #d7dde4;
+  border-radius: 6px;
+  padding: 0.8rem 1rem;
+  background: #fafbfc;
+}
+
+.gk-panel-promoted,
+.gk-panel-first_version {
+  border-color: #82e0aa;
+  background: #f0fdf5;
+}
+
+.gk-panel-rejected {
+  border-color: #f5b7b1;
+  background: #fef6f5;
+}
+
+.gk-verdict {
+  font-weight: bold;
+  margin-bottom: 0.4rem;
+  color: #2c3e50;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.gk-panel .gk-report-text {
+  padding: 0.3rem 0 0.5rem;
+  border-top: none;
+}
+
+.gk-metrics {
+  font-size: 0.85rem;
+  color: #4a5568;
+  margin: 0.3rem 0 0.5rem;
+  line-height: 1.6;
+}
+
+.gk-metrics b {
+  color: #2c3e50;
+}
+
+.gk-panel details summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: #34495e;
+  user-select: none;
+  margin-top: 0.35rem;
+}
+
+.class-ap-table {
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+}
+
+.ap-regressed {
+  color: #c0392b;
+  font-weight: bold;
+}
+
+.ap-warn {
+  margin-left: 0.35rem;
+  font-size: 0.72rem;
+  padding: 0.05rem 0.35rem;
+  background: #fdecea;
+  border: 1px solid #f5b7b1;
+  border-radius: 8px;
+}
+
+.gk-override-btn {
+  margin-top: 0.6rem;
 }
 </style>

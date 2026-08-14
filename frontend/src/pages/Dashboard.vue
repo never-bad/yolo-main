@@ -37,14 +37,6 @@
           <button>进入模型管理</button>
         </router-link>
       </div>
-
-      <div class="card">
-        <h2>🔍 模型推理</h2>
-        <p>使用训练好的模型进行推理</p>
-        <router-link to="/infer">
-          <button>开始推理</button>
-        </router-link>
-      </div>
     </div>
   </div>
 </template>

@@ -19,6 +19,10 @@ class UploadModelRequest(BaseModel):
     name: Optional[str] = None
     classes: Optional[list[str]] = None
 
+class OverrideModelRequest(BaseModel):
+    business: Optional[str] = None      # 业务/算法类型（可选，用于隔离与版本对齐）
+    reason: Optional[str] = None        # 强制覆盖原因（高级工程师填写，用于审计）
+
 @router.get("")
 async def list_models():
     """列出所有模型"""
@@ -37,6 +41,12 @@ async def list_custom_models():
                 "size": pt.stat().st_size if pt.exists() else 0
             })
     return {"models": models}
+
+# 注意：静态路由必须定义在 /{model_id} 参数路由之前，否则会被参数路由拦截
+@router.get("/production")
+async def list_production_models(business: Optional[str] = None):
+    """列出当前在役的生产模型（status=production_ready），可按业务/算法类型过滤"""
+    return await model_service.list_production_models(business)
 
 @router.get("/{model_id}")
 async def get_model(model_id: str):
@@ -108,6 +118,24 @@ async def upload_model(
         return result
     except Exception as e:
         raise HTTPException(400, str(e))
+
+@router.post("/{model_id}/override")
+async def override_model(model_id: str, request: Optional[OverrideModelRequest] = None):
+    """人工强制覆盖（Override）：高级工程师手动将被守门员拦截的模型强制设为生产版本。
+
+    仅限高级工程师在特殊情况下使用（如数据质量已确认、线上紧急修复等）。
+    系统会记录覆盖操作与原因，便于审计追溯。
+    """
+    reason = request.reason if request else None
+    business = request.business if request else None
+    try:
+        return await model_service.override_model(model_id, business=business, reason=reason)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
 
 @router.get("/{model_id}/export")
 async def export_model(model_id: str):

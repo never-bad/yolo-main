@@ -812,3 +812,116 @@ class ModelService:
             if cand.exists():
                 return str(cand)
         return weights
+
+    # ------------------------------------------------------------------
+    # 模型守门员：生产模型查询 / 人工强制覆盖
+    # ------------------------------------------------------------------
+    async def list_production_models(self, business: str = None):
+        """列出当前在役的生产模型（status=production_ready）。
+
+        Args:
+            business: 业务/算法类型；缺省返回所有业务的生产模型
+        """
+        def _list_sync():
+            models = []
+            if not self.registry_dir.exists():
+                return models
+            for model_dir in self.registry_dir.iterdir():
+                if not model_dir.is_dir():
+                    continue
+                model_file = model_dir / "model.json"
+                if not model_file.exists():
+                    continue
+                try:
+                    model_meta = _load_json(model_file)
+                except Exception:
+                    continue
+                if model_meta.get("status") != "production_ready":
+                    continue
+                if business and model_meta.get("business") != business:
+                    continue
+                weights_path = model_meta.get("weights_path")
+                if weights_path and Path(weights_path).exists():
+                    model_meta["file_size_mb"] = round(os.path.getsize(weights_path) / (1024 * 1024), 2)
+                models.append(model_meta)
+            return models
+
+        models = await asyncio.to_thread(_list_sync)
+        return {"models": sorted(models, key=lambda x: self._parse_version(x.get("version")), reverse=True)}
+
+    @staticmethod
+    def _parse_version(ver) -> float:
+        """解析 'v1.0' 形式版本号为数值，无法解析返回 0（保证排序不报错）"""
+        if not ver or not str(ver).startswith("v"):
+            return 0.0
+        try:
+            return float(str(ver)[1:])
+        except (TypeError, ValueError):
+            return 0.0
+
+    async def override_model(self, model_id: str, business: str = None, reason: str = None):
+        """人工强制覆盖（Override）：高级工程师手动将被拦截的模型设为生产版本。
+
+        通常用于守门员判定 rejected（淘汰）后，且同业务已有生产模型在役时的强制晋升；
+        同业务存在更高/更早生产模型时，也允许将任意版本强制设为当前服役版本。
+        """
+        model_dir = self.registry_dir / model_id
+        model_file = model_dir / "model.json"
+        if not await asyncio.to_thread(lambda: model_file.exists()):
+            raise ValueError(f"模型 {model_id} 不存在")
+
+        def _override_sync():
+            meta = _load_json(model_file)
+            weights_path = meta.get("weights_path")
+            if not weights_path or not Path(weights_path).exists():
+                raise ValueError("模型权重文件不存在，无法强制设为生产")
+
+            # 记录覆盖操作（保留原状态便于追溯）
+            override_record = {
+                "from_status": meta.get("status", "unknown"),
+                "to_status": "production_ready",
+                "operated_at": datetime.now().isoformat(),
+                "reason": reason or "人工强制覆盖（高级工程师操作）",
+            }
+            if business:
+                meta["business"] = business
+
+            # 低版本强制覆盖高版本的情况：授予与旧生产版本一致的版本号，避免版本回退
+            current = self._parse_version(meta.get("version"))
+            superseded = []
+            if business:
+                for other in self.registry_dir.iterdir():
+                    if not other.is_dir():
+                        continue
+                    of = other / "model.json"
+                    if not of.exists():
+                        continue
+                    try:
+                        om = _load_json(of)
+                    except Exception:
+                        continue
+                    if om.get("model_id") == model_id or om.get("status") != "production_ready":
+                        continue
+                    if om.get("business") != business:
+                        continue
+                    ov = self._parse_version(om.get("version"))
+                    if ov > current:
+                        superseded.append({"model_id": om.get("model_id"), "version": om.get("version")})
+
+            meta["status"] = "production_ready"
+            meta["override"] = override_record
+            superseded_records = []
+            for s in superseded:
+                sf = self.registry_dir / s["model_id"] / "model.json"
+                try:
+                    sm = _load_json(sf)
+                    sm["status"] = "superseded"
+                    _save_json(sf, sm)
+                    superseded_records.append(s["model_id"])
+                except Exception:
+                    pass
+            _save_json(model_file, meta)
+            return {"meta": meta, "superseded": superseded_records}
+
+        result = await asyncio.to_thread(_override_sync)
+        return result

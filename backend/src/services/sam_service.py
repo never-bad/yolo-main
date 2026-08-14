@@ -214,7 +214,8 @@ class SAMService:
             return None
         weights = cfg.get("sam_weights", "sam_b.pt")
         from ultralytics import SAM
-        self._sam = SAM(weights)
+        # 优先从本地模型目录（sam/、custom/、backend 根目录）解析权重，找不到再由 ultralytics 自动联网下载
+        self._sam = SAM(self._find_model_file(weights))
         self._sam_name = weights
         return self._sam
 
