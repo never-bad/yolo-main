@@ -68,8 +68,12 @@ class AnnotationService:
             if not images_dir:
                 raise ValueError(f"数据集 {dataset_id}/{version} 中未找到图片目录，请确保已执行 prepare 操作")
             
-            # 如果没有提供类别，尝试从 data.yaml 读取
-            task_classes = classes if classes else self._load_classes_from_yaml(dataset_dir)
+            # 类别合并规则：数据集类别文件中的类别在前（真实类别名，class_id 顺序与已有标注对齐），
+            # 用户输入中的新增类别追加在后；两者合并去重。这样数据集已有类别时可在其基础上扩展，
+            # 数据集读不到类别时用户输入即为全部类别（避免标注任务无类别导致 AI 预标注不可用）
+            auto_classes = self._load_classes_from_yaml(dataset_dir) or []
+            manual = classes or []
+            task_classes = auto_classes + [c for c in manual if c not in auto_classes]
             
             # 收集所有图片
             # 若 images 目录下已有 train/val/test 划分，只遍历划分目录，避免平铺图与划分子目录重复收集

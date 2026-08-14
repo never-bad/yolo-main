@@ -17,3 +17,4 @@ backend/_repro_*.py
 backend/_repro_out.txt
 backend/*_install_log.txt
 backend/runs/
+_tmp/

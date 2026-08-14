@@ -11,7 +11,7 @@
         <span class="tree-caret">{{ caretText(node) }}</span>
         <span class="tree-icon">{{ iconText(node) }}</span>
         <span class="tree-name">{{ node.name }}</span>
-        <span v-if="node.type === 'dir' && (node.children?.length ?? 0)" class="tree-count">{{ (node.children ?? []).length }}</span>
+        <span v-if="node.type === 'dir' && (node.file_count ?? node.children?.length ?? 0)" class="tree-count">{{ node.file_count ?? (node.children ?? []).length }}</span>
         <span v-if="node.type === 'file'" class="tree-size">{{ formatSize(node.size) }}</span>
         <span v-if="node.truncated" class="tree-truncated" title="条目过多已省略">…</span>
       </div>
@@ -38,6 +38,7 @@ interface TreeNode {
   size?: number
   children?: TreeNode[]
   truncated?: boolean
+  file_count?: number
 }
 
 const props = defineProps<{

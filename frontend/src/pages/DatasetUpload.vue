@@ -3,7 +3,7 @@
     <div class="card">
       <h2>上传数据集</h2>
       <div class="form-group">
-        <label>选择 ZIP 文件</label>
+        <label>选择压缩包文件（支持 .zip / .tar / .tar.gz / .tgz）</label>
         <div v-if="selectedFile" class="selected-file">
           <span class="selected-file-icon">📦</span>
           <span class="selected-file-name">{{ selectedFile.name }}</span>
@@ -11,7 +11,7 @@
         </div>
         <div v-else class="selected-file empty">尚未选择文件</div>
         <div class="upload-row">
-          <input type="file" accept=".zip" id="datasetZip" @change="handleFileSelect" :disabled="uploading" class="file-input" />
+          <input type="file" accept=".zip,.tar,.tgz,.tar.gz" id="datasetZip" @change="handleFileSelect" :disabled="uploading" class="file-input" />
           <label for="datasetZip" class="file-btn" :disabled="uploading">选择文件</label>
           <button class="upload-btn" @click="uploadFile" :disabled="!selectedFile || uploading">
             <span v-if="uploading" class="loading-spinner"></span>
@@ -21,10 +21,9 @@
       </div>
       <div v-if="uploadResult" class="result">
         <p>✓ 上传成功: {{ uploadResult.dataset_id }}</p>
-        <button @click="prepareDataset" :disabled="preparingNew">
-          <span v-if="preparingNew" class="loading-spinner"></span>
-          {{ preparingNew ? '准备中...' : '准备数据集' }}
-        </button>
+        <p v-if="preparingNew" class="auto-prepare-tip">
+          <span class="loading-spinner"></span>正在自动准备数据集（解压/重组/统计），请稍候...
+        </p>
       </div>
     </div>
 
@@ -43,14 +42,6 @@
           <div class="dataset-header">
             <h3 class="dataset-name" @click="viewDataset(dataset)" title="点击查看数据集文件夹结构">{{ dataset.dataset_id }}</h3>
             <div class="dataset-actions">
-              <button 
-                v-if="dataset.status === 'uploaded'" 
-                @click="prepareDatasetFromList(dataset.dataset_id)" 
-                :disabled="preparingDataset === dataset.dataset_id"
-              >
-                <span v-if="preparingDataset === dataset.dataset_id" class="loading-spinner"></span>
-                {{ preparingDataset === dataset.dataset_id ? '准备中...' : '准备' }}
-              </button>
               <button 
                 @click="viewDataset(dataset)" 
                 class="secondary"
@@ -211,7 +202,6 @@ const uploading = ref(false)
 const uploadResult = ref<any>(null)
 const datasets = ref<any[]>([])
 const loading = ref(false)
-const preparingDataset = ref<string | null>(null)  // 正在准备的数据集ID（列表中）
 const preparingNew = ref(false)  // 正在准备新上传的数据集
 const editingDataset = ref<string | null>(null)  // 正在编辑的数据集ID
 const deletingDataset = ref<string | null>(null)  // 正在删除的数据集ID
@@ -332,41 +322,23 @@ const uploadFile = async () => {
   try {
     const result = await uploadDataset(selectedFile.value)
     uploadResult.value = result
-    alert('上传成功!')
     loadDatasets()
+    // 上传成功后自动准备（无需用户额外操作）
+    preparingNew.value = true
+    try {
+      await prepareDst(result.dataset_id)
+      alert('上传并准备成功!')
+      uploadResult.value = null
+      loadDatasets()
+    } catch (error: any) {
+      alert('准备失败: ' + (error.response?.data?.detail || error.message))
+    } finally {
+      preparingNew.value = false
+    }
   } catch (error: any) {
     alert('上传失败: ' + (error.response?.data?.detail || error.message))
   } finally {
     uploading.value = false
-  }
-}
-
-const prepareDataset = async () => {
-  if (!uploadResult.value) return
-  
-  preparingNew.value = true
-  try {
-    await prepareDst(uploadResult.value.dataset_id)
-    alert('准备成功!')
-    uploadResult.value = null
-    loadDatasets()
-  } catch (error: any) {
-    alert('准备失败: ' + (error.response?.data?.detail || error.message))
-  } finally {
-    preparingNew.value = false
-  }
-}
-
-const prepareDatasetFromList = async (datasetId: string) => {
-  preparingDataset.value = datasetId
-  try {
-    await prepareDst(datasetId)
-    alert('准备成功!')
-    loadDatasets()
-  } catch (error: any) {
-    alert('准备失败: ' + (error.response?.data?.detail || error.message))
-  } finally {
-    preparingDataset.value = null
   }
 }
 
@@ -543,6 +515,14 @@ onMounted(() => {
   padding: 1rem;
   background: #d5f4e6;
   border-radius: 4px;
+}
+
+.auto-prepare-tip {
+  margin-top: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: #1f6f4a;
 }
 
 .dataset-list {

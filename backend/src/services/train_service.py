@@ -11,6 +11,7 @@ import psutil
 from src.core.settings import settings
 from src.utils.fs_tree import build_tree
 from src.yolo.gatekeeper import infer_business, _normalize_classes
+from src.yolo.train_script import ensure_local_base_weights
 
 
 def _load_json(path: Path):
@@ -186,18 +187,27 @@ class TrainService:
         else:
             batch, imgsz = 4, 512
 
-        # 训练轮数随数据量反比：数据少多轮、数据多少轮
+        # 训练轮数随数据量反比：数据少多轮、数据多少轮；
+        # CPU 环境自动调低轮数（无 GPU 时训练慢，200 轮耗时不可接受），有 GPU 才给足轮数
         if image_count > 0:
-            if image_count < 300:
-                epochs = 200
-            elif image_count < 1200:
-                epochs = 120
-            elif image_count < 3000:
-                epochs = 80
+            if cuda_ok:
+                if image_count < 300:
+                    epochs = 200
+                elif image_count < 1200:
+                    epochs = 120
+                elif image_count < 3000:
+                    epochs = 80
+                else:
+                    epochs = 50
             else:
-                epochs = 50
+                if image_count < 300:
+                    epochs = 30
+                elif image_count < 1200:
+                    epochs = 20
+                else:
+                    epochs = 10
         else:
-            epochs = 100
+            epochs = 100 if cuda_ok else 20
 
         # 高级参数默认值（YOLO 推荐起点）
         lr0 = 0.01
@@ -225,11 +235,12 @@ class TrainService:
         }
 
         # ---------- 4. 说明文案 ----------
+        cpu_hint = "；当前为 CPU 环境，已自动调低训练轮数以节省时间" if not cuda_ok else ""
         reason = (
             f"检测到 {device_info['name']}"
             f"（{'CUDA 显存 ' + str(device_info['vram_gb']) + 'GB' if cuda_ok else 'CPU'}），"
             f"数据集约 {image_count} 张图 / {class_count} 类，"
-            f"已按{mode}场景推荐参数（可手动修改）。"
+            f"已按{mode}场景推荐参数（可手动修改）{cpu_hint}。"
         )
 
         return {
@@ -287,6 +298,21 @@ class TrainService:
         except Exception as e:
             print(f"[list_gpus] 检测 GPU 失败: {e}")
         return result
+
+    async def prepare_base_weights(self, model_name: str) -> dict:
+        """训练前确认/预下载预训练权重到本地 models/custom（镜像加速缓存），
+        避免训练启动时 ultralytics 联网下载导致的长时间空窗。
+
+        status:
+          - ready:    本地已就绪（缓存命中或本次镜像下载完成）
+          - fallback: 本地与镜像均不可用，将交由 ultralytics 内置下载兜底
+        """
+        try:
+            path = await asyncio.to_thread(ensure_local_base_weights, model_name)
+            return {"status": "ready" if os.path.exists(path) else "fallback", "path": path}
+        except Exception as e:
+            print(f"[prepare-weights] 权重准备失败: {e}")
+            return {"status": "fallback", "path": model_name, "error": str(e)}
     
     @staticmethod
     def _parse_version(ver) -> float:

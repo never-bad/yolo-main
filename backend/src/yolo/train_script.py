@@ -60,6 +60,58 @@ def resolve_model_file(weights: str) -> str:
     return weights
 
 
+# 预训练权重下载镜像站（国内加速，顺序尝试；全部失败则交 ultralytics 内置直连兜底）
+BASE_WEIGHT_MIRRORS = (
+    "https://gh-proxy.com/https://github.com/ultralytics/assets/releases/download/v0.0.0/{name}",
+    "https://ghproxy.net/https://github.com/ultralytics/assets/releases/download/v0.0.0/{name}",
+    "https://github.com/ultralytics/assets/releases/download/v0.0.0/{name}",
+)
+
+
+def ensure_local_base_weights(weights: str, timeout: int = 300) -> str:
+    """将标准预训练权重（yolov8n.pt 等）本地化到 backend/models/custom，
+    避免 ultralytics 训练启动时直连 GitHub 下载导致的长时间空窗（国内网络尤甚）。
+
+    规则：
+      - 已是本地存在的路径/带目录结构的路径 → 直接使用；
+      - 裸文件名（标准预训练名）→ 依次从镜像站下载缓存；全部失败原样返回（由
+        ultralytics 内置下载兜底）。
+    """
+    p = Path(weights)
+    if p.exists() or p.suffix != ".pt" or "/" in weights or "\\" in weights:
+        return weights
+    import shutil
+    import urllib.request
+    backend_dir = Path(__file__).resolve().parent.parent.parent
+    custom_dir = backend_dir / "models" / "custom"
+    custom_dir.mkdir(parents=True, exist_ok=True)
+    target = custom_dir / weights
+    if target.exists():
+        return str(target)
+    for mirror in BASE_WEIGHT_MIRRORS:
+        url = mirror.format(name=weights)
+        tmp = target.with_suffix(".pt.tmp")
+        try:
+            print(f"[{datetime.now().isoformat()}] 本地无预训练权重 {weights}，"
+                  f"正在从镜像下载（{url}）...")
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "yolo-training-platform/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp, open(tmp, "wb") as f:
+                shutil.copyfileobj(resp, f)
+            os.replace(tmp, target)
+            print(f"[{datetime.now().isoformat()}] 预训练权重已缓存到本地: {target}")
+            return str(target)
+        except Exception as e:
+            print(f"[{datetime.now().isoformat()}] 预训练权重下载失败（{url}）: {e}")
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+    return weights
+
+
 def next_model_version(registry_dir: str, business: str) -> str:
     """计算该业务下一个模型版本号：扫描模型仓库中同业务已有版本，最大值 + 0.1；首版 v1.0"""
     best = 0.99  # best + 0.1 = 1.0 → 首版 v1.0
@@ -179,6 +231,9 @@ def main():
             print(f"[{datetime.now().isoformat()}] Loading model: {args.model}")
             # 优先使用本地已有权重（models/custom、models/sam、backend 根目录），避免重复联网下载
             resume_path = resolve_model_file(args.model)
+            # 标准预训练权重（yolov8n.pt 等）本地未缓存时，从国内镜像下载到 models/custom，
+            # 避免 ultralytics 直连 GitHub 下载导致训练长时间卡在启动阶段
+            resume_path = ensure_local_base_weights(resume_path)
         
         model = YOLO(resume_path)
         

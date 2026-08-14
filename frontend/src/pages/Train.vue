@@ -49,14 +49,7 @@
         </label>
       </div>
       <div v-if="!useFineTune" class="form-group">
-        <label class="model-label">
-          预训练模型
-          <button type="button" class="add-model-btn" @click="ptFile?.click()" :disabled="uploadingPt">
-            <span v-if="uploadingPt" class="loading-spinner"></span>
-            {{ uploadingPt ? '导入中...' : '添加' }}
-          </button>
-          <input ref="ptFile" type="file" accept=".pt" class="pt-file-input" @change="handlePtFile" />
-        </label>
+        <label class="model-label">预训练模型</label>
         <div class="model-selector">
           <div class="version-select">
             <label>YOLO版本</label>
@@ -75,14 +68,22 @@
             </select>
           </div>
         </div>
-        <div v-if="customModels.length" class="custom-model-block">
-          <label class="custom-model-label">自定义导入的模型</label>
-          <select v-model="customSelectedPath" :disabled="training" @change="onSelectCustomModel">
+        <div class="custom-model-block">
+          <label class="custom-model-label">
+            <button type="button" class="add-model-btn" @click="ptFile?.click()" :disabled="uploadingPt">
+              <span v-if="uploadingPt" class="loading-spinner"></span>
+              {{ uploadingPt ? '导入中...' : '添加' }}
+            </button>
+            自定义导入的模型
+          </label>
+          <select v-if="customModels.length" v-model="customSelectedPath" :disabled="training" @change="onSelectCustomModel">
             <option value="">-- 使用上方 YOLO 预训练模型 --</option>
             <option v-for="cm in customModels" :key="cm.path" :value="cm.path">
               {{ cm.filename }} ({{ (cm.size / 1024 / 1024).toFixed(1) }} MB)
             </option>
           </select>
+          <small v-else>尚未导入自定义模型，可点「添加」上传 .pt 权重文件</small>
+          <input ref="ptFile" type="file" accept=".pt" class="pt-file-input" @change="handlePtFile" />
         </div>
         <small>当前选择: {{ trainForm.model_name }}</small>
       </div>
@@ -100,7 +101,8 @@
             {{ loadingModels ? '加载中...' : '刷新' }}
           </button>
         </div>
-        <small>将从所选模型开始继续训练</small>
+        <small v-if="autoPickInfo" class="auto-pick-info">{{ autoPickInfo }}</small>
+        <small v-else>勾选后将从所选模型继续训练；若与数据集业务匹配到已训练模型会自动默认选中</small>
       </div>
       <div class="form-group">
         <label>训练节点（GPU）</label>
@@ -166,9 +168,9 @@
         </div>
       </div>
       <div v-if="suggestReason" class="suggest-reason">{{ suggestReason }}</div>
-      <button @click="startTraining" :disabled="training || !trainForm.dataset_id">
-        <span v-if="training" class="loading-spinner"></span>
-        {{ training ? '训练中...' : '开始训练' }}
+      <button @click="startTraining" :disabled="training || preparingWeight || !trainForm.dataset_id">
+        <span v-if="training || preparingWeight" class="loading-spinner"></span>
+        {{ training ? '训练中...' : (preparingWeight ? '准备权重中（仅首次下载）...' : '开始训练') }}
       </button>
     </div>
 
@@ -189,6 +191,7 @@
           <p>模型: {{ job.model_name }}</p>
           <p>轮数: {{ job.epochs }} | 图片尺寸: {{ job.imgsz }} | 批次: {{ job.batch }}</p>
           <p>节点: {{ job.gpu_index != null && job.gpu_index !== undefined ? 'GPU ' + job.gpu_index : '自动选择' }}</p>
+          <p>启动时间: {{ new Date(job.created_at).toLocaleString() }}</p>
           <p>状态: <span :class="'status-badge status-' + job.status">{{ job.status }}</span> <span v-if="job.early_stopped" class="early-stop-badge" title="模型已收敛，系统自动提前停止训练以节省资源">✓ 已完成（早停）</span></p>
           <div v-if="job.status === 'running'" class="job-progress">
             <div class="progress-bar">
@@ -368,7 +371,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { createTrainJob, listTrainJobs, deleteTrainJob, resumeTrainJob, getTrainJobTree, suggestTrainParams, inferBusiness, listGpus, type TrainJobRequest } from '@/api/train'
+import { createTrainJob, listTrainJobs, deleteTrainJob, resumeTrainJob, getTrainJobTree, suggestTrainParams, inferBusiness, listGpus, prepareWeights, type TrainJobRequest } from '@/api/train'
 import { listModels, uploadPretrainedPt, listCustomModels } from '@/api/models'
 import { listDatasets } from '@/api/datasets'
 import { subscribeLogsSSE, pollLogsTail, getLogLines } from '@/api/logs'
@@ -570,16 +573,18 @@ const fetchSuggest = async () => {
   } catch (e: any) {
     // 推荐失败不打断用户操作，保留当前值
     console.error('获取推荐参数失败:', e)
-    suggestReason.value = ''
+    const detail = e?.response?.data?.detail || e?.message || '网络异常'
+    suggestReason.value = `自动推荐失败（已保留当前参数）：${detail}`
   } finally {
     suggesting.value = false
   }
 }
 
-// 数据集/模型/微调开关变化 → 防抖自动推荐
+// 数据集/版本/模型/微调开关变化 → 防抖自动推荐
 watch(
   [
     () => trainForm.value.dataset_id,
+    () => trainForm.value.version,
     () => trainForm.value.model_name,
     () => trainForm.value.base_model_id,
     useFineTune
@@ -617,6 +622,56 @@ watch(
   () => autoAssignBusiness()
 )
 
+// ===== 微调模型自动匹配 =====
+// 勾选「基于已有模型微调」时，按当前数据集的业务/算法类型（由类别名自动推断，
+// 无需数据集命名规则）自动默认选中同业务已训练的生产模型（版本最高者）；
+// 若无匹配则保持空，等待手动选择。
+const pickScope = ref('')          // 已自动匹配过的 数据集:版本:业务 范围，避免重复请求
+const autoPickInfo = ref('')       // 自动匹配结果提示
+let autoPickTimer: any = null
+const numOfVersion = (ver: any) => {
+  const s = String(ver ?? '')
+  if (!s.startsWith('v')) return 0
+  const n = parseFloat(s.slice(1))
+  return isNaN(n) ? 0 : n
+}
+const autoPickBaseModel = async () => {
+  const datasetId = trainForm.value.dataset_id
+  const version = trainForm.value.version || 'v1'
+  if (!useFineTune.value || !datasetId) return
+  const biz = trainForm.value.business || (await (async () => {
+    try {
+      const res = await inferBusiness(datasetId, version)
+      return res?.business || ''
+    } catch (e: any) {
+      console.error('推断业务失败:', e)
+      return ''
+    }
+  })())
+  if (!biz) return
+  if (pickScope.value === `${datasetId}:${version}:${biz}`) return
+  pickScope.value = `${datasetId}:${version}:${biz}`
+  if (!models.value.length) {
+    try { await loadModels() } catch (e) { return }
+  }
+  const candidates = models.value.filter(
+    (m: any) => m.business === biz && m.status === 'production_ready'
+  ).sort((a: any, b: any) => numOfVersion(b.version) - numOfVersion(a.version))
+  if (candidates.length) {
+    trainForm.value.base_model_id = candidates[0].model_id
+    autoPickInfo.value = `✓ 已自动匹配同业务「${bizLabel(biz)}」的已训练模型 ${candidates[0].model_id}（可改选其它）`
+  } else {
+    autoPickInfo.value = `同业务「${bizLabel(biz)}」暂无已训练的生产模型，可手动选择任意模型`
+  }
+}
+watch(
+  [useFineTune, () => trainForm.value.dataset_id, () => trainForm.value.version],
+  () => {
+    clearTimeout(autoPickTimer)
+    autoPickTimer = setTimeout(autoPickBaseModel, 300)
+  }
+)
+
 const loadDatasets = async () => {
   loadingDatasets.value = true
   try {
@@ -652,11 +707,19 @@ const selectDataset = (ds: any) => {
   trainForm.value.dataset_id = ds.dataset_id
 }
 
-// 加载已上传的自定义模型
+// 加载已上传的自定义模型；若客户上传过模型（且尚未手动选择），默认优先使用它，
+// 未上传任何模型时才保持内置预训练模型（首次使用时镜像下载并缓存）
+let autoPickedCustom = false
 const loadCustomModels = async () => {
   try {
     const result = await listCustomModels()
     customModels.value = result.models || []
+    // 默认用客户上传的模型（仅页面进入第一次生效，后续尊重用户手动选择）
+    if (!autoPickedCustom && !useFineTune.value && customModels.value.length) {
+      autoPickedCustom = true
+      customSelectedPath.value = customModels.value[0].path
+      trainForm.value.model_name = customModels.value[0].path
+    }
     // 若当前选中了已存在的自定义模型，保持状态
     if (customSelectedPath.value && !customModels.value.some(cm => cm.path === customSelectedPath.value)) {
       customSelectedPath.value = ''
@@ -702,6 +765,8 @@ const onSelectCustomModel = () => {
 
 const router = useRouter()
 const training = ref(false)
+// 训练前准备权重（镜像下载缓存）的进行中标记，用于按钮提示
+const preparingWeight = ref(false)
 const currentJobId = ref<string | null>(null)
 const jobs = ref<any[]>([])
 let eventSource: EventSource | null = null
@@ -740,6 +805,19 @@ const startTraining = async () => {
   
   training.value = true
   try {
+    // 训练前先确保预训练权重已本地化（镜像下载缓存），避免启动阶段联网下载卡顿。
+    // 自定义导入/微调模型本就是本地路径，命中缓存秒返；下载失败不阻断（训练脚本内仍有镜像/官方兜底）。
+    if (!useFineTune.value && trainForm.value.model_name?.endsWith('.pt') &&
+        !trainForm.value.model_name.includes('/') && !trainForm.value.model_name.includes('\\')) {
+      preparingWeight.value = true
+      try {
+        await prepareWeights(trainForm.value.model_name)
+      } catch (e: any) {
+        console.warn('权重预下载失败，将由训练脚本兜底:', e?.message || e)
+      } finally {
+        preparingWeight.value = false
+      }
+    }
     const params: TrainJobRequest = {
       ...trainForm.value,
       base_model_id: useFineTune.value ? trainForm.value.base_model_id : undefined
@@ -1401,6 +1479,11 @@ onUnmounted(() => {
   gap: 0.35rem;
 }
 
+.auto-pick-info {
+  font-size: 0.8rem;
+  color: #27ae60;
+}
+
 .adv-grid .form-group {
   min-width: 0;
 }
@@ -1641,6 +1724,9 @@ onUnmounted(() => {
 }
 
 .custom-model-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
   font-size: 0.875rem;
   color: #7f8c8d;
 }

@@ -37,6 +37,11 @@ def build_tree(
             entries = sorted(current.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
         except OSError:
             return node
+        # 真实条目总数（跳过隐藏文件）：children 可能被 max_children 截断，
+        # 但 file_count 必须完整，避免前端"按目录数出的图片数"偏小
+        node["file_count"] = sum(
+            1 for e in entries if not (skip_hidden and e.name.startswith("."))
+        )
         count = 0
         for entry in entries:
             if skip_hidden and entry.name.startswith("."):

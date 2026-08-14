@@ -572,7 +572,9 @@ class SAMService:
         text_prompts = prompts if prompts else classes
         if not text_prompts:
             return []
-        caption = " . ".join(text_prompts)
+        # GD 的 post_process_grounded_object_detection 要求短语以 "." 分隔且以句点结尾，
+        # 否则结果解析为空（单类别时 join 无句点会返回 0 个目标）
+        caption = " . ".join(text_prompts) + " ."
         device = self._resolve_device(cfg)
         try:
             import torch
@@ -597,8 +599,12 @@ class SAMService:
                 target_sizes=[(image.height, image.width)],
             )[0]
         except Exception as e:
-            print(f"Warning: GroundingDINO detect failed: {e}")
-            return []
+            # 不静默吞掉：模型未下载/加载失败时若返回空数组，用户会误以为"类别设置错误/图里没目标"
+            raise RuntimeError(
+                f"GroundingDINO 检测器不可用：{e}\n"
+                "请先在右上角检测模型下拉切到 YOLO-World（如 yolov8s-world.pt，本地已就绪），"
+                "或确认已下载 IDEA-Research/grounding-dino-tiny 模型。"
+            ) from e
 
         out = []
         boxes = results.get("boxes")

@@ -17,9 +17,10 @@ class UpdateDatasetRequest(BaseModel):
 
 @router.post("/upload")
 async def upload_dataset(file: UploadFile = File(...)):
-    """上传数据集zip文件"""
-    if not file.filename.endswith('.zip'):
-        raise HTTPException(400, "Only zip files are allowed")
+    """上传数据集压缩包（zip / tar / tar.gz / tgz）"""
+    allowed = (".zip", ".tar", ".tar.gz", ".tgz")
+    if not (file.filename or "").lower().endswith(allowed):
+        raise HTTPException(400, "Only zip / tar / tar.gz / tgz files are allowed")
     
     result = await dataset_service.upload_dataset(file)
     return result

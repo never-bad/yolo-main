@@ -36,6 +36,15 @@ export const createTrainJob = async (params: TrainJobRequest) => {
 }
 
 /**
+ * 训练前确保预训练权重已本地化（镜像加速下载缓存），避免启动阶段联网下载卡顿。
+ * 已缓存时立即返回（status=ready），自定义/微调模型同样秒返。
+ */
+export const prepareWeights = async (model_name: string) => {
+  const { data } = await api.post('/train/prepare-weights', { model_name })
+  return data
+}
+
+/**
  * 获取当前服务器的 GPU 列表（训练节点），无 GPU 时 cuda_available=false
  */
 export const listGpus = async (): Promise<GpuListResult> => {

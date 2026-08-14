@@ -19,5 +19,7 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=True,
-        reload_dirs=["src"]  # 指定重载目录
+        # 只监听 src 源码目录（绝对路径），避免上传的数据集（可能含 .py 文件）
+        # 解压进 data/ 时触发热重载导致后端重启
+        reload_dirs=[str(backend_dir / "src")]
     )

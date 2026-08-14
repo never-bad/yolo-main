@@ -37,6 +37,15 @@ async def infer_business(dataset_id: str, version: str = "v1"):
     """根据数据集类别名自动推断业务/算法类型（选中数据集后系统自动分配，无需手动选择）"""
     return await train_service.infer_dataset_business(dataset_id, version)
 
+class PrepareWeightsRequest(BaseModel):
+    """训练前权重准备请求：仅需要模型名"""
+    model_name: str = "yolov8n.pt"
+
+@router.post("/prepare-weights")
+async def prepare_weights(request: PrepareWeightsRequest):
+    """训练前预下载/确认预训练权重已本地化（镜像加速），避免启动时联网下载卡顿"""
+    return await train_service.prepare_base_weights(request.model_name)
+
 @router.post("/jobs")
 async def create_train_job(request: TrainJobRequest):
     """创建训练任务（支持基于已有模型微调）"""

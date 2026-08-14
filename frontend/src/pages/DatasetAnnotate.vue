@@ -8,13 +8,12 @@
       <div class="form-group">
         <label>选择数据集</label>
         <div class="select-with-refresh">
-          <select v-model="newTask.datasetId" :disabled="loadingDatasets || creatingTask">
+          <select v-model="newTask.datasetId" :disabled="loadingDatasets || creatingTask" @change="syncClassesFromDataset(newTask.datasetId)">
             <option value="">-- 请选择数据集 --</option>
             <option 
-              v-for="ds in datasets" 
+              v-for="ds in preparedDatasets" 
               :key="ds.dataset_id" 
               :value="ds.dataset_id"
-              :disabled="!isDatasetPrepared(ds)"
             >
               {{ ds.dataset_id }} ({{ getDatasetStatus(ds) }}) 
               {{ ds.image_count ? `- ${ds.image_count}张图片` : '' }}
@@ -27,9 +26,9 @@
         </div>
         <div class="ds-grid">
           <div
-            v-for="ds in datasets"
+            v-for="ds in preparedDatasets"
             :key="ds.dataset_id"
-            :class="['ds-card', { selected: newTask.datasetId === ds.dataset_id, disabled: !isDatasetPrepared(ds) }]"
+            :class="['ds-card', { selected: newTask.datasetId === ds.dataset_id }]"
             @click="selectDataset(ds)"
           >
             <div class="ds-card-header">
@@ -43,16 +42,15 @@
                 {{ ds.classes.length }} 类: {{ ds.classes.slice(0, 3).join(', ') }}<template v-if="ds.classes.length > 3"> 等</template>
               </span>
             </div>
-            <div v-if="!isDatasetPrepared(ds)" class="ds-card-warn">需先"准备"</div>
           </div>
-          <div v-if="!loadingDatasets && datasets.length === 0" class="empty-state">暂无数据集，请先上传</div>
+          <div v-if="!loadingDatasets && preparedDatasets.length === 0" class="empty-state">暂无已准备的数据集，请先在数据集页执行"准备"</div>
         </div>
-        <small>提示：点击卡片选择数据集。状态为"已上传"需先在数据集页执行"准备"；已准备的可直接创建任务</small>
+        <small>提示：仅展示已准备（prepared）的数据集</small>
       </div>
       <div class="form-group">
         <label>类别（逗号分隔，可选）</label>
-        <input v-model="classesInput" type="text" placeholder="留空则自动读取 data.yaml / classes.txt / coco.names" :disabled="creatingTask" />
-        <small>提示：留空自动读取类别。支持 data.yaml（names 字段）、classes.txt、coco.names 等纯文本（按行读取）</small>
+        <input v-model="classesInput" type="text" placeholder="留空则自动读取类别文件；多个类别用逗号分隔（中英文逗号均可）" :disabled="creatingTask" />
+        <small>提示：切换数据集会自动填充其已有类别，可在此基础上追加/删改；留空则创建时自动从类别文件读取</small>
       </div>
       <button @click="createTask" :disabled="creatingTask || !newTask.datasetId">
         <span v-if="creatingTask" class="loading-spinner"></span>
@@ -313,18 +311,24 @@ const getDatasetStatus = (dataset: any) => {
   return dataset.status || '未知'
 }
 
-// 检查数据集是否已准备（允许 prepared 和 uploaded 状态）
-const isDatasetPrepared = (dataset: any) => {
-  return dataset.status === 'prepared' || dataset.status === 'uploaded'
+// 标注页只展示"已准备"的数据集（未准备无法创建标注任务）
+const preparedDatasets = computed(() => {
+  return (datasets.value || []).filter((d: any) => d.status === 'prepared')
+})
+
+// 切换数据集时自动刷新类别输入框：跟随所选数据集的类别；
+// 数据集无类别则清空，避免把上一个数据集的类别误带到新数据集
+const syncClassesFromDataset = (dsId: string) => {
+  const ds = datasets.value.find(d => d.dataset_id === dsId)
+  if (!ds) return
+  const dsClasses = Array.isArray(ds.classes) ? ds.classes : []
+  classesInput.value = dsClasses.join(', ')
 }
 
 // 卡片式选择数据集
 const selectDataset = (ds: any) => {
-  if (!isDatasetPrepared(ds)) {
-    alert('该数据集尚未准备，请先在"数据集"页面执行"准备"操作')
-    return
-  }
   newTask.value.datasetId = ds.dataset_id
+  syncClassesFromDataset(ds.dataset_id)
 }
 const classesInput = ref('')  // 默认为空，从数据集自动读取
 const classes = ref<string[]>([])
@@ -493,8 +497,13 @@ const createTask = async () => {
     return
   }
   
-  // 始终让后端读取所选数据集的类别文件（覆盖输入框已有内容），确保使用真实类别名
-  const inputClasses = undefined
+  // 类别优先级：数据集类别文件能读到则以后端读取为准（真实类别名）；
+  // 读不到（如尚未标注过的新数据集）时用输入框填写的类别兜底，避免标注任务无类别导致"请先设置类别"
+  const rawClasses = (classesInput.value || '').trim()
+  // 兼容中英文逗号分隔（", " / "， "混用均可）
+  const inputClasses = rawClasses
+    ? rawClasses.split(/[,，]/).map((s: string) => s.trim()).filter(Boolean)
+    : undefined
   
   creatingTask.value = true
   try {
@@ -618,6 +627,11 @@ const restoreAnnotateState = async () => {
 }
 
 const selectImage = async (index: number) => {
+  // 若有未保存改动，先立即保存再切换（避免切图丢弃 1.5s 防抖窗口内的修改）
+  if (dirty.value) {
+    clearTimeout(autoSaveTimer.value)
+    await persistAnnotation(true)
+  }
   currentIndex.value = index
   currentImage.value = items.value[index]
   currentBoxes.value = []
@@ -748,7 +762,7 @@ const fitView = () => {
   canvasRef.value.width = Math.max(w, 1)
   canvasRef.value.height = Math.max(h, 1)
   if (!img.value.width) return
-  const s = Math.min(w / img.value.width, h / img.value.height, 1)
+  const s = Math.min(w / img.value.width, h / img.value.height)
   viewScale.value = s
   viewOffset.value = {
     x: Math.max((w - img.value.width * s) / 2, 0),
@@ -1107,6 +1121,7 @@ const undo = () => {
   currentBoxes.value = undoStack.value.pop()!
   selectedBoxIndex.value = -1
   redrawCanvas()
+  markDirty()
 }
 
 const redo = () => {
@@ -1115,6 +1130,7 @@ const redo = () => {
   currentBoxes.value = redoStack.value.pop()!
   selectedBoxIndex.value = -1
   redrawCanvas()
+  markDirty()
 }
 
 // 修改标注框类别（支持撤销）
@@ -1674,6 +1690,11 @@ onUnmounted(() => {
   padding: 1rem;
 }
 
+/* grid 列允许收缩：防止大尺寸画布把中间列撑到原图宽度，顶开右侧面板 */
+.canvas-area, .annotations-panel {
+  min-width: 0;
+}
+
 .split-config {
   display: flex;
   align-items: center;
@@ -1884,7 +1905,9 @@ onUnmounted(() => {
   position: relative;
   border: 2px solid #ddd;
   overflow: hidden;
-  max-height: 600px;
+  /* 确定高度（而非依赖画布内容自撑）：大图不再把布局顶开，小图也有稳定的适配区域 */
+  height: min(600px, calc(100vh - 340px));
+  min-height: 240px;
   cursor: crosshair;
   /* 图片小于显示框时居中；图片过大溢出时 margin 自动归零，从左上滚动不受影响 */
   display: flex;
@@ -2019,6 +2042,11 @@ onUnmounted(() => {
 canvas {
   display: block;
   margin: auto;
+  /* 显示尺寸上限=容器，避免任何时刻画布缓冲过大把布局撑开 */
+  max-width: 100%;
+  max-height: 100%;
+  min-width: 0;
+  min-height: 0;
 }
 
 .controls {
