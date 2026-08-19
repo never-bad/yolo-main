@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import random
 import subprocess
 import signal
 import shutil
@@ -12,6 +14,11 @@ from src.core.settings import settings
 from src.utils.fs_tree import build_tree
 from src.yolo.gatekeeper import infer_business, _normalize_classes
 from src.yolo.train_script import ensure_local_base_weights
+from src.services.dataset_service import (
+    STAGE_TRAINING, STAGE_COMPLETED, STAGE_FAILED,
+    TRAIN_STATUS_INCOMPLETE, TRAIN_STATUS_COMPLETED,
+    TRAINABLE_STAGES, _ensure_stage_fields,
+)
 
 
 def _load_json(path: Path):
@@ -59,6 +66,32 @@ def _delete_directory(path: Path):
     """同步删除目录"""
     if path.exists():
         shutil.rmtree(path)
+
+
+def _norm_class_name(name) -> str:
+    """类别名归一化（小写 + 去空白），用于与模型标签字典 english_code 匹配"""
+    return re.sub(r"\s+", "", str(name or "")).strip().lower()
+
+
+def _names_list(names) -> list:
+    """将 data.yaml 的 names（list / dict）归一化为按类 ID 排序的类别名列表"""
+    if isinstance(names, dict):
+        return [str(names[k]) for k in sorted(names)]
+    if isinstance(names, list):
+        return [str(n) for n in names]
+    return []
+
+
+def _link_or_copy(src: Path, dst: Path):
+    """优先硬链接（零拷贝），失败（跨卷/无权限）回退普通复制"""
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+class LabelFilterError(ValueError):
+    """阶段0.3 标签过滤失败（如数据集与微调模型类别零交集）→ 应中断创建任务而非回退原数据"""
 
 
 class _RecoveredProcess:
@@ -351,33 +384,620 @@ class TrainService:
                 best_score, best_path, best_id = score, str(w), meta.get("model_id")
         return best_path, best_id
 
+    def _apply_label_filter(self, job_id: str, data_yaml: Path, base_model_id: str,
+                            out_subdir: str = "filtered_data"):
+        """阶段0.3：按基础模型的标签字典过滤数据集类别并生成训练副本（同步，线程内调用）。
+
+        微调时仅训练模型标签字典（labels_dict.json）定义的类别：
+          - 数据集里模型字典之外的类别 → 剔除对应标注；
+          - 类别顺序与模型字典不一致 → 按模型字典顺序重映射 class id。
+        图片经硬链接复用（零拷贝），labels 现场过滤重映射，不污染原始标注。
+
+        返回 (实际使用的 data.yaml 路径, 过滤信息 dict)；无需过滤时直接返回原 yaml。
+        """
+        model_dir = self.registry_dir / base_model_id
+        dict_file = model_dir / "labels_dict.json"
+        if not dict_file.exists():
+            return data_yaml, None
+
+        try:
+            dic = _load_json(dict_file)
+        except Exception:
+            return data_yaml, None
+
+        model_labels = sorted(dic.get("labels") or [], key=lambda x: int(x.get("index", 0)))
+        code_to_original = {}
+        for l in model_labels:
+            ec = (l.get("english_code") or "").strip()
+            if ec:
+                code_to_original[_norm_class_name(ec)] = ec
+        model_codes = list(code_to_original.keys())
+        if not model_codes:
+            return data_yaml, None
+
+        data_cfg = self._load_yaml(data_yaml)
+        names = _names_list(data_cfg.get("names", []))
+        if not names:
+            return data_yaml, None
+
+        # 计算 old_id -> new_id（new_id 按模型字典顺序；模型字典外的类别被剔除）
+        kept_codes = []       # 保留类别（归一化 key，按模型字典顺序）
+        dropped = []          # 数据集有、模型字典没有 → 剔除
+        mapping = {}          # old_id -> new_id
+        kept_index = {}
+        for i, n in enumerate(names):
+            key = _norm_class_name(n)
+            if key in model_codes:
+                if key not in kept_index:
+                    kept_index[key] = len(kept_codes)
+                    kept_codes.append(key)
+                mapping[str(i)] = str(kept_index[key])
+            else:
+                dropped.append(n)
+
+        identity = all(int(k) == int(v) for k, v in mapping.items())
+        new_names = [code_to_original[k] for k in kept_codes]  # 新类别名（英文原文）
+        info = {
+            "filtered": bool(dropped) or not identity,
+            "model_id": base_model_id,
+            "model_code": dic.get("model_code"),
+            "dataset_classes": names,
+            "kept": new_names,
+            "dropped": dropped,
+            "mapping": mapping,
+        }
+        if not info["filtered"]:
+            # 数据集类别与模型字典一致（或为其同序子集）→ 直接用原 data.yaml
+            return data_yaml, info
+        if not kept_codes:
+            # 数据集与模型标签字典零交集 → 训练毫无意义，阻止创建任务
+            raise LabelFilterError(
+                f"数据集类别与微调模型标签字典无交集（数据集: {names}，模型 labels_dict: {new_names or '空'}），"
+                f"无法按模型类别训练。请选择类别匹配的数据集或更换微调模型。"
+            )
+
+        # ------- 生成过滤副本：图片硬链接 + labels 重映射 -------
+        version_dir = data_yaml.parent
+        img_src = version_dir / "images"
+        lbl_src = version_dir / "labels"
+        filtered_dir = self.jobs_dir / job_id / out_subdir
+        if filtered_dir.exists():
+            _delete_directory(filtered_dir)
+        filtered_dir.mkdir(parents=True, exist_ok=True)
+
+        if img_src.exists():
+            shutil.copytree(img_src, filtered_dir / "images", copy_function=_link_or_copy)
+
+        if lbl_src.exists():
+            filter_log = {
+                "mapping": mapping,
+                "dropped": dropped,
+                "converted_txt": 0,
+                "dropped_rows": 0,
+            }
+            lbl_dst = filtered_dir / "labels"
+            for txt in lbl_src.rglob("*.txt"):
+                rel = txt.relative_to(lbl_src)
+                dst = lbl_dst / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                new_lines = []
+                with open(txt, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        parts = line.split()
+                        if not parts:
+                            continue
+                        if len(parts) < 5:
+                            continue  # 非法行直接丢弃
+                        new_id = mapping.get(parts[0])
+                        if new_id is None:
+                            filter_log["dropped_rows"] += 1
+                            continue  # 模型字典外类别 → 丢弃该标注
+                        parts[0] = new_id
+                        new_lines.append(" ".join(parts[:5]) + "\n")
+                with open(dst, "w", encoding="utf-8") as f:
+                    f.writelines(new_lines)
+                filter_log["converted_txt"] += 1
+            _save_json(filtered_dir / "filter.json", filter_log)
+
+        new_yaml = {
+            "path": str(filtered_dir.absolute()),
+            "train": data_cfg.get("train", "images/train"),
+            "val": data_cfg.get("val", "images"),
+            "nc": len(new_names),
+            "names": new_names,
+        }
+        if data_cfg.get("test"):
+            new_yaml["test"] = data_cfg["test"]
+        with open(filtered_dir / "data.yaml", "w", encoding="utf-8") as f:
+            yaml.safe_dump(new_yaml, f, allow_unicode=True, sort_keys=False)
+
+        print(f"[create_job] 标签过滤: 保留 {len(new_names)} 类（{new_names}），"
+              f"剔除 {len(dropped)} 类（{dropped}），过滤副本: {filtered_dir}")
+        return filtered_dir / "data.yaml", info
+
+    def _aggregate_job_data(self, job_id: str, specs: list, base_model_id: str):
+        """阶段1.3：多数据集聚合（雪球合训）。
+
+        specs: [(dataset_id, version, data_yaml_path), ...]
+        统一类别命名空间（可选按模型标签字典过滤）→ 逐数据集硬链接图片 + 重映射 labels
+        → 生成聚合 data.yaml（train/val 支持列表）。返回 (data.yaml 路径, 聚合信息 dict)。
+
+        - 类别空间统一规则：
+            base_model_id 存在 → 仅保留模型标签字典类别（顺序 = 模型字典顺序，字典外剔除）；
+            base_model_id 为空 → 各数据集类别并集（先见顺序）。
+        - 每数据集独立子目录 images/{i}、labels/{i}，避免不同数据集文件名/划分结构冲突。
+        """
+        # ---------- 1. 统一类别命名空间 ----------
+        model_codes = []
+        if base_model_id:
+            dict_file = self.registry_dir / base_model_id / "labels_dict.json"
+            if dict_file.exists():
+                try:
+                    _dic = _load_json(dict_file)
+                    _labels = sorted(_dic.get("labels") or [], key=lambda x: int(x.get("index", 0)))
+                    model_codes = [(l.get("english_code") or "").strip() for l in _labels]
+                except Exception:
+                    model_codes = []
+
+        model_key_set = {_norm_class_name(c) for c in model_codes if c}
+        unified_index = {}   # 归一化 key -> global class id
+        unified_names = []   # 展示名（模型字典原文优先）
+        for _ds_id, _ver, _yaml_p in specs:
+            try:
+                _cfg = self._load_yaml(_yaml_p)
+            except Exception as e:
+                raise ValueError(f"数据集 {_ds_id}/{_ver} 的 data.yaml 解析失败: {e}")
+            for n in _names_list(_cfg.get("names", [])):
+                key = _norm_class_name(n)
+                if model_key_set and key not in model_key_set:
+                    continue
+                if key not in unified_index:
+                    unified_index[key] = len(unified_names)
+                    if model_key_set:
+                        display = next((c for c in model_codes if _norm_class_name(c) == key), n)
+                    else:
+                        display = n
+                    unified_names.append(display)
+        if not unified_names:
+            raise LabelFilterError(
+                "聚合数据集类别与微调模型标签字典无交集（或全部为空），无法按模型类别训练。"
+                "请选择类别匹配的数据集或更换微调模型。"
+            )
+
+        # ---------- 2. 逐数据集生成聚合副本 ----------
+        agg_dir = self.jobs_dir / job_id / "aggregated"
+        if agg_dir.exists():
+            _delete_directory(agg_dir)
+        agg_dir.mkdir(parents=True, exist_ok=True)
+        img_agg = agg_dir / "images"
+        lbl_agg = agg_dir / "labels"
+        img_agg.mkdir()
+        lbl_agg.mkdir()
+
+        per_ds = []
+        total_images = 0
+        for i, (ds_id, ver, yaml_p) in enumerate(specs):
+            cfg = self._load_yaml(yaml_p)
+            src_names = _names_list(cfg.get("names", []))
+            mapping = {}
+            dropped = []
+            for old, n in enumerate(src_names):
+                key = _norm_class_name(n)
+                if key in unified_index:
+                    mapping[str(old)] = str(unified_index[key])
+                else:
+                    dropped.append(n)
+
+            version_dir = yaml_p.parent
+            img_src = version_dir / "images"
+            lbl_src = version_dir / "labels"
+            sub_img = img_agg / str(i)
+            if img_src.exists():
+                shutil.copytree(img_src, sub_img, copy_function=_link_or_copy)
+                count_img = self._count_images(sub_img)
+                total_images += count_img
+            else:
+                count_img = 0
+
+            ds_log = {
+                "dataset_id": ds_id,
+                "version": ver,
+                "images": count_img,
+                "dropped_classes": dropped,
+                "class_mapping": mapping,
+            }
+            if lbl_src.exists():
+                sub_lbl = lbl_agg / str(i)
+                converted = 0
+                dropped_rows = 0
+                for txt in lbl_src.rglob("*.txt"):
+                    rel = txt.relative_to(lbl_src)
+                    dst = sub_lbl / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    new_lines = []
+                    with open(txt, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            parts = line.split()
+                            if len(parts) < 5:
+                                continue
+                            new_id = mapping.get(parts[0])
+                            if new_id is None:
+                                dropped_rows += 1
+                                continue
+                            parts[0] = new_id
+                            new_lines.append(" ".join(parts[:5]) + "\n")
+                    with open(dst, "w", encoding="utf-8") as f:
+                        f.writelines(new_lines)
+                    converted += 1
+                ds_log["converted_txt"] = converted
+                ds_log["dropped_rows"] = dropped_rows
+            per_ds.append(ds_log)
+
+        # ---------- 3. 生成聚合 data.yaml（train/val 为路径列表） ----------
+        train_paths, val_paths = [], []
+        for i in range(len(specs)):
+            imgs_i = img_agg / str(i)
+            if not imgs_i.exists():
+                continue
+            if (imgs_i / "train").is_dir():
+                train_paths.append(f"images/{i}/train")
+                if (imgs_i / "val").is_dir():
+                    val_paths.append(f"images/{i}/val")
+            else:
+                train_paths.append(f"images/{i}")
+        if not val_paths:
+            val_paths = train_paths[:1]
+
+        new_yaml = {
+            "path": str(agg_dir.absolute()),
+            "train": train_paths,
+            "val": val_paths,
+            "nc": len(unified_names),
+            "names": unified_names,
+        }
+        with open(agg_dir / "data.yaml", "w", encoding="utf-8") as f:
+            yaml.safe_dump(new_yaml, f, allow_unicode=True, sort_keys=False)
+
+        agg_info = {
+            "aggregated": True,
+            "dataset_count": len(specs),
+            "unified_names": unified_names,
+            "datasets": per_ds,
+            "total_images": total_images,
+            "yaml": str(agg_dir / "data.yaml"),
+        }
+        _save_json(agg_dir / "aggregation.json", agg_info)
+        print(f"[create_job] 聚合完成: {len(specs)} 个数据集 → {len(unified_names)} 类"
+              f"（{unified_names}），共 {total_images} 张图: {agg_dir}")
+        return agg_dir / "data.yaml", agg_info
+
+    def _find_trainable_incomplete(self, exclude_ids: set, business: str) -> list:
+        """阶段1.4：扫描未完成训练数据集（stage∈{sealed,failed} 且 training_status=incomplete，
+        同业务）→ 自动带进下一轮聚合训练（雪球）。返回 [(dataset_id, version), ...]"""
+        candidates = []
+        if not self.datasets_dir.exists():
+            return candidates
+        for d in self.datasets_dir.iterdir():
+            if not d.is_dir() or d.name in exclude_ids:
+                continue
+            meta_p = d / "meta.json"
+            if not meta_p.exists():
+                continue
+            try:
+                meta = _load_json(meta_p)
+                _ensure_stage_fields(meta)
+            except Exception:
+                continue
+            if meta.get("training_status") == TRAIN_STATUS_COMPLETED:
+                continue
+            if meta.get("stage") not in TRAINABLE_STAGES:
+                continue
+            ver = meta.get("version", "v1")
+            yaml_p = d / ver / "data.yaml"
+            if not yaml_p.exists():
+                continue
+            try:
+                cfg = self._load_yaml(yaml_p)
+                b = infer_business(cfg.get("names", []))
+            except Exception:
+                b = None
+            if b != business:
+                continue
+            candidates.append((d.name, ver))
+        return candidates
+
+    # ------------------------------------------------------------------
+    # 阶段1.5（回忆集混训）/ 阶段1.6（样本池抽样并入）
+    # ------------------------------------------------------------------
+    def _find_recall_dirs(self, business: str, exclude_ids: set, max_datasets: int = 3) -> list:
+        """阶段1.5：扫描同业务已完成训练的数据集（stage=completed 且 training_status=completed），
+        供增量训练混入少量旧数据（防灾难性遗忘）。返回 [{dir, yaml, names, dataset_id}, ...]"""
+        recalls = []
+        if not self.datasets_dir.exists():
+            return recalls
+        for d in self.datasets_dir.iterdir():
+            if not d.is_dir() or d.name in exclude_ids:
+                continue
+            meta_p = d / "meta.json"
+            if not meta_p.exists():
+                continue
+            try:
+                meta = _load_json(meta_p)
+                _ensure_stage_fields(meta)
+            except Exception:
+                continue
+            if meta.get("stage") != STAGE_COMPLETED:
+                continue
+            if meta.get("training_status") != TRAIN_STATUS_COMPLETED:
+                continue
+            ver = meta.get("version", "v1")
+            yaml_p = d / ver / "data.yaml"
+            if not yaml_p.exists():
+                continue
+            try:
+                cfg = self._load_yaml(yaml_p)
+                names = _names_list(cfg.get("names", []))
+                if infer_business(names) != business:
+                    continue
+            except Exception:
+                continue
+            recalls.append({"dataset_id": d.name, "version": ver, "yaml": yaml_p, "names": names})
+            if len(recalls) >= max_datasets:
+                break
+        return recalls
+
+    @staticmethod
+    def _pool_image_files(root: Path) -> list:
+        """样本池图片文件列表（jpg/jpeg/png/bmp/webp）"""
+        if not root or not root.exists():
+            return []
+        exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        return [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts]
+
+    def _merge_training_extras(self, job_id: str, data_yaml: str, base_model_id: str,
+                               business: str, exclude_ids: set, recall_enabled: bool,
+                               hard_ratio: float, bg_ratio: float):
+        """阶段1.5/1.6：训练前把增强样本混入训练集（仅混入 train，不碰 val/test）。
+
+        来源（互不影响，全部可选）：
+        1) 回忆集（1.5）：增量训练（有 base_model_id）时，从同业务已完成训练的数据集
+           随机抽取少量图片+标注（类别按名字重映射）；
+        2) 困难样本库（1.6）：base_model_id 对应的 hard/{model_id}，按 hard_ratio 抽样，
+           标注类别按名字重映射到本次训练的类别空间；
+        3) 空白样本库（1.6）：全局 background 按 bg_ratio 抽样（配空标注 = 负样本）。
+
+        增强样本统一放入 jobs/{job_id}/sample_pool_train/{images,labels}，并生成一份
+        独立 data.yaml（train/val 转绝对路径列表）—— 不污染原数据集，resume 可复用。
+        返回 (data.yaml 路径, 混合信息 dict | None)。
+        """
+        yaml_p = Path(data_yaml)
+        if not yaml_p.exists():
+            return yaml_p, None
+        try:
+            cfg = self._load_yaml(yaml_p)
+        except Exception:
+            return yaml_p, None
+        names = _names_list(cfg.get("names", []))
+        if not names:
+            return yaml_p, None
+        target_index = {_norm_class_name(n): i for i, n in enumerate(names)}
+
+        rng = random.Random(abs(hash(job_id)))
+        sp_dir = self.jobs_dir / job_id / "sample_pool_train"
+        t_img = sp_dir / "images"
+        t_lbl = sp_dir / "labels"
+        t_img.mkdir(parents=True, exist_ok=True)
+        t_lbl.mkdir(parents=True, exist_ok=True)
+
+        merged = {"hard": 0, "background": 0, "recall": 0}
+        used_stems = set()
+
+        def _emit(kind: str, img_src: Path, label_lines: list):
+            """复制图片 + 写标注到增强目录（前缀防重名）"""
+            name = f"{kind}_{img_src.name}"
+            stem = Path(name).stem
+            if stem in used_stems:
+                return
+            used_stems.add(stem)
+            shutil.copy2(img_src, t_img / name)
+            if label_lines:
+                (t_lbl / f"{stem}.txt").write_text("\n".join(label_lines) + "\n", encoding="utf-8")
+            else:
+                (t_lbl / f"{stem}.txt").touch()
+            return stem
+
+        # ---------- 1. 回忆集混训（1.5，仅增量训练） ----------
+        if base_model_id and recall_enabled:
+            try:
+                recalls = self._find_recall_dirs(business, exclude_ids)
+            except Exception as e:
+                print(f"[merge_training_extras] 扫描回忆集失败（跳过）: {e}")
+                recalls = []
+            for rc in recalls:
+                r_cfg = self._load_yaml(rc["yaml"])
+                rc_names = _names_list(r_cfg.get("names", []))
+                rc_imgs = self._pool_image_files(rc["yaml"].parent / "images")
+                rng.shuffle(rc_imgs)
+                # 每个旧数据集最多抽 20 张，总量 ≤ 100，防止喧宾夺主
+                for im in rc_imgs[: min(20, len(rc_imgs))]:
+                    if merged["recall"] >= 100:
+                        break
+                    txt = rc["yaml"].parent / "labels" / f"{im.stem}.txt"
+                    lines = []
+                    if txt.exists():
+                        for line in txt.read_text(encoding="utf-8", errors="ignore").splitlines():
+                            parts = line.split()
+                            if len(parts) < 5:
+                                continue
+                            try:
+                                old_id = int(parts[0])
+                            except ValueError:
+                                continue
+                            src_name = rc_names[old_id] if 0 <= old_id < len(rc_names) else None
+                            new_id = target_index.get(_norm_class_name(src_name)) if src_name else None
+                            if new_id is None:
+                                continue
+                            parts[0] = str(new_id)
+                            lines.append(" ".join(parts[:5]))
+                    if _emit("recall", im, lines):
+                        merged["recall"] += 1
+
+        # ---------- 2. 困难样本库（1.6，按模型） ----------
+        if base_model_id and hard_ratio and hard_ratio > 0:
+            hard_dir = settings.HARD_POOL_DIR / base_model_id
+            if hard_dir.exists():
+                try:
+                    pool_meta = _load_json(hard_dir / "meta.json")
+                except Exception:
+                    pool_meta = {}
+                pool_names = pool_meta.get("names") or []
+                pool_index = {_norm_class_name(n): i for i, n in enumerate(pool_names)}
+                pool_imgs = self._pool_image_files(hard_dir / "images")
+                rng.shuffle(pool_imgs)
+                limit = max(1, int(len(pool_imgs) * float(hard_ratio)))
+                for im in pool_imgs[:limit]:
+                    txt = hard_dir / "labels" / f"{im.stem}.txt"
+                    lines = []
+                    if txt.exists():
+                        for line in txt.read_text(encoding="utf-8", errors="ignore").splitlines():
+                            parts = line.split()
+                            if len(parts) < 5:
+                                continue
+                            try:
+                                old_id = int(parts[0])
+                            except ValueError:
+                                continue
+                            src_name = pool_names[old_id] if 0 <= old_id < len(pool_names) else None
+                            new_id = target_index.get(_norm_class_name(src_name)) if src_name else None
+                            if new_id is None:
+                                continue
+                            parts[0] = str(new_id)
+                            lines.append(" ".join(parts[:5]))
+                    if _emit("hard", im, lines):
+                        merged["hard"] += 1
+
+        # ---------- 3. 空白负样本库（1.6，全局共享） ----------
+        if bg_ratio and bg_ratio > 0:
+            bg_imgs = self._pool_image_files(settings.BACKGROUND_POOL_DIR / "images")
+            rng.shuffle(bg_imgs)
+            limit = max(1, int(len(bg_imgs) * float(bg_ratio)))
+            for im in bg_imgs[:limit]:
+                if _emit("bg", im, []):   # 空标注 = 背景负样本
+                    merged["background"] += 1
+
+        if not any(merged.values()):
+            shutil.rmtree(sp_dir, ignore_errors=True)
+            return yaml_p, None
+
+        # ---------- 4. 生成独立 data.yaml（train/val 绝对路径列表） ----------
+        def _resolve_entries(entries) -> list:
+            root = Path(cfg.get("path") or yaml_p.parent)
+            if isinstance(entries, str):
+                entries = [entries]
+            resolved = []
+            for e in entries or []:
+                e = str(e)
+                p = Path(e)
+                resolved.append(str(p if p.is_absolute() else root / e))
+            return resolved
+
+        train_abs = _resolve_entries(cfg.get("train")) or ["images/train"]
+        val_abs = _resolve_entries(cfg.get("val")) or train_abs[:1]
+        new_cfg = {
+            "path": str(sp_dir.absolute()),
+            "train": train_abs + ["images"],
+            "val": val_abs,
+            "nc": len(names),
+            "names": names,
+        }
+        if cfg.get("test"):
+            new_cfg["test"] = _resolve_entries(cfg.get("test"))
+        with open(sp_dir / "data.yaml", "w", encoding="utf-8") as f:
+            yaml.safe_dump(new_cfg, f, allow_unicode=True, sort_keys=False)
+
+        info = merged | {
+            "enabled": True,
+            "dir": str(sp_dir),
+            "yaml": str(sp_dir / "data.yaml"),
+        }
+        _save_json(sp_dir / "extra.json", info)
+        print(f"[merge_training_extras] 训练增强混入: 回忆集 {merged['recall']} 张，"
+              f"困难样本 {merged['hard']} 张，空白负样本 {merged['background']} 张 → {sp_dir}")
+        return sp_dir / "data.yaml", info
+
     async def create_job(self, dataset_id: str, version: str, model_name: str, 
                          epochs: int, imgsz: int, batch: int, base_model_id: str = None,
                          lr0: float = None, optimizer: str = None,
                          weight_decay: float = None, patience: int = None,
-                         gpu_index: int = None, business: str = None):
+                         gpu_index: int = None, business: str = None,
+                         dataset_ids: list = None, aggregate_incomplete: bool = False,
+                         hard_sample_ratio: float = 0.1, background_sample_ratio: float = 0.05,
+                         recall_enabled: bool = True):
         """创建训练任务（支持高级训练参数与训练节点选择、业务/算法类型隔离）
 
-        business 为空时按数据集类别名自动推断业务/算法类型，无需用户手动选择。
+        阶段1.3（训练任务聚合）：支持多数据集聚合训练。
+          - dataset_ids: 可选，待聚合训练的数据集列表（缺省=仅 dataset_id 单个）；
+            聚合时统一类别命名空间（微调按模型标签字典过滤），训练副本落 jobs/{job_id}/aggregated。
+          - aggregate_incomplete: 阶段1.4（雪球）— 自动扫描同业务未完成训练数据集
+            （stage∈{sealed,failed} 且 training_status=incomplete）一并聚合进本轮训练。
+          - 训练开始前，所有参与数据集置 stage=training，结果由 train_script 回写
+            （合格→completed/已完成训练；不合格→failed/保持未完成，参与下一轮雪球）。
         """
         job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
-        # 检查数据集
-        dataset_dir = self.datasets_dir / dataset_id / version
-        data_yaml = dataset_dir / "data.yaml"
-        
-        if not await asyncio.to_thread(lambda: data_yaml.exists()):
-            raise ValueError(f"Dataset {dataset_id}/{version} not prepared")
-        
-        # 业务/算法类型：未指定时根据数据集类别名（data.yaml names）自动推断
+
+        # ---------- 解析待训练数据集列表（1.3 聚合） ----------
+        specs = []  # [(dataset_id, version, data_yaml_path), ...]
+        seen_ids = set()
+
+        def _push_spec(ds_id: str, ds_version: str = None):
+            if ds_id in seen_ids:
+                return
+            use_ver = ds_version or version
+            d_dir = self.datasets_dir / ds_id / use_ver
+            d_yaml = d_dir / "data.yaml"
+            if not d_yaml.exists():
+                raise ValueError(f"Dataset {ds_id}/{use_ver} not prepared")
+            seen_ids.add(ds_id)
+            specs.append((ds_id, use_ver, d_yaml))
+
+        _push_spec(dataset_id)
+        if dataset_ids:
+            for ds_id in dataset_ids:
+                _push_spec(ds_id)
+
+        # 阶段1.4（雪球）：自动带入同业务未完成训练数据集
+        if aggregate_incomplete and len(specs) == 1:
+            primary_yaml = specs[0][2]
+            try:
+                primary_cfg = await asyncio.to_thread(self._load_yaml, primary_yaml)
+                primary_business = business or infer_business(primary_cfg.get("names", []))
+            except Exception:
+                primary_business = None
+            if primary_business:
+                try:
+                    extra = await asyncio.to_thread(
+                        self._find_trainable_incomplete, seen_ids, primary_business
+                    )
+                except Exception as e:
+                    print(f"[create_job] 扫描未完成数据集失败（跳过自动聚合）: {e}")
+                    extra = []
+                for extra_ds_id, extra_ver in extra:
+                    _push_spec(extra_ds_id, extra_ver)
+                if extra:
+                    print(f"[create_job] 1.4 雪球: 自动带入 {len(extra)} 个未完成数据集: {extra}")
+
+        primary_id = specs[0][0]
+        primary_yaml = specs[0][2]
+
+        # 业务/算法类型：未指定时根据主数据集类别名（data.yaml names）自动推断
         if not business:
             try:
-                data_cfg = await asyncio.to_thread(self._load_yaml, data_yaml)
+                data_cfg = await asyncio.to_thread(self._load_yaml, primary_yaml)
                 business = infer_business(data_cfg.get("names", []))
-                print(f"[create_job] 自动识别业务/算法类型: {business}（数据集 {dataset_id}/{version}）")
+                print(f"[create_job] 自动识别业务/算法类型: {business}（主数据集 {primary_id}/{version}）")
             except Exception:
                 business = "general"
-        
+
         # 处理模型路径：如果提供了 base_model_id，使用已有模型的权重
         actual_model_path = model_name
         if base_model_id:
@@ -428,11 +1048,61 @@ class TrainService:
         # 训练结束后 train_script 内评测新模型 vs 该基准；无生产模型（首版）由 gatekeeper 直晋
         baseline_path, baseline_model_id = self._pick_baseline(business)
 
+        # ---------- 训练数据准备（单数据集 / 多数据集聚合） ----------
+        actual_data_yaml = primary_yaml
+        label_filter = None
+        aggregation = None
+
+        if len(specs) == 1:
+            # 单数据集：阶段0.3 微调时按基础模型标签字典过滤
+            if base_model_id:
+                try:
+                    actual_data_yaml, label_filter = await asyncio.to_thread(
+                        self._apply_label_filter, job_id, primary_yaml, base_model_id
+                    )
+                except LabelFilterError as e:
+                    raise ValueError(str(e)) from e
+                except Exception as e:
+                    print(f"[create_job] 标签过滤执行异常，按原数据集训练: {e}")
+                    actual_data_yaml = primary_yaml
+        else:
+            # 多数据集：阶段1.3 统一类别空间聚合（微调时仅保留模型字典类别）
+            try:
+                actual_data_yaml, aggregation = await asyncio.to_thread(
+                    self._aggregate_job_data, job_id, specs, base_model_id
+                )
+            except LabelFilterError as e:
+                raise ValueError(str(e)) from e
+            except Exception as e:
+                print(f"[create_job] 数据聚合执行异常，按主数据集训练: {e}")
+                actual_data_yaml = primary_yaml
+
+        # 阶段1.5/1.6：训练前混入增强样本（回忆集防遗忘 + 困难样本库 + 空白负样本库）
+        # 只混入 train 划分，不改 val/test，保证守门员对比口径与前代一致
+        sample_pool_info = None
+        try:
+            actual_data_yaml, sample_pool_info = await asyncio.to_thread(
+                self._merge_training_extras, job_id, actual_data_yaml, base_model_id,
+                business, seen_ids, recall_enabled,
+                hard_sample_ratio, background_sample_ratio
+            )
+        except Exception as e:
+            print(f"[create_job] 样本池/回忆集混入执行异常（忽略，按原数据训练）: {e}")
+
         # 创建job元数据
         job_meta = {
             "job_id": job_id,
-            "dataset_id": dataset_id,
+            "dataset_id": primary_id,             # 兼容旧字段：主数据集
+            "dataset_ids": [s[0] for s in specs],  # 1.3 参与训练的完整数据集列表
+            "datasets": [
+                {"dataset_id": s[0], "version": s[1]} for s in specs
+            ],
+            "aggregated": len(specs) > 1,          # 1.3 是否聚合训练
             "version": version,
+            "data_yaml": str(actual_data_yaml),  # 实际用于训练的 data.yaml（可能是过滤/聚合副本）
+            "label_filter": label_filter,          # 阶段0.3 标签过滤信息（无需过滤为 None）
+            "aggregation": aggregation,            # 阶段1.3 聚合信息（非聚合为 None）
+            "sample_pool": sample_pool_info,       # 阶段1.5/1.6 采样并入信息（未混入为 None）
             "model_name": model_name,
             "base_model_id": base_model_id,
             "original_model_path": actual_model_path,  # 保存原始模型路径，用于恢复
@@ -453,15 +1123,59 @@ class TrainService:
         
         job_file = self.jobs_dir / f"{job_id}.json"
         await asyncio.to_thread(_save_json, job_file, job_meta)
+
+        # 启动训练进程（在线程中执行）。先启动成功再标记数据集状态，
+        # 启动失败（如 Popen 异常）则清理任务文件并回滚，避免留下"训练中"残留
+        try:
+            await asyncio.to_thread(
+                self._start_training, job_id, actual_data_yaml, actual_model_path, epochs, imgsz, batch, False,
+                lr0, optimizer, weight_decay, patience, gpu_index,
+                business, baseline_path, baseline_model_id
+            )
+        except Exception as e:
+            try:
+                _delete_file(job_file)
+            except Exception:
+                pass
+            try:
+                _delete_directory(self.jobs_dir / job_id)
+            except Exception:
+                pass
+            raise RuntimeError(f"训练进程启动失败，任务已回滚: {e}") from e
+
+        # 1.3：所有参与数据集置「训练中」（训练结果由 train_script 回写）
+        await asyncio.to_thread(self._mark_datasets_training, specs)
         
-        # 启动训练进程（在线程中执行）
-        await asyncio.to_thread(
-            self._start_training, job_id, data_yaml, actual_model_path, epochs, imgsz, batch, False,
-            lr0, optimizer, weight_decay, patience, gpu_index,
-            business, baseline_path, baseline_model_id
-        )
-        
-        return {"job_id": job_id, "status": "running"}
+        resp = {"job_id": job_id, "status": "running",
+                "dataset_ids": [s[0] for s in specs], "aggregated": len(specs) > 1}
+        if aggregation:
+            resp["aggregation"] = {
+                "dataset_count": aggregation.get("dataset_count"),
+                "unified_names": aggregation.get("unified_names", []),
+                "total_images": aggregation.get("total_images"),
+            }
+        elif label_filter and label_filter.get("filtered"):
+            resp["label_filter"] = {
+                "model_code": label_filter.get("model_code"),
+                "kept": label_filter.get("kept", []),
+                "dropped": label_filter.get("dropped", []),
+            }
+        return resp
+
+    def _mark_datasets_training(self, specs: list):
+        """1.3：训练开始前，将参与数据集置 stage=training（结果由 train_script 回写）"""
+        for ds_id, version, _yaml_p in specs:
+            meta_path = self.datasets_dir / ds_id / "meta.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = _load_json(meta_path)
+                _ensure_stage_fields(meta)
+                meta["stage"] = STAGE_TRAINING
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(meta, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                print(f"[create_job] 数据集 {ds_id} 置训练中失败（忽略）: {e}")
     
     def _active_training_count(self) -> int:
         """当前活跃训练进程数（先清理已结束的进程，避免残留计数）"""
@@ -499,6 +1213,7 @@ class TrainService:
             "--job_id", job_id,
             "--job_file", str(job_file),
             "--registry_dir", str(self.registry_dir),
+            "--datasets_dir", str(self.datasets_dir),
             "--business", business
         ]
         
@@ -827,10 +1542,10 @@ class TrainService:
                         f"Cannot resume training. Please start a new training job."
                     )
         
-        # 检查数据集
-        dataset_dir = self.datasets_dir / job_meta["dataset_id"] / job_meta["version"]
-        data_yaml = dataset_dir / "data.yaml"
-        
+        # 检查数据集（恢复优先使用训练时保存的 data.yaml，可能是标签过滤副本）
+        saved_yaml = job_meta.get("data_yaml")
+        data_yaml = Path(saved_yaml) if saved_yaml else (self.datasets_dir / job_meta["dataset_id"] / job_meta["version"] / "data.yaml")
+
         if not await asyncio.to_thread(lambda: data_yaml.exists()):
             raise ValueError(f"Dataset {job_meta['dataset_id']}/{job_meta['version']} not found")
         

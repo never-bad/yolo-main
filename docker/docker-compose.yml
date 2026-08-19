@@ -1,9 +1,16 @@
-# YOLO 训练可视化平台 - 生产镜像部署（单容器）
+# YOLO 训练可视化平台 - 生产镜像部署（单容器 + Ollama 千问本地推理）
 # 镜像已包含：前端构建产物 + 后端 FastAPI + torch(CUDA 12.8) + 全部模型文件 + nginx
 # 服务器零配置：无需上传代码/模型，拉取镜像即用
 #
 # 启动：
 #   docker compose up -d   # 默认使用下方真实仓库地址，无需任何配置
+#
+# 千问 VL（Ollama）：
+#   首次启动会自动拉取 qwen2.5-vl:7b（约 6GB），模型下载较慢属正常；
+#   下载快慢取决于镜像/模型源，国内环境可用以下方式加速：
+#     1) 镜像加速：OLLAMA_IMAGE=docker.m.daocloud.io/ollama/ollama docker compose up -d
+#     2) 换模型：  OLLAMA_QWEN_MODEL=qwen2.5-vl:7b docker compose up -d
+#   部署后在平台「标注页 → 千问设置」勾选启用，endpoint 已默认指向 http://ollama:11434
 
 services:
   # 统一镜像：一个容器同时提供前端(:80)与后端(:8000)
@@ -19,9 +26,13 @@ services:
       # GPU 支持 - 继承宿主机 NVIDIA 驱动（需已安装 NVIDIA Container Toolkit）
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # 千问 VL：backend 通过服务名访问 Ollama（UI「千问设置」endpoint 默认值来源）
+      - OLLAMA_HOST=http://ollama:11434
     volumes:
       # 数据集持久化（训练数据）；模型已打进镜像 /app/models，不再挂载
       - yolo-data:/app/data
+    depends_on:
+      - ollama
     deploy:
       resources:
         reservations:
@@ -36,6 +47,42 @@ services:
       retries: 3
       start_period: 60s
 
+  # 千问 VL 本地推理服务（Ollama）：官方镜像 + 模型卷持久化（重下镜像不丢模型）
+  # 国内拉镜像慢时设置 OLLAMA_IMAGE（如 docker.m.daocloud.io/ollama/ollama）
+  ollama:
+    image: ${OLLAMA_IMAGE:-ollama/ollama}
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_KEEP_ALIVE=24h
+    volumes:
+      - ollama-models:/root/.ollama
+    # 启动后自动拉取千问 VL 模型（已存在则跳过），随镜像持久化在卷里
+    command: >
+      /bin/sh -c "ollama serve &
+                   sleep 5 &&
+                   (ollama list | grep -q '${OLLAMA_QWEN_MODEL:-qwen2.5-vl:7b}' ||
+                    ollama pull '${OLLAMA_QWEN_MODEL:-qwen2.5-vl:7b}')
+                   && wait"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
 # 数据集持久化卷（重建容器不丢失数据）
 volumes:
   yolo-data:
+  # Ollama 模型卷：模型下载一次后不再重复拉取
+  ollama-models:

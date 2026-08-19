@@ -150,6 +150,43 @@ def normalize_class_names(names) -> list:
         return [str(n) for n in names]
     return []
 
+
+def update_datasets_train_state(job_file: str, datasets_dir: str, stage: str,
+                                training_status: str, trained_at: str = None):
+    """阶段1.3：训练结果回写数据集状态机。
+
+    - 每个参与训练的数据集（job_file.dataset_ids，兼容旧字段 dataset_id）：
+        合格 → stage=completed / training_status=completed / trained_at / round+1；
+        不合格/失败 → stage=failed / training_status=incomplete（保持未完成，参与下一轮雪球）。
+    """
+    try:
+        if not datasets_dir:
+            return
+        with open(job_file, "r", encoding="utf-8") as f:
+            jm = json.load(f)
+        ds_ids = jm.get("dataset_ids") or ([jm.get("dataset_id")] if jm.get("dataset_id") else [])
+        for ds_id in ds_ids:
+            if not ds_id:
+                continue
+            meta_p = Path(datasets_dir) / str(ds_id) / "meta.json"
+            if not meta_p.exists():
+                continue
+            with open(meta_p, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            meta.setdefault("stage", "annotating")
+            meta.setdefault("training_status", "incomplete")
+            meta["stage"] = stage
+            meta["training_status"] = training_status
+            if trained_at:
+                meta["trained_at"] = trained_at
+                meta["last_trained_round"] = int(meta.get("last_trained_round", 0)) + 1
+            with open(meta_p, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False)
+            print(f"[{datetime.now().isoformat()}] 数据集状态回写: {ds_id} → stage={stage}, training_status={training_status}")
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] 数据集状态回写失败（忽略）: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True)
@@ -162,6 +199,7 @@ def main():
     parser.add_argument("--job_id", required=True)
     parser.add_argument("--job_file", required=True)
     parser.add_argument("--registry_dir", required=True)
+    parser.add_argument("--datasets_dir", default=None, help="数据集根目录（训练结果回写数据集状态机用）")
     parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint")
     # 高级训练参数（可选，缺省则由 ultralytics 使用默认值）
     parser.add_argument("--lr0", type=float, default=None, help="Initial learning rate")
@@ -467,6 +505,20 @@ def main():
             json.dump(job_meta, f, indent=2)
         
         print(f"[{datetime.now().isoformat()}] Job status updated")
+
+        # 阶段1.3：训练结果回写数据集状态机
+        # 守门员合格 → 数据集 completed/已完成训练；守门员不合格 → failed/保持未完成（雪球回收）
+        if gk and gk.get("promoted"):
+            update_datasets_train_state(
+                args.job_file, args.datasets_dir,
+                stage="completed", training_status="completed",
+                trained_at=datetime.now().isoformat(),
+            )
+        else:
+            update_datasets_train_state(
+                args.job_file, args.datasets_dir,
+                stage="failed", training_status="incomplete",
+            )
         
     except Exception as e:
         import traceback
@@ -488,6 +540,15 @@ def main():
             with open(args.job_file, "w") as f:
                 json.dump(job_meta, f, indent=2)
         except:
+            pass
+
+        # 阶段1.3：训练失败 → 相关数据集回 failed（保持未完成，参与下一轮雪球）
+        try:
+            update_datasets_train_state(
+                args.job_file, args.datasets_dir,
+                stage="failed", training_status="incomplete",
+            )
+        except Exception:
             pass
         
         sys.exit(1)

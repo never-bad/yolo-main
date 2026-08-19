@@ -14,11 +14,11 @@
           <div
             v-for="ds in datasets"
             :key="ds.dataset_id"
-            :class="['ds-card', { selected: trainForm.dataset_id === ds.dataset_id, disabled: !isDatasetPrepared(ds) }]"
+            :class="['ds-card', { selected: isDsSelected(ds.dataset_id), disabled: !isDatasetPrepared(ds) }]"
             @click="selectDataset(ds)"
           >
             <div class="ds-card-header">
-              <span class="ds-name">{{ ds.dataset_id }}</span>
+              <span class="ds-name">{{ ds.dataset_id }} <span v-if="trainForm.dataset_id === ds.dataset_id" class="ds-main-tag">主</span></span>
               <span :class="'status-badge status-' + ds.status">{{ getDatasetStatus(ds) }}</span>
             </div>
             <div class="ds-card-info">
@@ -30,7 +30,12 @@
           </div>
           <div v-if="!loadingDatasets && datasets.length === 0" class="empty-state">暂无已标注导出的数据集，请先在标注页完成标注并导出</div>
         </div>
-        <small>提示：仅显示在标注页执行过"导出YOLO(自动划分)"的数据集；点击卡片选择</small>
+        <small v-if="selectedDatasetIds.length > 1">✓ 已选 {{ selectedDatasetIds.length }} 个数据集，将聚合为同一训练任务（统一类别命名空间，自动按已标注导出训练）</small>
+        <small v-else>提示：仅显示已标注的数据集；点击卡片可多选聚合训练（单数据集训练保持不变）</small>
+        <label class="aggregate-opt">
+          <input type="checkbox" v-model="aggregateIncomplete" :disabled="training" />
+          自动带入同业务「未完成训练」数据集（阶段1.4 雪球：上一轮不合格的一并合训）
+        </label>
       </div>
       <div class="form-group">
         <label>业务场景</label>
@@ -133,7 +138,7 @@
       <div class="form-group adv-block">
         <label class="adv-toggle">
           <input type="checkbox" v-model="showAdvanced" :disabled="training" />
-          高级参数（学习率 / 优化器 / 权重衰减 / 早停）
+          高级参数（学习率 / 优化器 / 训练增强）
         </label>
         <span v-if="suggesting" class="suggest-status">
           <span class="loading-spinner"></span> 分析环境并推荐参数...
@@ -165,6 +170,25 @@
           <label>早停轮数 patience</label>
           <input v-model.number="trainForm.patience" type="number" min="0" :disabled="training" />
           <small>验证指标连续 N 轮不涨则停止（0 = 关闭）</small>
+        </div>
+      </div>
+      <div v-if="showAdvanced" class="adv-enhance">
+        <div class="form-group">
+          <label class="check-line">
+            <input type="checkbox" v-model="trainForm.recall_enabled" :disabled="training" />
+            回忆集混训（增量训练防遗忘）
+          </label>
+          <small>训练时自动混入同业务已完成旧数据少量样本（每集 ≤20 张），防止灾难性遗忘</small>
+        </div>
+        <div class="form-group">
+          <label for="hard_ratio">困难样本抽样比例 {{ trainForm.hard_sample_ratio }}</label>
+          <input id="hard_ratio" v-model.number="trainForm.hard_sample_ratio" type="range" min="0" max="0.5" step="0.01" :disabled="training" />
+          <small>从该模型困难样本库按比例抽样并入训练（0 = 关闭，默认 10%）</small>
+        </div>
+        <div class="form-group">
+          <label for="bg_ratio">空白样本抽样比例 {{ trainForm.background_sample_ratio }}</label>
+          <input id="bg_ratio" v-model.number="trainForm.background_sample_ratio" type="range" min="0" max="0.5" step="0.01" :disabled="training" />
+          <small>空白样本库（负样本）抽样比例（0 = 关闭，默认 5%）</small>
         </div>
       </div>
       <div v-if="suggestReason" class="suggest-reason">{{ suggestReason }}</div>
@@ -370,7 +394,7 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { createTrainJob, listTrainJobs, deleteTrainJob, resumeTrainJob, getTrainJobTree, suggestTrainParams, inferBusiness, listGpus, prepareWeights, type TrainJobRequest } from '@/api/train'
 import { listModels, uploadPretrainedPt, listCustomModels } from '@/api/models'
 import { listDatasets } from '@/api/datasets'
@@ -390,8 +414,18 @@ const trainForm = ref<TrainJobRequest>({
   batch: -1,  // -1 表示根据显存自动计算最佳 batch size
   base_model_id: undefined,
   business: 'general',
-  gpu_index: null  // null = 自动选择 GPU
+  gpu_index: null,  // null = 自动选择 GPU
+  // 1.5/1.6 训练增强：样本池抽样 + 回忆集混训
+  hard_sample_ratio: 0.1,
+  background_sample_ratio: 0.05,
+  recall_enabled: true
 })
+
+// 阶段1.3（训练任务聚合）：多选数据集 → 聚合为同一训练任务（第一个选中者为主数据集）
+const selectedDatasetIds = ref<string[]>([])
+// 阶段1.4（雪球）：自动带入同业务「未完成训练」数据集
+const aggregateIncomplete = ref(false)
+const isDsSelected = (id: string) => selectedDatasetIds.value.includes(id)
 
 // 业务/算法场景：模型按业务隔离存储与守门员对比
 const businessScenes = [
@@ -676,7 +710,7 @@ const loadDatasets = async () => {
   loadingDatasets.value = true
   try {
     const result = await listDatasets()
-    // 只显示已标注导出的数据集（在标注页执行过"导出YOLO(自动划分)"）
+    // 只显示已标注的数据集
     datasets.value = (result.datasets || []).filter((d: any) => d.annotated)
   } catch (error: any) {
     console.error('加载数据集失败:', error)
@@ -698,13 +732,25 @@ const isDatasetPrepared = (dataset: any) => {
   return dataset.status === 'prepared' || dataset.status === 'uploaded'
 }
 
-// 卡片式选择数据集
+// 卡片式选择数据集（支持多选聚合：1.3）
 const selectDataset = (ds: any) => {
   if (!isDatasetPrepared(ds)) {
     alert('该数据集尚未准备，请先在"数据集"页面执行"准备"操作')
     return
   }
-  trainForm.value.dataset_id = ds.dataset_id
+  const idx = selectedDatasetIds.value.indexOf(ds.dataset_id)
+  if (idx >= 0) {
+    selectedDatasetIds.value.splice(idx, 1)
+    // 若取消的是主数据集，自动顺延首位为新的主数据集
+    if (trainForm.value.dataset_id === ds.dataset_id) {
+      trainForm.value.dataset_id = selectedDatasetIds.value[0] || ''
+    }
+  } else {
+    selectedDatasetIds.value.push(ds.dataset_id)
+    if (!trainForm.value.dataset_id) {
+      trainForm.value.dataset_id = selectedDatasetIds.value[0]
+    }
+  }
 }
 
 // 加载已上传的自定义模型；若客户上传过模型（且尚未手动选择），默认优先使用它，
@@ -764,6 +810,7 @@ const onSelectCustomModel = () => {
 }
 
 const router = useRouter()
+const route = useRoute()
 const training = ref(false)
 // 训练前准备权重（镜像下载缓存）的进行中标记，用于按钮提示
 const preparingWeight = ref(false)
@@ -820,12 +867,35 @@ const startTraining = async () => {
     }
     const params: TrainJobRequest = {
       ...trainForm.value,
-      base_model_id: useFineTune.value ? trainForm.value.base_model_id : undefined
+      base_model_id: useFineTune.value ? trainForm.value.base_model_id : undefined,
+      // 阶段1.3/1.4：多选聚合 + 未完成回收
+      dataset_ids: selectedDatasetIds.value.length > 1 ? [...selectedDatasetIds.value] : undefined,
+      aggregate_incomplete: aggregateIncomplete.value ? true : undefined
     }
     
     const result = await createTrainJob(params)
     currentJobId.value = result.job_id
-    alert('训练任务已启动!')
+    // 阶段1.3：聚合训练结果提示
+    if (result.aggregated && result.aggregation) {
+      alert(
+        `训练任务已启动！聚合 ${result.aggregation.dataset_count} 个数据集、` +
+        `${result.aggregation.unified_names.length} 类统一命名空间、` +
+        `${result.aggregation.total_images} 张图片进行训练。`
+      )
+    } else {
+      const lf = result.label_filter
+      if (lf && lf.dropped && lf.dropped.length > 0) {
+        alert(
+          '训练任务已启动！\n\n' +
+          '已按微调模型标签字典过滤数据集类别：\n' +
+          `剔除（模型字典外）: ${lf.dropped.join('、')}\n` +
+          `保留训练: ${lf.kept.join('、')}` +
+          (lf.model_code ? `\n模型: ${lf.model_code}` : '')
+        )
+      } else {
+        alert('训练任务已启动!')
+      }
+    }
     
     // 开始订阅日志
     logStore.clearLogs()
@@ -833,9 +903,12 @@ const startTraining = async () => {
     
     loadJobs()
     
-    // 重置表单
+    // 重置表单（保留主数据集；聚合/雪球开关复位）
+    const keepMain = trainForm.value.dataset_id
+    selectedDatasetIds.value = keepMain ? [keepMain] : []
+    aggregateIncomplete.value = false
     trainForm.value = {
-      dataset_id: trainForm.value.dataset_id,
+      dataset_id: keepMain,
       version: 'v1',
       model_name: 'yolov8n.pt',
       epochs: 10,
@@ -843,7 +916,10 @@ const startTraining = async () => {
       batch: 16,
       base_model_id: undefined,
       business: trainForm.value.business || 'general',
-      gpu_index: null
+      gpu_index: null,
+      hard_sample_ratio: 0.1,
+      background_sample_ratio: 0.05,
+      recall_enabled: true
     }
     useFineTune.value = false
   } catch (error: any) {
@@ -873,7 +949,11 @@ const retrainJob = async (job: any) => {
       optimizer: job.optimizer || undefined,
       weight_decay: job.weight_decay ?? undefined,
       patience: job.patience ?? undefined,
-      gpu_index: job.gpu_index ?? undefined
+      gpu_index: job.gpu_index ?? undefined,
+      // 阶段1.3：聚合任务重跑时带原始数据集列表
+      ...(Array.isArray(job.dataset_ids) && job.dataset_ids.length > 1
+        ? { dataset_ids: job.dataset_ids }
+        : {})
     }
     const result = await createTrainJob(params)
     restoreScroll(prevScrollY)
@@ -1383,10 +1463,22 @@ const loadJobs = async () => {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
   loadJobs()
   loadModels()
-  loadDatasets()
+  // 1.7 模型仓库跳转：/train?dataset_ids=ds1,ds2 自动预选聚合
+  const q = route.query.dataset_ids
+  if (typeof q === 'string' && q) {
+    await loadDatasets()
+    const ids = q.split(',').filter(Boolean)
+    const selectable = ids.filter((id: string) => datasets.value.some((d: any) => d.dataset_id === id))
+    if (selectable.length) {
+      selectDataset({ dataset_id: selectable[0] })
+      selectable.slice(1).forEach((id: string) => selectDataset({ dataset_id: id }))
+    }
+  } else {
+    loadDatasets()
+  }
   loadCustomModels()
   loadGpus()
   // 每秒跳动，刷新"最后更新 X 秒前"提示
@@ -1486,6 +1578,41 @@ onUnmounted(() => {
 
 .adv-grid .form-group {
   min-width: 0;
+}
+
+.adv-enhance {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1rem;
+  margin-top: 0.75rem;
+  padding: 0.8rem 1rem;
+  background: #f6f9fc;
+  border: 1px solid #e3eaf2;
+  border-radius: 6px;
+}
+
+.adv-enhance .form-group {
+  min-width: 0;
+}
+
+.adv-enhance .form-group small {
+  display: block;
+  margin-top: 0.25rem;
+  color: #8593a6;
+  line-height: 1.4;
+}
+
+.check-line {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+  color: #2c3e50;
+  font-weight: 600;
+}
+
+.check-line input {
+  width: auto;
 }
 
 .suggest-reason {
@@ -1677,6 +1804,26 @@ onUnmounted(() => {
   margin-top: 0.35rem;
   font-size: 0.75rem;
   color: #b9770e;
+}
+
+.ds-main-tag {
+  font-size: 0.65rem;
+  background: #8e44ad;
+  color: #fff;
+  border-radius: 4px;
+  padding: 0.05rem 0.3rem;
+  margin-left: 0.25rem;
+  vertical-align: middle;
+}
+
+.aggregate-opt {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.4rem;
+  font-size: 0.8rem;
+  color: #27ae60;
+  cursor: pointer;
 }
 
 .empty-state {

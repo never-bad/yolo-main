@@ -1,6 +1,6 @@
 # 🚀 YOLO 训练平台
 
-基于 **YOLOv8 + FastAPI + Vue3** 的自动化目标检测训练平台，覆盖「数据集准备 → AI 预标注 → 模型训练 → 模型调优（模型守门员）」全流程，内置轻量级 MLOps 机制，保证生产环境模型**越换越好**。
+基于 **YOLOv8 + FastAPI + Vue3** 的自动化目标检测训练平台，覆盖「数据采集 → 自动上传归类 → AI 预标注 → 封板 → 模型训练 → 模型调优（模型守门员）」全流程，内置轻量级 MLOps 机制，保证生产环境模型**越换越好**。
 
 ---
 
@@ -8,22 +8,29 @@
 
 ### 1. 📁 数据集管理
 
-- **多格式上传**：支持 `.zip` / `.tar` / `.tar.gz` / `.tgz` 压缩包，上传后**自动准备**（解压 → 自动识别或重组为 YOLO 标准结构 `images/{train,val,test}` + `labels/` → 生成 `data.yaml` / `classes.txt` → 统计），全程无需手动操作
-- **幂等准备**：重复「准备」会先清空版本目录再从压缩包重建，目录始终保持单份干净数据，不会产生重复图片
-- 数据集多版本目录（`v1`…）、元信息管理、描述/标签编辑、标注导出（带标签打包下载）、删除
+- **多格式上传**：支持 `.zip` / `.tar` / `.tar.gz` / `.tgz` 压缩包，上传后**自动准备**（解压 → 自动识别或重组为 YOLO 标准结构 `images/` + `labels/` → 统计），全程无需手动操作
+- **按模型归属**：上传时可手动指定归属模型；也可由平台根据「包内类别 → 模型标签字典覆盖率」**自动匹配**（完全覆盖立即命中，覆盖 ≥ 0.6 兜底绑定），未匹配的数据集保持未归属并提示
+- **txt 标注包导入**：导入类别按模型标签字典**过滤冗余类 + class_id 重映射**，保留源 txt 与重叠框最紧化处理，过滤后的数据进入该模型的等待队列
+- **全生命周期状态机**：`collecting（采集）→ annotating（标注中）→ sealed（已封板）→ training / completed / failed`，每个阶段一目了然
+- **封板（Seal）机制**：一键封板 = 一次性划分 train/val/test + 转 txt + 生成 `data.yaml`，封板时按模型补全类别；封板后数据生成 **v{N} 只读快照**（训练不再受后续标注改动影响）
+- **数据血缘**：每个数据集记录 `display_name` + `parent_dataset_id`，封板快照可追溯到源头数据集
+- **封板门槛**：默认需达到 `SEAL_MIN_IMAGES = 1500` 张标注图片才允许封板（前端有进度提示），确有需要时支持强制封板兜底
 
 ### 2. 🖱️ AI 智能标注
 
 - **GroundingDINO + SAM**：输入类别名（中英文均可，逗号分隔）→ GroundingDINO 开放词汇检测出目标框，可选开启 SAM 精修分割；支持单图与整数据集批量预标注
-- 标注页仅展示已「准备」的数据集；切换数据集自动同步其已有类别，可在此基础上追加/删改
+- **框合并策略**：同类紧邻框自动合并（IoU / 中心距阈值），高度重叠的框保留**最紧框**，避免误检框互相堆积
+- **手动加框**：人工补框自动标记为「困难样本」，进入该模型的困难样本库（训练时 1:1 并入，专治难例）
+- **千问 VL 新类识别**：本地部署 Ollama（零 token 成本），对标注中的图片自动判读疑似新类别 → 生成候选标签 → 一键采纳追加到模型标签字典
 - **自动保存**：编辑后 1.5s 防抖自动保存，切图时强制保存未完成的改动，撤销/重做同样触发保存
-- 标注画布自适应布局（不撑开工具栏、小图可放大），支持框的增删改、类别调整、撤销重做
+- 标注画布自适应布局，支持框的增删改、类别调整、撤销重做
 
 ### 3. 🏋️ 模型训练
 
 - 可选 **YOLOv8 全新训练 / 基于已有模型微调**（n/s/m/l/x 多种规格预训练权重本地化）
 - **参数自动推荐**：按 GPU/CPU 与数据集规模自动推荐轮次、图片尺寸、批次、学习率、早停耐心值等，专家可手动覆盖
 - 训练节点（GPU）选择、早停机制（触发时标记「已完成（早停）」）、任务卡实时进度与百分比显示
+- **困难样本 / 空白样本并池**：训练抽样时困难样本（hard/{model_id}）按 1:1 并入，空白样本库（background，全局共享）按 0:N 随机并入，提升鲁棒性
 - 训练稳定性保障：AMP 失败自动降级 FP32、容器单进程数据加载、失败原因中文提示 + 一键重训
 
 ### 4. 🛡️ 模型调优（模型守门员 Gatekeeper）
@@ -42,34 +49,55 @@
 - **人工强制覆盖**：高级工程师可对被拦截模型强制晋升为生产版本（记录原因，旧生产版本自动退役）
 - **血缘管理**：每个模型附带 `lineage`（父模型、基座模型、数据集、训练任务），版本可追溯
 
+### 5. 🗂️ 模型仓库（以模型为中心）
+
+- **一个模型一个卡片**：采集/上传的数据挂靠到对应模型下，点击卡片查看其数据集、状态分布、队列与待封板进度
+- **标签字典管理**：每个模型维护类别标签字典（english_code / 中文名 / 描述），支持追加与删除保护（已被标注使用的标签不可删）
+- **数据等待队列**：txt 包导入与归集的数据进入该模型的等待队列，后台定时（5 分钟）自动打包进入标注页，实现「采集 → 标注」无人值守衔接
+- **相似模型扫描与合并**：按标签字典相似度扫描重复模型，勾选合并（差集类别自动并入主模型、数据集重归属、日志可回滚）
+- **导出 / 导入**：模型可打包导出（模型 + 标签字典 + 血缘信息），也可重新上传迁移
+
 ---
 
 ## 技术栈
 
-- 后端：Python 3.11 · FastAPI · Ultralytics YOLOv8 · PyTorch · GroundingDINO · SAM
-- 前端：Vue 3 · Vite · TypeScript · Element Plus
-- 部署：Docker 单镜像（Nginx + Uvicorn + Supervisor），数据独立挂载卷
+- 后端：Python 3.11 · FastAPI · Ultralytics YOLOv8 · PyTorch · GroundingDINO · SAM · Transformers
+- 前端：Vue 3 · Vite · TypeScript · ECharts（vue-echarts）
+- AI 新类识别：Ollama 本地部署千问 VL（`qwen2.5-vl:7b`，零 token 成本）
+- 部署：Docker 单镜像（Nginx + Uvicorn + Supervisor）+ 独立 Ollama 服务，数据/模型独立挂载卷
 
 ## 快速开始
 
+### Docker 部署（生产，含 Ollama 千问）
+
 ```bash
-# Docker 单镜像构建并启动
 cd docker
-docker compose up -d --build
+
+# 国内拉取 ollama 镜像慢时，先设置加速变量：
+#   export OLLAMA_IMAGE=docker.m.daocloud.io/ollama/ollama
+# 换模型（默认 qwen2.5-vl:7b）：
+#   export OLLAMA_QWEN_MODEL=qwen2.5-vl:7b
+
+docker compose up -d
 ```
 
-本地开发：
+- 前端：`http://<服务器IP>:3000`
+- 后端 API：`http://<服务器IP>:8000`
+- Ollama：`http://<服务器IP>:11434`（首次启动自动拉取千问模型，约 6GB）
+- 部署后在「标注页 → 千问设置」勾选启用，endpoint 默认指向 `http://ollama:11434`
+
+### 本地开发
 
 ```bash
-# 后端
+# 后端（建议使用 conda 环境）
 cd backend
 pip install -r requirements.txt
-uvicorn src.main:app --host 0.0.0.0 --port 8000
+python run.py   # uvicorn, http://localhost:8000
 
 # 前端
 cd frontend
 npm install
-npm run dev   # http://localhost:3000
+npm run dev     # http://localhost:3000
 ```
 
 ## 目录结构
@@ -77,12 +105,13 @@ npm run dev   # http://localhost:3000
 ```
 backend/
   src/
-    api/routes/       # REST 接口（数据集 / 标注 / 训练 / 模型）
-    services/         # 核心服务（数据集准备、AI 标注、训练、模型仓库）
+    api/routes/       # REST 接口（数据集 / 标注 / 训练 / 模型 / 样本池 / 队列）
+    services/         # 核心服务（数据集、AI 标注、训练、模型仓库、队列、样本池）
     yolo/             # 训练脚本与守门员（gatekeeper）
-    utils/            # 文件树等工具
-  data/               # 运行数据（数据集、模型仓库，挂载卷，不入库）
+  data/               # 运行数据（数据集、标注、队列，挂载卷，不入库）
+  models/             # 模型文件（权重 / 模型仓库，不入库）
 frontend/
-  src/pages/          # 数据集 / 标注 / 训练 / 模型 / 推理页面
-  src/components/     # 标注画布、文件树等组件
+  src/pages/          # 数据集 / 标注 / 训练 / 模型 / 模型详情页面
+  src/components/     # 标注画布、日志面板、文件树等组件
+docker/               # 镜像构建、docker-compose（含 Ollama）、Nginx 配置
 ```

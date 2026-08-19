@@ -36,11 +36,14 @@
           <div class="model-header">
             <h3>
               <span v-if="model.status" :class="'m-status m-' + model.status">{{ statusText(model) }}</span>
-              {{ model.model_id }}
+              {{ model.display_name || model.model_id }}
+              <span v-if="model.model_code" class="m-code">{{ model.model_code }}</span>
+              <span v-else class="m-code m-code-unset" title="尚未配置模型唯一 code，可在「编辑」中配置（模型流转/自动关联依赖它）">未配置code</span>
               <span v-if="model.version" class="m-version">版本 {{ model.version }}</span>
             </h3>
             <div class="model-actions">
               <button @click="viewModelDetails(model)" class="secondary">详情</button>
+              <button @click="openLabelsDict(model)" class="secondary" title="维护该模型统一标签字典（index/english_code/中文名/中文描述）">标签字典</button>
               <button 
                 @click="editModel(model)" 
                 class="secondary"
@@ -113,6 +116,90 @@
         <span v-if="loadingModels" class="loading-spinner"></span>
         {{ loadingModels ? '加载中...' : '刷新模型列表' }}
       </button>
+    </div>
+
+    <!-- 2.7 相似模型排查与合并（人工工具） -->
+    <div class="card">
+      <div class="sim-header">
+        <h2>相似模型排查与合并</h2>
+        <div class="sim-actions">
+          <label class="sim-threshold">
+            相似度阈值
+            <input type="number" v-model.number="simThreshold" min="0" max="1" step="0.05" :disabled="simScanning" />
+          </label>
+          <button class="secondary" @click="runSimilarScan" :disabled="simScanning">
+            <span v-if="simScanning" class="loading-spinner"></span>
+            {{ simScanning ? '扫描中...' : '扫描相似模型' }}
+          </button>
+          <button class="secondary" @click="loadMergeLogs" :disabled="loadingMergeLogs" title="查看合并历史记录（回滚依据）">合并日志</button>
+          <button class="danger-outline" @click="doRollbackMerge(-1)" :disabled="rollingBackMerge" title="回滚最近一次合并（还原数据集归属）">
+            <span v-if="rollingBackMerge" class="loading-spinner"></span>
+            回滚最近合并
+          </button>
+        </div>
+      </div>
+      <p class="form-hint">
+        按标签字典类别名（english_code）相似度扫描模型对；命中组推荐「数据集更多者」为主模型。
+        勾选后合并：差集类别自动并入主模型标签字典、数据集重归属主模型、被合并模型保留为历史分支（不删除），全程写入日志可回滚。
+      </p>
+
+      <div v-if="simScanning" class="loading-state"><span class="loading-spinner"></span>扫描中...</div>
+      <div v-else-if="simPairs.length" class="sim-list">
+        <div v-for="(pair, i) in simPairs" :key="i" class="sim-pair" :class="{ checked: pair.checked }">
+          <div class="sim-pair-main">
+            <input type="checkbox" v-model="pair.checked" class="sim-check" />
+            <span class="sim-score">{{ (pair.similarity * 100).toFixed(0) }}% 相似</span>
+            <span class="sim-models">
+              <span class="sim-model" :class="{ 'is-main': pair.suggested_main === pair.a.model_id }">
+                {{ pair.a.name }} <code>{{ pair.a.code }}</code>（{{ pair.a.dataset_count }} DS）
+                <span v-if="pair.suggested_main === pair.a.model_id" class="sim-main-tag">主</span>
+              </span>
+              <span class="sim-vs">⇄</span>
+              <span class="sim-model" :class="{ 'is-main': pair.suggested_main === pair.b.model_id }">
+                {{ pair.b.name }} <code>{{ pair.b.code }}</code>（{{ pair.b.dataset_count }} DS）
+                <span v-if="pair.suggested_main === pair.b.model_id" class="sim-main-tag">主</span>
+              </span>
+            </span>
+          </div>
+          <div class="sim-common" v-if="pair.common_classes.length">共同类别: {{ pair.common_classes.join('、') }}</div>
+        </div>
+        <button class="primary" @click="confirmMergeSelected" :disabled="!selectedPairCount || mergingSim">
+          <span v-if="mergingSim" class="loading-spinner"></span>
+          {{ mergingSim ? '合并中...' : `合并选中的 ${selectedPairCount} 组（按推荐主模型吸收）` }}
+        </button>
+      </div>
+      <div v-else-if="simScanned" class="empty-state">
+        未发现相似度 ≥ {{ simThreshold }} 的模型对（可在「标签字典」中完善 english_code / 中文名后再扫）
+      </div>
+    </div>
+
+    <!-- 合并日志弹窗 -->
+    <div v-if="showMergeLogs" class="modal-overlay" @click.self="closeMergeLogs">
+      <div class="modal-content modal-large">
+        <div class="modal-header">
+          <h3>合并日志（2.7 · 可回滚）</h3>
+          <button @click="closeMergeLogs" class="close-btn">×</button>
+        </div>
+        <div class="modal-body">
+          <div v-if="loadingMergeLogs" class="loading-state"><span class="loading-spinner"></span>加载中...</div>
+          <div v-else-if="!mergeLogs.length" class="empty-state">暂无合并记录</div>
+          <div v-else class="merge-logs">
+            <div v-for="(log, i) in mergeLogs" :key="i" class="merge-log-item">
+              <div class="merge-log-head">
+                <b>{{ log.at }}</b>
+                <span>主模型: <code>{{ log.main_model_id }}</code></span>
+                <span>被合并: <code>{{ (log.merged_model_ids || []).join(', ') }}</code></span>
+                <button class="danger-outline small" @click="doRollbackMerge(i)" :disabled="rollingBackMerge">回滚此条</button>
+              </div>
+              <div class="merge-log-detail">
+                <span>{{ (log.classes_added || []).reduce((s: number, c: any) => s + (c.added_classes || []).length, 0) }} 个类别并入主字典</span>
+                <span>{{ Object.keys(log.datasets_rebound || {}).reduce((s: number, k: string) => s + (log.datasets_rebound[k] || []).length, 0) }} 个数据集重归属</span>
+                <small v-if="log.reason">原因: {{ log.reason }}</small>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- 模型详情对话框 -->
@@ -354,11 +441,81 @@
       </div>
     </div>
   </div>
+<!-- 标签字典弹窗（阶段0：模型统一标签字典四字段） -->
+<div v-if="showLabelsDict" class="modal-overlay" @click.self="closeLabelsDict">
+  <div class="modal-content modal-large">
+    <div class="modal-header">
+      <h3>标签字典：{{ labelsDictModel?.model_code || labelsDictModel?.model_id }}</h3>
+      <button @click="closeLabelsDict" class="close-btn">×</button>
+    </div>
+    <div class="modal-body">
+      <p class="form-hint">
+        四字段含义：<b>index</b>（YOLO 训练序号，保存后自动重排连续）· <b>english_code</b>（检测与 GD 预标注用，必填且唯一）·
+        <b>中文名</b>（界面显示）· <b>中文描述</b>（大模型预标注的语义描述）。训练时只会保留本字典内的标签。
+      </p>
+      <div v-if="labelsDictLoading" class="loading-state"><span class="loading-spinner"></span>加载中...</div>
+      <template v-else>
+        <table class="detail-table">
+          <thead>
+            <tr><th style="width:56px">index</th><th>english_code *</th><th>中文名</th><th>中文描述</th><th style="width:44px"></th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="(lab, i) in labelsDictLabels" :key="i">
+              <td class="labels-index">{{ i }}</td>
+              <td><input v-model="lab.english_code" class="dict-input" placeholder="如 person" /></td>
+              <td><input v-model="lab.chinese_name" class="dict-input" placeholder="如 行人" /></td>
+              <td><input v-model="lab.chinese_desc" class="dict-input" placeholder="大模型预标注语义描述，可空" /></td>
+              <td><button class="danger-outline small" @click="removeLabelRow(i)" title="删除该标签（已被图片标注的标签保存时会被拒绝）">✕</button></td>
+            </tr>
+            <tr v-if="!labelsDictLabels.length"><td colspan="5" class="empty-state">暂无标签，请添加</td></tr>
+          </tbody>
+        </table>
+        <div class="form-actions">
+          <button class="secondary" @click="addLabelRow">+ 添加标签</button>
+          <button class="secondary" @click="prepareSuggest" title="用千问 VL 识别数据集中已知标签之外的新目标，给出候选标签（四字段），勾选后一键采纳追加">🤖 AI 识别新标签</button>
+          <button class="primary" @click="saveLabelsDict" :disabled="labelsDictSaving">
+            <span v-if="labelsDictSaving" class="loading-spinner"></span>
+            {{ labelsDictSaving ? '保存中...' : '保存字典' }}
+          </button>
+        </div>
+        <div v-if="suggestReady" class="suggest-box">
+          <div class="suggest-toolbar">
+            <select v-model="suggestDatasetId" class="dict-input" style="width:auto">
+              <option v-for="ds in suggestDatasets" :key="ds.dataset_id" :value="ds.dataset_id">{{ ds.dataset_id }}</option>
+            </select>
+            <button class="secondary" @click="runSuggest" :disabled="suggestRunning">
+              <span v-if="suggestRunning" class="loading-spinner"></span>
+              {{ suggestRunning ? '识别中...' : '识别' }}
+            </button>
+            <span class="suggest-msg">{{ suggestMsg }}</span>
+          </div>
+          <table v-if="suggestCandidates.length" class="detail-table">
+            <thead>
+              <tr><th style="width:32px"></th><th>english_code</th><th>中文名</th><th>中文描述</th><th>命中图</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="(c, i) in suggestCandidates" :key="i">
+                <td><input type="checkbox" v-model="suggestSelected" :value="c" /></td>
+                <td>{{ c.english_code }}</td>
+                <td>{{ c.chinese_name }}</td>
+                <td>{{ c.chinese_desc }}</td>
+                <td class="suggest-imgs">{{ (c.images || []).join(', ') }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-if="suggestCandidates.length" class="form-actions">
+            <button class="primary" @click="adoptSuggest" :disabled="!suggestSelected.length">采纳选中（{{ suggestSelected.length }}）</button>
+          </div>
+        </div>
+      </template>
+    </div>
+  </div>
+</div>
 </template>
 
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
-import { listModels, updateModel, deleteModel, getModel, uploadModel, exportModel, generateTrainingCharts, promoteToDetector, overrideModel, type ModelDetails } from '@/api/models'
+import { listModels, updateModel, deleteModel, getModel, uploadModel, exportModel, generateTrainingCharts, promoteToDetector, overrideModel, getLabelsDict, updateLabelsDict, getModelDatasets, suggestModelLabels, findSimilarModels, mergeModels, getMergeLogs, rollbackMerge, type ModelDetails } from '@/api/models'
 import { downloadFile } from '@/utils/download'
 import { showAlert, showConfirm, showPrompt } from '@/composables/useDialog'
 import VChart from 'vue-echarts'
@@ -394,6 +551,107 @@ use([
 ])
 
 const models = ref<any[]>([])
+
+// ===== 阶段0：标签字典弹窗 =====
+const showLabelsDict = ref(false)
+const labelsDictModel = ref<any>(null)
+const labelsDictLoading = ref(false)
+const labelsDictSaving = ref(false)
+const labelsDictLabels = ref<any[]>([])
+
+const openLabelsDict = async (model: any) => {
+  showLabelsDict.value = true
+  labelsDictModel.value = model
+  labelsDictLoading.value = true
+  labelsDictLabels.value = []
+  try {
+    const dic = await getLabelsDict(model.model_id)
+    labelsDictLabels.value = (dic.labels || []).map((l: any) => ({ ...l }))
+  } catch (e: any) {
+    alert('加载标签字典失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    labelsDictLoading.value = false
+  }
+}
+const closeLabelsDict = () => {
+  showLabelsDict.value = false
+  labelsDictModel.value = null
+}
+const addLabelRow = () => {
+  labelsDictLabels.value.push({ index: labelsDictLabels.value.length, english_code: '', chinese_name: '', chinese_desc: '' })
+}
+const removeLabelRow = async (i: number) => {
+  const ok = await showConfirm('确认删除该标签？\n已被图片标注使用的标签在保存时会被平台拒绝（追加禁删保护）。')
+  if (ok) labelsDictLabels.value.splice(i, 1)
+}
+
+// ---- AI 识别新类别（千问 VL 看图 → 候选标签 → 一键采纳追加）----
+const suggestReady = ref(false)
+const suggestDatasets = ref<any[]>([])
+const suggestDatasetId = ref('')
+const suggestRunning = ref(false)
+const suggestMsg = ref('')
+const suggestCandidates = ref<any[]>([])
+const suggestSelected = ref<any[]>([])
+
+const prepareSuggest = async () => {
+  suggestReady.value = true
+  suggestMsg.value = ''
+  suggestCandidates.value = []
+  suggestSelected.value = []
+  try {
+    const res = await getModelDatasets(labelsDictModel.value.model_id)
+    suggestDatasets.value = res.datasets || []
+    suggestDatasetId.value = suggestDatasets.value[0]?.dataset_id || ''
+    if (!suggestDatasets.value.length) suggestMsg.value = '该模型暂无绑定数据集，请先绑定后再 AI 识别'
+  } catch (e: any) {
+    suggestMsg.value = '加载模型数据集失败：' + (e.response?.data?.detail || e.message)
+  }
+}
+const runSuggest = async () => {
+  if (!suggestDatasetId.value) { suggestMsg.value = '请先选择数据集'; return }
+  suggestRunning.value = true
+  suggestMsg.value = ''
+  try {
+    const res = await suggestModelLabels(labelsDictModel.value.model_id, suggestDatasetId.value, 3)
+    if (!res.ok) { suggestMsg.value = res.message || '识别失败'; suggestCandidates.value = []; return }
+    suggestCandidates.value = res.candidates || []
+    suggestMsg.value = res.message || ''
+  } catch (e: any) {
+    suggestMsg.value = 'AI 识别失败：' + (e.response?.data?.detail || e.message)
+  } finally {
+    suggestRunning.value = false
+  }
+}
+const adoptSuggest = () => {
+  const exist = new Set(labelsDictLabels.value.map((l: any) => (l.english_code || '').toLowerCase()))
+  let added = 0
+  for (const c of suggestSelected.value) {
+    const code = (c.english_code || '').trim()
+    if (!code || exist.has(code.toLowerCase())) continue
+    labelsDictLabels.value.push({ index: labelsDictLabels.value.length, english_code: code, chinese_name: c.chinese_name || '', chinese_desc: c.chinese_desc || '' })
+    exist.add(code.toLowerCase())
+    added++
+  }
+  suggestSelected.value = []
+  showAlert(added ? `已追加 ${added} 个标签到字典末尾（index 递增，已标注数据不受影响），检查后点「保存字典」即可生效` : '选中的标签已存在于字典或为空，未追加')
+}
+const saveLabelsDict = async () => {
+  if (!labelsDictLabels.value.length) { alert('标签字典不能为空'); return }
+  for (const lab of labelsDictLabels.value) {
+    if (!lab.english_code || !lab.english_code.trim()) { alert('english_code 不能为空'); return }
+  }
+  labelsDictSaving.value = true
+  try {
+    await updateLabelsDict(labelsDictModel.value.model_id, labelsDictLabels.value)
+    showAlert('标签字典已保存!')
+    closeLabelsDict()
+  } catch (e: any) {
+    alert('保存失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    labelsDictSaving.value = false
+  }
+}
 
 // ===== 模型仓库 / 守门员辅助 =====
 const businessScenes: { value: string; label: string }[] = [
@@ -1315,6 +1573,12 @@ const heatmapChartOption = computed(() => {
 })
 
 const editModel = async (model: any) => {
+  const code = await showPrompt('模型唯一 code（小写字母+下划线，如 safety_helmet；模型流转/自动关联依赖它，留空则不修改）:', model.model_code || '')
+  if (code === null) return
+
+  const displayName = await showPrompt('模型中文名（界面显示用，可选）:', model.display_name || '')
+  if (displayName === null) return
+
   const name = await showPrompt('请输入模型名称（可选）:', model.name || model.model_id)
   if (name === null) return
   
@@ -1327,6 +1591,8 @@ const editModel = async (model: any) => {
   editingModel.value = model.model_id
   try {
     await updateModel(model.model_id, {
+      model_code: code.trim() || undefined,
+      display_name: displayName.trim() || undefined,
       name: name || undefined,
       description: description || undefined,
       tags: tags
@@ -1442,6 +1708,102 @@ const exportModelFile = async (modelId: string) => {
 onMounted(() => {
   loadModels()
 })
+
+// ===== 2.7 相似模型排查与合并 =====
+const simThreshold = ref(0.5)
+const simPairs = ref<any[]>([])
+const simScanning = ref(false)
+const simScanned = ref(false)
+const mergingSim = ref(false)
+const selectedPairCount = computed(() => simPairs.value.filter(p => p.checked).length)
+
+const runSimilarScan = async () => {
+  simScanning.value = true
+  try {
+    const res = await findSimilarModels(simThreshold.value)
+    simPairs.value = (res.pairs || []).map((p: any) => ({ ...p, checked: false }))
+    simScanned.value = true
+    if (simPairs.value.length) {
+      alert(`发现 ${simPairs.value.length} 组相似模型对，请勾选（默认按推荐主模型吸收）后点击合并。`)
+    }
+  } catch (e: any) {
+    alert('扫描失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    simScanning.value = false
+  }
+}
+
+const confirmMergeSelected = async () => {
+  const selected = simPairs.value.filter(p => p.checked)
+  if (!selected.length) return
+  const reason = await showPrompt('合并原因（写入日志用于审计，可选）:', '')
+  if (reason === null) return
+  const detail = selected.map((p: any) => {
+    const mainId = p.suggested_main
+    const sub = p.a.model_id === mainId ? p.b : p.a
+    return `· 将「${sub.name || sub.model_id}」并入主模型「${mainId === p.a.model_id ? p.a.name : p.b.name}」`
+  }).join('\n')
+  if (!(await showConfirm(`确认执行以下合并吗？\n\n${detail}\n\n合并后：差集类别并入主模型标签字典、数据集重归属主模型、被合并模型保留为历史分支。`))) return
+  mergingSim.value = true
+  try {
+    let totalDs = 0, totalCls = 0
+    for (const p of selected) {
+      const mainId = p.suggested_main
+      const subId = p.a.model_id === mainId ? p.b.model_id : p.a.model_id
+      const res = await mergeModels(mainId, [subId], reason || undefined)
+      totalDs += res.datasets_rebound || 0
+      totalCls += res.classes_added_count || 0
+    }
+    alert(`合并完成：${selected.length} 组，共并入 ${totalCls} 个类别、重归属 ${totalDs} 个数据集。\n可在「合并日志」中查看记录或回滚。`)
+    simPairs.value = []
+    simScanned.value = false
+    loadModels()
+  } catch (e: any) {
+    alert('合并失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    mergingSim.value = false
+  }
+}
+
+// 合并日志弹窗
+const showMergeLogs = ref(false)
+const mergeLogs = ref<any[]>([])
+const loadingMergeLogs = ref(false)
+const rollingBackMerge = ref(false)
+const loadMergeLogs = async () => {
+  showMergeLogs.value = true
+  loadingMergeLogs.value = true
+  try {
+    const res = await getMergeLogs(20)
+    mergeLogs.value = res.logs || []
+  } catch (e: any) {
+    alert('加载合并日志失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    loadingMergeLogs.value = false
+  }
+}
+const closeMergeLogs = () => {
+  showMergeLogs.value = false
+}
+
+const doRollbackMerge = async (logIndex: number) => {
+  if (!(await showConfirm(
+    logIndex === -1
+      ? '确定回滚最近一次合并吗？\n\n将还原数据集归属、撤销被合并模型的标记（并入主模型的标签类别保留）。'
+      : '确定回滚这条合并吗？\n\n将还原数据集归属、撤销被合并模型的标记（并入主模型的标签类别保留）。'
+  ))) return
+  rollingBackMerge.value = true
+  try {
+    const res = await rollbackMerge(logIndex)
+    alert(`回滚完成：还原 ${res.restored_datasets?.length || 0} 个数据集、撤销 ${res.unmarked_models?.length || 0} 个模型标记。`)
+    closeMergeLogs()
+    loadModels()
+  } catch (e: any) {
+    alert('回滚失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    rollingBackMerge.value = false
+  }
+}
 </script>
 
 <style scoped>
@@ -1932,6 +2294,84 @@ button {
   vertical-align: middle;
 }
 
+/* 模型唯一 code 标记（阶段0） */
+.m-code {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 1px 8px;
+  font-size: 0.75rem;
+  font-family: Consolas, Monaco, monospace;
+  color: #2471a3;
+  background: #eaf2f8;
+  border: 1px solid #aed6f1;
+  border-radius: 4px;
+  vertical-align: middle;
+}
+
+.m-code-unset {
+  color: #c0392b;
+  background: #fdedec;
+  border-color: #f5b7b1;
+}
+
+.dict-input {
+  width: 100%;
+  padding: 4px 8px;
+  border: 1px solid #d7dde4;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  box-sizing: border-box;
+}
+
+.dict-input:focus {
+  outline: none;
+  border-color: #3498db;
+}
+
+.labels-index {
+  color: #7f8c8d;
+  font-family: Consolas, Monaco, monospace;
+  text-align: center;
+}
+
+.suggest-box {
+  margin-top: 0.9rem;
+  padding: 0.8rem;
+  border: 1px dashed #3498db;
+  border-radius: 6px;
+  background: rgba(52, 152, 219, 0.04);
+}
+
+.suggest-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.suggest-msg {
+  font-size: 0.8rem;
+  color: #7f8c8d;
+}
+
+.suggest-imgs {
+  font-size: 0.75rem;
+  color: #95a5a6;
+  font-family: Consolas, Monaco, monospace;
+}
+
+.small {
+  padding: 2px 8px;
+  font-size: 0.75rem;
+}
+
+.form-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.8rem;
+  justify-content: flex-end;
+}
+
 .danger-outline {
   background: #fff5f5;
   border: 1px solid #e74c3c;
@@ -2055,5 +2495,156 @@ button {
 
 .gk-override-btn {
   margin-top: 0.6rem;
+}
+
+/* ===== 2.7 相似模型排查与合并 ===== */
+.sim-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.5rem;
+}
+
+.sim-header h2 {
+  margin: 0;
+}
+
+.sim-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.sim-threshold {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: #4a5568;
+}
+
+.sim-list {
+  margin-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.sim-pair {
+  border: 1px solid #e0e3e8;
+  border-radius: 6px;
+  padding: 0.6rem 0.8rem;
+  background: #fafbfc;
+}
+
+.sim-pair.checked {
+  border-color: #3498db;
+  background: #f0f7ff;
+}
+
+.sim-pair-main {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.sim-check { width: auto; }
+
+.sim-score {
+  font-weight: bold;
+  color: #2c6ec5;
+  background: #e8f0fb;
+  padding: 0.15rem 0.6rem;
+  border-radius: 10px;
+  white-space: nowrap;
+  font-size: 0.82rem;
+}
+
+.sim-models {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.sim-model {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.88rem;
+  color: #34495e;
+}
+
+.sim-model code {
+  font-size: 0.72rem;
+  color: #7a8aa0;
+  background: #f3f6fa;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.sim-model.is-main {
+  color: #1e8449;
+  font-weight: bold;
+}
+
+.sim-main-tag {
+  background: #1e8449;
+  color: #fff;
+  font-size: 0.68rem;
+  padding: 0 5px;
+  border-radius: 8px;
+  font-weight: bold;
+}
+
+.sim-vs { color: #b0b8c4; }
+
+.sim-common {
+  margin-top: 0.35rem;
+  font-size: 0.8rem;
+  color: #7f8c8d;
+}
+
+.merge-logs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.merge-log-item {
+  border: 1px solid #e0e3e8;
+  border-radius: 6px;
+  padding: 0.6rem 0.8rem;
+  background: #fafbfc;
+}
+
+.merge-log-head {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  flex-wrap: wrap;
+  font-size: 0.85rem;
+  color: #34495e;
+}
+
+.merge-log-head code {
+  font-size: 0.72rem;
+  color: #7a8aa0;
+  background: #f3f6fa;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.merge-log-detail {
+  margin-top: 0.4rem;
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  font-size: 0.8rem;
+  color: #7f8c8d;
 }
 </style>

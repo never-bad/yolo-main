@@ -6,6 +6,8 @@ export interface BBox {
   y1: number
   x2: number
   y2: number
+  confidence?: number
+  source?: string
 }
 
 export const createAnnotationTask = async (datasetId: string, version: string, classes?: string[]) => {
@@ -13,6 +15,14 @@ export const createAnnotationTask = async (datasetId: string, version: string, c
     dataset_id: datasetId,
     version,
     classes: classes || null  // 如果不提供则从 data.yaml 读取
+  })
+  return data
+}
+
+// 按数据集查找已存在的标注任务（标注页直达 / 自动建任务去重用）
+export const findAnnotationTask = async (datasetId: string, version: string = 'v1') => {
+  const { data } = await api.get(`/annotations/tasks/by-dataset/${datasetId}`, {
+    params: { version }
   })
   return data
 }
@@ -27,22 +37,19 @@ export const getImageAnnotation = async (taskId: string, imageId: string) => {
   return data
 }
 
-export const saveAnnotation = async (taskId: string, imageId: string, boxes: BBox[], ai_annotated = false) => {
+export const saveAnnotation = async (taskId: string, imageId: string, boxes: BBox[], ai_annotated = false, sampleType?: string, sampleReason?: string) => {
   const { data } = await api.post(`/annotations/tasks/${taskId}/items/${imageId}`, {
     boxes,
-    ai_annotated
+    ai_annotated,
+    sample_type: sampleType || null,
+    sample_reason: sampleReason || null
   })
   return data
 }
 
+// 导出为YOLO格式（不划分，数据集划分在封板时进行）
 export const exportAnnotations = async (taskId: string) => {
   const { data } = await api.get(`/annotations/tasks/${taskId}/export?format=yolo`)
-  return data
-}
-
-// 导出为YOLO格式，并按比例自动划分训练/验证/测试集
-export const exportAnnotationsSplit = async (taskId: string, train: number, val: number, test: number) => {
-  const { data } = await api.post(`/annotations/tasks/${taskId}/export-split`, { train, val, test })
   return data
 }
 

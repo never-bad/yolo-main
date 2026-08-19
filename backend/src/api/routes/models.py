@@ -3,17 +3,32 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
 from src.services.model_service import ModelService
+from src.services.dataset_service import DatasetService
+from src.services.queue_service import ModelQueueService
 from src.core.settings import settings
 import os
 import shutil
 
 router = APIRouter(prefix="/models", tags=["models"])
 model_service = ModelService()
+queue_service = ModelQueueService()
 
 class UpdateModelRequest(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     tags: Optional[list[str]] = None
+    model_code: Optional[str] = None      # 模型唯一标识（小写+下划线，自动规范化并全局校验唯一）
+    display_name: Optional[str] = None    # 业务中文名
+    status: Optional[str] = None          # active / inactive
+
+class LabelItem(BaseModel):
+    index: int = 0
+    english_code: str
+    chinese_name: Optional[str] = ""
+    chinese_desc: Optional[str] = ""
+
+class UpdateLabelsRequest(BaseModel):
+    labels: list[LabelItem]
 
 class UploadModelRequest(BaseModel):
     name: Optional[str] = None
@@ -42,7 +57,46 @@ async def list_custom_models():
             })
     return {"models": models}
 
+@router.get("/queues")
+async def list_queue_overview():
+    """4.2 模型消息队列总览（查看各模型待打包数据包）"""
+    return queue_service.list_queues()
+
 # 注意：静态路由必须定义在 /{model_id} 参数路由之前，否则会被参数路由拦截
+@router.get("/similar-scan")
+async def find_similar_models(min_similarity: float = Query(0.5, ge=0.0, le=1.0)):
+    """2.7 相似模型排查：按标签字典类别名相似度扫描全部模型对（含自动选主建议）"""
+    return await model_service.find_similar_models(min_similarity)
+
+class MergeRequest(BaseModel):
+    main_model_id: str
+    merged_model_ids: list[str]
+    reason: Optional[str] = None
+
+@router.post("/merge")
+async def merge_models(request: MergeRequest):
+    """2.7 合并相似模型：差集类别并入主字典、数据集重归属、历史版本保留为分支、日志可回滚"""
+    try:
+        return await model_service.merge_models(request.main_model_id, request.merged_model_ids, request.reason)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@router.get("/merge-log")
+async def merge_logs(limit: int = Query(20, ge=1, le=100)):
+    """2.7 合并日志（回滚依据）"""
+    return await model_service.merge_log(limit)
+
+class RollbackMergeRequest(BaseModel):
+    log_index: int = -1   # -1 = 最近一次
+
+@router.post("/rollback-merge")
+async def rollback_merge(request: RollbackMergeRequest):
+    """2.7 回滚合并：还原数据集归属、撤销 merged_into 标记"""
+    try:
+        return await model_service.rollback_merge(request.log_index)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
 @router.get("/production")
 async def list_production_models(business: Optional[str] = None):
     """列出当前在役的生产模型（status=production_ready），可按业务/算法类型过滤"""
@@ -58,9 +112,56 @@ async def get_model(model_id: str):
 
 @router.put("/{model_id}")
 async def update_model(model_id: str, request: UpdateModelRequest):
-    """更新模型信息"""
-    result = await model_service.update_model(model_id, request)
+    """更新模型信息（含阶段0：唯一 code / 中文名 / 启用状态）"""
+    try:
+        result = await model_service.update_model(model_id, request)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     if not result:
+        raise HTTPException(404, "Model not found")
+    return result
+
+@router.get("/{model_id}/labels")
+async def get_model_labels(model_id: str):
+    """获取模型统一标签字典（四字段：index/english_code/chinese_name/chinese_desc）。
+
+    不存在时自动从 model.json 的 classes 初始化。
+    """
+    result = await model_service.get_labels_dict(model_id)
+    if not result:
+        raise HTTPException(404, "Model not found")
+    return result
+
+@router.put("/{model_id}/labels")
+async def update_model_labels(model_id: str, request: UpdateLabelsRequest):
+    """保存模型标签字典（全量覆写；追加禁删保护：在用标签禁止删除/重命名/重排）"""
+    try:
+        labels = [item.model_dump() for item in request.labels]
+        result = await model_service.update_labels_dict(model_id, labels)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not result:
+        raise HTTPException(404, "Model not found")
+    return result
+
+class SuggestLabelsRequest(BaseModel):
+    dataset_id: str
+    limit: Optional[int] = 3
+
+@router.post("/{model_id}/labels/suggest")
+async def suggest_model_labels(model_id: str, request: SuggestLabelsRequest):
+    """AI 识别图片新类别：取该数据集困难/空白样本图发千问 VL，
+    返回已知标签之外的新标签候选（四字段），用户采纳后追加进字典"""
+    return await model_service.suggest_labels_from_dataset(model_id, request.dataset_id, request.limit)
+
+class AdoptSuggestRequest(BaseModel):
+    suggestions: list[dict]  # [{english_code, chinese_name, chinese_desc}]
+
+@router.post("/{model_id}/labels/suggest/adopt")
+async def adopt_model_labels(model_id: str, request: AdoptSuggestRequest):
+    """采纳 AI 建议的新标签：追加到该模型标签字典末尾（跳过已存在项）"""
+    result = await model_service.adopt_suggested_labels(model_id, request.suggestions)
+    if result is None:
         raise HTTPException(404, "Model not found")
     return result
 
@@ -71,6 +172,25 @@ async def delete_model(model_id: str):
     if not result:
         raise HTTPException(404, "Model not found")
     return result
+
+@router.get("/{model_id}/datasets")
+async def get_model_datasets(model_id: str):
+    """1.7 模型仓库：返回归属于该模型的所有数据集（含状态机字段）"""
+    res = await DatasetService().list_datasets()
+    return {"model_id": model_id, "datasets": [d for d in res["datasets"] if d.get("model_id") == model_id]}
+
+@router.get("/{model_id}/queue")
+async def get_model_queue(model_id: str):
+    """4.2 模型消息队列详情：待打包数据 + 打包历史"""
+    return queue_service.get_queue(model_id)
+
+class PackQueueRequest(BaseModel):
+    force: Optional[bool] = False
+
+@router.post("/{model_id}/queue/pack")
+async def pack_model_queue(model_id: str, request: Optional[PackQueueRequest] = None):
+    """4.2 手动触发打包：队列中的数据包立即进入标注页（自动按模型取类别）"""
+    return await queue_service.pack_model(model_id)
 
 @router.post("/upload-pt")
 async def upload_pretrained_model(file: UploadFile = File(...)):

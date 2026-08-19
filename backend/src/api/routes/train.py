@@ -15,12 +15,19 @@ class TrainJobRequest(BaseModel):
     batch: int = -1
     base_model_id: Optional[str] = None  # 用于微调的已有模型ID
     business: Optional[str] = None       # 业务/算法类型：传空则系统按数据集类别名自动分配（守门员按此隔离对比）
+    # 阶段1.3（训练任务聚合）：多数据集聚合训练
+    dataset_ids: Optional[list[str]] = None  # 待聚合训练的数据集列表（缺省=仅 dataset_id）
+    aggregate_incomplete: bool = False       # 阶段1.4（雪球）：自动带同业务未完成训练数据集
     # 高级训练参数（可选，缺省则由系统默认）
     lr0: Optional[float] = None          # 初始学习率
     optimizer: Optional[str] = None      # auto / SGD / Adam / AdamW
     weight_decay: Optional[float] = None # 权重衰减
     patience: Optional[int] = None       # 早停轮数（0 = 关闭）
     gpu_index: Optional[int] = None      # 训练节点：指定 GPU 索引（多卡环境；缺省自动）
+    # 阶段1.5/1.6（训练增强）：回忆集混训 + 样本池抽样并入（缺省开启，池为空时自动跳过）
+    hard_sample_ratio: float = 0.1       # 困难样本库抽样比例（针对 base_model_id）
+    background_sample_ratio: float = 0.05  # 空白负样本库抽样比例
+    recall_enabled: bool = True          # 增量训练时是否混入已完成旧数据（回忆集）
 
 @router.get("/gpus")
 async def list_gpus():
@@ -63,7 +70,12 @@ async def create_train_job(request: TrainJobRequest):
             optimizer=request.optimizer,
             weight_decay=request.weight_decay,
             patience=request.patience,
-            gpu_index=request.gpu_index
+            gpu_index=request.gpu_index,
+            dataset_ids=request.dataset_ids,
+            aggregate_incomplete=request.aggregate_incomplete,
+            hard_sample_ratio=request.hard_sample_ratio,
+            background_sample_ratio=request.background_sample_ratio,
+            recall_enabled=request.recall_enabled
         )
         return result
     except ValueError as e:

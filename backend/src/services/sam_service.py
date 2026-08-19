@@ -10,6 +10,7 @@
 import json
 import asyncio
 import uuid
+import os
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -33,8 +34,27 @@ DEFAULT_CONFIG = {
     "sam_imgsz": 1024,               # SAM 输入尺寸
     "conf": 0.10,                    # 默认置信度阈值（调低以提升召回）
     "iou": 0.40,                     # NMS IoU 阈值（调低以合并遮挡/重叠产生的重复框）
+    # 检出框合并（#4 重叠/紧邻框保留最紧框）：
+    # 同类合并：互相紧邻/重叠的同类框并为一个（person 中心点过近会误并，调低 ioU/dist 可规避）
+    "merge_iou": 0.45,               # 同类合并 IoU 阈值（两个同类框交并比 ≥ 该值视为重复）
+    "merge_dist": 0.35,              # 同类合并中心距阈值（≤ 该值×对角距离 视为同一物体分裂）
+    # 高度重合保留最紧框：IoU 很高 + 面积接近 + 中心错位小 → 保留最小（最紧）框
+    "merge_tight_iou": 0.7,          # 最紧框判据：IoU 下限（高度重合）
+    "merge_tight_center": 0.15,      # 最紧框判据：中心距上限（×对角）
+    "merge_tight_area_ratio": 1.6,   # 最紧框判据：面积比上限（两框大小接近）
     "half": False,                   # 半精度，省显存
     "device": "auto",                # auto | cpu | GPU 索引字符串
+    # ------------------------------------------------------------------
+    # 千问 VL 大模型预标注（本地预留接口：qwen_enabled=False 时不启用，
+    # 部署到服务器/接入百炼 API 后改为 True 并填写 endpoint/key 即可启用）
+    # ------------------------------------------------------------------
+    "qwen_enabled": False,           # 是否启用千问 VL 作为检测引擎（yolo_world | grounding_dino | qwen_vl | none）
+    "qwen_backend": "ollama",        # ollama（本地大模型）| dashscope（阿里云百炼 OpenAI 兼容接口）
+    "qwen_endpoint": "http://localhost:11434",  # ollama: http://localhost:11434；dashscope: https://dashscope.aliyuncs.com/compatible-mode/v1
+    "qwen_model": "qwen2.5-vl-7b-instruct",      # ollama 模型名 或 百炼模型名（qwen-vl-max 等）
+    "qwen_api_key": "",              # dashscope 需要 API Key；ollama 不需要
+    "qwen_timeout": 90,              # 单图推理超时（秒），VLM 速度慢需给足余量
+    "qwen_mock": False,              # 本地联调：True 时返回模拟框，不真实调用大模型（仅用于验证链路）
 }
 
 
@@ -62,6 +82,8 @@ class BatchTask:
         self.boxes_written = 0
         self.current_image: Optional[str] = None
         self.annotated_images: List[str] = []  # 本次批量预标注实际写入过框的图片ID
+        self.retried = 0                       # 检空后通过降阈/换引擎成功补标上的图片数
+        self.skipped_candidates: List[str] = []  # 两次兜底仍未检出的图片ID（真正需要人工复核的候选）
         self.cancelled = False
         self.status = "running"  # running | done | cancelled | error
         self.error: Optional[str] = None
@@ -92,12 +114,20 @@ class SAMService:
 
     def _read_config(self) -> dict:
         cfg = dict(DEFAULT_CONFIG)
+        overrides = {}
         p = self._config_path()
         if p.exists():
             try:
-                cfg.update(_load_json(p))
+                saved = _load_json(p)
+                cfg.update(saved)
+                overrides = saved
             except Exception:
                 pass
+        # Docker 部署（Ollama）：backend 容器内通过服务名访问 ollama 服务；
+        # 仅当用户未在 UI 显式配置过 endpoint 时注入，本地联调默认值不受影响
+        env_endpoint = os.environ.get("OLLAMA_HOST", "").strip()
+        if env_endpoint and "qwen_endpoint" not in overrides:
+            cfg["qwen_endpoint"] = env_endpoint.rstrip("/")
         return cfg
 
     def _save_config(self, cfg: dict) -> None:
@@ -108,6 +138,39 @@ class SAMService:
 
     def get_config(self) -> dict:
         return self._read_config()
+
+    def _task_labels_desc(self, task_id: str) -> Optional[dict]:
+        """千问预标注：回溯 标注任务→数据集→归属模型 的 labels_dict.json，
+        取出标签字典（index/english_code/chinese_name/chinese_desc），
+        供提示词使用中文名+中文描述，提升大模型对业务类别的识别精度。
+        任一层缺失均返回 None（不阻断标注，回退到纯类别名提示词）。
+        """
+        try:
+            task_file = settings.ANNOTATIONS_DIR / task_id / "task.json"
+            if not task_file.exists():
+                return None
+            task_meta = _load_json(task_file)
+            dataset_id = task_meta.get("dataset_id")
+            version = task_meta.get("version", "v1")
+            if not dataset_id:
+                return None
+            ds_meta_file = settings.DATASETS_DIR / dataset_id / version / "meta.json"
+            if not ds_meta_file.exists():
+                ds_meta_file = settings.DATASETS_DIR / dataset_id / "meta.json"
+            if not ds_meta_file.exists():
+                return None
+            ds_meta = _load_json(ds_meta_file)
+            model_id = ds_meta.get("model_id")
+            if not model_id:
+                return None
+            dict_file = settings.REGISTRY_DIR / model_id / "labels_dict.json"
+            if not dict_file.exists():
+                return None
+            labels = (_load_json(dict_file) or {}).get("labels") or []
+            return {"model_id": model_id, "labels": labels}
+        except Exception as e:
+            print(f"qwen: 读取标签字典失败(不影响标注): {e}")
+            return None
 
     def update_config(self, request) -> dict:
         cfg = self._read_config()
@@ -173,6 +236,9 @@ class SAMService:
         det_type = cfg.get("detector", "yolo_world")
         if det_type == "none":
             return None
+        if det_type == "qwen_vl":
+            # 千问 VL 为远程/本地大模型服务，无需加载本地检测权重；返回就绪标记
+            return True
         if det_type == "grounding_dino":
             # GroundingDINO 走 Transformers 集成，加载后返回占位标记表示已就绪
             self._load_grounding_dino(cfg)
@@ -293,6 +359,13 @@ class SAMService:
         if not img_abs.exists():
             raise ValueError(f"Image file not found: {img_abs}")
 
+        # 千问预标注：携带模型标签字典（中文名+中文描述）进提示词
+        if cfg.get("qwen_enabled", False):
+            ld = self._task_labels_desc(task_id)
+            if ld:
+                cfg = dict(cfg)
+                cfg["qwen_labels_desc"] = ld
+
         # 模型推理非线程安全，加锁串行化，避免并发访问导致模型状态损坏
         async with self._lock:
             boxes = await asyncio.to_thread(self._run_auto_label_sync, img_abs, classes, conf, cfg, prompts)
@@ -323,6 +396,13 @@ class SAMService:
         img_abs = settings.DATA_DIR / item["image_path"]
         if not img_abs.exists():
             raise ValueError(f"Image file not found: {img_abs}")
+
+        # 千问预标注：携带模型标签字典（中文名+中文描述）进提示词
+        if cfg.get("qwen_enabled", False):
+            ld = self._task_labels_desc(task_id)
+            if ld:
+                cfg = dict(cfg)
+                cfg["qwen_labels_desc"] = ld
 
         # 模型推理非线程安全，加锁串行化
         async with self._lock:
@@ -371,29 +451,48 @@ class SAMService:
         else:
             det_boxes = self._detect(img_abs, classes, conf, cfg, prompts)
 
-        det_boxes = self._merge_same_class_boxes(det_boxes)
+        det_boxes = self._merge_same_class_boxes(
+            det_boxes, cfg.get("merge_iou", 0.45), cfg.get("merge_dist", 0.35),
+            tight=self._merge_tight_cfg(cfg))
         det_boxes = self._merge_cross_class_boxes(det_boxes)
         if cfg.get("sam_enabled", True):
             # SAM 在原图上按映射回原图的框做分割精修
             return self._refine_with_sam(img_abs, det_boxes, cfg)
         return det_boxes
 
+    def _merge_tight_cfg(self, cfg: dict) -> dict:
+        """读取"高度重合保留最紧框"判据（配置项 merge_tight_*）"""
+        return {
+            "iou": float(cfg.get("merge_tight_iou", 0.7)),
+            "center": float(cfg.get("merge_tight_center", 0.15)),
+            "area_ratio": float(cfg.get("merge_tight_area_ratio", 1.6)),
+        }
+
     def _run_auto_label_sync(self, img_abs: Path, classes: List[str], conf: float, cfg: dict, prompts=None) -> list:
         """同步执行：检测 → 合并被遮挡分裂的同类框 → (可选) SAM 精修 → 返回 BBox 列表"""
         det_boxes = self._detect(img_abs, classes, conf, cfg, prompts)
         # 合并被遮挡物（如电线杆）分裂成多个的同类框，避免同一物体被识别成两个
-        det_boxes = self._merge_same_class_boxes(det_boxes)
+        det_boxes = self._merge_same_class_boxes(
+            det_boxes, cfg.get("merge_iou", 0.45), cfg.get("merge_dist", 0.35),
+            tight=self._merge_tight_cfg(cfg))
         # 跨类别高度重合合并（GD 常把同一目标误标成不同类别，导致高度重合框残留）
         det_boxes = self._merge_cross_class_boxes(det_boxes)
         if cfg.get("sam_enabled", True):
             return self._refine_with_sam(img_abs, det_boxes, cfg)
         return det_boxes
 
-    def _merge_same_class_boxes(self, boxes: list, iou_thr: float = 0.15, dist_thr: float = 0.6) -> list:
+    def _merge_same_class_boxes(self, boxes: list, iou_thr: float = 0.45, dist_thr: float = 0.35,
+                                tight: dict = None) -> list:
         """合并同类且高度重叠/紧邻的框，解决遮挡导致的同一物体被识别成多个框的问题。
 
         同一物体被遮挡物（如电线杆）隔开时，YOLO-World 常输出多个相邻/重叠的同类框。
-        这里对同类别、IoU 高于阈值或中心距离较近的框取并集合并为一个外接框。
+        合并规则（关键：既要吞掉"遮挡分裂的碎框"，又不能把"两个近距离独立目标"并成一框）：
+        - tight 模式（高度重合判据，默认配置 merge_tight_iou=0.7 等）：IoU 很高 + 面积接近
+          （面积比 ≤ merge_tight_area_ratio）且中心错位小（≤ merge_tight_center×对角）
+          → 判定为同一目标的双框，保留面积更小（更紧贴目标）的框；
+        - 否则仅 IoU 高于 iou_thr 或中心距离很近才取并集合并（默认 0.45 / 0.35×对角）；
+        - 都不满足（如背人的大小悬殊框、中心错开的两框）→ 视为不同目标，两个都保留。
+        tight 参数示例：{"iou": 0.7, "center": 0.15, "area_ratio": 1.6}
         """
         if not boxes:
             return boxes
@@ -414,6 +513,10 @@ class SAMService:
             cb = ((b["x1"] + b["x2"]) / 2, (b["y1"] + b["y2"]) / 2)
             return ((ca[0] - cb[0]) ** 2 + (ca[1] - cb[1]) ** 2) ** 0.5
 
+        tight_iou = float((tight or {}).get("iou", 0.0))
+        tight_center = float((tight or {}).get("center", 1.0))
+        tight_area_ratio = float((tight or {}).get("area_ratio", 1.0))
+
         # 按类别分组，逐组合并
         by_class: Dict[int, list] = {}
         for b in boxes:
@@ -433,6 +536,23 @@ class SAMService:
                     if used[j]:
                         continue
                     other = group[j]
+                    # tight 判据：高度重合的同一目标 → 保留更紧（面积更小）的框
+                    if tight_iou > 0 and _iou(base, other) >= tight_iou:
+                        o_w = other["x2"] - other["x1"]
+                        o_h = other["y2"] - other["y1"]
+                        b_w = base["x2"] - base["x1"]
+                        b_h = base["y2"] - base["y1"]
+                        ratio = max(o_w * o_h, b_w * b_h) / (min(o_w * o_h, b_w * b_h) or 1.0)
+                        is_tight = ratio <= tight_area_ratio and \
+                            _center_dist(base, other) <= tight_center * base_diag
+                        if is_tight:
+                            # 保留面积更小的框（更紧贴目标），score 取更高者
+                            if o_w * o_h < b_w * b_h:
+                                base["x1"], base["y1"] = other["x1"], other["y1"]
+                                base["x2"], base["y2"] = other["x2"], other["y2"]
+                            base["score"] = max(base.get("score", 0.0), other.get("score", 0.0))
+                            used[j] = True
+                            continue
                     if _iou(base, other) >= iou_thr:
                         # 合并取外接矩形，保留更高 score
                         base["x1"] = min(base["x1"], other["x1"])
@@ -485,36 +605,67 @@ class SAMService:
 
         复用与检测时完全相同的合并逻辑（_merge_same_class_boxes + _merge_cross_class_boxes），
         一次性根治历史遗留的重叠标注——无论之前用的是哪个检测模型，都统一清理，无需按模型分别处理。
+        标注读取优先每图 JSON（一图一文件），兼容历史任务集中式 annotations.json。
         """
         task_dir = settings.ANNOTATIONS_DIR / task_id
-        annotations_file = task_dir / "annotations.json"
-        if not annotations_file.exists():
+        task_file = task_dir / "task.json"
+        if not task_file.exists():
             return {"ok": False, "error": "Task not found"}
-        return await asyncio.to_thread(self._clean_task_annotations_sync, annotations_file)
-
-    def _clean_task_annotations_sync(self, annotations_file: Path) -> dict:
         try:
-            annotations = _load_json(annotations_file)
-        except Exception as e:
-            return {"ok": False, "error": f"读取标注文件失败: {e}"}
+            task_meta = _load_json(task_file)
+        except Exception:
+            return {"ok": False, "error": "读取任务元数据失败"}
+        dataset_id = task_meta.get("dataset_id", "")
+        version = task_meta.get("version", "v1")
+        return await asyncio.to_thread(self._clean_task_annotations_sync, dataset_id, version, task_dir)
 
+    def _clean_task_annotations_sync(self, dataset_id: str, version: str, task_dir: Path) -> dict:
         images_cleaned = 0
         boxes_removed = 0
-        for image_id, ann in annotations.items():
+
+        def _clean_one(ann: dict) -> bool:
+            """合并一张图的重复框；有变化则更新并返回 True"""
+            nonlocal images_cleaned, boxes_removed
             boxes = ann.get("boxes") or []
             if not boxes:
-                continue
+                return False
             orig_len = len(boxes)
-            merged = self._merge_same_class_boxes(boxes)
+            merged = self._merge_same_class_boxes(
+                boxes, tight=self._merge_tight_cfg(self._read_config()))
             merged = self._merge_cross_class_boxes(merged)
             if len(merged) < orig_len:
                 ann["boxes"] = merged
                 ann["updated_at"] = datetime.now().isoformat()
                 images_cleaned += 1
                 boxes_removed += orig_len - len(merged)
+                return True
+            return False
 
-        if images_cleaned > 0:
-            _save_json(annotations_file, annotations)
+        # 每图 JSON（新存储）
+        ann_dir = settings.DATASETS_DIR / dataset_id / version / "annotations"
+        if ann_dir.exists():
+            for p in ann_dir.glob("*.json"):
+                try:
+                    ann = _load_json(p)
+                except Exception:
+                    continue
+                if _clean_one(ann):
+                    _save_json(p, ann)
+
+        # 旧版本任务集中式标注文件（兼容清洗）
+        legacy_file = task_dir / "annotations.json"
+        if legacy_file.exists():
+            try:
+                legacy = _load_json(legacy_file)
+            except Exception as e:
+                return {"ok": False, "error": f"读取标注文件失败: {e}"}
+            dirty = False
+            for ann in legacy.values():
+                if _clean_one(ann):
+                    dirty = True
+            if dirty:
+                _save_json(legacy_file, legacy)
+
         return {
             "ok": True,
             "images_cleaned": images_cleaned,
@@ -522,8 +673,13 @@ class SAMService:
         }
 
     def _detect(self, img_abs, classes, conf, cfg, prompts=None) -> list:
-        if cfg.get("detector") == "grounding_dino":
+        det = cfg.get("detector")
+        if det == "grounding_dino":
             return self._detect_grounding_dino(img_abs, classes, conf, cfg, prompts)
+        if det == "qwen_vl":
+            return self._detect_qwen(img_abs, classes, conf, cfg, prompts)
+        if det == "none":
+            return []
         return self._detect_yolo(img_abs, classes, conf, cfg, prompts)
 
     def _detect_yolo(self, img_abs, classes, conf, cfg, prompts=None) -> list:
@@ -561,6 +717,262 @@ class SAMService:
                     "score": float(boxes.conf[i]),
                 })
         return out
+
+    def _detect_qwen(self, img_abs, classes, conf, cfg, prompts=None) -> list:
+        """千问 VL 大模型预标注（本地预留接口）。
+
+        - qwen_enabled=False（本地默认）：不启用，返回空并提示。
+        - qwen_mock=True：返回模拟框，仅用于本地验证链路（不真实调用大模型）。
+        - 真实调用：把图片+类别清单发给千问 VL，要求对每个类别输出 像素坐标 bbox，
+          解析 <box>x1,y1,x2,y2</box> 格式的结果映射回 classes 索引。
+        """
+        if not cfg.get("qwen_enabled", False):
+            return []
+        if cfg.get("qwen_mock", False):
+            return self._mock_qwen_boxes(img_abs, classes)
+        import base64, io
+        from PIL import Image as PILImage
+        try:
+            image = PILImage.open(img_abs).convert("RGB")
+            # 尽量压缩：宽高比保持，最长边 ≤1024（VLM 输入分辨率过大既慢又易超 MaxInputError）
+            max_side = 1024
+            w, h = image.size
+            if max(w, h) > max_side:
+                scale = max_side / max(w, h)
+                image = image.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+            buf = io.BytesIO()
+            image.save(buf, format="JPEG", quality=88)
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception as e:
+            print(f"qwen: 图片编码失败 {img_abs}: {e}")
+            return []
+        # 类别清单：若当前任务所属模型的标签字典可用，则附加中文名+中文描述，
+        # 帮助大模型理解业务类别（千问输出仅按序号 class_id 对齐 classes，不依赖名称匹配）
+        desc_info = cfg.get("qwen_labels_desc") or {}
+        labels_desc = desc_info.get("labels") or []
+        if labels_desc and len(labels_desc) >= len(classes):
+            label_text = ", ".join(
+                f"{i}:{lab.get('chinese_name') or classes[i]}" 
+                + (f"（{lab.get('chinese_desc')}）" if lab.get("chinese_desc") else "")
+                for i, lab in enumerate(labels_desc[:len(classes)])
+            )
+        else:
+            label_text = ", ".join([f"{i}:{c}" for i, c in enumerate(classes)])
+        sys_msg = (
+            "你是一个精细的视觉目标检测助手。对给定的图片和类别清单，找出图中出现的每一个目标实例。\n"
+            "对所有找到的实例，输出格式为每行一个：\n"
+            "<box>x1,y1,x2,y2</box> <class>i</class>\n"
+            "其中 x1,y1,x2,y2 是该目标在图片中的像素坐标边界框（左上角与右下角，整数即可），\n"
+            "i 是类别清单中的序号（0 起）。必须逐行输出，每行只能有一个实例，不要输出任何其他文字或解释。\n"
+            "如果某个类别没有目标，不要输出它的行。\n"
+        )
+        user_msg = f"类别清单：\n{label_text}\n请检测这张图片中的所有目标实例。"
+        endpoint = (cfg.get("qwen_endpoint") or "http://localhost:11434").rstrip("/")
+        api_key = cfg.get("qwen_api_key") or ""
+        # 同时兼容 OpenAI 兼容接口（含默认 /v1/chat/completions）与 Ollama /api/chat
+        url, payload, headers = None, None, {"Content-Type": "application/json"}
+        data_url = f"data:image/jpeg;base64,{b64}"
+        if "ollama" in (cfg.get("qwen_backend") or "").lower() or endpoint.startswith("http://localhost:1143"):
+            url = endpoint + "/api/chat"
+            payload = {
+                "model": cfg.get("qwen_model", "qwen2.5-vl-7b-instruct"),
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": sys_msg},
+                    {"role": "user", "content": user_msg, "images": [b64]},
+                ],
+            }
+        else:
+            url = endpoint + "/v1/chat/completions"
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            payload = {
+                "model": cfg.get("qwen_model", "qwen-vl-max"),
+                "temperature": 0.0,
+                "messages": [
+                    {"role": "system", "content": sys_msg},
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                        {"type": "text", "text": user_msg},
+                    ]},
+                ],
+            }
+        import urllib.request
+        import json as _json
+        try:
+            req = urllib.request.Request(url, data=_json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=cfg.get("qwen_timeout", 90)) as resp:
+                body = _json.loads(resp.read().decode("utf-8"))
+            content = ((body.get("message") or {}).get("content")
+                       or (body.get("choices") or [{}])[0].get("message", {}).get("content")
+                       or "")
+            return self._parse_qwen_boxes(content, classes)
+        except Exception as e:
+            print(f"qwen: 推理失败 {img_abs}: {e}")
+            return []
+
+    def _parse_qwen_boxes(self, content: str, classes) -> list:
+        """解析千问输出：<box>x1,y1,x2,y2</box> <class>i</class> → 标准 boxes"""
+        import re
+        boxes = []
+        for m in re.finditer(r"<box>\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*</box>", content, re.IGNORECASE):
+            try:
+                x1, y1, x2, y2 = (float(m.group(i)) for i in range(1, 5))
+            except Exception:
+                continue
+            cm = re.search(r"<class>\s*(\d+)\s*</class>", content[m.end():])
+            if cm is None:
+                continue
+            cls = int(cm.group(1))
+            if not (0 <= cls < len(classes)):
+                continue
+            boxes.append({
+                "class_id": cls,
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "score": 0.9,  # 千问不返回置信度，固定高值表示"已确认检出"；由标注页与 SAM 精修协同
+            })
+        return boxes
+
+    def _mock_qwen_boxes(self, img_abs, classes) -> list:
+        """本地联调用模拟框：不调用大模型，产生每个类别一个位于图中心的框，便于验证前端链路"""
+        from PIL import Image as PILImage
+        try:
+            w, h = PILImage.open(img_abs).size
+        except Exception:
+            w, h = 640, 640
+        cx, cy, bw, bh = w / 2, h / 2, w * 0.5, h * 0.5
+        out = []
+        for i, _cls in enumerate(classes):
+            ox = i * 0.08 * w
+            out.append({
+                "class_id": i,
+                "x1": cx - bw / 2 + ox, "y1": cy - bh / 2,
+                "x2": cx + bw / 2 + ox, "y2": cy + bh / 2,
+                "score": 0.9,
+            })
+        print(f"qwen IN-MOCK: {len(classes)} boxes for {img_abs}（本地联调模式，未调用真实模型）")
+        return out
+
+    # ------------------------------------------------------------------
+    # 标签建议：AI 识别图片中「已知标签之外」的新类别（辅助不懂标签的用户）
+    # ------------------------------------------------------------------
+    def qwen_suggest_labels(self, image_paths: list, known_codes: list, cfg: dict = None) -> tuple:
+        """用千问 VL 识别图片中已知类别之外的新目标，给出标签候选（四字段）。
+
+        返回 (candidates, message)：
+        - qwen_enabled=False：返回 (None, 提示文案)，不调用真实模型（本地默认）
+        - qwen_mock=True：返回预设模拟候选，便于本地验证链路
+        - 真实调用：多张图聚合，按 english_code 去重并统计命中图数
+        candidates: [{"english_code","chinese_name","chinese_desc","images":[路径]}]
+        对已 known 类别的大小写不敏感过滤，空 english_code 丢弃。
+        """
+        cfg = cfg or self._read_config()
+        if not cfg.get("qwen_enabled", False):
+            return None, (
+                "千问 VL 未启用（SAM 预标注设置 → 勾选启用千问大模型）。"
+                "启用后即可自动识别图片中的新标签候选。"
+            )
+        known = {str(c).strip().lower() for c in (known_codes or []) if str(c).strip()}
+
+        if cfg.get("qwen_mock", False):
+            mock = [
+                {"english_code": "helmet", "chinese_name": "安全帽", "chinese_desc": "人员头部佩戴的安全帽",
+                 "images": list(image_paths[:2])},
+                {"english_code": "traffic_light", "chinese_name": "交通信号灯", "chinese_desc": "路口红绿灯灯杆上的信号灯",
+                 "images": list(image_paths[:1])},
+            ]
+            print("qwen suggest IN-MOCK：返回模拟新类别候选（未调用真实模型）")
+            return [m for m in mock if m["english_code"].lower() not in known], ""
+
+        import base64, io, re, json as _json
+        from PIL import Image as PILImage
+        import urllib.request
+        sys_msg = (
+            "你是一个视觉数据标注助手。给定图片与已知类别清单，找出图片中出现的、"
+            "**不属于已知类别清单** 的物体类别，为每个新类别给出规范化的标签建议。\n"
+            "输出严格为 JSON 数组（不要任何解释文字）：\n"
+            '[{"english_code": "唯一英文标识(小写字母数字下划线)", "chinese_name": "中文名", "chinese_desc": "一句中文描述"}]'
+            "\n如果没有任何已知类别之外的新目标，输出 []。"
+        )
+        endpoint = (cfg.get("qwen_endpoint") or "http://localhost:11434").rstrip("/")
+        api_key = cfg.get("qwen_api_key") or ""
+        known_text = ", ".join(known) if known else "（无）"
+        user_msg = f"已知类别清单：{known_text}\n请识别这张图片中已知类别之外的新目标类别。"
+        agg = {}  # code -> {meta, images}
+        for img_abs in image_paths:
+            try:
+                image = PILImage.open(img_abs).convert("RGB")
+                max_side = 1024
+                w, h = image.size
+                if max(w, h) > max_side:
+                    scale = max_side / max(w, h)
+                    image = image.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+                buf = io.BytesIO()
+                image.save(buf, format="JPEG", quality=88)
+                b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            except Exception as e:
+                print(f"qwen suggest: 图片编码失败 {img_abs}: {e}")
+                continue
+            data_url = f"data:image/jpeg;base64,{b64}"
+            url, payload, headers = None, None, {"Content-Type": "application/json"}
+            if "ollama" in (cfg.get("qwen_backend") or "").lower() or endpoint.startswith("http://localhost:1143"):
+                url = endpoint + "/api/chat"
+                payload = {
+                    "model": cfg.get("qwen_model", "qwen2.5-vl-7b-instruct"),
+                    "stream": False,
+                    "messages": [
+                        {"role": "system", "content": sys_msg},
+                        {"role": "user", "content": user_msg, "images": [b64]},
+                    ],
+                }
+            else:
+                url = endpoint + "/v1/chat/completions"
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                payload = {
+                    "model": cfg.get("qwen_model", "qwen-vl-max"),
+                    "temperature": 0.0,
+                    "messages": [
+                        {"role": "system", "content": sys_msg},
+                        {"role": "user", "content": [
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                            {"type": "text", "text": user_msg},
+                        ]},
+                    ],
+                }
+            try:
+                req = urllib.request.Request(url, data=_json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=cfg.get("qwen_timeout", 90)) as resp:
+                    body = _json.loads(resp.read().decode("utf-8"))
+                content = ((body.get("message") or {}).get("content")
+                           or (body.get("choices") or [{}])[0].get("message", {}).get("content")
+                           or "")
+            except Exception as e:
+                print(f"qwen suggest: 推理失败 {img_abs}: {e}")
+                continue
+            # 提取首个 JSON 数组
+            m = re.search(r"\[[\s\S]*\]", content)
+            if not m:
+                continue
+            try:
+                items = _json.loads(m.group(0))
+            except Exception:
+                continue
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                code = (it.get("english_code") or "").strip().lower()
+                if not code or code in known:
+                    continue
+                cand = agg.setdefault(code, {
+                    "english_code": it.get("english_code", "").strip(),
+                    "chinese_name": (it.get("chinese_name") or "").strip(),
+                    "chinese_desc": (it.get("chinese_desc") or "").strip(),
+                    "images": [],
+                })
+                if img_abs not in cand["images"]:
+                    cand["images"].append(img_abs)
+        return list(agg.values()), ""
 
     def _detect_grounding_dino(self, img_abs, classes, conf, cfg, prompts=None) -> list:
         """GroundingDINO（Transformers 集成）文本驱动检测。
@@ -720,6 +1132,12 @@ class SAMService:
     async def _run_batch(self, batch_id: str, items: list) -> None:
         bt = self.batch_tasks[batch_id]
         cfg = self._read_config()
+        # 千问预标注：批量携带模型标签字典（中文名+中文描述），一次解析全批复用
+        if cfg.get("qwen_enabled", False):
+            ld = self._task_labels_desc(bt.task_id)
+            if ld:
+                cfg = dict(cfg)
+                cfg["qwen_labels_desc"] = ld
         try:
             # 预加载模型，避免逐张重复实例化（CPU 上模型加载较慢，提前检查取消）
             if bt.cancelled:
@@ -761,23 +1179,73 @@ class SAMService:
                             boxes = await asyncio.to_thread(
                                 self._run_auto_label_sync, img_abs, bt.classes, bt.conf, cfg, bt.prompts
                             )
+                            # 兜底重试（缓解「AI 标不了导致人工补标压力大」）：
+                            # 1) 检空 → 降置信度重试（提升召回，conf 0.25 → ~0.1）
+                            # 2) 仍空 → 切换另一检测引擎重试（YOLO-World <-> GroundingDINO 双引擎）
+                            if not boxes:
+                                fallback_conf = max(0.05, round(bt.conf * 0.4, 3))
+                                bt.retried += 1
+                                try:
+                                    boxes = await asyncio.to_thread(
+                                        self._run_auto_label_sync, img_abs, bt.classes, fallback_conf, cfg, bt.prompts
+                                    )
+                                except Exception as e:
+                                    print(f"批量预标注降阈重试失败 {image_id}: {e}")
+                                if not boxes:
+                                    alt_cfg = dict(cfg)
+                                    alt_cfg["detector"] = "grounding_dino" if cfg.get("detector") != "grounding_dino" else "yolo_world"
+                                    bt.skipped_candidates.append(image_id)
+                                    try:
+                                        boxes = await asyncio.to_thread(
+                                            self._run_auto_label_sync, img_abs, bt.classes, fallback_conf, alt_cfg, bt.prompts
+                                        )
+                                        if boxes:
+                                            bt.retried += 1
+                                    except Exception as e:
+                                        print(f"批量预标注换引擎重试失败 {image_id}: {e}")
+                                # 兜底重试③：本地引擎均检空且千问启用时，交给 VLM 再试（缓解"标不了"）
+                                if not boxes and cfg.get("qwen_enabled", False):
+                                    qwen_cfg = dict(cfg)
+                                    qwen_cfg["detector"] = "qwen_vl"
+                                    try:
+                                        boxes = await asyncio.to_thread(
+                                            self._run_auto_label_sync, img_abs, bt.classes, fallback_conf, qwen_cfg, bt.prompts
+                                        )
+                                        if boxes:
+                                            bt.retried += 1
+                                    except Exception as e:
+                                        print(f"批量预标注千问重试失败 {image_id}: {e}")
                     # 只保留缺失类别的检测框（class_id 为全局索引，与 bt.classes 对齐）
                     missing_set = set(missing_indices)
                     new_boxes = [b for b in boxes if b["class_id"] in missing_set]
                     if new_boxes:
                         clean_existing = [
                             {"class_id": b.get("class_id"), "x1": b.get("x1"), "y1": b.get("y1"),
-                             "x2": b.get("x2"), "y2": b.get("y2")}
+                             "x2": b.get("x2"), "y2": b.get("y2"),
+                             "score": b.get("score") or b.get("confidence"),
+                             "source": b.get("source", "manual")}
                             for b in existing_boxes if b.get("x1") is not None
                         ]
                         clean_new = [
                             {"class_id": b["class_id"], "x1": b["x1"], "y1": b["y1"],
-                             "x2": b["x2"], "y2": b["y2"]}
+                             "x2": b["x2"], "y2": b["y2"],
+                             "score": b.get("score") or b.get("confidence"),
+                             "source": "ai"}
                             for b in new_boxes
                         ]
                         await self.annotation_service.save_annotation(bt.task_id, image_id, clean_existing + clean_new, ai_annotated=True)
                         bt.boxes_written += 1
                         bt.annotated_images.append(image_id)
+                    elif not any(b.get("x1") is not None for b in existing_boxes):
+                        # AI 兜底重试后仍检空且该图无任何标注：标记为困难样本（ai_miss），
+                        # 供人工重点审核（空白/难例由审核者定夺），避免被静默跳过
+                        try:
+                            await self.annotation_service.save_annotation(
+                                bt.task_id, image_id, [], ai_annotated=True,
+                                sample_type=self.annotation_service.SAMPLE_HARD,
+                                sample_reason="ai_miss")
+                        except Exception as e:
+                            print(f"批量预标注标记困难样本失败 {image_id}: {e}")
                     bt.done += 1
                 except Exception as e:
                     print(f"批量预标注跳过图片 {image_id}: {e}")
@@ -802,6 +1270,8 @@ class SAMService:
             "done": bt.done,
             "boxes_written": bt.boxes_written,
             "annotated_images": bt.annotated_images,
+            "retried": bt.retried,
+            "skipped_candidates": bt.skipped_candidates,
             "current_image": bt.current_image,
             "error": bt.error,
             "summary": bt.result_summary,

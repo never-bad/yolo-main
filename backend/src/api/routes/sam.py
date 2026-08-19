@@ -9,7 +9,7 @@ sam_service = SAMService()
 
 
 class ConfigRequest(BaseModel):
-    detector: Optional[str] = None            # yolo_world | grounding_dino | none
+    detector: Optional[str] = None            # yolo_world | grounding_dino | qwen_vl | none
     detector_weights: Optional[str] = None
     grounding_dino_model: Optional[str] = None  # Transformers 集成的 GD 模型名（如 IDEA-Research/grounding-dino-tiny）
     sam_enabled: Optional[bool] = None
@@ -20,6 +20,14 @@ class ConfigRequest(BaseModel):
     iou: Optional[float] = None              # NMS IoU 阈值（在线可调）
     half: Optional[bool] = None
     device: Optional[str] = None              # auto | cpu | GPU 索引
+    # 千问 VL 大模型预标注（本地预留接口）
+    qwen_enabled: Optional[bool] = None
+    qwen_backend: Optional[str] = None        # ollama | dashscope
+    qwen_endpoint: Optional[str] = None
+    qwen_model: Optional[str] = None
+    qwen_api_key: Optional[str] = None
+    qwen_timeout: Optional[int] = None
+    qwen_mock: Optional[bool] = None
 
 
 class AutoLabelRequest(BaseModel):

@@ -114,6 +114,8 @@
           >
             <span class="image-item-name">{{ item.image_id }}</span>
             <span class="image-item-badges">
+              <span v-if="item.sample_type === 'hard'" class="img-badge hard" title="困难样本：AI 低置信度/检空，需重点审核">难</span>
+              <span v-else-if="item.sample_type === 'background'" class="img-badge bg" title="空白样本（负样本）：无目标框">空</span>
               <span v-if="item.annotated" class="img-badge ok" title="已有标注">✓</span>
               <span v-if="item.ai_annotated" class="img-badge ai" title="AI 预标注，建议人工审核">AI</span>
             </span>
@@ -143,12 +145,14 @@
           <label class="ai-conf-label">检测模型:</label>
           <select v-model="selectedDetector" class="model-select" @change="applyDetectorModel">
             <option value="__grounding_dino__">grounding-dino-tiny (GroundingDINO)</option>
+            <option value="__qwen_vl__">qwen-vl (千问大模型)</option>
             <option v-for="m in samModels" :key="m.name" :value="m.name">{{ m.name }}</option>
           </select>
           <label class="ai-conf-label model-add-label">
             <input type="file" accept=".pt" class="model-add-input" @change="onSamModelFile" />
             添加
           </label>
+          <button class="ai-btn small" @click="openQwenConfig" title="配置千问 VL：本地部署(Ollama)或云端API">千问设置</button>
           <label class="ai-conf-label">置信度:</label>
           <input type="number" v-model.number="aiConf" min="0" max="1" step="0.05" class="conf-input" />
           <label class="ai-conf-label">IoU:</label>
@@ -241,19 +245,24 @@
         <button class="danger" @click="cleanOverlaps" :disabled="counts.annotated === 0" title="清理历史遗留的高度重合标注框（跨类别/同类重复）">
           清理重叠框
         </button>
+        <div class="sample-type-group" title="标注完成后给该图片分级：普通/困难（AI 低置信度或漏检，重点审核）/空白（无目标负样本）；不选则自动判定">
+          <span class="sample-type-label">样本</span>
+          <template v-for="st in SAMPLE_TYPES" :key="st.value">
+            <button
+              v-if="st.value !== ''"
+              class="sample-type-btn"
+              :class="{ active: currentSampleType === st.value }"
+              @click="setSampleType(st.value)"
+            >{{ st.label }}</button>
+          </template>
+        </div>
         <button @click="saveAnnotation" :disabled="savingAnnotation">
           <span v-if="savingAnnotation" class="loading-spinner"></span>
           {{ savingAnnotation ? '保存中...' : '保存' }}
         </button>
-        <div class="split-config">
-          <span class="split-label">划分比例</span>
-          <label>训练 <input type="number" v-model.number="ratioTrain" min="0" max="1" step="0.05" class="ratio-input" /></label>
-          <label>验证 <input type="number" v-model.number="ratioVal" min="0" max="1" step="0.05" class="ratio-input" /></label>
-          <label>测试 <input type="number" v-model.number="ratioTest" min="0" max="1" step="0.05" class="ratio-input" /></label>
-        </div>
         <button @click="exportTask" :disabled="exporting">
           <span v-if="exporting" class="loading-spinner"></span>
-          {{ exporting ? '导出中...' : '导出YOLO(自动划分)' }}
+          {{ exporting ? '导出中...' : '导出' }}
         </button>
         <label class="import-label" title="导入 X-AnyLabeling 等外部工具导出的 YOLO 标注（zip 内含 labels/*.txt）">
           <input type="file" accept=".zip" class="import-input" @change="onImportYolo" />
@@ -263,14 +272,105 @@
       </div>
     </div>
   </div>
+  <!-- 千问 VL 大模型预标注配置弹窗（本地预留接口） -->
+  <div v-if="showQwenConfig" class="modal-overlay" @click.self="closeQwenConfig">
+    <div class="modal-box qwen-modal">
+      <h3>千问 VL 大模型预标注配置</h3>
+      <p class="hint">
+        本地默认关闭（qwen_enabled=false）。部署到服务器 / 接入阿里云百炼后填写并启用即可。
+        联调阶段可开启「模拟框」模式，不调用真实模型、仅验证标注链路。
+      </p>
+      <label class="row">
+        <input type="checkbox" v-model="qwenForm.qwen_enabled" />
+        <span>启用千问 VL 作为检测引擎</span>
+      </label>
+      <label class="row">
+        <span>接入方式：</span>
+        <select v-model="qwenForm.qwen_backend">
+          <option value="ollama">Ollama（本地大模型，免费）</option>
+          <option value="dashscope">阿里云百炼 DashScope（云端 API）</option>
+        </select>
+      </label>
+      <label class="row">
+        <span>服务地址：</span>
+        <input type="text" v-model="qwenForm.qwen_endpoint" class="w-input"
+               placeholder="ollama: http://localhost:11434" />
+        <span class="hint">dashscope: .../compatible-mode/v1</span>
+      </label>
+      <label class="row">
+        <span>模型名：</span>
+        <input type="text" v-model="qwenForm.qwen_model" class="w-input"
+               placeholder="qwen2.5-vl-7b-instruct / qwen-vl-max" />
+      </label>
+      <label class="row">
+        <span>API Key：</span>
+        <input type="password" v-model="qwenForm.qwen_api_key" class="w-input"
+               placeholder="dashscope 需要；ollama 可留空" />
+      </label>
+      <label class="row">
+        <span>单图超时(秒)：</span>
+        <input type="number" v-model.number="qwenForm.qwen_timeout" min="10" max="600" class="w-input short" />
+      </label>
+      <label class="row">
+        <input type="checkbox" v-model="qwenForm.qwen_mock" />
+        <span>模拟框模式（本地联调，不调用真实模型）</span>
+      </label>
+      <div class="modal-footer">
+        <button @click="closeQwenConfig">取消</button>
+        <button class="primary" @click="saveQwenConfig">保存</button>
+      </div>
+    </div>
+  </div>
+
+    <div v-if="suggestDialogOpen" class="modal-overlay" @click.self="suggestDialogOpen = false">
+      <div class="modal suggest-modal">
+        <h3>🤖 AI 识别新标签</h3>
+        <p class="suggest-hint">千问 VL 正在查看本任务中困难/空白样本图，找出已知标签之外的新目标</p>
+        <div v-if="suggestLoading" class="suggest-msg">✨ 正在分析候选图片，请稍候…</div>
+        <template v-else>
+          <div v-if="suggestMsg" class="suggest-msg">{{ suggestMsg }}</div>
+          <label v-for="c in suggestCandidates" :key="c.english_code" class="suggest-item">
+            <input type="checkbox" :value="c" v-model="suggestSelected" />
+            <div class="suggest-item-body">
+              <b>{{ c.chinese_name }}</b>
+              <code>{{ c.english_code }}</code>
+              <span class="suggest-desc">{{ c.chinese_desc }}</span>
+              <span class="suggest-imgs">命中 {{ (c.images || []).length }} 张图</span>
+            </div>
+          </label>
+          <div v-if="suggestCandidates.length === 0" class="suggest-msg">未发现已知类别之外的新目标。</div>
+          <div v-if="suggestCandidates.length" class="suggest-actions">
+            <button class="primary" @click="adoptSuggest" :disabled="suggestAdopting || suggestSelected.length === 0">
+              {{ suggestAdopting ? '采纳中…' : `采纳选中（${suggestSelected.length}）` }}
+            </button>
+            <button @click="suggestDialogOpen = false">关闭</button>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- 困难/空白样本提醒弹窗：进入任务且存在这类样本时弹一次，不再常驻横幅 -->
+    <div v-if="suggestPromptOpen" class="modal-overlay" @click.self="suggestPromptOpen = false">
+      <div class="modal suggest-modal">
+        <h3>⚠ 困难/空白样本提醒</h3>
+        <p class="suggest-hint">
+          本任务有 <b>{{ suggestBannerCount }}</b> 张困难/空白样本，AI 检空或低置信度，可能漏检了某些目标
+        </p>
+        <div class="suggest-actions">
+          <button v-if="taskModelId" class="btn-soft" @click="suggestPromptOpen = false; openSuggestDialog()">🤖 分析新类别</button>
+          <button @click="suggestPromptOpen = false">知道了</button>
+        </div>
+      </div>
+    </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import type { BBox } from '@/api/annotations'
-import { createAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotationsSplit, autoLabelImage, interactiveLabelImage, startBatchLabel, getBatchProgress, stopBatchLabel, getSamConfig, updateSamConfig, getSamModels, uploadSamModel, clearAiAnnotations, cleanTaskOverlaps, importYoloLabels } from '@/api/annotations'
+import { createAnnotationTask, findAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotations, autoLabelImage, interactiveLabelImage, startBatchLabel, getBatchProgress, stopBatchLabel, getSamConfig, updateSamConfig, getSamModels, uploadSamModel, clearAiAnnotations, cleanTaskOverlaps, importYoloLabels } from '@/api/annotations'
 import { listDatasets } from '@/api/datasets'
 import { showConfirm } from '@/composables/useDialog'
+import { suggestModelLabels, adoptSuggestedLabels } from '@/api/models'
 
 const newTask = ref({ datasetId: '', version: 'v1' })
 const datasets = ref<any[]>([])
@@ -286,10 +386,6 @@ const importing = ref(false)
 const exporting = ref(false)
 // 标注任务持久化 key，用于中途离开页面后返回时恢复
 const ANNOTATE_STORE_KEY = 'annotate_task_resume'
-// 数据集划分比例（默认 7:2:1）
-const ratioTrain = ref(0.7)
-const ratioVal = ref(0.2)
-const ratioTest = ref(0.1)
 
 const loadDatasets = async () => {
   loadingDatasets.value = true
@@ -341,6 +437,91 @@ const currentBoxes = ref<BBox[]>([])
 const selectedBoxIndex = ref(-1)  // 当前选中的标注框索引（点击画布或左侧列表时更新）
 const importedCount = ref(0)  // 导入的标注数量
 const loadingAnnotation = ref(false)  // 加载标注状态
+// 当前图片样本类型（人工可改）：'' 未定 | normal 普通 | hard 困难 | background 空白负样本
+const currentSampleType = ref('')
+const SAMPLE_TYPES = [
+  { value: '', label: '自动' },
+  { value: 'normal', label: '普通' },
+  { value: 'hard', label: '困难' },
+  { value: 'background', label: '空白' },
+]
+const setSampleType = (t: string) => {
+  if (currentSampleType.value === t) return
+  currentSampleType.value = t
+  if (currentImage.value) currentImage.value.sample_type = t
+  if (currentIndex.value >= 0 && items.value[currentIndex.value]) {
+    items.value[currentIndex.value].sample_type = t
+  }
+  markDirty()  // 触发防抖自动保存，无需手动点保存
+}
+
+// ===== 新类别主动提醒：任务中有困难/空白样本 → 横幅提示 → 点击才跑 AI 识别 =====
+const taskDatasetId = ref('')
+const taskModelId = ref('')
+const suggestPromptOpen = ref(false)
+const suggestPrompted = ref(false)
+const suggestDialogOpen = ref(false)
+const suggestLoading = ref(false)
+const suggestAdopting = ref(false)
+const suggestCandidates = ref<any[]>([])
+const suggestSelected = ref<any[]>([])
+const suggestMsg = ref('')
+
+// 横幅计数：困难/空白样本数（不调用千问，仅统计，提醒用户可能漏检新类别）
+const suggestBannerCount = computed(() => {
+  return items.value.filter((it: any) => it.sample_type === 'hard' || it.sample_type === 'background').length
+})
+
+const openSuggestDialog = async () => {
+  suggestDialogOpen.value = true
+  suggestCandidates.value = []
+  suggestSelected.value = []
+  suggestMsg.value = ''
+  await runSuggest()
+}
+
+const runSuggest = async () => {
+  if (!taskModelId.value || !taskDatasetId.value) {
+    suggestMsg.value = '该任务未绑定模型，无法识别新类别'
+    return
+  }
+  suggestLoading.value = true
+  suggestCandidates.value = []
+  suggestSelected.value = []
+  suggestMsg.value = ''
+  try {
+    const res = await suggestModelLabels(taskModelId.value, taskDatasetId.value, 3)
+    if (res.ok) {
+      suggestCandidates.value = res.candidates || []
+      if (suggestCandidates.value.length === 0 && res.message) suggestMsg.value = res.message
+    } else {
+      suggestMsg.value = res.message || '识别失败'
+    }
+  } catch (error: any) {
+    suggestMsg.value = '识别失败: ' + (error.response?.data?.detail || error.message)
+  } finally {
+    suggestLoading.value = false
+  }
+}
+
+const adoptSuggest = async () => {
+  if (!taskModelId.value || suggestSelected.value.length === 0) return
+  suggestAdopting.value = true
+  try {
+    const res = await adoptSuggestedLabels(taskModelId.value, suggestSelected.value.map(c => ({
+      english_code: c.english_code,
+      chinese_name: c.chinese_name,
+      chinese_desc: c.chinese_desc
+    })))
+    const added = res.added || []
+    alert(`已采纳 ${added.length} 个新标签，追加到模型标签字典末尾：${added.join('、') || '（无新增）'}`)
+    suggestDialogOpen.value = false
+  } catch (error: any) {
+    alert('采纳失败: ' + (error.response?.data?.detail || error.message))
+  } finally {
+    suggestAdopting.value = false
+  }
+}
 
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 const ctx = ref<CanvasRenderingContext2D | null>(null)
@@ -383,6 +564,47 @@ const samConfig = ref<any>({ detector_weights: 'yolov8s-world.pt', conf: 0.15 })
 const samModels = ref<any[]>([])
 // 检测模型下拉当前选中项：__grounding_dino__ 表示 GroundingDINO，其余为 YOLO-World .pt 文件名
 const selectedDetector = ref('__grounding_dino__')
+
+// 千问 VL 大模型预标注配置（本地预留接口；部署到服务器/接入百炼后填写即可用）
+const showQwenConfig = ref(false)
+const qwenForm = ref({
+  qwen_enabled: false,
+  qwen_backend: 'ollama',
+  qwen_endpoint: 'http://localhost:11434',
+  qwen_model: 'qwen2.5-vl-7b-instruct',
+  qwen_api_key: '',
+  qwen_timeout: 90,
+  qwen_mock: false,
+})
+
+const openQwenConfig = () => {
+  const c = samConfig.value || {}
+  qwenForm.value = {
+    qwen_enabled: !!c.qwen_enabled,
+    qwen_backend: c.qwen_backend || 'ollama',
+    qwen_endpoint: c.qwen_endpoint || 'http://localhost:11434',
+    qwen_model: c.qwen_model || 'qwen2.5-vl-7b-instruct',
+    qwen_api_key: c.qwen_api_key || '',
+    qwen_timeout: c.qwen_timeout ?? 90,
+    qwen_mock: !!c.qwen_mock,
+  }
+  showQwenConfig.value = true
+}
+
+const saveQwenConfig = async () => {
+  try {
+    await updateSamConfig({ ...qwenForm.value })
+    samConfig.value = { ...samConfig.value, ...qwenForm.value }
+    showQwenConfig.value = false
+    alert(qwenForm.value.qwen_enabled
+      ? '千问配置已保存并启用' + (qwenForm.value.qwen_mock ? '（模拟框模式，未调用真实模型）' : '')
+      : '千问配置已保存（未启用，选择检测模型时仍可用 YOLO 与 GroundingDINO）')
+  } catch (e: any) {
+    alert('保存千问配置失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+const closeQwenConfig = () => { showQwenConfig.value = false }
 const batchId = ref<string | null>(null)
 const batchProgress = ref<any>(null)
 const batchTimer = ref<any>(null)
@@ -538,6 +760,16 @@ const loadTaskItems = async () => {
   try {
     const result = await getTaskItems(currentTask.value)
     items.value = result.items
+    taskDatasetId.value = result.dataset_id || ''
+    taskModelId.value = result.model_id || ''
+    // 每次进入任务重置：存在困难/空白样本时弹一次提醒（「知道了」仅本次会话生效）
+    suggestPrompted.value = false
+    nextTick(() => {
+      if (suggestBannerCount.value > 0 && !suggestPrompted.value) {
+        suggestPromptOpen.value = true
+        suggestPrompted.value = true
+      }
+    })
     
     // 更新类别（如果后端返回了）
     if (result.classes && result.classes.length > 0) {
@@ -587,6 +819,8 @@ const clearAnnotateState = () => {
 
 // 恢复上次未完成的标注任务
 const restoreAnnotateState = async () => {
+  // URL 直达（?dataset_id=xxx）优先，跳过本地恢复，避免旧任务覆盖直达任务
+  if (new URLSearchParams(window.location.search).has('dataset_id')) return
   let saved: any = null
   try {
     const raw = localStorage.getItem(ANNOTATE_STORE_KEY)
@@ -637,6 +871,7 @@ const selectImage = async (index: number) => {
   currentBoxes.value = []
   selectedBoxIndex.value = -1
   currentImageHasAi.value = false
+  currentSampleType.value = ''  // 切换图片重置样本类型（已有标注时由 loadExistingAnnotation 回填）
   // 切换图片：取消上一张的待保存状态（未保存的改动在离页时统一处理）
   dirty.value = false
   clearTimeout(autoSaveTimer.value)
@@ -668,15 +903,18 @@ const loadExistingAnnotation = async () => {
   loadingAnnotation.value = true
   try {
     const result = await getImageAnnotation(currentTask.value, currentImage.value.image_id)
-    if (result && result.boxes && result.boxes.length > 0) {
-      currentBoxes.value = result.boxes.map((box: any) => ({
-        class_id: box.class_id,
-        x1: box.x1,
-        y1: box.y1,
-        x2: box.x2,
-        y2: box.y2
-      }))
-      console.log('Loaded existing annotations:', currentBoxes.value.length)
+    if (result) {
+      currentSampleType.value = result.sample_type || ''
+      if (result.boxes && result.boxes.length > 0) {
+        currentBoxes.value = result.boxes.map((box: any) => ({
+          class_id: box.class_id,
+          x1: box.x1,
+          y1: box.y1,
+          x2: box.x2,
+          y2: box.y2
+        }))
+        console.log('Loaded existing annotations:', currentBoxes.value.length)
+      }
     }
   } catch (error: any) {
     console.error('加载标注失败:', error)
@@ -1182,6 +1420,8 @@ const loadSamConfigAndModels = async () => {
     // 初始化检测模型下拉选中项
     if (cfg.detector === 'grounding_dino') {
       selectedDetector.value = '__grounding_dino__'
+    } else if (cfg.detector === 'qwen_vl') {
+      selectedDetector.value = '__qwen_vl__'
     } else {
       selectedDetector.value = cfg.detector_weights ||
         ((models as any[])?.find?.((m: any) => m.name)?.name ?? 'yolov8s-world.pt')
@@ -1198,6 +1438,14 @@ const applyDetectorModel = async () => {
     if (name === '__grounding_dino__') {
       await updateSamConfig({ detector: 'grounding_dino', detector_weights: 'IDEA-Research/grounding-dino-tiny' })
       alert('已切换到 GroundingDINO（grounding-dino-tiny）\n（对单张图生效，批量任务会重新加载）')
+    } else if (name === '__qwen_vl__') {
+      if (!samConfig.value.qwen_enabled) {
+        alert('千问 VL 尚未启用。请先点击「千问设置」填写后启用。\n（本地联调可开启"模拟框"模式不调用真实模型）')
+        loadSamConfigAndModels()
+        return
+      }
+      await updateSamConfig({ detector: 'qwen_vl' })
+      alert('已切换到千问 VL 大模型标注\n（对单张图生效，批量任务会重新加载；若未配置服务端会记入日志并返回空）')
     } else {
       await updateSamConfig({ detector: 'yolo_world', detector_weights: name })
       alert(`已切换到检测模型: ${name}\n（对单张图生效，批量任务会重新加载）`)
@@ -1272,7 +1520,8 @@ const runAutoLabel = async () => {
       x1: b.x1,
       y1: b.y1,
       x2: b.x2,
-      y2: b.y2
+      y2: b.y2,
+      source: b.source || 'ai'
     }))
     // 按 IoU 去重：与已有任意类别框重叠 >=0.5 的视为同一目标，避免重复标注（含跨类别）
     const newAiBoxes = aiBoxes.filter(
@@ -1345,7 +1594,13 @@ const pollBatch = async () => {
   if (res.status === 'done') {
     batchId.value = null
     saveAnnotateState()
-    alert(`批量预标注完成！共标注 ${res.summary?.annotated ?? res.boxes_written} 张图片`)
+    const annotated = res.summary?.annotated ?? res.boxes_written ?? 0
+    const retried = res.retried || 0
+    const skipped = (res.skipped_candidates || []).length
+    let msg = `批量预标注完成！共标注 ${annotated} 张图片`
+    if (retried > 0) msg += `\n其中 ${retried} 张通过降阈值/双引擎兜底补标成功`
+    if (skipped > 0) msg += `\n仍有 ${skipped} 张两次兜底都未检出目标（可能需要人工复核或调整类别）`
+    alert(msg)
     await loadTaskItems()
   } else if (res.status === 'cancelled') {
     batchId.value = null
@@ -1447,10 +1702,19 @@ const persistAnnotation = async (silent = false): Promise<boolean> => {
   savingAnnotation.value = true
   try {
     const aiFlag = currentImageHasAi.value || !!currentImage.value.ai_annotated
-    await saveAnn(currentTask.value, currentImage.value.image_id, currentBoxes.value, aiFlag)
+    // 人工保存：显式样本类型时附带 manual 判据（人工确认），未选择时留空由后端自动判定
+    const manualType = currentSampleType.value || undefined
+    // 人工框标 source=manual（AI 框保存 source=ai_x），后端据此识别"人工补框→困难样本"
+    const payloadBoxes = currentBoxes.value.map((b: any) =>
+      b.source ? b : { ...b, source: 'manual' }
+    )
+    await saveAnn(currentTask.value, currentImage.value.image_id, payloadBoxes, aiFlag, manualType, manualType ? 'manual' : undefined)
     items.value[currentIndex.value].annotated = true
     if (aiFlag) {
       items.value[currentIndex.value].ai_annotated = true
+    }
+    if (manualType) {
+      items.value[currentIndex.value].sample_type = manualType
     }
     dirty.value = false
     if (!silent) alert('保存成功!')
@@ -1511,39 +1775,18 @@ const onImportYolo = async (e: any) => {
 
 const exportTask = async () => {
   if (!currentTask.value) return
-  
-  // 校验比例
-  const sum = ratioTrain.value + ratioVal.value + ratioTest.value
-  if (sum <= 0) {
-    alert('划分比例之和必须大于0')
-    return
-  }
   if (!(await showConfirm(
-    `确认导出并自动划分数据集？\n\n` +
-    `训练:验证:测试 = ${ratioTrain.value} : ${ratioVal.value} : ${ratioTest.value}\n\n` +
-    `导出结构：\n` +
-    `  train/images + train/labels\n` +
-    `  val/images + val/labels\n` +
-    `  test/images + test/labels\n` +
-    `  data.yaml（根目录）\n\n` +
-    `点击确定后将写入数据集目录。`
+    `确认导出已标注数据集？\n\n` +
+    `将把标注结果导出为 YOLO 格式（labels/*.txt）写入数据集目录。\n` +
+    `数据集划分将在「封板」时进行。`
   ))) return
 
   exporting.value = true
   try {
-    const result = await exportAnnotationsSplit(
-      currentTask.value,
-      ratioTrain.value,
-      ratioVal.value,
-      ratioTest.value
-    )
-    const c = result.counts || {}
+    const result = await exportAnnotations(currentTask.value)
     alert(
-      `导出并划分成功！共 ${result.total} 张已标注图片\n\n` +
-      `  训练集: ${c.train} 张\n` +
-      `  验证集: ${c.val} 张\n` +
-      `  测试集: ${c.test} 张\n` +
-      `data.yaml 已更新，可直接用于训练。`
+      `导出成功！共 ${result.total} 张已标注图片\n` +
+      `YOLO 标注已写入数据集目录，划分随封板进行。`
     )
   } catch (error: any) {
     alert('导出失败: ' + (error.response?.data?.detail || error.message))
@@ -1646,8 +1889,43 @@ onMounted(() => {
   window.addEventListener('keyup', handleKeyup)
   window.addEventListener('resize', fitView)
   document.addEventListener('click', handleDocClick)
+  handleUrlEntry()
   restoreAnnotateState()
 })
+
+// 雪球闭环（1.8）：?dataset_id=xxx 直达 —— 优先复用该数据集已有标注任务，
+// 无任务则自动创建并进入（对应数据集页"准备"后自动建任务 + "去标注"按钮跳转）
+const handleUrlEntry = async () => {
+  const params = new URLSearchParams(window.location.search)
+  const dsId = params.get('dataset_id')
+  if (!dsId) return
+  await loadDatasets()
+  const ds = datasets.value.find((d: any) => d.dataset_id === dsId)
+  if (!ds) {
+    alert('未找到数据集 ' + dsId + '，请先上传并准备')
+    return
+  }
+  newTask.value.datasetId = dsId
+  syncClassesFromDataset(dsId)
+  try {
+    const found = await findAnnotationTask(dsId, 'v1')
+    if (found?.task) {
+      currentTask.value = found.task.task_id
+      if ((found.task.classes || []).length) {
+        classes.value = found.task.classes
+        classesInput.value = found.task.classes.join(', ')
+      }
+      if (found.task.imported_annotations) importedCount.value = found.task.imported_annotations
+      await loadTaskItems()
+      // 直达成功（自动任务已存在），清掉 URL 参数避免刷新时重复触发
+      window.history.replaceState({}, '', '/annotate')
+    } else {
+      await createTask()  // 无任务 → 自动创建（后端 prepare 已建则由 find 命中，此处兜底）
+    }
+  } catch (e: any) {
+    alert('进入标注任务失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleKeydown)
@@ -1661,6 +1939,76 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+/* 千问 VL 配置弹窗 */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.modal-box {
+  background: #fff;
+  border-radius: 10px;
+  padding: 20px 24px;
+  width: 460px;
+  max-width: 92vw;
+  max-height: 86vh;
+  overflow: auto;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+}
+.modal-box h3 {
+  margin: 0 0 8px;
+  font-size: 16px;
+}
+.modal-box .row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0;
+  font-size: 13px;
+  color: #333;
+}
+.modal-box .hint {
+  font-size: 12px;
+  color: #7f8c8d;
+  line-height: 1.5;
+  margin: 4px 0 12px;
+  background: #f8f9fa;
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.modal-box .w-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  font-size: 13px;
+}
+.modal-box .w-input.short {
+  flex: 0 0 80px;
+}
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+.modal-footer button {
+  padding: 7px 18px;
+  border-radius: 6px;
+  border: 1px solid #d0d7de;
+  background: #fff;
+  cursor: pointer;
+}
+.modal-footer button.primary {
+  background: #3d7eff;
+  color: #fff;
+  border-color: #3d7eff;
+}
 .info-box {
   background: #fff3cd;
   border: 1px solid #ffc107;
@@ -1693,29 +2041,6 @@ onUnmounted(() => {
 /* grid 列允许收缩：防止大尺寸画布把中间列撑到原图宽度，顶开右侧面板 */
 .canvas-area, .annotations-panel {
   min-width: 0;
-}
-
-.split-config {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-  padding: 0.4rem 0;
-  font-size: 0.85rem;
-  color: #555;
-}
-
-.split-label {
-  font-weight: 600;
-  color: #333;
-}
-
-.ratio-input {
-  width: 60px;
-  padding: 0.3rem;
-  border: 1px solid #ddd;
-  border-radius: 4px;
-  margin-left: 0.2rem;
 }
 
 .image-list {
@@ -1863,6 +2188,44 @@ onUnmounted(() => {
 .img-badge.ai {
   color: #fff;
   background: #e67e22;
+}
+
+.img-badge.hard {
+  color: #e74c3c;
+  background: rgba(231, 76, 60, 0.15);
+}
+
+.img-badge.bg {
+  color: #7f8c8d;
+  background: rgba(127, 140, 141, 0.15);
+}
+
+.sample-type-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-right: 0.5rem;
+}
+
+.sample-type-label {
+  font-size: 0.78rem;
+  color: #7f8c8d;
+}
+
+.sample-type-btn {
+  font-size: 0.75rem;
+  padding: 0.25rem 0.5rem;
+  border: 1px solid #bdc3c7;
+  border-radius: 4px;
+  background: #fff;
+  color: #555;
+  cursor: pointer;
+}
+
+.sample-type-btn.active {
+  border-color: #3498db;
+  background: #3498db;
+  color: #fff;
 }
 
 .image-item:hover {
@@ -2377,5 +2740,85 @@ button.small {
   height: 100%;
   background: #3498db;
   transition: width 0.3s ease;
+}
+
+/* ===== 新类别主动提醒（困难/空白样本弹窗 + AI 识别弹窗） ===== */
+.btn-soft {
+  background: #8e44ad;
+  color: #fff;
+  border: none;
+  padding: 0.4rem 0.9rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: bold;
+}
+
+.btn-ghost {
+  background: transparent;
+  border: 1px solid #d0d3d8;
+  color: #666;
+  padding: 0.4rem 0.9rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.suggest-modal .suggest-hint {
+  color: #777;
+  font-size: 0.88rem;
+  margin-bottom: 0.8rem;
+}
+
+.suggest-modal .suggest-msg {
+  color: #8e44ad;
+  padding: 0.5rem 0;
+  font-size: 0.92rem;
+}
+
+.suggest-modal .suggest-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  padding: 0.55rem 0.6rem;
+  border: 1px solid #eee;
+  border-radius: 6px;
+  margin-bottom: 0.5rem;
+  cursor: pointer;
+}
+
+.suggest-modal .suggest-item:hover {
+  background: #f7f4fb;
+}
+
+.suggest-item-body {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  flex: 1;
+}
+
+.suggest-item-body code {
+  background: #f0ecf5;
+  color: #7d3c98;
+  border-radius: 3px;
+  padding: 0.05rem 0.35rem;
+  font-size: 0.82rem;
+}
+
+.suggest-desc {
+  color: #777;
+  font-size: 0.86rem;
+}
+
+.suggest-imgs {
+  color: #e67e22;
+  font-size: 0.82rem;
+  margin-left: auto;
+}
+
+.suggest-actions {
+  display: flex;
+  gap: 0.6rem;
+  margin-top: 0.8rem;
 }
 </style>

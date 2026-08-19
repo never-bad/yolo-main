@@ -4,6 +4,22 @@ export interface UpdateModelRequest {
   name?: string
   description?: string
   tags?: string[]
+  model_code?: string
+  display_name?: string
+  status?: 'active' | 'inactive' | string
+}
+
+/** 模型统一标签字典项（四字段：index / english_code / chinese_name / chinese_desc） */
+export interface LabelItem {
+  index: number
+  english_code: string
+  chinese_name?: string
+  chinese_desc?: string
+}
+
+export interface LabelsDict {
+  model_code?: string
+  labels: LabelItem[]
 }
 
 /** 模型守门员评估报告（训练结束后自动对比新旧模型生成） */
@@ -112,6 +128,38 @@ export const listModels = async () => {
   return data
 }
 
+// 1.7 模型仓库：归属于模型的数据集（含状态机字段）
+export interface ModelDataset {
+  dataset_id: string
+  filename?: string
+  name?: string
+  stage?: string                 // collecting/annotating/sealed/training/completed/failed
+  training_status?: string       // incomplete/completed 未完成训练/已完成训练
+  status?: string                // uploaded/prepared 等（待封板判定用）
+  image_count?: number
+  annotated?: boolean
+  sealed_at?: string | null
+  trained_at?: string | null
+  model_id?: string | null
+  classes?: string[]
+  label_count?: number
+  label_validation?: {
+    status?: 'ok' | 'failed'
+    checked_files?: number
+    lines_checked?: number
+    invalid_files?: number
+    invalid_lines?: number
+    errors?: string[]
+    checked_at?: string
+  } | null
+  uploaded_at?: string
+}
+
+export const getModelDatasets = async (modelId: string): Promise<{ model_id: string; datasets: ModelDataset[] }> => {
+  const { data } = await api.get(`/models/${modelId}/datasets`)
+  return data
+}
+
 export const getModel = async (modelId: string): Promise<ModelDetails> => {
   const { data } = await api.get(`/models/${modelId}`)
   return data
@@ -122,8 +170,72 @@ export const updateModel = async (modelId: string, request: UpdateModelRequest) 
   return data
 }
 
+// 阶段0：统一标签字典（四字段 CRUD）
+export const getLabelsDict = async (modelId: string): Promise<LabelsDict> => {
+  const { data } = await api.get(`/models/${modelId}/labels`)
+  return data
+}
+
+export const updateLabelsDict = async (modelId: string, labels: LabelItem[]): Promise<LabelsDict> => {
+  const { data } = await api.put(`/models/${modelId}/labels`, { labels })
+  return data
+}
+
+export interface LabelSuggestion {
+  english_code: string
+  chinese_name: string
+  chinese_desc: string
+  images: string[]
+}
+
+export const suggestModelLabels = async (modelId: string, datasetId: string, limit = 3) => {
+  const { data } = await api.post(`/models/${modelId}/labels/suggest`, { dataset_id: datasetId, limit })
+  return data as { ok: boolean; message?: string; candidates?: LabelSuggestion[] }
+}
+
+// 采纳 AI 建议的新标签：追加到模型标签字典末尾（跳过已存在项）
+export const adoptSuggestedLabels = async (modelId: string, suggestions: { english_code: string; chinese_name: string; chinese_desc: string }[]) => {
+  const { data } = await api.post(`/models/${modelId}/labels/suggest/adopt`, { suggestions })
+  return data as { added: string[]; skipped: string[] }
+}
+
 export const deleteModel = async (modelId: string) => {
   const { data } = await api.delete(`/models/${modelId}`)
+  return data
+}
+
+// ===== 2.7 相似模型排查与合并（人工工具） =====
+export interface SimilarPair {
+  a: { model_id: string; name?: string; code?: string; dataset_count: number; empty?: boolean; status?: string }
+  b: { model_id: string; name?: string; code?: string; dataset_count: number; empty?: boolean; status?: string }
+  similarity: number
+  common_classes: string[]
+  suggested_main: string
+  suggested_main_datasets: number
+  sub_datasets: number
+}
+
+export const findSimilarModels = async (minSimilarity: number = 0.5) => {
+  const { data } = await api.get('/models/similar-scan', { params: { min_similarity: minSimilarity } })
+  return data
+}
+
+export const mergeModels = async (mainModelId: string, mergedModelIds: string[], reason?: string) => {
+  const { data } = await api.post('/models/merge', {
+    main_model_id: mainModelId,
+    merged_model_ids: mergedModelIds,
+    reason: reason || undefined
+  })
+  return data
+}
+
+export const getMergeLogs = async (limit: number = 20) => {
+  const { data } = await api.get('/models/merge-log', { params: { limit } })
+  return data
+}
+
+export const rollbackMerge = async (logIndex: number = -1) => {
+  const { data } = await api.post('/models/rollback-merge', { log_index: logIndex })
   return data
 }
 
