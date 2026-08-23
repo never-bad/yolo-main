@@ -7,6 +7,7 @@ import asyncio
 import tempfile
 import zipfile
 import io
+import logging
 from pathlib import Path
 from datetime import datetime
 from fastapi import UploadFile
@@ -15,6 +16,8 @@ import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
+
+logger = logging.getLogger(__name__)
 
 
 def _load_json(path: Path):
@@ -403,7 +406,7 @@ class ModelService:
                 continue
         return None
 
-    async def create_empty_model(self, code: str, display_name: str = "", business: str = ""):
+    async def create_empty_model(self, code: str, display_name: str = "", business: str = "", description: str = ""):
         """动态创建空白模型（空标签字典 + 采集库）。code 已存在则直接返回现有模型。
 
         用于采集/上传时：「平台没有该模型 → 自动创建」的落地实现（2.2 / 1.7①）。
@@ -434,8 +437,12 @@ class ModelService:
                 "empty": True,               # 空模型：待采集 / 未有训练产出
                 "classes": [],               # 冗余英文码列表（与 labels_dict.json 一一对应，data.yaml names 来源）
                 "labels_file": "labels_dict.json",
-                "description": "",
+                "description": description or "",
                 "tags": [],
+                # M11：architecture 标准字段集（空模型暂无产出，置空占位）
+                "architecture_family": "",
+                "architecture_name": "",
+                "model_scale": "",
                 "created_at": now,
                 "updated_at": now,
             }
@@ -814,6 +821,49 @@ class ModelService:
             return dic
         return await asyncio.to_thread(_sync)
 
+    def init_labels_from_classes(self, model_id: str, classes: list) -> bool:
+        """标签字典自动生成（prepare 后懒回填）：归属模型的标签字典为空时，
+        用数据集检测到的真实类名初始化 labels_dict.json + model.json classes。
+
+        幂等：仅在字典为空时写入（有人工维护/合并结果的字典不覆盖，避免
+        重排 index 导致已标注数据类别错乱）。返回是否写入。
+        """
+        model_dir = self.registry_dir / model_id
+        if not (model_dir / "model.json").exists():
+            return False
+        dic = self._load_labels_dict_sync(model_dir)
+        if (dic.get("labels") or []):
+            return False  # 已有标签（人工维护/合并结果），不覆盖
+        uniq = []
+        seen = set()
+        for c in classes or []:
+            c = str(c).strip()
+            if not c:
+                continue
+            k = self._norm_class_name(c)
+            if k and k not in seen:
+                seen.add(k)
+                uniq.append(c)
+        if not uniq:
+            return False
+        labels = [
+            {"index": i, "english_code": c, "chinese_name": "", "chinese_desc": ""}
+            for i, c in enumerate(uniq)
+        ]
+        meta = _load_json(model_dir / "model.json")
+        meta["classes"] = uniq
+        meta["empty"] = False
+        meta["labels_auto_init"] = True
+        meta["labels_auto_init_at"] = datetime.now().isoformat()
+        meta["updated_at"] = meta["labels_auto_init_at"]
+        _save_json(model_dir / "model.json", meta)
+        _save_json(model_dir / "labels_dict.json", {
+            "model_code": meta.get("model_code"),
+            "labels": labels,
+        })
+        logger.info(f"model {model_id}: labels dict auto-initialized from dataset classes: {uniq}")
+        return True
+
     def _labels_usage_sync(self, model_id: str) -> dict:
         """统计该模型所有数据集标注中，每个 english_code 被标注的图片数（禁删保护用）。
 
@@ -836,8 +886,7 @@ class ModelService:
                 continue
             if ds_meta.get("model_id") != model_id:
                 continue
-            version = ds_meta.get("version", "v1")
-            ann_dir = ds_dir / version / "annotations"
+            ann_dir = ds_dir / "annotations"
             if not ann_dir.exists():
                 continue
             for p in ann_dir.glob("*.json"):
@@ -871,8 +920,7 @@ class ModelService:
                 ds_meta = _load_json(meta_file)
             except Exception:
                 ds_meta = {}
-            version = ds_meta.get("version", "v1")
-            ann_dir = ds_dir / version / "annotations"
+            ann_dir = ds_dir / "annotations"
             picks = []
             if ann_dir.exists():
                 for p in ann_dir.glob("*.json"):
@@ -885,7 +933,8 @@ class ModelService:
                     if boxes and not hard:
                         continue  # 已正常标注的跳过
                     img_rel = data.get("image_path") or ""
-                    img_abs = (ds_dir / version / img_rel) if img_rel else None
+                    # image_path 相对 DATA_DIR（如 datasets/ds_x/images/xxx.jpg）
+                    img_abs = (settings.DATA_DIR / img_rel) if img_rel else None
                     if img_abs and img_abs.exists():
                         picks.append((0 if hard else 1, str(img_abs)))
             picks.sort(key=lambda x: x[0])
@@ -1107,6 +1156,10 @@ class ModelService:
                 model_meta.setdefault("empty", False)
                 model_meta.setdefault("description", "")
                 model_meta.setdefault("tags", [])
+                # M11：architecture 标准字段集（上传模型无 base_model 可解析，置空占位）
+                model_meta.setdefault("architecture_family", "")
+                model_meta.setdefault("architecture_name", "")
+                model_meta.setdefault("model_scale", "")
                 model_meta["created_at"] = datetime.now().isoformat()
                 model_meta["updated_at"] = datetime.now().isoformat()
                 
@@ -1626,4 +1679,96 @@ class ModelService:
             return {"meta": meta, "superseded": superseded_records}
 
         result = await asyncio.to_thread(_override_sync)
+        return result
+
+    # ------------------------------------------------------------------
+    # P8 半自动发布：守门员通过 → production_ready(待确认) → 人工确认发布
+    # ------------------------------------------------------------------
+    async def list_pending_publish(self, business: str = None):
+        """列出待确认发布的模型：status=production_ready 且未确认发布（publish_status != published）。"""
+        def _list_sync():
+            models = []
+            if not self.registry_dir.exists():
+                return models
+            for model_dir in self.registry_dir.iterdir():
+                if not model_dir.is_dir():
+                    continue
+                model_file = model_dir / "model.json"
+                if not model_file.exists():
+                    continue
+                try:
+                    model_meta = _load_json(model_file)
+                except Exception:
+                    continue
+                if model_meta.get("status") != "production_ready":
+                    continue
+                if (model_meta.get("publish_status") or "pending") == "published":
+                    continue
+                if business and model_meta.get("business") != business:
+                    continue
+                models.append(model_meta)
+            return models
+
+        models = await asyncio.to_thread(_list_sync)
+        return {"models": sorted(models, key=lambda x: self._parse_version(x.get("version")), reverse=True)}
+
+    async def confirm_publish(self, model_id: str):
+        """确认发布（P8 半自动）：管理员点击后 → publish_status=published + published_at，
+        并将同业务其他已发布生产模型标 superseded，更新 model_libraries.current_production_model_id。
+        可选 24h 冷却期（副本内已由 ready_at 判定，这里只做状态转变，冷却判定由路由层做）。
+        """
+        model_dir = self.registry_dir / model_id
+        model_file = model_dir / "model.json"
+        if not await asyncio.to_thread(lambda: model_file.exists()):
+            raise ValueError(f"模型 {model_id} 不存在")
+
+        def _confirm_sync():
+            meta = _load_json(model_file)
+            if meta.get("status") != "production_ready":
+                raise ValueError(f"模型 {model_id} 当前状态 {meta.get('status')}，不可确认发布（需先通过守门员）")
+            meta["publish_status"] = "published"
+            meta["published_at"] = datetime.now().isoformat()
+
+            business = meta.get("business") or ""
+            superseded = []
+            if business:
+                for other in self.registry_dir.iterdir():
+                    if not other.is_dir():
+                        continue
+                    of = other / "model.json"
+                    if not of.exists():
+                        continue
+                    try:
+                        om = _load_json(of)
+                    except Exception:
+                        continue
+                    if om.get("model_id") == model_id or om.get("status") != "production_ready":
+                        continue
+                    if om.get("business") != business:
+                        continue
+                    if (om.get("publish_status") or "pending") != "published":
+                        continue
+                    om["status"] = "superseded"
+                    _save_json(of, om)
+                    superseded.append(om.get("model_id"))
+            _save_json(model_file, meta)
+            return {"meta": meta, "superseded": superseded}
+
+        result = await asyncio.to_thread(_confirm_sync)
+
+        # 更新 model_libraries.current_production_model_id 指向唯一生产模型
+        try:
+            if settings.PG_ENABLED:
+                from src.db import meta_store
+                libs = await meta_store.list_model_libraries()
+                biz = result["meta"].get("business") or ""
+                target_lib = next((l for l in libs if l["model_library_id"] == f"{biz}_lib"), None)
+                if target_lib is not None:
+                    await meta_store.upsert_model_library({
+                        **target_lib,
+                        "current_production_model_id": model_id,
+                        "updated_at": datetime.now().isoformat(),
+                    })
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"confirm_publish: update model_libraries failed: {e}")
         return result

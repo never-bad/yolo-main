@@ -25,6 +25,7 @@ class BBox(BaseModel):
     y2: float
     confidence: Optional[float] = None  # AI 置信度（仅 AI 标注携带）
     source: Optional[str] = None        # manual | ai | ai_qwen | import
+    audit: Optional[dict] = None        # L2 千问/人工审核结论，随框落盘（供问题图片检索）
 
 class SaveAnnotationRequest(BaseModel):
     boxes: List[BBox]
@@ -78,6 +79,14 @@ async def get_image_annotation(task_id: str, image_id: str):
     if not result:
         raise HTTPException(404, "Image not found")
     return result
+
+@router.delete("/tasks/{task_id}/images/{image_id}")
+async def delete_task_image(task_id: str, image_id: str):
+    """删除任务中的一张图片（同时清理其标注 JSON 与同名标签文件，并同步数据集计数）"""
+    try:
+        return await annotation_service.delete_image(task_id, image_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 @router.get("/tasks/{task_id}/export")
 async def export_annotations(task_id: str, format: str = "yolo"):

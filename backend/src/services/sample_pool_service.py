@@ -68,9 +68,10 @@ class SamplePoolService:
             raise ValueError("请选择至少一张图片")
 
         def _sync() -> dict:
-            version_dir = self.datasets_dir / dataset_id / version
+            # 数据集一律为 datasets/{dataset_id}（无 version 子目录）
+            version_dir = self.datasets_dir / dataset_id
             if not version_dir.exists():
-                raise ValueError(f"数据集 {dataset_id}/{version} 不存在")
+                raise ValueError(f"数据集 {dataset_id} 不存在")
             base = Path(settings.BASE_DIR)
             yaml_path = version_dir / "data.yaml"
             pool_names = []
@@ -90,7 +91,7 @@ class SamplePoolService:
                 labels_dir = cand
                 break
             if images_dir is None:
-                raise ValueError(f"数据集 {dataset_id}/{version} 未准备（无 images 目录）")
+                raise ValueError(f"数据集 {dataset_id} 未准备（无 images 目录）")
 
             # 目标目录
             target = self.hard_root / model_id
@@ -163,15 +164,16 @@ class SamplePoolService:
             raise ValueError("请选择至少一张图片")
 
         def _sync() -> dict:
-            version_dir = self.datasets_dir / dataset_id / version
+            # 数据集一律为 datasets/{dataset_id}（无 version 子目录）
+            version_dir = self.datasets_dir / dataset_id
             if not version_dir.exists():
-                raise ValueError(f"数据集 {dataset_id}/{version} 不存在")
+                raise ValueError(f"数据集 {dataset_id} 不存在")
             images_dir = None
             for cand in list(version_dir.rglob("images")):
                 images_dir = cand
                 break
             if images_dir is None:
-                raise ValueError(f"数据集 {dataset_id}/{version} 未准备（无 images 目录）")
+                raise ValueError(f"数据集 {dataset_id} 未准备（无 images 目录）")
 
             t_img = self.bg_root / "images"
             t_lbl = self.bg_root / "labels"

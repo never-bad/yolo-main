@@ -3,6 +3,9 @@ uvicorn[standard]==0.27.0
 python-multipart==0.0.6
 pydantic==2.5.3
 pydantic-settings==2.1.0
+# 元数据库：PostgreSQL 异步接入（连接参数由 .env 配置，服务器部署直接改环境变量）
+sqlalchemy[asyncio]>=2.0.30
+asyncpg>=0.29.0
 ultralytics==8.3.251
 pillow>=11.0.0
 pyyaml==6.0.1

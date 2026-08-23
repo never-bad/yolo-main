@@ -1,6 +1,7 @@
 import json
 import yaml
 import asyncio
+import logging
 import shutil
 import zipfile
 import re
@@ -8,6 +9,8 @@ from pathlib import Path
 from datetime import datetime
 from PIL import Image
 from src.core.settings import settings
+
+logger = logging.getLogger(__name__)
 
 
 def _load_json(path: Path):
@@ -54,7 +57,7 @@ class AnnotationService:
     
     # ------------------------------------------------------------------
     # 统一 JSON 标注格式（数据链路改造：一图一 JSON 为唯一权威标注）
-    # datasets/{dataset_id}/{version}/annotations/{image_id}.json
+    # datasets/{dataset_id}/annotations/{image_id}.json
     # {
     #   "image_id": "img_001", "image_path": "images/img_001.jpg",
     #   "width": 1920, "height": 1080,
@@ -72,10 +75,10 @@ class AnnotationService:
     #     }
     #   ]
     # }
-    # 读取时兼容旧任务集中式 annotations.json（任务目录下），新写入一律每图一文件
+    # 注：数据集一律为 datasets/{dataset_id}（无 version 子目录）}
     # ------------------------------------------------------------------
     def _image_ann_path(self, dataset_id: str, version: str, image_id: str) -> Path:
-        return self.datasets_dir / dataset_id / version / "annotations" / f"{image_id}.json"
+        return self.datasets_dir / dataset_id / "annotations" / f"{image_id}.json"
 
     def _load_image_ann(self, dataset_id: str, version: str, image_id: str) -> dict:
         p = self._image_ann_path(dataset_id, version, image_id)
@@ -98,7 +101,7 @@ class AnnotationService:
 
     def _load_all_image_anns(self, dataset_id: str, version: str) -> dict:
         """读取数据集下所有每图 JSON 标注（缺失/损坏按空处理）"""
-        ann_dir = self.datasets_dir / dataset_id / version / "annotations"
+        ann_dir = self.datasets_dir / dataset_id / "annotations"
         out = {}
         if not ann_dir.exists():
             return out
@@ -203,6 +206,10 @@ class AnnotationService:
             source = b.get("source")
             if source:
                 nb["source"] = source
+            # 审核结论（L2 千问/人工）随框落盘，供"问题图片检索"等使用
+            audit = b.get("audit")
+            if audit:
+                nb["audit"] = audit
             out.append(nb)
         return out
 
@@ -249,20 +256,23 @@ class AnnotationService:
         # 异步创建目录
         await asyncio.to_thread(lambda: task_dir.mkdir(parents=True, exist_ok=True))
         
-        # 获取数据集图片
-        dataset_dir = self.datasets_dir / dataset_id / version
-        
-        # 检查数据集目录是否存在
-        if not await asyncio.to_thread(lambda: dataset_dir.exists()):
-            raise ValueError(f"数据集 {dataset_id}/{version} 不存在，请先上传并准备数据集")
+        # 获取数据集图片（数据集一律为 datasets/{dataset_id}，无 version 子目录）
+        dataset_dir = self.datasets_dir / dataset_id
+
+        # 检查数据集目录是否存在（标准 YOLO 结构：images/{train,val,test} + 根 data.yaml）
+        if not await asyncio.to_thread(
+            lambda: (dataset_dir / "data.yaml").exists()
+            or (dataset_dir / "images").exists()
+        ):
+            raise ValueError(f"数据集 {dataset_id} 不存在或未准备，请先上传并执行 prepare")
         
         # 在线程中执行所有同步操作
         def _create_task_sync():
             images_dir = self._find_images_dir(dataset_dir)
             labels_dir = self._find_labels_dir(dataset_dir)
-            
+
             if not images_dir:
-                raise ValueError(f"数据集 {dataset_id}/{version} 中未找到图片目录，请确保已执行 prepare 操作")
+                raise ValueError(f"数据集 {dataset_id} 中未找到图片目录，请确保已执行 prepare 操作")
 
             # 数据集归属模型 + 类别（记录 model_id；类别权威来源 = 数据集 meta.json 的 classes，prepare 时已写入）
             ds_meta_path = self.datasets_dir / dataset_id / "meta.json"
@@ -272,6 +282,20 @@ class AnnotationService:
                     ds_meta = _load_json(ds_meta_path)
                     model_id = ds_meta.get("model_id", "")
                     auto_classes = ds_meta.get("classes") or []
+                else:
+                    # 标准 YOLO 结构数据集：类别从根 data.yaml 的 names 读取
+                    data_yaml = self.datasets_dir / dataset_id / "data.yaml"
+                    if data_yaml.exists():
+                        cfg = yaml.safe_load(
+                            data_yaml.read_text(encoding="utf-8")
+                        ) or {}
+                        names = cfg.get("names") or []
+                        if isinstance(names, dict):
+                            names = [
+                                names[k]
+                                for k in sorted(names, key=lambda x: int(x))
+                            ]
+                        auto_classes = [str(n) for n in names]
             except Exception:
                 pass
             
@@ -384,6 +408,7 @@ class AnnotationService:
         annotations_root = self.annotations_dir
         if not annotations_root.exists():
             return None
+
         for task_dir in sorted(annotations_root.iterdir(), reverse=True):
             task_file = task_dir / "task.json"
             if not task_file.is_file():
@@ -403,6 +428,41 @@ class AnnotationService:
                     "created_at": meta.get("created_at"),
                 }
         return None
+
+    async def delete_image(self, task_id: str, image_id: str):
+        """删除标注任务中的一张图片。
+
+        先经任务定位数据集，再调用 DatasetService.delete_image 删除图片文件、
+        每图 JSON 标注与同名标签文件并更新数据集 meta 计数；
+        最后从任务 item 列表中移除该图，保持列表与磁盘一致。
+        """
+        def _sync():
+            task_dir = self.annotations_dir / task_id
+            task_file = task_dir / "task.json"
+            if not task_file.exists():
+                raise ValueError(f"标注任务 {task_id} 不存在")
+            return _load_json(task_file)
+
+        meta = await asyncio.to_thread(_sync)
+        ds_id = meta.get("dataset_id") or ""
+        if not ds_id:
+            raise ValueError("标注任务未绑定数据集，无法删除图片")
+
+        from src.services.dataset_service import DatasetService
+        result = await DatasetService().delete_image(ds_id, image_id)
+        removed_id = result.get("image_id", image_id)
+
+        # 从任务 items 中移除，保持列表与磁盘一致
+        items = [it for it in (meta.get("items") or []) if it.get("image_id") != removed_id]
+        meta["items"] = items
+
+        def _save():
+            task_dir = self.annotations_dir / task_id
+            _save_json(task_dir / "task.json", meta)
+
+        await asyncio.to_thread(_save)
+        result["total_images"] = len(items)
+        return result
     
     def _calculate_image_path(self, img_path: Path) -> str:
         """计算图片相对于 DATA_DIR 的路径"""
@@ -540,6 +600,8 @@ class AnnotationService:
                 item["annotated"] = item["image_id"] in annotations
                 item["ai_annotated"] = bool(ann.get("ai_annotated", False))
                 item["sample_type"] = ann.get("sample_type", "")
+                # P2：has_label=该图标注是否存在有内容的框（approved 且 has_label 联合完成判定）
+                item["has_label"] = bool(ann.get("boxes"))
                 unique_items.append(item)
             
             return {
@@ -641,6 +703,10 @@ class AnnotationService:
             
             # 查找图片信息（首次写入时补充元数据）
             info = next((it for it in task_meta.get("items", []) if it.get("image_id") == image_id), {})
+            # 批量预标注进行中允许删除图片：图已被删除（不在任务 items 且图片文件不存在）时
+            # 拒绝写回标注，避免残留“孤儿标注”JSON（图片没了标注还在）
+            if not info:
+                return {"ok": False, "error": "Image removed from task"}
             
             # 规范化框（补全标签四字段 + 置信度/来源），并判定样本类型
             classes = task_meta.get("classes", []) or []
@@ -681,9 +747,18 @@ class AnnotationService:
             }
             
             self._save_image_ann(dataset_id, version, image_id, ann_data)
-            return {"ok": True, "sample_type": s_type, "sample_reasons": s_reasons}
+            return {"ok": True, "sample_type": s_type, "sample_reasons": s_reasons,
+                    "has_label": bool(norm_boxes)}
         
-        return await asyncio.to_thread(_save_annotation_sync)
+        result = await asyncio.to_thread(_save_annotation_sync)
+        # P2：标注完成/更新时回填 PG 影子库 has_label（容错：PG 不可用不影响 JSON 主存储）
+        if result.get("ok") and settings.PG_ENABLED:
+            try:
+                from src.db import meta_store
+                await meta_store.update_task_item_has_label(task_id, image_id, bool(result.get("has_label")))
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"backfill has_label {task_id}/{image_id} failed: {e}")
+        return result
 
     async def clear_ai_annotations(self, task_id: str):
         """清除该任务所有 AI 预标注（批量误标过多时一键清理，便于重新标注）。
@@ -750,10 +825,10 @@ class AnnotationService:
                 except Exception:
                     pass
                 
-                # 获取数据集labels目录
+                # 获取数据集labels目录（数据集一律为 datasets/{dataset_id}，无 version 子目录）
                 dataset_id = task_meta["dataset_id"]
                 version = task_meta["version"]
-                dataset_dir = self.datasets_dir / dataset_id / version
+                dataset_dir = self.datasets_dir / dataset_id
                 
                 if not dataset_dir.exists():
                     return {"ok": False, "error": f"Dataset directory not found: {dataset_dir}"}
@@ -857,7 +932,7 @@ class AnnotationService:
         
         # 方法2：如果方法1失败，尝试从 image_path 解析
         if label_path is None:
-            # image_path 格式：datasets/ds_xxx/v1/images/xxx.jpg 或 datasets/ds_xxx/v1/images/train/xxx.jpg
+            # image_path 格式：datasets/ds_xxx/images/xxx.jpg 或 datasets/ds_xxx/images/train/xxx.jpg
             if image_path_str and ('/images/' in image_path_str or '\\images\\' in image_path_str):
                 # 提取 images/ 之后的部分
                 if '/images/' in image_path_str:

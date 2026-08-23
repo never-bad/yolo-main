@@ -26,9 +26,11 @@ DEFAULT_CONFIG = {
     "detector": "yolo_world",        # yolo_world | grounding_dino | none
     "detector_weights": "yolov8s-world.pt",
     "grounding_dino_model": "IDEA-Research/grounding-dino-tiny",  # Transformers 集成的 GD 模型名
+    "detectors": [],             # 多引擎同时检测：["grounding_dino","yolo_world","qwen_vl"]，空=沿用下方单 engine
     "grounding_dino_size": 640,      # GroundingDINO 推理分辨率（越小越快，默认 800）
     "grounding_dino_min_conf": 0.25, # GD 置信度下限（GD 分数尺度与 YOLO 不同，过低会大量误检）
-    "sam_enabled": True,             # 是否启用 SAM 分割精修
+    "sam_enabled": True,             # 是否启用 SAM 分割精修（单图 AI 标注）
+    "batch_sam_enabled": False,      # 批量预标注是否启用 SAM 精修（默认关：速度快一倍以上，框贴合略降；可改 true 恢复）
     "sam_weights": "sam_b.pt",
     "imgsz": 640,                    # 检测器输入尺寸
     "sam_imgsz": 1024,               # SAM 输入尺寸
@@ -51,10 +53,13 @@ DEFAULT_CONFIG = {
     "qwen_enabled": False,           # 是否启用千问 VL 作为检测引擎（yolo_world | grounding_dino | qwen_vl | none）
     "qwen_backend": "ollama",        # ollama（本地大模型）| dashscope（阿里云百炼 OpenAI 兼容接口）
     "qwen_endpoint": "http://localhost:11434",  # ollama: http://localhost:11434；dashscope: https://dashscope.aliyuncs.com/compatible-mode/v1
-    "qwen_model": "qwen2.5-vl-7b-instruct",      # ollama 模型名 或 百炼模型名（qwen-vl-max 等）
+    "qwen_model": "qwen3-vl:8b",     # ollama 模型名 或 百炼模型名（qwen-vl-max 等）；服务器部署用环境变量 OLLAMA_QWEN_MODEL 覆盖
     "qwen_api_key": "",              # dashscope 需要 API Key；ollama 不需要
     "qwen_timeout": 90,              # 单图推理超时（秒），VLM 速度慢需给足余量
     "qwen_mock": False,              # 本地联调：True 时返回模拟框，不真实调用大模型（仅用于验证链路）
+    # Qwen3-VL 服务器部署配套（仅 ollama 后端生效，随每次请求传递）：
+    "qwen_keep_alive": "5m",         # Ollama keep_alive：模型驻留内存时长（"5m"/"30m"/"-1"=常驻），避免频繁换载
+    "qwen_num_parallel": 1,          # OLLAMA_NUM_PARALLEL：同一模型并行处理请求数（GPU 显存充裕可调大）
 }
 
 
@@ -88,6 +93,11 @@ class BatchTask:
         self.status = "running"  # running | done | cancelled | error
         self.error: Optional[str] = None
         self.result_summary: Optional[dict] = None
+        # L2 千问审核汇总（只统计不落盘，前端批量进度展示）
+        self.audit_checked = 0    # 已自动审核的图片数
+        self.audit_boxes = 0      # 已审核的 AI 新增框数
+        self.audit_errors = 0     # 审核失败/无输出次数
+        self.audit_summary = {"keep": 0, "modify": 0, "reject": 0, "split": 0, "missed": 0}
 
 
 class SAMService:
@@ -128,6 +138,10 @@ class SAMService:
         env_endpoint = os.environ.get("OLLAMA_HOST", "").strip()
         if env_endpoint and "qwen_endpoint" not in overrides:
             cfg["qwen_endpoint"] = env_endpoint.rstrip("/")
+        # Qwen3-VL 部署配套：OLLAMA_QWEN_MODEL 环境变量覆盖模型名（未在 UI 显式配置时）
+        env_qwen_model = os.environ.get("OLLAMA_QWEN_MODEL", "").strip()
+        if env_qwen_model and "qwen_model" not in overrides:
+            cfg["qwen_model"] = env_qwen_model
         return cfg
 
     def _save_config(self, cfg: dict) -> None:
@@ -151,12 +165,10 @@ class SAMService:
                 return None
             task_meta = _load_json(task_file)
             dataset_id = task_meta.get("dataset_id")
-            version = task_meta.get("version", "v1")
             if not dataset_id:
                 return None
-            ds_meta_file = settings.DATASETS_DIR / dataset_id / version / "meta.json"
-            if not ds_meta_file.exists():
-                ds_meta_file = settings.DATASETS_DIR / dataset_id / "meta.json"
+            # 数据集一律为 datasets/{dataset_id}/meta.json（无 version 子目录）
+            ds_meta_file = settings.DATASETS_DIR / dataset_id / "meta.json"
             if not ds_meta_file.exists():
                 return None
             ds_meta = _load_json(ds_meta_file)
@@ -179,7 +191,31 @@ class SAMService:
             if v is not None:
                 cfg[k] = v
         self._save_config(cfg)
+        # 清空检测器单例缓存：修改引擎/权重后无需重启，下次推理自动按新配置重新加载
+        self._detector = None
+        self._detector_name = None
+        self._detector_prompts = None
+        self._gd_model = None
+        self._gd_processor = None
+        self._gd_name = None
         return cfg
+
+    # ------------------------------------------------------------------
+    # 多引擎解析
+    # ------------------------------------------------------------------
+    def _active_detectors(self, cfg: dict) -> list:
+        """返回本次要运行的检测引擎列表（支持多引擎同时检测，结果合并、自动去重保序）。
+        detectors 列表非空时优先；否则回退到旧的单引擎字段 detector。
+        """
+        multi = cfg.get("detectors") or []
+        if multi:
+            dets = []
+            for d in multi:
+                if d not in dets:
+                    dets.append(d)
+            return dets
+        det = cfg.get("detector", "yolo_world")
+        return [det] if det and det != "none" else []
 
     # ------------------------------------------------------------------
     # 检测模型管理
@@ -232,8 +268,8 @@ class SAMService:
     # ------------------------------------------------------------------
     # 模型加载（单例缓存）
     # ------------------------------------------------------------------
-    def _load_detector(self, cfg: dict):
-        det_type = cfg.get("detector", "yolo_world")
+    def _load_detector(self, cfg: dict, det_type: str = None):
+        det_type = det_type or cfg.get("detector", "yolo_world")
         if det_type == "none":
             return None
         if det_type == "qwen_vl":
@@ -251,6 +287,16 @@ class SAMService:
         self._detector = YOLO(self._find_model_file(weights))
         self._detector_name = weights
         return self._detector
+
+    def _load_engine(self, det: str, cfg: dict):
+        """按引擎名加载对应检测模型（多引擎预加载/可用性检查用）；单例缓存，unused 引擎不加载"""
+        if det == "grounding_dino":
+            self._load_grounding_dino(cfg)
+            return True
+        if det == "qwen_vl":
+            # 千问 VL 为远程/本地大模型服务，无需加载本地权重
+            return True
+        return self._load_detector(cfg, det_type=det if det != "yolo_world" else None)
 
     def _resolve_gd_model_name(self, model_name: str) -> str:
         """本地优先解析 GroundingDINO 模型：若已下载到 SAM_MODELS_DIR/<名称> 则用本地路径，避免联网"""
@@ -294,9 +340,12 @@ class SAMService:
         def _check() -> dict:
             try:
                 det_ok = True
-                if cfg.get("detector") != "none":
-                    det = self._load_detector(cfg)
-                    det_ok = det is not None
+                for det in self._active_detectors(cfg):
+                    try:
+                        if self._load_engine(det, cfg) is None:
+                            det_ok = False
+                    except Exception:
+                        det_ok = False
                 sam_ok = True
                 if cfg.get("sam_enabled", True):
                     sam = self._load_sam(cfg)
@@ -318,21 +367,25 @@ class SAMService:
         def _validate() -> dict:
             try:
                 checks = {}
-                if cfg.get("detector") != "none":
-                    if cfg.get("detector") == "grounding_dino":
-                        self._load_grounding_dino(cfg)
-                        checks["detector"] = "ok"
+                for det in self._active_detectors(cfg):
+                    try:
+                        if det == "grounding_dino":
+                            self._load_grounding_dino(cfg)
+                        else:
+                            model = self._load_engine(det, cfg)
+                            if model is not None:
+                                model.set_classes(["test"])
+                                model.predict(
+                                    np.zeros((64, 64, 3), dtype=np.uint8),
+                                    conf=0.5,
+                                    verbose=False,
+                                    imgsz=64,
+                                    device=self._resolve_device(cfg),
+                                )
+                    except Exception:
+                        checks[f"detector:{det}"] = "fail"
                     else:
-                        det = self._load_detector(cfg)
-                        det.set_classes(["test"])
-                        det.predict(
-                            np.zeros((64, 64, 3), dtype=np.uint8),
-                            conf=0.5,
-                            verbose=False,
-                            imgsz=64,
-                            device=self._resolve_device(cfg),
-                        )
-                        checks["detector"] = "ok"
+                        checks[f"detector:{det}"] = "ok"
                 if cfg.get("sam_enabled", True):
                     self._load_sam(cfg)
                     checks["sam"] = "ok"
@@ -369,11 +422,23 @@ class SAMService:
         # 模型推理非线程安全，加锁串行化，避免并发访问导致模型状态损坏
         async with self._lock:
             boxes = await asyncio.to_thread(self._run_auto_label_sync, img_abs, classes, conf, cfg, prompts)
+        # L2 千问审核（设计文档 §6.2/§6.3）：qwen 启用时对预标注结果自动二次审核。
+        # box_id = 返回列表下标，前端按此映射审核结论到对应框。
+        audit, audit_msg = None, None
+        if boxes and cfg.get("qwen_enabled", False):
+            for i, b in enumerate(boxes):
+                b["box_id"] = i
+            audit, audit_msg = await asyncio.to_thread(
+                self.qwen_audit_detections, img_abs, boxes,
+                cfg.get("qwen_labels_desc"), cfg, classes
+            )
         return {
             "image_id": image_id,
             "width": item["width"],
             "height": item["height"],
             "boxes": boxes,
+            "audit": audit,
+            "audit_message": audit_msg,
         }
 
     async def interactive_label(self, task_id: str, image_id: str,
@@ -641,8 +706,8 @@ class SAMService:
                 return True
             return False
 
-        # 每图 JSON（新存储）
-        ann_dir = settings.DATASETS_DIR / dataset_id / version / "annotations"
+        # 每图 JSON（新存储，数据集一律为 datasets/{dataset_id}，无 version 子目录）
+        ann_dir = settings.DATASETS_DIR / dataset_id / "annotations"
         if ann_dir.exists():
             for p in ann_dir.glob("*.json"):
                 try:
@@ -673,14 +738,23 @@ class SAMService:
         }
 
     def _detect(self, img_abs, classes, conf, cfg, prompts=None) -> list:
-        det = cfg.get("detector")
-        if det == "grounding_dino":
-            return self._detect_grounding_dino(img_abs, classes, conf, cfg, prompts)
-        if det == "qwen_vl":
-            return self._detect_qwen(img_abs, classes, conf, cfg, prompts)
-        if det == "none":
-            return []
-        return self._detect_yolo(img_abs, classes, conf, cfg, prompts)
+        """按配置运行一个或多个检测引擎，多引擎时结果合并（统一交给后续同类/跨类别合并去重）"""
+        out = []
+        for det in self._active_detectors(cfg):
+            try:
+                if det == "grounding_dino":
+                    boxes = self._detect_grounding_dino(img_abs, classes, conf, cfg, prompts)
+                elif det == "qwen_vl":
+                    boxes = self._detect_qwen(img_abs, classes, conf, cfg, prompts)
+                elif det == "yolo_world":
+                    boxes = self._detect_yolo(img_abs, classes, conf, cfg, prompts)
+                else:
+                    continue
+            except Exception as e:
+                print(f"multi-detect: 引擎 {det} 推理失败: {e}")
+                boxes = []
+            out.extend(boxes)
+        return out
 
     def _detect_yolo(self, img_abs, classes, conf, cfg, prompts=None) -> list:
         det = self._load_detector(cfg)
@@ -730,29 +804,13 @@ class SAMService:
             return []
         if cfg.get("qwen_mock", False):
             return self._mock_qwen_boxes(img_abs, classes)
-        import base64, io
-        from PIL import Image as PILImage
-        try:
-            image = PILImage.open(img_abs).convert("RGB")
-            # 尽量压缩：宽高比保持，最长边 ≤1024（VLM 输入分辨率过大既慢又易超 MaxInputError）
-            max_side = 1024
-            w, h = image.size
-            if max(w, h) > max_side:
-                scale = max_side / max(w, h)
-                image = image.resize((max(1, int(w * scale)), max(1, int(h * scale))))
-            buf = io.BytesIO()
-            image.save(buf, format="JPEG", quality=88)
-            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-        except Exception as e:
-            print(f"qwen: 图片编码失败 {img_abs}: {e}")
-            return []
         # 类别清单：若当前任务所属模型的标签字典可用，则附加中文名+中文描述，
         # 帮助大模型理解业务类别（千问输出仅按序号 class_id 对齐 classes，不依赖名称匹配）
         desc_info = cfg.get("qwen_labels_desc") or {}
         labels_desc = desc_info.get("labels") or []
         if labels_desc and len(labels_desc) >= len(classes):
             label_text = ", ".join(
-                f"{i}:{lab.get('chinese_name') or classes[i]}" 
+                f"{i}:{lab.get('chinese_name') or classes[i]}"
                 + (f"（{lab.get('chinese_desc')}）" if lab.get("chinese_desc") else "")
                 for i, lab in enumerate(labels_desc[:len(classes)])
             )
@@ -767,49 +825,10 @@ class SAMService:
             "如果某个类别没有目标，不要输出它的行。\n"
         )
         user_msg = f"类别清单：\n{label_text}\n请检测这张图片中的所有目标实例。"
-        endpoint = (cfg.get("qwen_endpoint") or "http://localhost:11434").rstrip("/")
-        api_key = cfg.get("qwen_api_key") or ""
-        # 同时兼容 OpenAI 兼容接口（含默认 /v1/chat/completions）与 Ollama /api/chat
-        url, payload, headers = None, None, {"Content-Type": "application/json"}
-        data_url = f"data:image/jpeg;base64,{b64}"
-        if "ollama" in (cfg.get("qwen_backend") or "").lower() or endpoint.startswith("http://localhost:1143"):
-            url = endpoint + "/api/chat"
-            payload = {
-                "model": cfg.get("qwen_model", "qwen2.5-vl-7b-instruct"),
-                "stream": False,
-                "messages": [
-                    {"role": "system", "content": sys_msg},
-                    {"role": "user", "content": user_msg, "images": [b64]},
-                ],
-            }
-        else:
-            url = endpoint + "/v1/chat/completions"
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
-            payload = {
-                "model": cfg.get("qwen_model", "qwen-vl-max"),
-                "temperature": 0.0,
-                "messages": [
-                    {"role": "system", "content": sys_msg},
-                    {"role": "user", "content": [
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                        {"type": "text", "text": user_msg},
-                    ]},
-                ],
-            }
-        import urllib.request
-        import json as _json
-        try:
-            req = urllib.request.Request(url, data=_json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=cfg.get("qwen_timeout", 90)) as resp:
-                body = _json.loads(resp.read().decode("utf-8"))
-            content = ((body.get("message") or {}).get("content")
-                       or (body.get("choices") or [{}])[0].get("message", {}).get("content")
-                       or "")
-            return self._parse_qwen_boxes(content, classes)
-        except Exception as e:
-            print(f"qwen: 推理失败 {img_abs}: {e}")
+        content = self._qwen_image_chat(cfg, sys_msg, user_msg, img_abs)
+        if not content:
             return []
+        return self._parse_qwen_boxes(content, classes)
 
     def _parse_qwen_boxes(self, content: str, classes) -> list:
         """解析千问输出：<box>x1,y1,x2,y2</box> <class>i</class> → 标准 boxes"""
@@ -852,6 +871,395 @@ class SAMService:
             })
         print(f"qwen IN-MOCK: {len(classes)} boxes for {img_abs}（本地联调模式，未调用真实模型）")
         return out
+
+    def _qwen_image_chat(self, cfg: dict, sys_msg: str, user_msg: str, img_abs: Path) -> str:
+        """统一调千问 VL（ollama / OpenAI 兼容接口），返回模型文本输出；失败返回 ''。
+
+        - 自动压缩图片（最长边 ≤1024，VLM 输入过大既慢又易超 MaxInputError）
+        - 同时兼容 Ollama /api/chat 与 OpenAI 兼容 /v1/chat/completions
+        检测（_detect_qwen）与审核（qwen_audit_detections）共用。
+        """
+        import base64, io
+        import json as _json
+        import urllib.request
+        from PIL import Image as PILImage
+        try:
+            image = PILImage.open(img_abs).convert("RGB")
+            max_side = 1024
+            w, h = image.size
+            if max(w, h) > max_side:
+                scale = max_side / max(w, h)
+                image = image.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+            buf = io.BytesIO()
+            image.save(buf, format="JPEG", quality=88)
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception as e:
+            print(f"qwen: 图片编码失败 {img_abs}: {e}")
+            return ""
+        endpoint = (cfg.get("qwen_endpoint") or "http://localhost:11434").rstrip("/")
+        api_key = cfg.get("qwen_api_key") or ""
+        headers = {"Content-Type": "application/json"}
+        data_url = f"data:image/jpeg;base64,{b64}"
+        if "ollama" in (cfg.get("qwen_backend") or "").lower() or endpoint.startswith("http://localhost:1143"):
+            url = endpoint + "/api/chat"
+            payload = {
+                "model": cfg.get("qwen_model", "qwen3-vl:8b"),
+                "stream": False,
+                "keep_alive": cfg.get("qwen_keep_alive", "5m"),          # 模型驻留内存时长；"-1"=常驻
+                "num_parallel": cfg.get("qwen_num_parallel", 1),          # 并行处理请求数（OLLAMA_NUM_PARALLEL）
+                "messages": [
+                    {"role": "system", "content": sys_msg},
+                    {"role": "user", "content": user_msg, "images": [b64]},
+                ],
+            }
+        else:
+            url = endpoint + "/v1/chat/completions"
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            payload = {
+                "model": cfg.get("qwen_model", "qwen-vl-max"),
+                "temperature": 0.0,
+                "messages": [
+                    {"role": "system", "content": sys_msg},
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                        {"type": "text", "text": user_msg},
+                    ]},
+                ],
+            }
+        try:
+            req = urllib.request.Request(url, data=_json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=cfg.get("qwen_timeout", 90)) as resp:
+                body = _json.loads(resp.read().decode("utf-8"))
+            return ((body.get("message") or {}).get("content")
+                    or (body.get("choices") or [{}])[0].get("message", {}).get("content")
+                    or "")
+        except Exception as e:
+            print(f"qwen: 推理失败 {img_abs}: {e}")
+            return ""
+
+    # ------------------------------------------------------------------
+    # L2 千问审核（设计文档 §6.2.2）：对 AI 预标注结果做中文语义二次审核
+    # 输入：图片 + 预标注框（含 box_id）+ 标签字典（zh+desc 作为"审核法典"）
+    # 输出：结构化 JSON —— box_reviews（keep/modify/reject/split + tags）
+    #       + missed_targets（漏标补框）+ stats 统计；前端据此渲染绿/黄/红/蓝色虚线框
+    # ------------------------------------------------------------------
+    def qwen_audit_detections(self, img_abs: Path, dets: list,
+                              labels_desc: Optional[dict], cfg: dict,
+                              classes: list) -> tuple:
+        """对一张图的已有检测框做千问 L2 审核。
+
+        返回 (audit_dict | None, message)：
+        - qwen_enabled=False → (None, 提示文案)
+        - qwen_mock=True → 返回模拟审核结果（便于本地验证前端渲染链路）
+        - 真实调用：按 §6.2.2 System Prompt 模板注入 zh+desc 审核法典与预标注框 JSON
+        audit_dict: {"ok", "box_reviews":[{box_id, action, reason, tags, kind, suggested_class_id}],
+                     "missed_targets":[{class_id, x1,y1,x2,y2, reason}], "stats", "box_count"}
+        """
+        if not cfg.get("qwen_enabled", False):
+            return None, "千问 VL 未启用（AI 标注模型设置 → 启用千问）。启用后，AI 预标注会自动附加 L2 审核。"
+        if not dets:
+            return None, "没有可审核的框"
+
+        # 统一给每个框分配 box_id（调用方已赋值则沿用），作为审核结果回写的索引
+        audit_dets = []
+        for i, b in enumerate(dets):
+            bid = b.get("box_id")
+            if bid is None:
+                bid = i
+                b["box_id"] = i
+            audit_dets.append({
+                "box_id": bid,
+                "class_id": b.get("class_id"),
+                "bbox": [round(float(b["x1"]), 1), round(float(b["y1"]), 1),
+                         round(float(b["x2"]), 1), round(float(b["y2"]), 1)],
+                "score": round(float(b.get("score") or b.get("confidence") or 0.9), 3),
+            })
+
+        if cfg.get("qwen_mock", False):
+            print(f"qwen audit IN-MOCK: {len(audit_dets)} boxes for {img_abs}（本地联调模式，未调用真实模型）")
+            return self._mock_qwen_audit(audit_dets, classes), ""
+
+        labels = (labels_desc or {}).get("labels") or []
+        defs = []
+        for i, c in enumerate(classes):
+            lab = labels[i] if i < len(labels) else None
+            zh = (lab or {}).get("chinese_name") or c
+            desc = (lab or {}).get("chinese_desc") or ""
+            defs.append(f"{i}. {zh}{('：' + desc) if desc else ''}")
+        labels_text = "\n".join(defs)
+        dets_text = json.dumps(audit_dets, ensure_ascii=False)
+        sys_msg = (
+            "# Role\n"
+            "你是资深的工业视觉数据审核专家。请对当前图片及 AI 预标注的边界框进行严苛的二次审核。\n\n"
+            "# Context\n"
+            f"- 目标类别定义（含审核标准）：\n{labels_text}\n"
+            f"- 预标注结果：{dets_text}\n"
+            "（JSON 格式：box_id 唯一标识每个框，bbox 为图片像素坐标 [x1,y1,x2,y2]，class_id 对应上面的类别序号）\n\n"
+            "# Audit Dimensions（审核维度）\n"
+            "请严格执行以下检查：\n"
+            "1. 语义准确性：框内物体是否与类别定义（desc）严格匹配？输出 keep / modify / reject。\n"
+            "2. 标签错误检测：框内物体是否被错误分类？若发现标签错误，输出 reject 并给出 suggested_class（建议的正确类别序号）。\n"
+            "3. 漏标排查：仔细扫描全图，是否还有符合类别定义的目标没有被框出来？输出到 missed_targets，bbox 为像素坐标。\n"
+            "4. 粘连框检测：是否有框内包含两个或多个独立目标？输出到 merged_boxes，action=split 或 reject。\n"
+            "5. 边界质量：框是否过大、过小或未贴合边缘？过大/过小输出 modify。\n"
+            "6. 业务合规：目标是否存在违规行为（如未戴安全帽、未穿反光衣）？在对应框的 tags 中加入 #compliance_issue。\n\n"
+            "# Output Format\n"
+            "仅返回标准 JSON，不要包含任何解释：\n"
+            "{\n"
+            "  \"missed_targets\": [\n"
+            "    {\"class_id\": 序号, \"bbox\": [x1, y1, x2, y2], \"reason\": \"漏标原因（限20字）\"}\n"
+            "  ],\n"
+            "  \"merged_boxes\": [\n"
+            "    {\"box_id\": 1, \"action\": \"split | reject\", \"reason\": \"包含两个独立目标（限20字）\"}\n"
+            "  ],\n"
+            "  \"label_errors\": [\n"
+            "    {\"box_id\": 3, \"suggested_class\": 正确类别序号, \"reason\": \"框内实际为XXX而非当前标签（限20字）\"}\n"
+            "  ],\n"
+            "  \"box_reviews\": [\n"
+            "    {\"box_id\": 2, \"action\": \"keep | modify | reject\", \"reason\": \"审核理由（限20字）\", \"tags\": [\"#occluded\", \"#blur\"]}\n"
+            "  ]\n"
+            "}"
+        )
+        user_msg = f"类别定义：\n{labels_text}\n\n预标注框：\n{dets_text}\n请审核这张图片。"
+        content = self._qwen_image_chat(cfg, sys_msg, user_msg, img_abs)
+        if not content:
+            return None, "千问审核推理失败（无输出）"
+        return self._parse_qwen_audit(content, audit_dets, labels, classes), ""
+
+    def _parse_qwen_audit(self, content: str, audit_dets: list, labels: list, classes: list) -> dict:
+        """解析千问审核输出 JSON → 归一化 audit 结构（容错：模型可能加 ```json 包裹或解释文字）"""
+        import re
+        m = re.search(r"\{[\s\S]*\}", content)
+        if not m:
+            return {"ok": False, "error": "千问审核输出不是标准 JSON", "raw": content[:500]}
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            return {"ok": False, "error": "千问审核输出 JSON 解析失败", "raw": m.group(0)[:500]}
+        if not isinstance(data, dict):
+            return {"ok": False, "error": "千问审核输出格式异常", "raw": content[:300]}
+
+        def cls_to_id(val) -> Optional[int]:
+            """类别名（中文名/英文 code/序号）→ class_id；无法映射返回 None"""
+            if val is None:
+                return None
+            if isinstance(val, bool):
+                return None
+            if isinstance(val, int):
+                return val if 0 <= val < len(classes) else None
+            s = str(val).strip()
+            if s.lstrip("-").isdigit():
+                i = int(s)
+                return i if 0 <= i < len(classes) else None
+            for i, c in enumerate(classes):
+                lab = labels[i] if i < len(labels) else {}
+                zh = str(lab.get("chinese_name") or "").strip()
+                if zh and zh == s:
+                    return i
+                if str(c).strip().lower() == s.lower():
+                    return i
+            return None
+
+        ids = {d["box_id"] for d in audit_dets}
+        box_reviews: List[dict] = []
+        # ① box_reviews：逐框审核
+        for r in (data.get("box_reviews") or []):
+            try:
+                bid = int(r.get("box_id"))
+            except (TypeError, ValueError):
+                continue
+            if bid not in ids:
+                continue
+            box_reviews.append({
+                "box_id": bid,
+                "action": (str(r.get("action") or "keep").lower() if str(r.get("action") or "").strip() else "keep"),
+                "kind": "review",
+                "reason": (str(r.get("reason") or ""))[:50],
+                "tags": [str(t) for t in (r.get("tags") or []) if str(t).strip()],
+                "suggested_class_id": None,
+            })
+        # ② label_errors：标签错误 → 补录/更新 reject + 建议类别
+        for r in (data.get("label_errors") or []):
+            try:
+                bid = int(r.get("box_id"))
+            except (TypeError, ValueError):
+                continue
+            if bid not in ids:
+                continue
+            sug = cls_to_id(r.get("suggested_class"))
+            found = next((b for b in box_reviews if b["box_id"] == bid), None)
+            if found is None:
+                box_reviews.append({
+                    "box_id": bid, "action": "reject", "kind": "label_error",
+                    "reason": (str(r.get("reason") or ""))[:50], "tags": [],
+                    "suggested_class_id": sug,
+                })
+            else:
+                found["kind"] = "label_error"
+                found["action"] = "reject"
+                found["suggested_class_id"] = sug
+                if not found["reason"]:
+                    found["reason"] = (str(r.get("reason") or ""))[:50]
+        # ③ merged_boxes：粘连框 → 补录/更新 split/reject
+        for r in (data.get("merged_boxes") or []):
+            try:
+                bid = int(r.get("box_id"))
+            except (TypeError, ValueError):
+                continue
+            if bid not in ids:
+                continue
+            act = str(r.get("action") or "split").lower()
+            found = next((b for b in box_reviews if b["box_id"] == bid), None)
+            if found is None:
+                box_reviews.append({
+                    "box_id": bid, "action": act if act in ("split", "reject") else "split",
+                    "kind": "merged", "reason": (str(r.get("reason") or ""))[:50], "tags": [],
+                    "suggested_class_id": None,
+                })
+            else:
+                found["kind"] = "merged"
+                if act in ("split", "reject"):
+                    found["action"] = act
+        # ④ missed_targets：漏标补框
+        missed = []
+        for mt in (data.get("missed_targets") or []):
+            cid = cls_to_id(mt.get("class_id") if "class_id" in mt else mt.get("class"))
+            bb = mt.get("bbox") or []
+            if cid is None or not isinstance(bb, (list, tuple)) or len(bb) != 4:
+                continue
+            try:
+                x1, y1, x2, y2 = (float(v) for v in bb)
+            except (TypeError, ValueError):
+                continue
+            missed.append({
+                "class_id": cid, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "reason": (str(mt.get("reason") or ""))[:50],
+            })
+        stats = {"keep": 0, "modify": 0, "reject": 0, "split": 0, "missed": len(missed)}
+        for b in box_reviews:
+            stats[b["action"]] = stats.get(b["action"], 0) + 1
+        return {
+            "ok": True,
+            "box_reviews": box_reviews,
+            "missed_targets": missed,
+            "stats": stats,
+            "box_count": len(audit_dets),
+        }
+
+    def _mock_qwen_audit(self, audit_dets: list, classes: list) -> dict:
+        """本地联调用模拟审核：便于验证前端渲染链路（不真实调用大模型）"""
+        box_reviews = []
+        for i, d in enumerate(audit_dets):
+            bid = d["box_id"]
+            if i == 0:
+                box_reviews.append({"box_id": bid, "action": "keep", "kind": "review",
+                                    "tags": [], "reason": "模拟：框贴合度良好", "suggested_class_id": None})
+            elif i == 1:
+                box_reviews.append({"box_id": bid, "action": "reject", "kind": "label_error",
+                                    "suggested_class_id": (0 % len(classes)) if classes else None,
+                                    "tags": [], "reason": "模拟：框中非目标物"})
+            elif i == 2:
+                box_reviews.append({"box_id": bid, "action": "modify", "kind": "review",
+                                    "tags": ["#occluded"], "reason": "模拟：存在遮挡",
+                                    "suggested_class_id": None})
+            else:
+                box_reviews.append({"box_id": bid, "action": "keep", "kind": "review",
+                                    "tags": [], "reason": "", "suggested_class_id": None})
+        missed = []
+        if audit_dets and len(classes) > 1:
+            missed.append({"class_id": 1 % len(classes), "x1": 20, "y1": 20, "x2": 90, "y2": 110,
+                           "reason": "模拟：漏标一个目标"})
+        stats = {"keep": 0, "modify": 0, "reject": 0, "split": 0, "missed": len(missed)}
+        for b in box_reviews:
+            stats[b["action"]] = stats.get(b["action"], 0) + 1
+        return {
+            "ok": True, "box_reviews": box_reviews, "missed_targets": missed,
+            "stats": stats, "box_count": len(audit_dets),
+        }
+
+    def _task_classes(self, task_id: str) -> list:
+        """读取标注任务注册的类别清单（英文 code，与 labels_dict/labels 序号对齐）"""
+        try:
+            meta = _load_json(settings.ANNOTATIONS_DIR / task_id / "task.json")
+            return list(meta.get("classes") or [])
+        except Exception:
+            return []
+
+    async def audit_image(self, task_id: str, image_id: str,
+                          boxes: Optional[list] = None) -> dict:
+        """对单张图当前标注框做千问 L2 审核（设计文档 §6.2.2 / §6.3 前端渲染）。
+
+        boxes 由前端传入当前画布上的框（未保存也可审）；缺省时读取已保存标注。
+        返回 {"image_id", "width", "height", "audit", "message"}。
+        """
+        cfg = self._read_config()
+        item = await self._get_item(task_id, image_id)
+        if not item:
+            raise ValueError("Image not found in task")
+        img_abs = settings.DATA_DIR / item["image_path"]
+        if not img_abs.exists():
+            raise ValueError(f"Image file not found: {img_abs}")
+        if boxes is None:
+            existing = await self.annotation_service.get_image_annotation(task_id, image_id)
+            boxes = (existing or {}).get("boxes") or []
+        else:
+            boxes = [b for b in boxes if b.get("x1") is not None]
+        if not boxes:
+            return {
+                "image_id": image_id, "width": item["width"], "height": item["height"],
+                "audit": None, "message": "当前图片没有标注框，无法审核",
+            }
+        classes = self._task_classes(task_id)
+        labels_desc = self._task_labels_desc(task_id)
+        if cfg.get("qwen_enabled", False):
+            if labels_desc is None:
+                labels_desc = {"labels": []}
+        audit, message = await asyncio.to_thread(
+            self.qwen_audit_detections, img_abs, boxes, labels_desc, cfg, classes
+        )
+        return {
+            "image_id": image_id, "width": item["width"], "height": item["height"],
+            "audit": audit, "message": message,
+        }
+
+    async def list_audit_issues(self, task_id: str) -> dict:
+        """扫描任务全部图片的已保存标注，返回带审核异议（reject/modify/split）的图片列表。
+
+        配合"审核落盘"：标注员不必逐张翻图，即可定位需要人工复核的图片。
+        未标注/无异议的图片不计入。
+        """
+        task_meta = await self._load_task_meta(task_id)
+        if not task_meta:
+            raise ValueError("Task not found")
+        dataset_id = task_meta.get("dataset_id", "")
+        version = task_meta.get("version", "v1")
+
+        def _scan():
+            issues = []
+            for item in task_meta.get("items", []):
+                image_id = item["image_id"]
+                ann = self.annotation_service._load_image_ann(dataset_id, version, image_id)
+                cnt = {"reject": 0, "modify": 0, "split": 0}
+                for b in (ann.get("boxes") or []):
+                    act = (b.get("audit") or {}).get("action")
+                    if act in cnt:
+                        cnt[act] += 1
+                total = cnt["reject"] + cnt["modify"] + cnt["split"]
+                if total:
+                    issues.append({
+                        "image_id": image_id,
+                        "image_path": item["image_path"],
+                        "width": item.get("width"),
+                        "height": item.get("height"),
+                        "issue_count": total,
+                        "actions": cnt,
+                    })
+            issues.sort(key=lambda x: x["issue_count"], reverse=True)
+            return issues
+
+        issues = await asyncio.to_thread(_scan)
+        return {"task_id": task_id, "total": len(issues), "issues": issues}
 
     # ------------------------------------------------------------------
     # 标签建议：AI 识别图片中「已知标签之外」的新类别（辅助不懂标签的用户）
@@ -918,8 +1326,10 @@ class SAMService:
             if "ollama" in (cfg.get("qwen_backend") or "").lower() or endpoint.startswith("http://localhost:1143"):
                 url = endpoint + "/api/chat"
                 payload = {
-                    "model": cfg.get("qwen_model", "qwen2.5-vl-7b-instruct"),
+                    "model": cfg.get("qwen_model", "qwen3-vl:8b"),
                     "stream": False,
+                    "keep_alive": cfg.get("qwen_keep_alive", "5m"),          # 模型驻留内存时长；"-1"=常驻
+                    "num_parallel": cfg.get("qwen_num_parallel", 1),          # 并行处理请求数（OLLAMA_NUM_PARALLEL）
                     "messages": [
                         {"role": "system", "content": sys_msg},
                         {"role": "user", "content": user_msg, "images": [b64]},
@@ -1132,6 +1542,9 @@ class SAMService:
     async def _run_batch(self, batch_id: str, items: list) -> None:
         bt = self.batch_tasks[batch_id]
         cfg = self._read_config()
+        # 批量加速：默认关闭 SAM 精修（CPU 上 SAM 是每图最贵的一步，关掉速度翻倍以上；
+        # 框贴合度略降，单图 AI 标注不受影响；sam_config.json 中 batch_sam_enabled 可开回）
+        cfg["sam_enabled"] = cfg.get("batch_sam_enabled", False)
         # 千问预标注：批量携带模型标签字典（中文名+中文描述），一次解析全批复用
         if cfg.get("qwen_enabled", False):
             ld = self._task_labels_desc(bt.task_id)
@@ -1143,7 +1556,8 @@ class SAMService:
             if bt.cancelled:
                 bt.status = "cancelled"
                 return
-            await asyncio.to_thread(self._load_detector, cfg)
+            for det in self._active_detectors(cfg):
+                await asyncio.to_thread(self._load_engine, det, cfg)
             if cfg.get("sam_enabled", True):
                 await asyncio.to_thread(self._load_sam, cfg)
             # 模型加载完成后再次检查取消，避免加载期间点停止无效
@@ -1151,7 +1565,32 @@ class SAMService:
                 bt.status = "cancelled"
                 return
 
+            # 续标恢复：已标注图片无需重新推理。先只读扫描标注文件（不触发模型），
+            # 将已覆盖全部类别的图片计入 done —— 进度条从实际已完成数起步；
+            # 主循环只处理未标完的图片，中断后重新启动即从断点续跑。
+            remaining = []
             for item in items:
+                if bt.cancelled:
+                    bt.status = "cancelled"
+                    return
+                image_id = item["image_id"]
+                try:
+                    existing = await self.annotation_service.get_image_annotation(bt.task_id, image_id)
+                    existing_boxes = existing.get("boxes") or [] if existing else []
+                    existing_class_ids = {
+                        b.get("class_id") for b in existing_boxes if b.get("class_id") is not None
+                    }
+                    if existing_class_ids.issuperset(range(len(bt.classes))):
+                        bt.done += 1  # 所有类别的框都已标注（含 AI/人工）→ 计为已完成
+                        continue
+                except Exception:
+                    pass  # 读取失败按未完成处理，交给主循环重试
+                remaining.append(item)
+            if bt.cancelled:
+                bt.status = "cancelled"
+                return
+
+            for item in remaining:
                 if bt.cancelled:
                     bt.status = "cancelled"
                     return
@@ -1218,6 +1657,36 @@ class SAMService:
                     # 只保留缺失类别的检测框（class_id 为全局索引，与 bt.classes 对齐）
                     missing_set = set(missing_indices)
                     new_boxes = [b for b in boxes if b["class_id"] in missing_set]
+                    # L2 千问审核（设计文档 §6.2/§6.3）：每张图检测后自动二次审核，
+                    # 只统计汇总（keep/modify/reject/split/漏标）供批量进度展示，结论不落盘；
+                    # 失败仅计数，不影响批量主流程
+                    if new_boxes and cfg.get("qwen_enabled", False):
+                        for i, b in enumerate(new_boxes):
+                            b["box_id"] = i
+                        try:
+                            audit, audit_msg = await asyncio.to_thread(
+                                self.qwen_audit_detections, img_abs, new_boxes,
+                                cfg.get("qwen_labels_desc"), cfg, bt.classes
+                            )
+                            if audit and audit.get("ok"):
+                                st = audit.get("stats") or {}
+                                bt.audit_checked += 1
+                                bt.audit_boxes += len(new_boxes)
+                                for k in ("keep", "modify", "reject", "split", "missed"):
+                                    bt.audit_summary[k] = bt.audit_summary.get(k, 0) + (st.get(k) or 0)
+                                # 审核结论映射回本图 AI 新增框（落盘，供"问题图片检索"；box_id 不落盘）
+                                rmap = {r.get("box_id"): r for r in (audit.get("box_reviews") or [])}
+                                for i, b in enumerate(new_boxes):
+                                    r = rmap.get(i)
+                                    if r:
+                                        b["audit"] = {k: r.get(k) for k in
+                                                      ("action", "kind", "reason", "tags", "suggested_class_id")
+                                                      if r.get(k) is not None}
+                            else:
+                                bt.audit_errors += 1
+                        except Exception as e:
+                            bt.audit_errors += 1
+                            print(f"批量预标注 L2 审核失败 {image_id}: {e}")
                     if new_boxes:
                         clean_existing = [
                             {"class_id": b.get("class_id"), "x1": b.get("x1"), "y1": b.get("y1"),
@@ -1230,7 +1699,8 @@ class SAMService:
                             {"class_id": b["class_id"], "x1": b["x1"], "y1": b["y1"],
                              "x2": b["x2"], "y2": b["y2"],
                              "score": b.get("score") or b.get("confidence"),
-                             "source": "ai"}
+                             "source": "ai",
+                             **({"audit": b["audit"]} if b.get("audit") else {})}
                             for b in new_boxes
                         ]
                         await self.annotation_service.save_annotation(bt.task_id, image_id, clean_existing + clean_new, ai_annotated=True)
@@ -1275,6 +1745,12 @@ class SAMService:
             "current_image": bt.current_image,
             "error": bt.error,
             "summary": bt.result_summary,
+            "audit": {
+                "checked": bt.audit_checked,
+                "boxes": bt.audit_boxes,
+                "stats": bt.audit_summary,
+                "errors": bt.audit_errors,
+            } if bt.audit_checked else None,
         }
 
     async def stop_batch(self, batch_id: str) -> Optional[dict]:

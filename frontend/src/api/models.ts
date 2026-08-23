@@ -62,6 +62,7 @@ export interface ModelDetails {
   created_at?: string
   weights_path?: string
   name?: string
+  display_name?: string         // 模型库显示名（新建时人工指定，可改）
   description?: string
   tags?: string[]
   file_size?: number
@@ -128,11 +129,54 @@ export const listModels = async () => {
   return data
 }
 
+// ===== 模型库（model_libraries：base_algorithm / 标签字典 / 当前生产模型指针） =====
+export interface ModelLibrary {
+  model_library_id: string
+  display_name?: string
+  description?: string
+  business_scenario?: string
+  base_algorithm?: string
+  architecture_family?: string
+  label_dict_id?: string | null
+  current_production_model_id?: string | null
+  production_model_name?: string    // 附加字段：该库当前生产模型名
+  model_count?: number              // 附加字段：库内挂接模型数
+  created_at?: string
+  updated_at?: string
+}
+
+export const listLibraries = async (): Promise<{ libraries: ModelLibrary[] }> => {
+  const { data } = await api.get('/models/libraries')
+  return data
+}
+
+export const createLibrary = async (req: Partial<ModelLibrary>): Promise<ModelLibrary> => {
+  const { data } = await api.post('/models/libraries', req)
+  return data
+}
+
+export const deleteLibrary = async (libraryId: string) => {
+  const { data } = await api.delete(`/models/libraries/${libraryId}`)
+  return data
+}
+
+// 首页「+ 新建模型库」：创建空白模型（空标签字典 + 采集库），code 已存在则返回现有模型
+export const createModel = async (req: {
+  display_name: string
+  model_code: string
+  business?: string
+  description?: string
+}) => {
+  const { data } = await api.post('/models', req)
+  return data
+}
+
 // 1.7 模型仓库：归属于模型的数据集（含状态机字段）
 export interface ModelDataset {
   dataset_id: string
   filename?: string
   name?: string
+  display_name?: string        // 数据集显示名（展示优先于 filename）
   stage?: string                 // collecting/annotating/sealed/training/completed/failed
   training_status?: string       // incomplete/completed 未完成训练/已完成训练
   status?: string                // uploaded/prepared 等（待封板判定用）
@@ -244,6 +288,33 @@ export const listProductionModels = async (business?: string) => {
   const { data } = await api.get('/models/production', {
     params: { business: business || undefined }
   })
+  return data
+}
+
+// ===== P8 半自动发布（守门员通过 → 待确认发布 → 管理员确认后为唯一生产版本） =====
+export interface PendingPublishModel extends ModelDetails {
+  publish_status?: 'pending' | 'published' | string   // pending=待确认 published=已确认
+  ready_at?: string                                   // 守门员通过(待确认)时间，用于冷却期判定
+  published_at?: string                               // 确认发布时间
+  migration?: {                                       // 2.4 迁移训练产出标记
+    enabled?: boolean
+    source?: string
+    target?: string
+  } | null
+}
+
+export const listPendingPublish = async (business?: string): Promise<{ models: PendingPublishModel[] }> => {
+  const { data } = await api.get('/models/publish/pending', {
+    params: { business: business || undefined }
+  })
+  return data
+}
+
+export const confirmPublish = async (
+  modelId: string,
+  options?: { force?: boolean }
+): Promise<{ meta: PendingPublishModel; superseded: string[] }> => {
+  const { data } = await api.post(`/models/publish/${modelId}`, options || {})
   return data
 }
 

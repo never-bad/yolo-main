@@ -15,7 +15,7 @@
               :key="ds.dataset_id" 
               :value="ds.dataset_id"
             >
-              {{ ds.dataset_id }} ({{ getDatasetStatus(ds) }}) 
+              {{ ds.display_name || ds.dataset_id }} ({{ getDatasetStatus(ds) }}) 
               {{ ds.image_count ? `- ${ds.image_count}张图片` : '' }}
             </option>
           </select>
@@ -32,7 +32,7 @@
             @click="selectDataset(ds)"
           >
             <div class="ds-card-header">
-              <span class="ds-name">{{ ds.dataset_id }}</span>
+              <span class="ds-name">{{ ds.display_name || ds.dataset_id }}</span>
               <span :class="'status-badge status-' + ds.status">{{ getDatasetStatus(ds) }}</span>
             </div>
             <div class="ds-card-info">
@@ -142,26 +142,36 @@
             <span v-if="aiLabeling" class="loading-spinner"></span>
             {{ aiLabeling ? 'AI标注中(点击取消)...' : 'AI 预标注' }}
           </button>
-          <label class="ai-conf-label">检测模型:</label>
-          <select v-model="selectedDetector" class="model-select" @change="applyDetectorModel">
-            <option value="__grounding_dino__">grounding-dino-tiny (GroundingDINO)</option>
-            <option value="__qwen_vl__">qwen-vl (千问大模型)</option>
-            <option v-for="m in samModels" :key="m.name" :value="m.name">{{ m.name }}</option>
-          </select>
-          <label class="ai-conf-label model-add-label">
-            <input type="file" accept=".pt" class="model-add-input" @change="onSamModelFile" />
-            添加
-          </label>
-          <button class="ai-btn small" @click="openQwenConfig" title="配置千问 VL：本地部署(Ollama)或云端API">千问设置</button>
-          <label class="ai-conf-label">置信度:</label>
-          <input type="number" v-model.number="aiConf" min="0" max="1" step="0.05" class="conf-input" />
-          <label class="ai-conf-label">IoU:</label>
-          <input type="number" v-model.number="aiIou" min="0" max="1" step="0.05" class="conf-input" />
-          <button class="ai-btn small" @click="onThreshChange" title="保存置信度/IoU 阈值，AI 标注即用">保存阈值</button>
+          <button class="ai-btn batch-btn" @click="runBatchLabel" :disabled="batchRunning || !items.length" title="对任务内全部未标注图片执行 AI 预标注">
+            <span v-if="batchRunning" class="loading-spinner"></span>
+            {{ batchRunning ? '批量预标注中...' : '批量预标注' }}
+          </button>
+          <span class="ai-classes-label" v-if="classes.length" :title="'检测类别（由当前模型库自动同步）：\n' + classes.join('、')">
+            检测类别: {{ classes.length }}个
+          </span>
+          <details class="ai-params">
+            <summary title="置信度 / IoU 阈值参数（AI 预标注即用）">参数</summary>
+            <div class="ai-params-body">
+              <label class="ai-conf-label">置信度:</label>
+              <input type="number" v-model.number="aiConf" min="0" max="1" step="0.05" class="conf-input" />
+              <label class="ai-conf-label">IoU:</label>
+              <input type="number" v-model.number="aiIou" min="0" max="1" step="0.05" class="conf-input" />
+              <button class="ai-btn small" @click="onThreshChange" title="保存置信度/IoU 阈值，AI 标注即用">保存阈值</button>
+            </div>
+          </details>
           <div v-if="batchId" class="batch-progress">
             <span>批量预标注: {{ batchProgress?.done || 0 }}/{{ batchProgress?.total || 0 }}</span>
             <div class="progress-bar">
               <div class="progress-fill" :style="{ width: batchPercent + '%' }"></div>
+            </div>
+            <div v-if="batchProgress?.audit" class="audit-batch-line">
+              L2 审核: {{ batchProgress.audit.checked }} 图/{{ batchProgress.audit.boxes }} 框
+              · <span class="a-keep">✓{{ batchProgress.audit.stats.keep }}</span>
+              <span class="a-modify">~{{ batchProgress.audit.stats.modify }}</span>
+              <span class="a-reject">✗{{ batchProgress.audit.stats.reject }}</span>
+              <span class="a-split">⧉{{ batchProgress.audit.stats.split }}</span>
+              <span class="a-missed">漏{{ batchProgress.audit.stats.missed }}</span>
+              <span v-if="batchProgress.audit.errors" class="a-reject">({{ batchProgress.audit.errors }} 次失败)</span>
             </div>
             <button class="danger small" @click="stopBatch" :disabled="!batchRunning">停止</button>
           </div>
@@ -200,7 +210,80 @@
       </div>
 
       <div class="annotations-panel">
-        <h3>当前标注</h3>
+        <div class="ann-panel-header">
+          <h3>当前标注</h3>
+          <div class="more-wrap">
+            <button class="more-btn" :class="{ active: moreOpen }" @click="moreOpen = !moreOpen" title="全局 / 批量操作">⋯ 更多</button>
+            <div v-if="moreOpen" class="menu-backdrop" @click="moreOpen = false"></div>
+            <div v-if="moreOpen" class="more-menu" @click.stop>
+              <button class="cfg-entry" @click="openModelCfg(); moreOpen = false" title="选择检测引擎（可多选同时检测）、调阈值、配置千问 VL">
+                标注模型设置
+              </button>
+              <button
+                @click="auditCurrentImage(); moreOpen = false"
+                :disabled="auditing || !currentBoxes.length"
+                title="对当前图片标注框调用千问 L2 审核：漏标/粘连/标签错误/框质量/合规。绿=通过、橙=待修正、红=建议删除、蓝虚线=漏标建议，可一键采纳"
+              >
+                <span v-if="auditing" class="loading-spinner"></span>
+                {{ auditing ? 'AI 审核中...' : 'AI 审核当前图（千问 L2）' }}
+              </button>
+              <button
+                @click="openAuditIssues(); moreOpen = false"
+                :disabled="loadingIssueList"
+                title="列出任务中带审核异议的图片（建议删除/待修正/粘连），点击直达，不用逐张翻图"
+              >
+                <span v-if="loadingIssueList" class="loading-spinner"></span>
+                审核问题图片
+              </button>
+              <button
+                @click="toggleInteractiveMode(); moreOpen = false"
+                :disabled="interactiveBusy || !items.length"
+                :class="{ active: interactiveMode }"
+                title="框选局部区域 + 文本提示（当前类别）检测，避免全图盲扫误标"
+              >
+                {{ interactiveMode ? '退出交互式标注' : '交互式标注' }}
+              </button>
+              <button class="danger" @click="clearAllAiLabels(); moreOpen = false" :disabled="counts.ai === 0" title="误标过多时一键清除，重新标注">
+                清除全部AI标注（{{ counts.ai }}）
+              </button>
+              <button class="danger" @click="cleanOverlaps(); moreOpen = false" :disabled="counts.annotated === 0" title="清理历史遗留的高度重合标注框（跨类别/同类重复）">
+                清理重叠框
+              </button>
+              <button @click="exportTask(); moreOpen = false" :disabled="exporting">
+                <span v-if="exporting" class="loading-spinner"></span>
+                {{ exporting ? '导出中...' : '导出' }}
+              </button>
+              <label class="import-label" title="导入 X-AnyLabeling 等外部工具导出的 YOLO 标注（zip 内含 labels/*.txt）">
+                <input type="file" accept=".zip" class="import-input" @change="onImportYolo" />
+                <span v-if="importing" class="loading-spinner"></span>
+                {{ importing ? '导入中...' : '导入YOLO标注' }}
+              </label>
+            </div>
+          </div>
+        </div>
+        <!-- 审核问题图片弹窗：任务级检索有异议的图片 -->
+        <div v-if="auditIssuesOpen" class="issue-mask" @click.self="auditIssuesOpen = false">
+          <div class="issue-dialog">
+            <div class="issue-dialog-head">
+              <strong>审核问题图片（{{ auditIssues.length }}）</strong>
+              <span class="issue-hint">建议删除 ✗ · 待修正 ~ · 粘连 ⧉</span>
+              <button class="small" @click="refreshAuditIssues" :disabled="loadingIssueList">刷新</button>
+              <button class="small" @click="auditIssuesOpen = false">关闭</button>
+            </div>
+            <div v-if="loadingIssueList && !auditIssues.length" class="issue-loading">加载中...</div>
+            <div v-else-if="!auditIssues.length" class="issue-empty">没有发现审核异议的图片</div>
+            <ul v-else class="issue-list">
+              <li v-for="it in auditIssues" :key="it.image_id" @click="gotoIssueImage(it.image_id)" title="点击跳转到该图">
+                <span class="issue-img">{{ it.image_id }}</span>
+                <span class="issue-badges">
+                  <em v-if="it.actions.reject" class="a-reject">✗{{ it.actions.reject }}</em>
+                  <em v-if="it.actions.modify" class="a-modify">~{{ it.actions.modify }}</em>
+                  <em v-if="it.actions.split" class="a-split">⧉{{ it.actions.split }}</em>
+                </span>
+              </li>
+            </ul>
+          </div>
+        </div>
         <div class="box-list">
           <div
             v-for="(box, idx) in currentBoxes"
@@ -211,6 +294,17 @@
           >
             <span class="box-color" :style="{ background: classColors[box.class_id] || '#999' }"></span>
             <span class="box-class-name" :title="classes[box.class_id] || ('类别' + box.class_id)">{{ classes[box.class_id] || ('类别' + box.class_id) }}</span>
+            <span
+              v-if="box.audit"
+              class="audit-chip"
+              :class="'a-' + (box.audit.action || 'keep')"
+              :title="'AI 审核: ' + (box.audit.reason || box.audit.action) + (box.audit.kind === 'label_error' ? '（标签错误）' : '') + (box.audit.kind === 'merged' ? '（粘连）' : '') + (box.audit.tags?.length ? ' ' + box.audit.tags.join(' ') : '')"
+            >
+              {{ box.audit.action === 'keep' ? '✓' : box.audit.action === 'reject' ? '✗' : box.audit.action === 'modify' ? '~' : '⧉' }}
+            </span>
+            <button v-if="box.audit?.suggested_class_id != null" class="small fix-btn" @click.stop="fixBoxClass(idx)" :title="'采纳 AI 建议类别：' + (classes[box.audit.suggested_class_id] ?? '')">
+              用{{ classes[box.audit.suggested_class_id] ?? '' }}
+            </button>
             <select :value="box.class_id" class="box-class-select" :title="classes[box.class_id] || ''" @click.stop @change="onBoxClassChange($event, idx)">
               <option v-for="(cls, cIdx) in classes" :key="cIdx" :value="cIdx">{{ cls }}</option>
             </select>
@@ -218,111 +312,149 @@
           </div>
           <div v-if="!currentBoxes.length" class="box-empty">暂无标注框，可手动绘制或使用 AI 预标注</div>
         </div>
-        <button class="danger" @click="clearCurrentBoxes" :disabled="!currentBoxes.length">
-          清空本图标注
-        </button>
-        <button @click="runBatchLabel" :disabled="batchRunning || !items.length">
-          <span v-if="batchRunning" class="loading-spinner"></span>
-          {{ batchRunning ? '批量预标注中...' : '批量预标注' }}
-        </button>
-        <button
-          @click="toggleInteractiveMode"
-          :disabled="interactiveBusy || !items.length"
-          :class="{ active: interactiveMode }"
-          title="框选局部区域 + 文本提示（当前类别）检测，避免全图盲扫误标"
-        >
-          {{ interactiveMode ? '退出交互式标注' : '交互式标注' }}
-        </button>
+        <!-- 千问 L2 审核汇总（设计文档 §6.3）：统计 + 漏标补框 + 一键操作 -->
+        <div v-if="imageAudit?.ok" class="audit-summary">
+          <div class="audit-head">
+            <span class="audit-title">AI 审核 · 千问 L2</span>
+            <button class="small" @click="clearAudit" title="去掉审核颜色/标签/漏标虚线，保留标注框">清除审核标记</button>
+          </div>
+          <div class="audit-stats">
+            <span class="a-keep">✓ 通过 {{ imageAudit.stats?.keep || 0 }}</span>
+            <span class="a-modify">~ 待修正 {{ imageAudit.stats?.modify || 0 }}</span>
+            <span class="a-reject">✗ 建议删除 {{ imageAudit.stats?.reject || 0 }}</span>
+            <span class="a-split">⧉ 粘连 {{ imageAudit.stats?.split || 0 }}</span>
+            <span class="a-miss">漏标 {{ imageAudit.missed_targets?.length || 0 }}</span>
+          </div>
+          <div v-if="auditRejectCount" class="audit-actions">
+            <button class="danger small" @click="removeRejectedBoxes">删除被拒框（{{ auditRejectCount }}）</button>
+          </div>
+          <div v-if="imageAudit.missed_targets?.length" class="audit-missed">
+            <div class="audit-missed-title">漏标建议（画布蓝虚线位置，点击补标即落框）</div>
+            <div v-for="(mt, i) in imageAudit.missed_targets" :key="'mt' + i" class="audit-mt-row">
+              <span class="mt-info">{{ classes[mt.class_id] || mt.class_id }}<em v-if="mt.reason">（{{ mt.reason }}）</em></span>
+              <button class="small primary" @click="addMissedTarget(mt)">补标</button>
+            </div>
+          </div>
+        </div>
         <div v-if="interactiveMode && !interactiveBusy" class="interactive-hint">
           在图上拖拽框选要标注的区域（建议先选好"当前类别"），Esc 退出
         </div>
         <div v-if="interactiveBusy" class="interactive-hint">
           <span class="loading-spinner"></span> 正在解析所选区域...
         </div>
-        <button class="danger" @click="clearAllAiLabels" :disabled="counts.ai === 0" title="误标过多时一键清除，重新标注">
-          清除全部AI标注（{{ counts.ai }}）
-        </button>
-        <button class="danger" @click="cleanOverlaps" :disabled="counts.annotated === 0" title="清理历史遗留的高度重合标注框（跨类别/同类重复）">
-          清理重叠框
-        </button>
-        <div class="sample-type-group" title="标注完成后给该图片分级：普通/困难（AI 低置信度或漏检，重点审核）/空白（无目标负样本）；不选则自动判定">
-          <span class="sample-type-label">样本</span>
-          <template v-for="st in SAMPLE_TYPES" :key="st.value">
-            <button
-              v-if="st.value !== ''"
-              class="sample-type-btn"
-              :class="{ active: currentSampleType === st.value }"
-              @click="setSampleType(st.value)"
-            >{{ st.label }}</button>
-          </template>
+        <div class="ann-fixed-actions" title="">
+          <div class="sample-type-group" title="标注完成后给该图片分级：普通/困难（AI 低置信度或漏检，重点审核）/空白（无目标负样本）；不选则自动判定">
+            <span class="sample-type-label">样本</span>
+            <template v-for="st in SAMPLE_TYPES" :key="st.value">
+              <button
+                v-if="st.value !== ''"
+                class="sample-type-btn"
+                :class="{ active: currentSampleType === st.value }"
+                @click="setSampleType(st.value)"
+              >{{ st.label }}</button>
+            </template>
+          </div>
+          <div class="ann-action-row">
+            <button class="primary" @click="saveAnnotation" :disabled="savingAnnotation" title="快捷键 Ctrl+S / Cmd+S 保存当前标注">
+              <span v-if="savingAnnotation" class="loading-spinner"></span>
+              {{ savingAnnotation ? '保存中...' : '保存' }}
+            </button>
+            <button class="danger" @click="clearCurrentBoxes" :disabled="!currentBoxes.length" title="清空本图所有标注框">
+              清空本图
+            </button>
+            <button class="danger" @click="deleteCurrentImage" :disabled="deletingImage || !currentImage" title="快捷键 X：删除当前图片（同时删除其标注与同名标签文件），不可恢复，批量标注中也可删除">
+              {{ deletingImage ? '删除中...' : '删除图片' }}
+            </button>
+          </div>
         </div>
-        <button @click="saveAnnotation" :disabled="savingAnnotation">
-          <span v-if="savingAnnotation" class="loading-spinner"></span>
-          {{ savingAnnotation ? '保存中...' : '保存' }}
-        </button>
-        <button @click="exportTask" :disabled="exporting">
-          <span v-if="exporting" class="loading-spinner"></span>
-          {{ exporting ? '导出中...' : '导出' }}
-        </button>
-        <label class="import-label" title="导入 X-AnyLabeling 等外部工具导出的 YOLO 标注（zip 内含 labels/*.txt）">
-          <input type="file" accept=".zip" class="import-input" @change="onImportYolo" />
-          <span v-if="importing" class="loading-spinner"></span>
-          {{ importing ? '导入中...' : '导入YOLO标注' }}
-        </label>
+        <div class="delete-toast" :class="toastType" v-if="toastMsg">{{ toastMsg }}</div>
       </div>
     </div>
   </div>
-  <!-- 千问 VL 大模型预标注配置弹窗（本地预留接口） -->
-  <div v-if="showQwenConfig" class="modal-overlay" @click.self="closeQwenConfig">
-    <div class="modal-box qwen-modal">
-      <h3>千问 VL 大模型预标注配置</h3>
-      <p class="hint">
-        本地默认关闭（qwen_enabled=false）。部署到服务器 / 接入阿里云百炼后填写并启用即可。
-        联调阶段可开启「模拟框」模式，不调用真实模型、仅验证标注链路。
-      </p>
-      <label class="row">
-        <input type="checkbox" v-model="qwenForm.qwen_enabled" />
-        <span>启用千问 VL 作为检测引擎</span>
-      </label>
-      <label class="row">
-        <span>接入方式：</span>
-        <select v-model="qwenForm.qwen_backend">
-          <option value="ollama">Ollama（本地大模型，免费）</option>
-          <option value="dashscope">阿里云百炼 DashScope（云端 API）</option>
-        </select>
-      </label>
-      <label class="row">
-        <span>服务地址：</span>
-        <input type="text" v-model="qwenForm.qwen_endpoint" class="w-input"
-               placeholder="ollama: http://localhost:11434" />
-        <span class="hint">dashscope: .../compatible-mode/v1</span>
-      </label>
-      <label class="row">
-        <span>模型名：</span>
-        <input type="text" v-model="qwenForm.qwen_model" class="w-input"
-               placeholder="qwen2.5-vl-7b-instruct / qwen-vl-max" />
-      </label>
-      <label class="row">
-        <span>API Key：</span>
-        <input type="password" v-model="qwenForm.qwen_api_key" class="w-input"
-               placeholder="dashscope 需要；ollama 可留空" />
-      </label>
-      <label class="row">
-        <span>单图超时(秒)：</span>
-        <input type="number" v-model.number="qwenForm.qwen_timeout" min="10" max="600" class="w-input short" />
-      </label>
-      <label class="row">
-        <input type="checkbox" v-model="qwenForm.qwen_mock" />
-        <span>模拟框模式（本地联调，不调用真实模型）</span>
-      </label>
+  <!-- AI 标注模型设置弹窗（多引擎可同时检测） -->
+  <div v-if="showModelCfg" class="modal-overlay" @click.self="closeModelCfg">
+    <div class="modal-box model-cfg-modal">
+      <h3>AI 标注模型设置</h3>
+      <p class="hint">支持同时启用多个检测引擎，多引擎检测结果自动合并去重。保存后立即生效，无需重启后端。<br />启用千问后，AI 预标注会自动附加 <b>L2 审核</b>（漏标/粘连/标签错误/框质量/合规），也可通过"⋯更多 → AI 审核当前图"手动审核。</p>
+      <div class="cfg-block">
+        <span class="cfg-title">检测引擎（可多选，同时使用）</span>
+        <label class="row">
+          <input type="checkbox" value="grounding_dino" v-model="modelCfg.detectors" />
+          <span>GroundingDINO <em class="dim">（零样本文本检测，无需权重）</em></span>
+        </label>
+        <label class="row">
+          <input type="checkbox" value="yolo_world" v-model="modelCfg.detectors" />
+          <span>YOLO-World（.pt 权重）</span>
+        </label>
+        <div class="row indent" v-if="modelCfg.detectors.includes('yolo_world')">
+          <span>权重文件：</span>
+          <select v-model="modelCfg.detector_weights">
+            <option v-for="m in availableModels" :key="m.name" :value="m.name">{{ m.name }}（{{ m.size_mb }}MB）</option>
+            <option v-if="!availableModels.length" value="yolov8s-world.pt">yolov8s-world.pt（默认）</option>
+          </select>
+        </div>
+        <label class="row">
+          <input type="checkbox" value="qwen_vl" v-model="modelCfg.detectors" />
+          <span>千问 VL（云端 / 本地 VLM 大模型）</span>
+        </label>
+      </div>
+      <div class="cfg-block">
+        <span class="cfg-title">AI 阈值</span>
+        <label class="row">
+          <span>置信度</span>
+          <input type="number" v-model.number="modelCfg.conf" min="0" max="1" step="0.05" class="w-input short" />
+          <span>IoU</span>
+          <input type="number" v-model.number="modelCfg.iou" min="0" max="1" step="0.05" class="w-input short" />
+        </label>
+      </div>
+      <div class="cfg-block" v-if="modelCfg.detectors.includes('qwen_vl')">
+        <span class="cfg-title">千问 VL 配置</span>
+        <label class="row">
+          <input type="checkbox" v-model="modelCfg.qwen_enabled" />
+          <span>启用千问 VL</span>
+        </label>
+        <label class="row">
+          <span>接入方式：</span>
+          <select v-model="modelCfg.qwen_backend">
+            <option value="ollama">Ollama（本地大模型，免费）</option>
+            <option value="dashscope">阿里云百炼 DashScope（云端 API）</option>
+          </select>
+        </label>
+        <label class="row">
+          <span>服务地址：</span>
+          <input type="text" v-model="modelCfg.qwen_endpoint" class="w-input" />
+        </label>
+        <label class="row">
+          <span>模型名：</span>
+          <input type="text" v-model="modelCfg.qwen_model" class="w-input" />
+        </label>
+        <label class="row">
+          <span>API Key：</span>
+          <input type="password" v-model="modelCfg.qwen_api_key" class="w-input" />
+        </label>
+        <label class="row">
+          <span>单图超时(秒)：</span>
+          <input type="number" v-model.number="modelCfg.qwen_timeout" min="10" max="600" class="w-input short" />
+        </label>
+        <label class="row" v-if="modelCfg.qwen_backend === 'ollama'">
+          <span>keep_alive(驻留)：</span>
+          <input type="text" v-model="modelCfg.qwen_keep_alive" placeholder="5m / 30m / -1=常驻" class="w-input short" />
+          <span>并行数：</span>
+          <input type="number" v-model.number="modelCfg.qwen_num_parallel" min="1" max="16" class="w-input short" />
+        </label>
+        <label class="row">
+          <input type="checkbox" v-model="modelCfg.qwen_mock" />
+          <span>模拟框模式（本地联调，不调用真实模型）</span>
+        </label>
+      </div>
       <div class="modal-footer">
-        <button @click="closeQwenConfig">取消</button>
-        <button class="primary" @click="saveQwenConfig">保存</button>
+        <button @click="closeModelCfg">取消</button>
+        <button class="primary" @click="saveModelCfg">保存并应用</button>
       </div>
     </div>
   </div>
 
-    <div v-if="suggestDialogOpen" class="modal-overlay" @click.self="suggestDialogOpen = false">
+  <div v-if="suggestDialogOpen" class="modal-overlay" @click.self="suggestDialogOpen = false">
       <div class="modal suggest-modal">
         <h3>🤖 AI 识别新标签</h3>
         <p class="suggest-hint">千问 VL 正在查看本任务中困难/空白样本图，找出已知标签之外的新目标</p>
@@ -367,7 +499,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import type { BBox } from '@/api/annotations'
-import { createAnnotationTask, findAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotations, autoLabelImage, interactiveLabelImage, startBatchLabel, getBatchProgress, stopBatchLabel, getSamConfig, updateSamConfig, getSamModels, uploadSamModel, clearAiAnnotations, cleanTaskOverlaps, importYoloLabels } from '@/api/annotations'
+import { createAnnotationTask, findAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotations, autoLabelImage, interactiveLabelImage, startBatchLabel, getBatchProgress, stopBatchLabel, getSamConfig, updateSamConfig, getSamModels, clearAiAnnotations, cleanTaskOverlaps, importYoloLabels, deleteTaskImage, auditImage, listAuditIssues } from '@/api/annotations'
 import { listDatasets } from '@/api/datasets'
 import { showConfirm } from '@/composables/useDialog'
 import { suggestModelLabels, adoptSuggestedLabels } from '@/api/models'
@@ -378,6 +510,37 @@ const loadingDatasets = ref(false)
 const creatingTask = ref(false)
 const loadingItems = ref(false)
 const savingAnnotation = ref(false)
+const deletingImage = ref(false)
+// 页面内轻提示（浏览器 iframe 会拦截原生 alert，删除操作必须给出可见反馈）
+const toastMsg = ref('')
+const toastType = ref<'success' | 'error' | 'info'>('info')
+// 右侧面板"⋯ 更多"（全局/批量操作）菜单开关
+const moreOpen = ref(false)
+// AI 标注模型设置弹窗（多引擎可同时检测）
+const showModelCfg = ref(false)
+const availableModels = ref<any[]>([])
+const modelCfg = ref<any>({
+  detectors: [] as string[],
+  detector_weights: 'yolov8s-world.pt',
+  conf: 0.25,
+  iou: 0.4,
+  qwen_enabled: false,
+  qwen_backend: 'ollama',
+  qwen_endpoint: 'http://localhost:11434',
+  qwen_model: 'qwen3-vl:8b',
+  qwen_api_key: '',
+  qwen_timeout: 90,
+  qwen_mock: false,
+  qwen_keep_alive: '5m',
+  qwen_num_parallel: 1,
+})
+let toastTimer: any = null
+const showToast = (msg: string, type: 'success' | 'error' | 'info' = 'info') => {
+  toastMsg.value = msg
+  toastType.value = type
+  if (toastTimer) clearTimeout(toastTimer)
+  toastTimer = setTimeout(() => { toastMsg.value = '' }, 2500)
+}
 // 自动保存（防抖）
 const autoSaveTimer = ref<any>(null)
 const dirty = ref(false)
@@ -560,51 +723,13 @@ const interactiveMode = ref(false)
 const interactiveBusy = ref(false)
 const interactiveRegion = ref<{ x1: number; y1: number; x2: number; y2: number } | null>(null)
 const currentImageHasAi = ref(false)  // 当前图片是否由 AI 生成了标注框（用于保存时标记 AI 来源）
+const imageAudit = ref<any>(null)     // 当前图千问 L2 审核结果 {ok,box_reviews,missed_targets,stats}
+const auditing = ref(false)           // 审核请求中
+// 问题图片检索（任务级）：列出带审核异议的图片，点击直达
+const auditIssues = ref<any[]>([])
+const auditIssuesOpen = ref(false)
+const loadingIssueList = ref(false)
 const samConfig = ref<any>({ detector_weights: 'yolov8s-world.pt', conf: 0.15 })
-const samModels = ref<any[]>([])
-// 检测模型下拉当前选中项：__grounding_dino__ 表示 GroundingDINO，其余为 YOLO-World .pt 文件名
-const selectedDetector = ref('__grounding_dino__')
-
-// 千问 VL 大模型预标注配置（本地预留接口；部署到服务器/接入百炼后填写即可用）
-const showQwenConfig = ref(false)
-const qwenForm = ref({
-  qwen_enabled: false,
-  qwen_backend: 'ollama',
-  qwen_endpoint: 'http://localhost:11434',
-  qwen_model: 'qwen2.5-vl-7b-instruct',
-  qwen_api_key: '',
-  qwen_timeout: 90,
-  qwen_mock: false,
-})
-
-const openQwenConfig = () => {
-  const c = samConfig.value || {}
-  qwenForm.value = {
-    qwen_enabled: !!c.qwen_enabled,
-    qwen_backend: c.qwen_backend || 'ollama',
-    qwen_endpoint: c.qwen_endpoint || 'http://localhost:11434',
-    qwen_model: c.qwen_model || 'qwen2.5-vl-7b-instruct',
-    qwen_api_key: c.qwen_api_key || '',
-    qwen_timeout: c.qwen_timeout ?? 90,
-    qwen_mock: !!c.qwen_mock,
-  }
-  showQwenConfig.value = true
-}
-
-const saveQwenConfig = async () => {
-  try {
-    await updateSamConfig({ ...qwenForm.value })
-    samConfig.value = { ...samConfig.value, ...qwenForm.value }
-    showQwenConfig.value = false
-    alert(qwenForm.value.qwen_enabled
-      ? '千问配置已保存并启用' + (qwenForm.value.qwen_mock ? '（模拟框模式，未调用真实模型）' : '')
-      : '千问配置已保存（未启用，选择检测模型时仍可用 YOLO 与 GroundingDINO）')
-  } catch (e: any) {
-    alert('保存千问配置失败: ' + (e.response?.data?.detail || e.message))
-  }
-}
-
-const closeQwenConfig = () => { showQwenConfig.value = false }
 const batchId = ref<string | null>(null)
 const batchProgress = ref<any>(null)
 const batchTimer = ref<any>(null)
@@ -871,6 +996,7 @@ const selectImage = async (index: number) => {
   currentBoxes.value = []
   selectedBoxIndex.value = -1
   currentImageHasAi.value = false
+  imageAudit.value = null  // 切图清空上一张的审核结果
   currentSampleType.value = ''  // 切换图片重置样本类型（已有标注时由 loadExistingAnnotation 回填）
   // 切换图片：取消上一张的待保存状态（未保存的改动在离页时统一处理）
   dirty.value = false
@@ -913,7 +1039,6 @@ const loadExistingAnnotation = async () => {
           x2: box.x2,
           y2: box.y2
         }))
-        console.log('Loaded existing annotations:', currentBoxes.value.length)
       }
     }
   } catch (error: any) {
@@ -930,7 +1055,7 @@ const loadImageToCanvas = () => {
   ctx.value = canvas.getContext('2d')
   
   // 处理图片路径
-  // 后端返回的路径应该是相对于 DATA_DIR 的（例如：datasets/ds_xxx/v1/images/xxx.jpg）
+  // 后端返回的路径应该是相对于 DATA_DIR 的（例如：datasets/ds_xxx/images/xxx.jpg）
   // 静态文件服务挂载在 /static，目录是 backend/data
   // 所以需要：/static/datasets/...
   let imagePath = currentImage.value.image_path
@@ -943,11 +1068,6 @@ const loadImageToCanvas = () => {
   // 静态文件路径不使用 API 基础路径，直接使用 /static/
   const imageUrl = '/static/' + imagePath
   
-  console.log('Loading image:', {
-    original: currentImage.value.image_path,
-    processed: imageUrl
-  })
-  
   img.value = new Image()
   img.value.crossOrigin = 'anonymous'
   
@@ -955,7 +1075,6 @@ const loadImageToCanvas = () => {
     if (!img.value || !ctx.value) return
     canvas.width = img.value.width
     canvas.height = img.value.height
-    console.log('Image loaded:', img.value.width, 'x', img.value.height)
 
     // 新图片加载后重置视图并居中
     fitView()
@@ -1288,13 +1407,31 @@ const selectBoxFromPanel = (index: number) => {
 const drawBox = (box: BBox, index = -1) => {
   if (!ctx.value) return
   const selected = index === selectedBoxIndex.value
+  // 框本体颜色 = 类别色（保持原有语义，不与审核结论混淆）
   const color = classColors.value[box.class_id] || 'lime'
+  const a = box.audit
   ctx.value.strokeStyle = selected ? 'orange' : color
   ctx.value.lineWidth = selected ? 3 : 2
   ctx.value.strokeRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1)
   ctx.value.fillStyle = selected ? 'orange' : color
   ctx.value.font = '14px Arial'
-  ctx.value.fillText(classes.value[box.class_id] || '', box.x1, Math.max(box.y1 - 5, 12))
+  let label = classes.value[box.class_id] || ''
+  if (a?.tags?.length) label += ' ' + a.tags.join(' ')
+  ctx.value.fillText(label, box.x1, Math.max(box.y1 - 5, 12))
+  // 审核结论走独立通道：框右上角徽标（reject ✗红 / modify ~橙 / split⧉黄），keep 无标记；
+  // 类别色与审核色不再混叠，只突出有异议的框
+  if (a && a.action && a.action !== 'keep') {
+    const sym = a.action === 'reject' ? '✗' : a.action === 'modify' ? '~' : '⧉'
+    const bg = a.action === 'reject' ? '#e74c3c' : a.action === 'modify' ? '#f39c12' : '#f1c40f'
+    const bs = 16
+    ctx.value.fillStyle = bg
+    ctx.value.fillRect(box.x2 - bs, box.y1, bs, bs)
+    ctx.value.fillStyle = '#fff'
+    ctx.value.font = 'bold 13px Arial'
+    ctx.value.textAlign = 'center'
+    ctx.value.fillText(sym, box.x2 - bs / 2, box.y1 + 12)
+    ctx.value.textAlign = 'left'
+  }
   if (selected) {
     const s = 8 / viewScale.value
     const pts = [
@@ -1325,6 +1462,18 @@ const redrawCanvas = () => {
     if (String(cur) === '-1' || box.class_id === Number(cur)) {
       drawBox(box, idx)
     }
+  })
+  // 千问审核漏标补框：蓝色虚线框（不参与框选中/移动，是"建议"，点面板补标才落框）
+  ;(imageAudit.value?.missed_targets || []).forEach((mt: any) => {
+    if (String(cur) !== '-1' && mt.class_id !== Number(cur)) return
+    ctx.value!.strokeStyle = '#00bcd4'
+    ctx.value!.lineWidth = 2
+    ctx.value!.setLineDash([8, 6])
+    ctx.value!.strokeRect(mt.x1, mt.y1, mt.x2 - mt.x1, mt.y2 - mt.y1)
+    ctx.value!.setLineDash([])
+    ctx.value!.fillStyle = '#00bcd4'
+    ctx.value!.font = '14px Arial'
+    ctx.value!.fillText('漏:' + (classes.value[mt.class_id] || mt.class_id), mt.x1, Math.max(mt.y1 - 5, 12))
   })
   // 正在画的新框
   if (isDrawing.value && editMode.value === 'draw') {
@@ -1409,67 +1558,102 @@ const clearCurrentBoxes = async () => {
   redrawCanvas()
 }
 
-// ===== SAM 大模型预标注 =====
+// 删除当前图片（连同标注 JSON 与同名标签文件，从数据集移除，不可恢复）
+const deleteCurrentImage = async () => {
+  if (!currentTask.value || !currentImage.value) return
+  deletingImage.value = true
+  try {
+    const res = await deleteTaskImage(currentTask.value, currentImage.value.image_id)
+    const removedId = res.image_id
+    const idx = items.value.findIndex(it => it.image_id === removedId)
+    items.value = items.value.filter(it => it.image_id !== removedId)
+    if (items.value.length === 0) {
+      currentImage.value = null
+      currentBoxes.value = []
+      currentSampleType.value = ''
+      redrawCanvas()
+    } else {
+      selectImage(Math.min(Math.max(idx, 0), items.value.length - 1))
+    }
+    saveAnnotateState()
+    showToast(`已删除图片 ${removedId}，当前图片总数：${res.image_count}`, 'success')
+  } catch (error: any) {
+    showToast('删除图片失败: ' + (error.response?.data?.detail || error.message), 'error')
+  } finally {
+    deletingImage.value = false
+  }
+}
+
+// ===== AI 预标注配置 =====
 const loadSamConfigAndModels = async () => {
   try {
-    const [cfg, models] = await Promise.all([getSamConfig(), getSamModels()])
+    const cfg = await getSamConfig()
     samConfig.value = cfg
-    samModels.value = models
     if (typeof cfg.conf === 'number') aiConf.value = cfg.conf
     if (typeof cfg.iou === 'number') aiIou.value = cfg.iou
-    // 初始化检测模型下拉选中项
-    if (cfg.detector === 'grounding_dino') {
-      selectedDetector.value = '__grounding_dino__'
-    } else if (cfg.detector === 'qwen_vl') {
-      selectedDetector.value = '__qwen_vl__'
-    } else {
-      selectedDetector.value = cfg.detector_weights ||
-        ((models as any[])?.find?.((m: any) => m.name)?.name ?? 'yolov8s-world.pt')
-    }
   } catch (e: any) {
-    console.error('加载 SAM 配置/模型失败:', e)
+    console.error('加载 SAM 配置失败:', e)
   }
 }
 
-const applyDetectorModel = async () => {
-  const name = selectedDetector.value
-  if (!name) return
+const openModelCfg = async () => {
   try {
-    if (name === '__grounding_dino__') {
-      await updateSamConfig({ detector: 'grounding_dino', detector_weights: 'IDEA-Research/grounding-dino-tiny' })
-      alert('已切换到 GroundingDINO（grounding-dino-tiny）\n（对单张图生效，批量任务会重新加载）')
-    } else if (name === '__qwen_vl__') {
-      if (!samConfig.value.qwen_enabled) {
-        alert('千问 VL 尚未启用。请先点击「千问设置」填写后启用。\n（本地联调可开启"模拟框"模式不调用真实模型）')
-        loadSamConfigAndModels()
-        return
-      }
-      await updateSamConfig({ detector: 'qwen_vl' })
-      alert('已切换到千问 VL 大模型标注\n（对单张图生效，批量任务会重新加载；若未配置服务端会记入日志并返回空）')
-    } else {
-      await updateSamConfig({ detector: 'yolo_world', detector_weights: name })
-      alert(`已切换到检测模型: ${name}\n（对单张图生效，批量任务会重新加载）`)
-    }
+    const [cfg, models] = await Promise.all([getSamConfig(), getSamModels()])
+    availableModels.value = models
+    const dets = (cfg.detectors && cfg.detectors.length)
+      ? cfg.detectors
+      : ((cfg.detector && cfg.detector !== 'none') ? [cfg.detector] : [])
+    modelCfg.value.detectors = dets
+    modelCfg.value.detector_weights = cfg.detector_weights || 'yolov8s-world.pt'
+    modelCfg.value.conf = typeof cfg.conf === 'number' ? cfg.conf : 0.25
+    modelCfg.value.iou = typeof cfg.iou === 'number' ? cfg.iou : 0.4
+    modelCfg.value.qwen_enabled = !!cfg.qwen_enabled
+    modelCfg.value.qwen_backend = cfg.qwen_backend || 'ollama'
+    modelCfg.value.qwen_endpoint = cfg.qwen_endpoint || 'http://localhost:11434'
+    modelCfg.value.qwen_model = cfg.qwen_model || 'qwen3-vl:8b'
+    modelCfg.value.qwen_api_key = cfg.qwen_api_key || ''
+    modelCfg.value.qwen_timeout = cfg.qwen_timeout ?? 90
+    modelCfg.value.qwen_mock = !!cfg.qwen_mock
+    modelCfg.value.qwen_keep_alive = cfg.qwen_keep_alive || '5m'
+    modelCfg.value.qwen_num_parallel = typeof cfg.qwen_num_parallel === 'number' ? cfg.qwen_num_parallel : 1
+    showModelCfg.value = true
   } catch (e: any) {
-    alert('切换模型失败: ' + (e.response?.data?.detail || e.message))
+    alert('读取 AI 标注配置失败: ' + (e.response?.data?.detail || e.message))
   }
 }
 
-const onSamModelFile = async (e: any) => {
-  const file = e.target.files?.[0]
-  e.target.value = ''
-  if (!file) return
+const closeModelCfg = () => { showModelCfg.value = false }
+
+const saveModelCfg = async () => {
   try {
-    alert(`正在上传模型 ${file.name}（${(file.size / 1e6).toFixed(1)} MB）...`)
-    const res = await uploadSamModel(file)
-    await loadSamConfigAndModels()
-    samConfig.value.detector = 'yolo_world'
-    samConfig.value.detector_weights = res.name
-    selectedDetector.value = res.name
-    await updateSamConfig({ detector: 'yolo_world', detector_weights: res.name })
-    alert(`模型 ${res.name} 上传成功并已启用`)
-  } catch (err: any) {
-    alert('上传模型失败: ' + (err.response?.data?.detail || err.message))
+    if (!modelCfg.value.detectors.length) {
+      alert('请至少勾选一个检测引擎')
+      return
+    }
+    await updateSamConfig({
+      detectors: [...modelCfg.value.detectors],
+      detector: modelCfg.value.detectors[0],   // 兼容旧字段（批量兜底重试等仍引用）
+      detector_weights: modelCfg.value.detector_weights,
+      conf: modelCfg.value.conf,
+      iou: modelCfg.value.iou,
+      qwen_enabled: modelCfg.value.detectors.includes('qwen_vl') ? !!modelCfg.value.qwen_enabled : false,
+      qwen_backend: modelCfg.value.qwen_backend,
+      qwen_endpoint: modelCfg.value.qwen_endpoint,
+      qwen_model: modelCfg.value.qwen_model,
+      qwen_api_key: modelCfg.value.qwen_api_key,
+      qwen_timeout: modelCfg.value.qwen_timeout,
+      qwen_mock: !!modelCfg.value.qwen_mock,
+      qwen_keep_alive: modelCfg.value.qwen_keep_alive,
+      qwen_num_parallel: modelCfg.value.qwen_num_parallel,
+    })
+    // 同步页面阈值并刷新本地配置
+    aiConf.value = modelCfg.value.conf
+    aiIou.value = modelCfg.value.iou
+    samConfig.value = await getSamConfig()
+    showModelCfg.value = false
+    showToast('AI 标注模型配置已保存并生效', 'success')
+  } catch (e: any) {
+    alert('保存 AI 标注配置失败: ' + (e.response?.data?.detail || e.message))
   }
 }
 
@@ -1515,24 +1699,48 @@ const runAutoLabel = async () => {
       alert('AI 预标注失败: ' + result.error)
       return
     }
+    const auditMap = new Map<number, any>()
+    ;(result.audit?.box_reviews || []).forEach((r: any) => auditMap.set(r.box_id, r))
     const aiBoxes = (result.boxes || []).map((b: any) => ({
       class_id: b.class_id,
       x1: b.x1,
       y1: b.y1,
       x2: b.x2,
       y2: b.y2,
-      source: b.source || 'ai'
+      source: b.source || 'ai',
+      box_id: b.box_id != null ? b.box_id : undefined
     }))
     // 按 IoU 去重：与已有任意类别框重叠 >=0.5 的视为同一目标，避免重复标注（含跨类别）
     const newAiBoxes = aiBoxes.filter(
       (ab: any) => !currentBoxes.value.some((cb: any) => iou(cb, ab) >= 0.5)
     )
+    // 把对应审核结论（box_id 映射回预标注下标）粘到新增框上，供画布/列表渲染；box_id 不落盘
+    newAiBoxes.forEach((ab: any) => {
+      if (ab.box_id != null) {
+        const r = auditMap.get(ab.box_id)
+        if (r) ab.audit = { ...r }
+      }
+      delete ab.box_id
+    })
     currentBoxes.value.push(...newAiBoxes)
     if (newAiBoxes.length > 0) {
       currentImageHasAi.value = true
       markDirty()
     }
+    // 持有审核汇总（统计 + 漏标补框），面板与画布虚线框据此渲染
+    imageAudit.value = result.audit && result.audit.ok ? result.audit : null
     redrawCanvas()
+    const st = imageAudit.value?.stats
+    if (st) {
+      const j = (x: any) => x || 0
+      const parts: string[] = []
+      if (j(st.keep)) parts.push(`通过 ${j(st.keep)}`)
+      if (j(st.modify)) parts.push(`待修正 ${j(st.modify)}`)
+      if (j(st.reject)) parts.push(`建议删除 ${j(st.reject)}`)
+      if (j(st.split)) parts.push(`粘连 ${j(st.split)}`)
+      if (j(st.missed)) parts.push(`漏标 ${j(st.missed)}`)
+      showToast(`L2 审核：${parts.join(' · ') || '全部通过'}`, parts.length ? 'info' : 'success')
+    }
     if (!aiBoxes.length) {
       alert('未检测到目标，可调低置信度重试')
     } else if (!newAiBoxes.length) {
@@ -1548,6 +1756,145 @@ const runAutoLabel = async () => {
     aiLabeling.value = false
     aiAbortCtrl.value = null
   }
+}
+
+// ===== 千问 L2 审核（设计文档 §6.2.2/§6.3）=====
+// 审核结论按 box_id（= 提交审核时的数组下标）回写；reject 红框 / modify 橙框 / keep 绿框 / split 黄框，
+// missed_targets 蓝虚线框可一键补标；label_errors 一键修正类别，tags（#occluded/#blur/#compliance_issue）随框显示。
+const applyAudit = (audit: any) => {
+  imageAudit.value = audit && audit.ok ? audit : null
+  if (audit && !audit.ok) {
+    alert('AI 审核失败: ' + (audit.error || '未知异常'))
+    return
+  }
+  const map = new Map<number, any>()
+  ;(audit?.box_reviews || []).forEach((r: any) => map.set(r.box_id, r))
+  currentBoxes.value.forEach((b: any, idx: number) => {
+    const r = map.get(idx)
+    if (r) b.audit = { ...r }
+    else delete b.audit
+  })
+  redrawCanvas()
+  const st = imageAudit.value?.stats
+  if (st) {
+    const j = (x: any) => x || 0
+    const parts: string[] = []
+    if (j(st.keep)) parts.push(`通过 ${j(st.keep)}`)
+    if (j(st.modify)) parts.push(`待修正 ${j(st.modify)}`)
+    if (j(st.reject)) parts.push(`建议删除 ${j(st.reject)}`)
+    if (j(st.split)) parts.push(`粘连 ${j(st.split)}`)
+    if (j(st.missed)) parts.push(`漏标 ${j(st.missed)}`)
+    showToast(`L2 审核：${parts.join(' · ') || '全部通过'}`, parts.length ? 'info' : 'success')
+  }
+}
+
+// 手动审核当前图（⋯更多 → AI 审核当前图）：把画布上当前框发给千问审核，未保存也可审
+const auditCurrentImage = async () => {
+  if (!currentTask.value || !currentImage.value) return
+  if (!currentBoxes.value.length) {
+    alert('当前图片没有标注框，无法审核')
+    return
+  }
+  auditing.value = true
+  try {
+    const res = await auditImage(
+      currentTask.value,
+      currentImage.value.image_id,
+      currentBoxes.value.map((b: any) => ({
+        class_id: b.class_id, x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2
+      }))
+    )
+    if (res.message && !res.audit) {
+      alert(res.message)
+      return
+    }
+    applyAudit(res.audit)
+  } catch (e: any) {
+    alert('AI 审核失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    auditing.value = false
+  }
+}
+
+// 问题图片检索：列出任务中带审核异议（reject/modify/split）的图片，点击直达
+const openAuditIssues = async () => {
+  if (!currentTask.value) return
+  auditIssuesOpen.value = true
+  await refreshAuditIssues()
+}
+
+const refreshAuditIssues = async () => {
+  if (!currentTask.value) return
+  loadingIssueList.value = true
+  try {
+    const res = await listAuditIssues(currentTask.value)
+    auditIssues.value = res?.issues || []
+  } catch (e: any) {
+    alert('加载审核问题列表失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    loadingIssueList.value = false
+  }
+}
+
+const gotoIssueImage = (imageId: string) => {
+  const idx = items.value.findIndex((it: any) => it.image_id === imageId)
+  if (idx < 0) return
+  auditIssuesOpen.value = false
+  selectImage(idx)
+}
+
+// 审核建议的漏标补框：一键添加为新标注框
+const addMissedTarget = (mt: any) => {
+  pushUndo()
+  currentBoxes.value.push({
+    class_id: mt.class_id, x1: mt.x1, y1: mt.y1, x2: mt.x2, y2: mt.y2,
+    source: 'ai_audit'
+  })
+  currentImageHasAi.value = true
+  markDirty()
+  redrawCanvas()
+  if (imageAudit.value) {
+    imageAudit.value.missed_targets = (imageAudit.value.missed_targets || []).filter(
+      (m: any) => m !== mt
+    )
+    if (imageAudit.value.stats) imageAudit.value.stats.missed = imageAudit.value.missed_targets.length
+  }
+  showToast(`已补标：${classes.value[mt.class_id] || mt.class_id}`, 'success')
+}
+
+// 一键采纳"建议类别"（label_errors 修正）
+const fixBoxClass = (idx: number) => {
+  const b = currentBoxes.value[idx]
+  if (!b?.audit || b.audit.suggested_class_id == null) return
+  pushUndo()
+  b.class_id = b.audit.suggested_class_id
+  delete b.audit
+  redrawCanvas()
+  showToast(`已修正类别为：${classes.value[b.class_id] || b.class_id}`, 'success')
+}
+
+// 一键删除被审核拒绝的框（reject / label_error / merged-reject）
+const auditRejectCount = computed(() =>
+  currentBoxes.value.filter((b) => b.audit && b.audit.action === 'reject').length
+)
+
+const removeRejectedBoxes = async () => {
+  const n = auditRejectCount.value
+  if (!n) return
+  if (!(await showConfirm(`${n} 个审核拒绝的框将被删除，是否继续？`))) return
+  pushUndo()
+  currentBoxes.value = currentBoxes.value.filter((b: any) => !(b.audit && b.audit.action === 'reject'))
+  redrawCanvas()
+  markDirty()
+  showToast(`已删除 ${n} 个审核拒绝的框`, 'success')
+}
+
+// 清除审核标记：保留框，去掉颜色/标签/漏标虚线
+const clearAudit = () => {
+  currentBoxes.value.forEach((b: any) => delete b.audit)
+  imageAudit.value = null
+  redrawCanvas()
+  showToast('已清除 AI 审核标记（标注框保留）', 'info')
 }
 
 const runBatchLabel = async () => {
@@ -1600,6 +1947,12 @@ const pollBatch = async () => {
     let msg = `批量预标注完成！共标注 ${annotated} 张图片`
     if (retried > 0) msg += `\n其中 ${retried} 张通过降阈值/双引擎兜底补标成功`
     if (skipped > 0) msg += `\n仍有 ${skipped} 张两次兜底都未检出目标（可能需要人工复核或调整类别）`
+    const au = res.audit
+    if (au) {
+      msg += `\nL2 审核: ${au.checked} 图 / ${au.boxes} 框`
+      msg += ` · 通过 ${au.stats.keep} · 待修正 ${au.stats.modify} · 建议删除 ${au.stats.reject} · 粘连 ${au.stats.split} · 漏标 ${au.stats.missed}`
+      if (au.errors > 0) msg += `（${au.errors} 张审核失败）`
+    }
     alert(msg)
     await loadTaskItems()
   } else if (res.status === 'cancelled') {
@@ -1705,9 +2058,11 @@ const persistAnnotation = async (silent = false): Promise<boolean> => {
     // 人工保存：显式样本类型时附带 manual 判据（人工确认），未选择时留空由后端自动判定
     const manualType = currentSampleType.value || undefined
     // 人工框标 source=manual（AI 框保存 source=ai_x），后端据此识别"人工补框→困难样本"
-    const payloadBoxes = currentBoxes.value.map((b: any) =>
-      b.source ? b : { ...b, source: 'manual' }
-    )
+    // audit 落盘（供"问题图片检索"），box_id 是预标注临时索引不落盘
+    const payloadBoxes = currentBoxes.value.map((b: any) => {
+      const { box_id, ...rest } = b
+      return rest.source ? rest : { ...rest, source: 'manual' }
+    })
     await saveAnn(currentTask.value, currentImage.value.image_id, payloadBoxes, aiFlag, manualType, manualType ? 'manual' : undefined)
     items.value[currentIndex.value].annotated = true
     if (aiFlag) {
@@ -1855,6 +2210,12 @@ const handleKeydown = (e: KeyboardEvent) => {
     case 'A':
       e.preventDefault()
       prevImage()
+      break
+    case 'x':
+    case 'X':
+      // 快捷键 X：直接删除当前图片（不弹确认；批量标注中也可删）
+      e.preventDefault()
+      deleteCurrentImage()
       break
     case 'Delete':
     case 'Backspace':
@@ -2041,6 +2402,124 @@ onUnmounted(() => {
 /* grid 列允许收缩：防止大尺寸画布把中间列撑到原图宽度，顶开右侧面板 */
 .canvas-area, .annotations-panel {
   min-width: 0;
+}
+
+/* 右侧标注面板：贴住视口顶部，长列表滚动时操作区始终可见 */
+.annotations-panel {
+  position: sticky;
+  top: 1rem;
+  align-self: start;
+  display: flex;
+  flex-direction: column;
+}
+
+.ann-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.ann-panel-header h3 {
+  margin: 0;
+}
+
+.more-wrap {
+  position: relative;
+}
+
+.more-btn {
+  width: auto !important;
+  margin-bottom: 0 !important;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.8rem;
+  background: #eef0f3;
+  border: 1px solid #d0d3d8;
+  border-radius: 4px;
+  color: #333;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
+.more-btn:hover,
+.more-btn.active {
+  background: #e2e5ea;
+}
+
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 24;
+}
+
+.more-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  width: 210px;
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  z-index: 25;
+  padding: 0.4rem;
+}
+
+.more-menu button,
+.more-menu .import-label {
+  width: 100%;
+  margin-bottom: 0.25rem;
+  font-size: 0.85rem;
+}
+
+.more-menu .import-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+  padding: 0.5rem;
+  border: 1px solid #d0d3d8;
+  border-radius: 4px;
+  background: #eef0f3;
+  color: #333;
+  cursor: pointer;
+  text-align: center;
+  box-sizing: border-box;
+}
+
+.more-menu .import-label:hover {
+  background: #e2e5ea;
+}
+
+/* 单图操作固定栏：标签列表滚动时保持可见 */
+.ann-fixed-actions {
+  margin-top: 0.5rem;
+  border-top: 1px solid #eee;
+  padding-top: 0.5rem;
+}
+
+.ann-action-row {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+
+.ann-action-row button {
+  flex: 1;
+  margin-bottom: 0 !important;
+  min-width: 0;
+}
+
+.ann-action-row .primary {
+  background: #3498db;
+  border-color: #3498db;
+  color: #fff;
+}
+
+.ann-action-row .primary:hover:not(:disabled) {
+  background: #2980b9;
 }
 
 .image-list {
@@ -2476,6 +2955,96 @@ canvas {
   text-align: center;
 }
 
+/* ===== 千问 L2 审核（设计文档 §6.3：绿/橙/红/黄框 + 蓝色虚线漏标 + 一键操作） ===== */
+.audit-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 0.35rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 10px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  min-width: 1.1rem;
+  color: #fff;
+}
+.audit-chip.a-keep { background: #2ecc71; }
+.audit-chip.a-modify { background: #f39c12; }
+.audit-chip.a-reject { background: #e74c3c; }
+.audit-chip.a-split, .audit-chip.a-merged { background: #f1c40f; color: #333; }
+.fix-btn {
+  flex: initial !important;
+  width: auto !important;
+  margin-right: 0.4rem !important;
+  margin-bottom: 0 !important;
+  padding: 0.15rem 0.4rem !important;
+  font-size: 0.72rem !important;
+  background: #fff3cd;
+  color: #856404;
+  border: 1px solid #ffc107;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.fix-btn:hover { background: #ffe69c; }
+
+.audit-summary {
+  margin-top: 0.75rem;
+  padding: 0.6rem;
+  border: 1px solid #d1e7ff;
+  border-radius: 6px;
+  background: #f6faff;
+  font-size: 0.8rem;
+}
+.audit-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.4rem;
+}
+.audit-title { font-weight: 600; color: #1c64f2; }
+.audit-summary button { width: auto !important; margin-bottom: 0 !important; }
+.audit-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.6rem;
+  margin-bottom: 0.4rem;
+}
+.audit-stats span { font-size: 0.75rem; padding: 0.1rem 0.35rem; border-radius: 4px; }
+.a-keep { background: #e6f9ef; color: #0e9f6e; }
+.a-modify { background: #fef3e2; color: #b45309; }
+.a-reject { background: #fde8e8; color: #e02424; }
+.a-split { background: #fef9e7; color: #a16207; }
+.a-missed { background: #e0f7fa; color: #0097a7; }
+.audit-batch-line { margin-top: 6px; font-size: 12px; color: #666; line-height: 1.5; word-break: break-all; }
+.audit-batch-line .a-keep, .audit-batch-line .a-modify, .audit-batch-line .a-reject,
+.audit-batch-line .a-split, .audit-batch-line .a-missed { padding: 0 4px; border-radius: 3px; margin: 0 2px; }
+.issue-mask { position: fixed; inset: 0; background: rgba(0, 0, 0, .45); z-index: 1000; display: flex; align-items: center; justify-content: center; }
+.issue-dialog { background: #fff; border-radius: 10px; width: 580px; max-width: 92vw; max-height: 76vh; display: flex; flex-direction: column; box-shadow: 0 8px 30px rgba(0, 0, 0, .25); padding: 14px 16px; }
+.issue-dialog-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 14px; }
+.issue-hint { color: #999; font-size: 12px; flex: 1; }
+.issue-loading, .issue-empty { padding: 24px; text-align: center; color: #999; font-size: 13px; }
+.issue-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; }
+.issue-list li { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.issue-list li:hover { background: #f0f7ff; }
+.issue-img { flex: 1; font-family: monospace; word-break: break-all; }
+.issue-badges em { font-style: normal; margin-left: 4px; padding: 1px 6px; border-radius: 4px; font-size: 12px; }
+.a-miss { background: #e0f7fa; color: #0097a7; }
+.audit-actions { margin-bottom: 0.4rem; }
+.audit-missed-title { font-size: 0.75rem; font-weight: 600; color: #0097a7; margin-bottom: 0.3rem; }
+.audit-mt-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  border-top: 1px dashed #c7e9ef;
+}
+.mt-info { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mt-info em { color: #999; font-style: normal; font-size: 0.72rem; }
+.audit-summary .primary { background: #1c64f2; color: #fff; border: none; }
+.audit-summary .danger { background: #e02424; color: #fff; border: none; }
+
 .annotations-panel button {
   width: 100%;
   margin-bottom: 0.5rem;
@@ -2617,6 +3186,41 @@ canvas {
   color: #7f8c8d;
 }
 
+/* 删除图片等操作结果的页面内轻提示（iframe 内原生 alert 可能被拦截，用此提示保证可见） */
+.delete-toast {
+  position: fixed;
+  top: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9999;
+  max-width: 70vw;
+  padding: 10px 18px;
+  border-radius: 8px;
+  font-size: 13px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  animation: delete-toast-in 0.2s ease-out;
+  white-space: pre-line;
+}
+.delete-toast.success {
+  background: #d4edda;
+  color: #155724;
+  border: 1px solid #c3e6cb;
+}
+.delete-toast.error {
+  background: #f8d7da;
+  color: #721c24;
+  border: 1px solid #f5c6cb;
+}
+.delete-toast.info {
+  background: #d1ecf1;
+  color: #0c5460;
+  border: 1px solid #bee5eb;
+}
+@keyframes delete-toast-in {
+  from { opacity: 0; transform: translate(-50%, -8px); }
+  to   { opacity: 1; transform: translate(-50%, 0); }
+}
+
 .loading-indicator {
   font-size: 0.875rem;
   color: #7f8c8d;
@@ -2649,6 +3253,16 @@ button.small {
 }
 .ai-btn:hover:not(:disabled) {
   background: #732d91;
+}
+
+/* 批量预标注：与单图 AI 预标注区分的高亮操作，显眼醒目 */
+.ai-btn.batch-btn {
+  background: #0e9f6e;
+  box-shadow: 0 2px 4px rgba(14, 159, 110, 0.35);
+}
+
+.ai-btn.batch-btn:hover:not(:disabled) {
+  background: #0b7a54;
 }
 
 .ai-toolbar {
@@ -2691,31 +3305,48 @@ button.small {
   border-radius: 4px;
 }
 
-.model-select {
-  padding: 0.35rem;
-  border: 1px solid #ddd;
-  border-radius: 4px;
-  max-width: 180px;
-  background: white;
-}
-
-.model-add-label {
-  cursor: pointer;
+.ai-classes-label {
+  display: inline-block;
   background: #eef0f3;
-  border: 1px solid #d0d3d8;
-  border-radius: 4px;
-  padding: 0.35rem 0.7rem;
-  color: #333;
-  font-size: 0.9rem;
+  border: 1px dashed #b8bcc4;
+  border-radius: 999px;
+  padding: 0.25rem 0.7rem;
+  color: #666;
+  font-size: 0.85rem;
+  cursor: help;
   white-space: nowrap;
 }
 
-.model-add-label:hover {
-  background: #e2e5ea;
+.ai-params {
+  position: relative;
 }
 
-.model-add-input {
+.ai-params summary {
+  cursor: pointer;
+  color: #8e44ad;
+  font-size: 0.9rem;
+  user-select: none;
+  list-style: none;
+}
+
+.ai-params summary::-webkit-details-marker {
   display: none;
+}
+
+.ai-params-body {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  background: white;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  white-space: nowrap;
 }
 
 .batch-progress {
@@ -2760,6 +3391,34 @@ button.small {
   padding: 0.4rem 0.9rem;
   border-radius: 4px;
   cursor: pointer;
+}
+
+.model-cfg-modal .cfg-block {
+  margin-bottom: 0.6rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.model-cfg-modal .cfg-title {
+  display: block;
+  font-weight: bold;
+  color: #444;
+  margin-bottom: 0.35rem;
+}
+
+.model-cfg-modal .indent {
+  margin-left: 1.3rem;
+}
+
+.model-cfg-modal .dim {
+  font-style: normal;
+  color: #999;
+}
+
+.model-cfg-modal select {
+  padding: 0.35rem;
+  border: 1px solid #ddd;
+  border-radius: 4px;
 }
 
 .suggest-modal .suggest-hint {

@@ -2,9 +2,9 @@
 
 数据链路改造（阶段B）：prepare 阶段检测到外部格式后调用，产物：
 
-    datasets/{dataset_id}/v1/images/{image_id}.jpg        # 图片平铺（封板前不划分）
-    datasets/{dataset_id}/v1/annotations/{image_id}.json  # 一图一 JSON 标注
-    datasets/{dataset_id}/v1/classes.txt                  # 类别（英文码，每行一个）
+    datasets/{dataset_id}/images/{image_id}.jpg        # 图片平铺（封板前不划分）
+    datasets/{dataset_id}/annotations/{image_id}.json  # 一图一 JSON 标注
+    datasets/{dataset_id}/classes.txt                  # 类别（英文码，每行一个）
 
 每图 JSON 结构与 annotation_service._image_ann_path 约定完全一致：
     {image_id, image_path, width, height, model_id, dataset_id, version,
@@ -51,7 +51,9 @@ def _iter_images(root: Path):
             continue
         if "annotations" in low_parts:
             continue
-        if any(k in p.name.lower() for k in EXCLUDE_KEYWORDS):
+        # 仅排除可视化预览图（xxx_result/predict/detect.jpg）：匹配文件名末尾标记，
+        # 而非全名子串 —— 否则 "*_detection_*.jpg" 等正常数据集图片会被误过滤
+        if any(p.stem.lower().endswith(k) for k in EXCLUDE_KEYWORDS):
             continue
         yield p
 
@@ -380,7 +382,7 @@ def import_external_annotations(root: Path, dataset_id: str, version: str,
                                 model_id: str = "") -> dict:
     """prepare 阶段统一入口：检测格式并转换为每图 JSON。
 
-    root = datasets/{dataset_id}/{version}/ 解压后的目录。
+    root = datasets/{dataset_id}/ 解压后的目录。
     返回 {format, images, annotated, classes, errors}；识别不出外部格式时返回 format=''。
     """
     fmt = detect_format(root)

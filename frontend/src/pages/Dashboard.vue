@@ -1,50 +1,244 @@
 <template>
   <div class="model-repo">
-    <div class="repo-header">
-      <div>
-        <h1>模型仓库</h1>
-        <p class="repo-sub">以模型为中心：一个模型一个卡片，采集/上传的数据挂靠到对应模型下，点击卡片查看其数据集与状态</p>
+    <!-- 顶部：标题 + 搜索 + 新建入口 -->
+    <div class="repo-toolbar">
+      <div class="repo-title">
+        <h1>AI 模型仓库</h1>
+        <p class="repo-sub">以模型为中心：一个模型一个卡片，采集/上传的数据挂靠到对应模型下，点击卡片查看详情</p>
       </div>
-      <div class="repo-stats">
-        <span class="stat-pill">共 {{ models.length }} 个模型</span>
-        <span class="stat-pill" v-if="totalDatasets">{{ totalDatasets }} 个数据集</span>
-        <span class="stat-pill warn" v-if="unboundCount">⚠ {{ unboundCount }} 个数据集未归属</span>
+      <div class="toolbar-right">
+        <input v-model="searchText" class="search-input" placeholder="搜索模型库..." @input="menuId = null" />
+        <button class="primary" @click="createDialogOpen = true">+ 新建模型库</button>
       </div>
+    </div>
+
+    <!-- A. 顶部统计栏三格（含待办提醒） -->
+    <div class="stats-bar">
+      <div class="stat-box">
+        <span class="stat-label">总模型库</span>
+        <b>{{ filteredModels.length }}</b>
+      </div>
+      <div class="stat-box">
+        <span class="stat-label">总数据集</span>
+        <b>{{ totalDatasets }}</b>
+      </div>
+      <div class="stat-box warn">
+        <span class="stat-label">待办事项</span>
+        <b>{{ todoPills.length }}</b>
+        <div class="todo-pills">
+          <span v-for="p in todoPills" :key="p">{{ p }}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- D. 快捷筛选器：算法 / 业务线 / 状态 -->
+    <div class="filter-row">
+      <select v-model="filterArch" class="filter-select">
+        <option value="">全部算法</option>
+        <option v-for="a in archOptions" :key="a" :value="a">{{ a }}</option>
+      </select>
+      <select v-model="filterBiz" class="filter-select">
+        <option value="">全部业务线</option>
+        <option v-for="b in bizOptions" :key="b" :value="b">{{ b }}</option>
+      </select>
+      <select v-model="filterStatus" class="filter-select">
+        <option value="">全部状态</option>
+        <option value="production_ready">生产就绪</option>
+        <option value="active">启用</option>
+        <option value="training">训练中</option>
+        <option value="evaluating">评估中</option>
+        <option value="rejected">守门员拦截</option>
+        <option value="superseded">已换代</option>
+        <option value="archived">已归档</option>
+      </select>
+      <span v-if="filterActive" class="filter-reset" @click="resetFilters">清除筛选</span>
+    </div>
+
+    <!-- 模型对比（勾选 2~3 个后出现） -->
+    <div v-if="compareIds.length >= 2" class="compare-bar">
+      <span>已选 <b>{{ compareIds.length }}</b> 个模型库（最多 3 个）</span>
+      <button class="primary small" @click="compareOpen = true">对比所选模型</button>
+      <span class="compare-close" @click="compareIds = []">✕ 取消选择</span>
     </div>
 
     <div v-if="loading" class="loading-state"><span class="loading-spinner"></span>加载模型仓库...</div>
 
     <div v-else-if="!models.length" class="empty-state">
-      <p>仓库还没有模型。模型可以暂时为空（待采集），注册第一个模型后挂载数据集。</p>
-      <router-link to="/models"><button class="primary">去模型管理</button></router-link>
+      <h3>欢迎使用 AI 模型管理平台</h3>
+      <p>仓库还没有模型库。按下面三步开始你的第一个检测模型：</p>
+      <div class="guide-steps">
+        <div class="guide-step">
+          <span class="step-no">1</span>
+          <b>上传数据</b>
+          <small>上传图片/标注压缩包，归属到模型库下的数据集</small>
+        </div>
+        <div class="guide-step">
+          <span class="step-no">2</span>
+          <b>标注图片</b>
+          <small>在标注工作台画框、走 AI 预标注流程</small>
+        </div>
+        <div class="guide-step">
+          <span class="step-no">3</span>
+          <b>训练模型</b>
+          <small>选择数据集与超参，训练并经守门员评估上线</small>
+        </div>
+      </div>
+      <div class="empty-actions">
+        <button class="primary" @click="createDialogOpen = true">+ 新建模型库</button>
+        <router-link to="/models"><button class="secondary">去模型管理</button></router-link>
+      </div>
     </div>
 
     <div v-else class="model-grid">
       <div
-        v-for="m in models"
+        v-for="m in filteredModels"
         :key="m.model_id"
         class="model-card"
-        @click="$router.push(`/models/${m.model_id}`)"
+        :class="{ comparing: isComparing(m.model_id) }"
+        @click="gotoDetail(m)"
       >
-        <div class="model-card-head">
-          <span class="model-name">{{ m.display_name || m.name || m.model_code || m.model_id }}</span>
-          <code class="model-code">{{ m.model_code || m.model_id }}</code>
+        <label class="compare-check" @click.stop>
+          <input
+            type="checkbox"
+            :checked="isComparing(m.model_id)"
+            @change="toggleCompare(m.model_id)"
+          />
+          <span class="compare-hint">对比</span>
+        </label>
+
+        <div class="mc-head">
+          <div class="mc-title">
+            <span class="mc-icon">🤖</span>
+            <span class="mc-name">{{ m.display_name || m.name || m.model_id }}</span>
+            <code class="mc-code">{{ m.model_code || m.model_id }}</code>
+          </div>
+          <div class="more-wrap" @mouseleave="menuId = null">
+            <button class="more-btn" @click.stop="menuId = menuId === m.model_id ? null : m.model_id">⋯</button>
+            <div v-if="menuId === m.model_id" class="more-menu" @click.stop>
+              <button class="menu-item" @click="openEditDialog(m)">编辑信息</button>
+              <button class="menu-item" @click="exportModelItem(m)" :disabled="exporting">
+                {{ exporting ? '导出中...' : '导出' }}
+              </button>
+              <button class="menu-item menu-danger" @click="deleteModelItem(m)" :disabled="deleting">
+                {{ deleting ? '删除中...' : '删除' }}
+              </button>
+            </div>
+          </div>
         </div>
 
-        <div class="model-ds-count">
-          挂载 <b>{{ m.dataset_count || 0 }}</b> 个数据集
+        <div v-if="m.description || m.business" class="mc-scene" :title="fullScene(m)">
+          <span class="scene-key">场景</span> {{ sceneShort(m) }}
         </div>
 
-        <div class="stage-bars">
-          <span v-for="(c, st) in m.dataset_stats" :key="st" class="stage-pill" :class="`stage-${st}`">
-            {{ stageLabel(String(st)) }} × {{ c }}
-          </span>
-          <span v-if="!m.dataset_count" class="stage-pill stage-empty">空模型 · 待采集</span>
+        <div class="mc-rows">
+          <div class="mc-row">
+            挂载 <b>{{ m.dataset_count || 0 }}</b> 个数据集
+            <span v-if="pendingCount(m)" class="row-pending">（{{ pendingCount(m) }} 个待处理）</span>
+          </div>
+          <div class="mc-row">
+            标签 <b>{{ m.classes?.length || 0 }}</b> 类
+            <span class="row-meta" v-if="m.classes?.length">· {{ classPreview(m) }}</span>
+          </div>
+          <div class="mc-row">
+            最新模型 <b v-if="latestModelText(m)" class="row-model">{{ latestModelText(m) }}</b>
+            <span v-else class="dim">暂无模型产出</span>
+          </div>
         </div>
 
-        <div class="model-card-foot">
+        <div class="mc-foot">
           <span class="status-tag" :class="m.status">{{ statusLabel(m.status) }}</span>
-          <span class="enter-btn">查看数据集 →</span>
+          <span v-if="m.version" class="version-badge" title="最新模型版本">最新 {{ normVer(m.version) }}</span>
+          <span class="enter">进入详情 →</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 新建模型库弹窗 -->
+    <div v-if="createDialogOpen" class="modal-mask" @click.self="createDialogOpen = false">
+      <div class="modal create-modal">
+        <h3>新建模型库</h3>
+        <p class="modal-sub">唯一标识用于生成底层路径，创建后写死不可修改</p>
+        <div class="form-field">
+          <label>模型库名称 <i>*</i></label>
+          <input v-model="createForm.display_name" placeholder="如：安全帽检测" />
+        </div>
+        <div class="form-field">
+          <label>唯一标识 <i>*</i></label>
+          <input v-model="createForm.model_code" placeholder="如：helmet_detect（小写+下划线）" />
+        </div>
+        <div class="form-field">
+          <label>业务线</label>
+          <select v-model="createForm.business">
+            <option value="">未指定</option>
+            <option v-for="(label, key) in BIZ_OPTIONS" :key="key" :value="key">{{ label }}</option>
+          </select>
+        </div>
+        <div class="form-field">
+          <label>业务场景描述</label>
+          <textarea v-model="createForm.description" rows="2" placeholder="告诉团队成员这个模型的用途"></textarea>
+        </div>
+        <div v-if="createError" class="form-error">{{ createError }}</div>
+        <div class="modal-actions">
+          <button class="secondary" @click="createDialogOpen = false">取消</button>
+          <button class="primary" @click="submitCreate" :disabled="creating">
+            {{ creating ? '创建中...' : '创建并进入详情' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 编辑信息弹窗 -->
+    <div v-if="editDialogOpen" class="modal-mask" @click.self="editDialogOpen = false">
+      <div class="modal edit-modal">
+        <h3>编辑模型库信息</h3>
+        <div class="form-field">
+          <label>模型库名称</label>
+          <input v-model="editForm.display_name" />
+        </div>
+        <div class="form-field">
+          <label>业务场景描述</label>
+          <textarea v-model="editForm.description" rows="2"></textarea>
+        </div>
+        <div v-if="editError" class="form-error">{{ editError }}</div>
+        <div class="modal-actions">
+          <button class="secondary" @click="editDialogOpen = false">取消</button>
+          <button class="primary" @click="submitEdit" :disabled="editing">
+            {{ editing ? '保存中...' : '保存' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 模型对比弹窗 -->
+    <div v-if="compareOpen" class="modal-mask" @click.self="compareOpen = false">
+      <div class="modal compare-modal">
+        <h3>模型库对比（{{ compareModels.length }} 个）</h3>
+        <table class="compare-table">
+          <thead>
+            <tr>
+              <th>模型库</th>
+              <th>mAP50-95</th>
+              <th>参数量</th>
+              <th>推理速度</th>
+              <th>标签类数</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="m in compareModels" :key="m.model_id">
+              <td>
+                <b>{{ m.display_name || m.name || m.model_id }}</b>
+                <small class="tb-code">{{ m.model_code || m.model_id }}</small>
+              </td>
+              <td :class="{ best: isBest(m, 'map') }">{{ mapText(m) }}</td>
+              <td>{{ paramsText(m) }}</td>
+              <td :class="{ best: isBest(m, 'speed') }">{{ speedText(m) }}</td>
+              <td>{{ m.classes?.length || 0 }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="modal-sub">绿色高亮为同列最优；参数量来自模型产出元数据，无产出模型显示 —</p>
+        <div class="modal-actions">
+          <button class="secondary" @click="compareOpen = false">关闭</button>
         </div>
       </div>
     </div>
@@ -52,56 +246,279 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import { listModels } from '@/api/models'
+import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
+import { listModels, createModel, updateModel, deleteModel, exportModel } from '@/api/models'
 import { listDatasets } from '@/api/datasets'
 
+const router = useRouter()
 const loading = ref(true)
 const models = ref<any[]>([])
 const totalDatasets = ref(0)
-const unboundCount = ref(0)
+const datasets = ref<any[]>([])
 
-const STAGE_LABEL: Record<string, string> = {
-  collecting: '采集中',
-  annotating: '标注中',
-  sealed: '已封板',
-  training: '训练中',
-  completed: '已完成训练',
-  failed: '训练失败'
+// ---- 搜索与筛选 ----
+const searchText = ref('')
+const filterArch = ref('')
+const filterBiz = ref('')
+const filterStatus = ref('')
+const filterActive = computed(() => searchText.value || filterArch.value || filterBiz.value || filterStatus.value)
+
+const BIZ_OPTIONS: Record<string, string> = {
+  general: '通用目标检测',
+  pedestrian: '行人检测',
+  vehicle: '车辆 / 车牌',
+  defect: '工业缺陷检测',
+  package: '包裹 / 物流'
+}
+function bizLabel(b: string): string {
+  return BIZ_OPTIONS[b] || b
 }
 
-function stageLabel(s: string) {
-  return STAGE_LABEL[s] || s
+function modelArch(m: any): string {
+  if (m?.architecture_name) return m.model_scale ? `${m.architecture_name}${m.model_scale}` : m.architecture_name
+  const src = m?.lineage?.base_model || m?.base_model || m?.name || ''
+  const mm = /(yolov?\d+[a-z]*?)([nslmxbce])\.pt/i.exec(src)
+  return mm ? mm[0].replace(/\.pt$/i, '') : ''
 }
 
+const archOptions = computed(() => Array.from(new Set(models.value.map(modelArch).filter(Boolean))))
+const bizOptions = computed(() => Array.from(new Set(models.value.map((m) => bizLabel(m.business || '')).filter(Boolean))))
+
+const filteredModels = computed(() =>
+  models.value.filter((m) => {
+    const kw = searchText.value.trim().toLowerCase()
+    if (kw) {
+      const hay = `${m.display_name || ''} ${m.name || ''} ${m.model_code || ''} ${m.model_id || ''}`.toLowerCase()
+      if (!hay.includes(kw)) return false
+    }
+    if (filterArch.value && modelArch(m) !== filterArch.value) return false
+    if (filterBiz.value && bizLabel(m.business || '') !== filterBiz.value) return false
+    if (filterStatus.value && (m.status || '') !== filterStatus.value) return false
+    return true
+  })
+)
+
+function resetFilters() {
+  searchText.value = ''
+  filterArch.value = ''
+  filterBiz.value = ''
+  filterStatus.value = ''
+}
+
+// ---- 待办事项 ----
+const todoPills = computed(() => {
+  const pills: string[] = []
+  const sealable = datasets.value.filter((d: any) => (d.stage || '').toLowerCase() === 'sealed').length
+  const failed = datasets.value.filter((d: any) => (d.stage || '').toLowerCase() === 'failed').length
+  if (sealable) pills.push(`${sealable} 个数据集待封板`)
+  if (failed) pills.push(`${failed} 个数据集训练失败`)
+  return pills
+})
+
+// ---- 卡片信息 ----
+function fullScene(m: any): string {
+  return [m.description, m.business ? `业务线：${bizLabel(m.business)}` : ''].filter(Boolean).join(' | ')
+}
+function sceneShort(m: any): string {
+  const s = fullScene(m).replace(/\s+/g, ' ').trim()
+  return s.length > 20 ? s.slice(0, 20) + '…' : s
+}
+function pendingCount(m: any): number {
+  const st = m.dataset_stats || {}
+  return (st.annotating || 0) + (st.sealed || 0)
+}
+function classPreview(m: any): string {
+  return (m.classes || []).slice(0, 5).join(', ')
+}
+function latestModelText(m: any): string {
+  const v = m.gatekeeper?.new_metrics?.mAP50_95
+  const base = normVer(m.version) || '—'
+  return v != null ? `${base} · mAP ${(v * 100).toFixed(0)}%` : base
+}
+function normVer(v?: string): string {
+  return v ? (String(v).startsWith('v') ? v : 'v' + v) : ''
+}
 function statusLabel(status?: string): string {
   if (!status) return '未知'
   const map: Record<string, string> = {
-    production_ready: '生产就绪',
-    rejected: '守门员拦截',
-    superseded: '已换代',
-    training: '训练中',
-    evaluating: '评估中',
-    active: '启用',
+    production_ready: '✅ 生产就绪',
+    production: '🏭 生产中',
+    active: '已发布',
+    archived: '已归档',
+    rejected: '❌ 已拦截',
+    superseded: '⚠️ 已换代',
+    training: '⏳ 训练中',
+    evaluating: '🔍 评估中',
     inactive: '停用'
   }
   return map[status] || status
 }
 
-onMounted(async () => {
+// ---- 卡片操作（⋯ 菜单） ----
+const menuId = ref<string | null>(null)
+const exporting = ref(false)
+const deleting = ref(false)
+
+function gotoDetail(m: any) {
+  router.push(`/models/${m.model_id}`)
+}
+
+const editDialogOpen = ref(false)
+const editForm = ref({ model_id: '', display_name: '', description: '' })
+const editError = ref('')
+const editing = ref(false)
+function openEditDialog(m: any) {
+  editForm.value = { model_id: m.model_id, display_name: m.display_name || m.name || '', description: m.description || '' }
+  editError.value = ''
+  editDialogOpen.value = true
+  menuId.value = null
+}
+async function submitEdit() {
+  if (!editForm.value.display_name.trim()) {
+    editError.value = '名称不能为空'
+    return
+  }
+  editing.value = true
+  try {
+    await updateModel(editForm.value.model_id, {
+      display_name: editForm.value.display_name.trim(),
+      description: editForm.value.description,
+      name: editForm.value.display_name.trim()
+    })
+    editDialogOpen.value = false
+    await load()
+  } catch (e: any) {
+    editError.value = e?.response?.data?.detail || '保存失败'
+  } finally {
+    editing.value = false
+  }
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+async function exportModelItem(m: any) {
+  exporting.value = true
+  try {
+    const blob = await exportModel(m.model_id)
+    downloadBlob(blob, `${m.model_code || m.model_id}.zip`)
+  } catch (e: any) {
+    alert(e?.response?.data?.detail || '导出失败')
+  } finally {
+    exporting.value = false
+    menuId.value = null
+  }
+}
+async function deleteModelItem(m: any) {
+  if (!confirm(`确认删除模型库「${m.display_name || m.name || m.model_id}」？该操作不可恢复。`)) return
+  deleting.value = true
+  try {
+    await deleteModel(m.model_id)
+    menuId.value = null
+    await load()
+  } catch (e: any) {
+    alert(e?.response?.data?.detail || '删除失败')
+  } finally {
+    deleting.value = false
+  }
+}
+
+// ---- 新建模型库 ----
+const createDialogOpen = ref(false)
+const createForm = ref({ display_name: '', model_code: '', business: '', description: '' })
+const createError = ref('')
+const creating = ref(false)
+async function submitCreate() {
+  createError.value = ''
+  const name = createForm.value.display_name.trim()
+  const code = createForm.value.model_code.trim()
+  if (!name) {
+    createError.value = '请填写模型库名称'
+    return
+  }
+  if (!code) {
+    createError.value = '请填写唯一标识（英文小写+下划线）'
+    return
+  }
+  creating.value = true
+  try {
+    const meta = await createModel({
+      display_name: name,
+      model_code: code,
+      business: createForm.value.business,
+      description: createForm.value.description.trim()
+    })
+    createDialogOpen.value = false
+    createForm.value = { display_name: '', model_code: '', business: '', description: '' }
+    await load()
+    router.push(`/models/${meta.model_id}`)
+  } catch (e: any) {
+    createError.value = e?.response?.data?.detail || '创建失败'
+  } finally {
+    creating.value = false
+  }
+}
+
+// ---- 模型对比 ----
+const compareIds = ref<string[]>([])
+const compareOpen = ref(false)
+function isComparing(id: string) {
+  return compareIds.value.includes(id)
+}
+function toggleCompare(id: string) {
+  const idx = compareIds.value.indexOf(id)
+  if (idx >= 0) {
+    compareIds.value.splice(idx, 1)
+  } else if (compareIds.value.length < 3) {
+    compareIds.value.push(id)
+  } else {
+    alert('最多同时对比 3 个模型库')
+  }
+}
+const compareModels = computed(() => compareIds.value.map((id) => models.value.find((m) => m.model_id === id)).filter(Boolean))
+function mapText(m: any): string {
+  const v = m?.gatekeeper?.new_metrics?.mAP50_95
+  return v == null ? '—' : (v * 100).toFixed(1) + '%'
+}
+function paramsText(m: any): string {
+  const p = m?.model_info?.total_params_m ?? m?.model_info?.total_params
+  if (p == null) return '—'
+  return m?.model_info?.total_params_m != null ? `${p}M` : String(p)
+}
+function speedText(m: any): string {
+  const s = m?.gatekeeper?.new_metrics?.speed_ms
+  return s == null ? '—' : s + 'ms'
+}
+function isBest(m: any, key: 'map' | 'speed') {
+  const list = compareModels.value
+  const val = key === 'map' ? m?.gatekeeper?.new_metrics?.mAP50_95 : m?.gatekeeper?.new_metrics?.speed_ms
+  if (val == null || !list.length) return false
+  if (key === 'map') return val === Math.max(...list.map((x) => x?.gatekeeper?.new_metrics?.mAP50_95 ?? -1))
+  return val === Math.min(...list.map((x) => x?.gatekeeper?.new_metrics?.speed_ms ?? Infinity))
+}
+
+// ---- 数据加载 ----
+async function load() {
   try {
     const modelRes = await listModels()
     models.value = modelRes.models || []
-
-    // 统计未归属数据集（尚未挂到任何模型，提示去模型详情页绑定）
     const dsRes = await listDatasets()
     const all = dsRes.datasets || []
+    datasets.value = all
     totalDatasets.value = all.length
-    unboundCount.value = all.filter((d: any) => !d.model_id).length
   } finally {
     loading.value = false
   }
-})
+}
+onMounted(load)
 </script>
 
 <style scoped>
@@ -109,16 +526,16 @@ onMounted(async () => {
   max-width: 1200px;
 }
 
-.repo-header {
+.repo-toolbar {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
   flex-wrap: wrap;
   gap: 12px;
-  margin-bottom: 20px;
+  margin-bottom: 14px;
 }
 
-.repo-header h1 {
+.repo-toolbar h1 {
   color: #2c3e50;
   margin-bottom: 6px;
 }
@@ -128,43 +545,185 @@ onMounted(async () => {
   margin: 0;
 }
 
-.repo-stats {
+.toolbar-right {
   display: flex;
-  gap: 8px;
+  align-items: center;
+  gap: 10px;
   flex-wrap: wrap;
 }
 
-.stat-pill {
-  background: #f0f4f8;
-  color: #4a6785;
-  border-radius: 12px;
-  padding: 4px 12px;
-  font-size: 0.8rem;
+.search-input {
+  width: 240px;
+  padding: 8px 12px;
   border: 1px solid #dce5ee;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  outline: none;
+  transition: border-color 0.2s;
 }
 
-.stat-pill.warn {
-  background: #fff7e6;
+.search-input:focus {
+  border-color: #2c6ec5;
+}
+
+.stats-bar {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.stat-box {
+  flex: 1;
+  min-width: 180px;
+  background: #f7fafc;
+  border: 1px solid #e4e9f0;
+  border-radius: 10px;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.stat-box b {
+  font-size: 1.6rem;
+  color: #1f2d3d;
+}
+
+.stat-box.warn {
+  background: #fff9f0;
+  border-color: #ffe3bd;
+}
+
+.stat-box.warn b {
   color: #b26a00;
-  border-color: #ffd591;
+}
+
+.stat-label {
+  color: #7a8aa0;
+  font-size: 0.8rem;
+}
+
+.todo-pills {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.todo-pills span {
+  background: #ffedd5;
+  color: #b26a00;
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 8px;
+}
+
+.filter-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.filter-select {
+  padding: 6px 10px;
+  border: 1px solid #dce5ee;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  background: #fff;
+  color: #33475b;
+}
+
+.filter-reset {
+  color: #2c6ec5;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.filter-reset:hover {
+  text-decoration: underline;
+}
+
+.compare-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: #eef4ff;
+  border: 1px solid #cfe0ff;
+  border-radius: 10px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  font-size: 0.9rem;
+  color: #1f3a5f;
+}
+
+.compare-close {
+  margin-left: auto;
+  color: #7a8aa0;
+  cursor: pointer;
+}
+
+.compare-close:hover {
+  color: #c62828;
+}
+
+.primary {
+  background: #2c6ec5;
+  color: #fff;
+  border: 1px solid #2c6ec5;
+  border-radius: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.primary:hover {
+  background: #2459a5;
+}
+
+.primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.primary.small {
+  padding: 5px 12px;
+  font-size: 0.82rem;
+}
+
+.secondary {
+  background: #fff;
+  color: #2c6ec5;
+  border: 1px solid #b8cbe4;
+  border-radius: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.secondary:hover {
+  background: #f2f7ff;
 }
 
 .model-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: 16px;
 }
 
 .model-card {
+  position: relative;
   background: #fff;
   border: 1px solid #e4e9f0;
   border-radius: 12px;
   padding: 16px;
   cursor: pointer;
-  transition: box-shadow 0.2s, transform 0.15s;
+  transition: box-shadow 0.2s, transform 0.15s, border-color 0.15s;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 
 .model-card:hover {
@@ -172,68 +731,184 @@ onMounted(async () => {
   transform: translateY(-2px);
 }
 
-.model-card-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
+.model-card.comparing {
+  border-color: #2c6ec5;
+  box-shadow: 0 0 0 2px rgba(44, 110, 197, 0.15);
 }
 
-.model-name {
-  font-size: 1.15rem;
+.compare-check {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  z-index: 2;
+}
+
+.compare-hint {
+  font-size: 0.7rem;
+  color: #7a8aa0;
+}
+
+.mc-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+  padding-right: 64px;
+}
+
+.mc-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.mc-icon {
+  font-size: 1.2rem;
+}
+
+.mc-name {
+  font-size: 1.12rem;
   font-weight: 700;
   color: #1f2d3d;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  max-width: 220px;
 }
 
-.model-code {
+.mc-code {
   font-size: 0.72rem;
   color: #7a8aa0;
   background: #f3f6fa;
   padding: 2px 8px;
   border-radius: 6px;
-  flex-shrink: 0;
 }
 
-.model-ds-count {
+.more-wrap {
+  position: relative;
+  z-index: 3;
+}
+
+.more-btn {
+  border: none;
+  background: #f3f6fa;
   color: #556;
-  font-size: 0.9rem;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 1.05rem;
+  line-height: 1;
 }
 
-.model-ds-count b {
-  color: #2c6ec5;
-  font-size: 1.2rem;
+.more-btn:hover {
+  background: #e4ebf3;
 }
 
-.stage-bars {
+.more-menu {
+  position: absolute;
+  top: 32px;
+  right: 0;
+  background: #fff;
+  border: 1px solid #e4e9f0;
+  border-radius: 10px;
+  box-shadow: 0 8px 22px rgba(30, 60, 110, 0.14);
+  min-width: 130px;
+  overflow: hidden;
+  z-index: 20;
+}
+
+.menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: none;
+  padding: 9px 14px;
+  font-size: 0.85rem;
+  color: #33475b;
+  cursor: pointer;
+}
+
+.menu-item:hover {
+  background: #f2f7ff;
+}
+
+.menu-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.menu-item.menu-danger {
+  color: #c62828;
+}
+
+.menu-item.menu-danger:hover {
+  background: #ffebee;
+}
+
+.mc-scene {
+  font-size: 0.82rem;
+  color: #556;
+  background: #f8fafc;
+  border-radius: 6px;
+  padding: 6px 10px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.scene-key {
+  color: #9e7362;
+  font-weight: 600;
+}
+
+.mc-rows {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: 6px;
 }
 
-.stage-pill {
-  font-size: 0.75rem;
-  padding: 3px 8px;
-  border-radius: 10px;
-  border: 1px solid transparent;
+.mc-row {
+  font-size: 0.86rem;
+  color: #445;
 }
 
-.stage-collecting { background: #eef4ff; color: #2c6ec5; border-color: #cfe0ff; }
-.stage-annotating { background: #fff3e0; color: #b26a00; border-color: #ffe0b2; }
-.stage-sealed { background: #e8f5e9; color: #2e7d32; border-color: #c8e6c9; }
-.stage-training { background: #ede7f6; color: #5e35b1; border-color: #d1c4e9; }
-.stage-completed { background: #e0f7fa; color: #00695c; border-color: #b2ebf2; }
-.stage-failed { background: #ffebee; color: #c62828; border-color: #ffcdd2; }
-.stage-empty { background: #fafafa; color: #9e9e9e; border-color: #e0e0e0; font-style: italic; }
+.mc-row b {
+  color: #2c6ec5;
+}
 
-.model-card-foot {
+.row-pending {
+  color: #b26a00;
+  font-size: 0.8rem;
+}
+
+.row-meta {
+  color: #7a8aa0;
+  font-size: 0.78rem;
+}
+
+.row-model {
+  color: #2e7d32;
+}
+
+.dim {
+  color: #aab5c2;
+  font-size: 0.8rem;
+}
+
+.mc-foot {
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  gap: 8px;
   border-top: 1px solid #eef2f6;
   padding-top: 10px;
+  flex-wrap: wrap;
 }
 
 .status-tag {
@@ -245,24 +920,225 @@ onMounted(async () => {
 }
 
 .status-tag.production_ready,
+.status-tag.production,
 .status-tag.active { background: #e8f5e9; color: #2e7d32; }
 .status-tag.rejected { background: #ffebee; color: #c62828; }
 .status-tag.superseded { background: #eceff1; color: #78909c; }
+.status-tag.training { background: #ede7f6; color: #5e35b1; }
+.status-tag.evaluating { background: #e8eaf6; color: #3949ab; }
 
-.enter-btn {
+.version-badge {
+  font-size: 0.72rem;
   color: #2c6ec5;
-  font-size: 0.85rem;
+  background: #eef4ff;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid #cfe0ff;
+}
+
+.enter {
+  margin-left: auto;
+  color: #2c6ec5;
+  font-size: 0.82rem;
   font-weight: 600;
 }
 
+/* 空状态引导 */
 .empty-state {
   text-align: center;
   color: #7f8c8d;
-  padding: 60px 20px;
+  padding: 40px 20px;
   background: #fff;
   border: 1px dashed #cfd8e3;
   border-radius: 12px;
 }
 
-.empty-state button { margin-top: 12px; }
+.empty-state h3 {
+  color: #2c3e50;
+  margin-bottom: 6px;
+}
+
+.guide-steps {
+  display: flex;
+  gap: 16px;
+  justify-content: center;
+  margin: 24px 0;
+  flex-wrap: wrap;
+}
+
+.guide-step {
+  width: 200px;
+  background: #f7fafc;
+  border: 1px solid #e4e9f0;
+  border-radius: 10px;
+  padding: 16px;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.step-no {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: #2c6ec5;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+
+.guide-step b {
+  color: #1f2d3d;
+}
+
+.guide-step small {
+  color: #7a8aa0;
+  line-height: 1.5;
+}
+
+.empty-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  margin-top: 12px;
+}
+
+/* 弹窗 */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 30, 45, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: #fff;
+  border-radius: 14px;
+  padding: 22px;
+  width: 480px;
+  max-width: 90vw;
+  max-height: 88vh;
+  overflow: auto;
+  box-shadow: 0 18px 48px rgba(20, 40, 70, 0.28);
+}
+
+.modal h3 {
+  color: #1f2d3d;
+  margin: 0 0 4px;
+}
+
+.modal-sub {
+  color: #7a8aa0;
+  font-size: 0.82rem;
+  margin: 0 0 14px;
+}
+
+.form-field {
+  margin-bottom: 12px;
+  text-align: left;
+}
+
+.form-field label {
+  display: block;
+  font-size: 0.85rem;
+  color: #445;
+  margin-bottom: 5px;
+}
+
+.form-field label i {
+  color: #c62828;
+  font-style: normal;
+}
+
+.form-field input,
+.form-field select,
+.form-field textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #d5dee8;
+  border-radius: 8px;
+  font-size: 0.88rem;
+  box-sizing: border-box;
+  outline: none;
+  font-family: inherit;
+}
+
+.form-field input:focus,
+.form-field select:focus,
+.form-field textarea:focus {
+  border-color: #2c6ec5;
+}
+
+.form-error {
+  color: #c62828;
+  font-size: 0.82rem;
+  margin-bottom: 10px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.compare-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+
+.compare-table th,
+.compare-table td {
+  border: 1px solid #e9eef4;
+  padding: 9px 12px;
+  text-align: left;
+}
+
+.compare-table th {
+  background: #f7fafc;
+  color: #445;
+  font-weight: 600;
+}
+
+.compare-table td.best {
+  color: #2e7d32;
+  font-weight: 700;
+}
+
+.tb-code {
+  display: block;
+  color: #7a8aa0;
+  font-size: 0.72rem;
+  margin-top: 2px;
+}
+
+.loading-state {
+  text-align: center;
+  color: #7f8c8d;
+  padding: 40px;
+}
+
+.loading-spinner {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  border: 2px solid #cfe0ff;
+  border-top-color: #2c6ec5;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
 </style>

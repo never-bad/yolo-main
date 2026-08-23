@@ -18,3 +18,14 @@ backend/_repro_out.txt
 backend/*_install_log.txt
 backend/runs/
 _tmp/
+
+# ============ GitHub 发布排除（2026-08-23） ============
+# 本地 Python 虚拟环境
+.venv/
+# 千问 GGUF 大模型（5.9GB，不适合入库）
+deploy/
+# 内部设计细节文档（除 README/API 文档外不入库）
+平台细节说明.md
+# 已解除跟踪的文档（git rm --cached 后防 git add . 重新加入）
+backend/INSTALL_PYTORCH.md
+docs/

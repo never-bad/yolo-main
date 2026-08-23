@@ -120,7 +120,8 @@ class ModelQueueService:
 
         同一 (dataset_id, image_id) 不入队两次；返回是否已达打包阈值。
         """
-        version_dir = settings.DATASETS_DIR / dataset_id / version
+        # 数据集一律为 datasets/{dataset_id}（无 version 子目录）
+        version_dir = settings.DATASETS_DIR / dataset_id
         image_ids = await asyncio.to_thread(self._scan_dataset_images, version_dir)
 
         def _sync():

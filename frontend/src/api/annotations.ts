@@ -8,6 +8,8 @@ export interface BBox {
   y2: number
   confidence?: number
   source?: string
+  box_id?: number          // AI 预标注返回列表下标，用于映射千问审核结论
+  audit?: any              // 千问 L2 审核结论 {action,reason,tags,kind,suggested_class_id}（不落盘）
 }
 
 export const createAnnotationTask = async (datasetId: string, version: string, classes?: string[]) => {
@@ -34,6 +36,12 @@ export const getTaskItems = async (taskId: string) => {
 
 export const getImageAnnotation = async (taskId: string, imageId: string) => {
   const { data } = await api.get(`/annotations/tasks/${taskId}/items/${imageId}`)
+  return data
+}
+
+// 删除任务中的一张图片（同时清理其标注 JSON 与同名标签文件，并同步数据集计数）
+export const deleteTaskImage = async (taskId: string, imageId: string) => {
+  const { data } = await api.delete(`/annotations/tasks/${taskId}/images/${imageId}`)
   return data
 }
 
@@ -115,6 +123,27 @@ export const autoLabelImage = async (taskId: string, imageId: string, classes: s
     conf: conf ?? undefined,
     prompts
   }, { signal })
+  return data
+}
+
+// 千问 L2 审核：对当前图片标注框做中文语义二次审核（漏标/粘连/标签错误/框质量/合规）
+// boxes 不传时后端读已保存标注；传时按数组下标当作 box_id 映射审核结论
+export const auditImage = async (
+  taskId: string,
+  imageId: string,
+  boxes?: { class_id: number; x1: number; y1: number; x2: number; y2: number }[]
+) => {
+  const { data } = await api.post('/sam/audit', {
+    task_id: taskId,
+    image_id: imageId,
+    boxes: boxes || null
+  })
+  return data
+}
+
+// 问题图片检索：返回任务中带审核异议（reject/modify/split）的图片列表
+export const listAuditIssues = async (taskId: string) => {
+  const { data } = await api.get('/sam/audit/issues', { params: { task_id: taskId } })
   return data
 }
 

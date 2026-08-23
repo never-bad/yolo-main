@@ -76,6 +76,11 @@ async def list_datasets():
     """列出所有数据集"""
     return await dataset_service.list_datasets()
 
+@router.post("/advance-buckets")
+async def advance_buckets():
+    """按模型滚动灌桶（幂等）：A 包标注完成自动灌桶，桶满 SEAL_MIN_IMAGES 自动封板出成品数据集"""
+    return await dataset_service.advance_buckets()
+
 @router.get("/{dataset_id}")
 async def get_dataset(dataset_id: str):
     """获取数据集详情"""

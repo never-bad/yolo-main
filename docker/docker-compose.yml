@@ -1,26 +1,32 @@
 # YOLO 训练可视化平台 - 生产镜像部署（单容器 + Ollama 千问本地推理）
-# 镜像已包含：前端构建产物 + 后端 FastAPI + torch(CUDA 12.8) + 全部模型文件 + nginx
-# 服务器零配置：无需上传代码/模型，拉取镜像即用
+# 分层镜像（环境/代码分开更新）：
+#   yolo-app-env : 环境层（系统依赖 + torch cu128 + Python 依赖 + nginx/supervisor），依赖变更才重建
+#   yolo-app     : 代码层（FROM 环境层 + 前端产物 + 后端代码 + 模型文件），日常更新只重建并推送此层
+# 服务器零配置：无需上传代码/模型，拉取 yolo-app 镜像即用（分层只影响构建与推送，运行仍是单容器）
 #
 # 启动：
 #   docker compose up -d   # 默认使用下方真实仓库地址，无需任何配置
 #
 # 千问 VL（Ollama）：
-#   首次启动会自动拉取 qwen2.5-vl:7b（约 6GB），模型下载较慢属正常；
+#   首次启动会自动拉取 qwen3-vl:8b（约 7GB），模型下载较慢属正常；
 #   下载快慢取决于镜像/模型源，国内环境可用以下方式加速：
 #     1) 镜像加速：OLLAMA_IMAGE=docker.m.daocloud.io/ollama/ollama docker compose up -d
-#     2) 换模型：  OLLAMA_QWEN_MODEL=qwen2.5-vl:7b docker compose up -d
+#     2) 换模型：  OLLAMA_QWEN_MODEL=qwen3-vl:8b docker compose up -d
 #   部署后在平台「标注页 → 千问设置」勾选启用，endpoint 已默认指向 http://ollama:11434
+#
+# 显存友好（Qwen3-VL 8B 峰值 ~8GB，A10 24GB 共享卡安全）：
+#   - OLLAMA_KEEP_ALIVE=1m：精审空闲后 1 分钟自动释放显存，不长期占用同事 GPU
+#   - OLLAMA_NUM_PARALLEL=1：限制并发推理为 1，避免挤占他人训练显存
 
 services:
   # 统一镜像：一个容器同时提供前端(:80)与后端(:8000)
   yolo-platform:
-    image: ${YOLO_IMAGE:-crpi-ujjfs42qeoqwaisn.cn-hangzhou.personal.cr.aliyuncs.com/yolo-main/yolo-platform:latest}
+    image: ${YOLO_IMAGE:-crpi-ujjfs42qeoqwaisn.cn-hangzhou.personal.cr.aliyuncs.com/yolo-main/yolo-app:latest}
     container_name: yolo-platform
     restart: unless-stopped
     ports:
-      - "3000:80"     # 前端（Nginx 托管）
-      - "8000:8000"   # 后端 API（uvicorn）
+      - "${PORT_WEB:-3000}:80"     # 前端（Nginx 托管），冲突时改 PORT_WEB
+      - "${PORT_API:-8000}:8000"   # 后端 API（uvicorn），冲突时改 PORT_API
     shm_size: '24gb'  # 增加共享内存大小以支持 PyTorch 多进程数据加载
     environment:
       # GPU 支持 - 继承宿主机 NVIDIA 驱动（需已安装 NVIDIA Container Toolkit）
@@ -28,11 +34,23 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       # 千问 VL：backend 通过服务名访问 Ollama（UI「千问设置」endpoint 默认值来源）
       - OLLAMA_HOST=http://ollama:11434
+      # PostgreSQL 影子库：指向本 compose 的 postgres 服务（端口不暴露宿主，避免冲突）
+      - PG_HOST=postgres
+      - PG_PORT=5432
+      - PG_USER=postgres
+      - PG_PASSWORD=postgres
+      - PG_DATABASE=yolo
     volumes:
       # 数据集持久化（训练数据）；模型已打进镜像 /app/models，不再挂载
-      - yolo-data:/app/data
+      # 部署时设置 DATA_DIR=/opt/yolo-data 则改挂宿主目录（便于直接放入数据集）；默认命名卷 yolo-data
+      - ${DATA_DIR:-yolo-data}:/app/data
+      # 训练输出（权重/日志）持久化，重建容器不丢失
+      - ${RUNS_DIR:-yolo-runs}:/app/runs
     depends_on:
-      - ollama
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
     deploy:
       resources:
         reservations:
@@ -47,25 +65,52 @@ services:
       retries: 3
       start_period: 60s
 
+  # PostgreSQL 元数据库（影子库：元数据入库，标注内容仍存 JSON 文件；仅容器内访问，不暴露宿主端口）
+  postgres:
+    image: ${PG_IMAGE:-postgres:17}
+    container_name: yolo-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=yolo
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d yolo"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   # 千问 VL 本地推理服务（Ollama）：官方镜像 + 模型卷持久化（重下镜像不丢模型）
   # 国内拉镜像慢时设置 OLLAMA_IMAGE（如 docker.m.daocloud.io/ollama/ollama）
+  # 模型随项目携带（deploy/qwen3-vl/ 只读挂载），启动时离线构建为 ollama 模型，无需服务器从外网拉 7GB
   ollama:
     image: ${OLLAMA_IMAGE:-ollama/ollama}
     container_name: ollama
     restart: unless-stopped
     ports:
-      - "11434:11434"
+      - "${PORT_OLLAMA:-11434}:11434"
     environment:
       - OLLAMA_HOST=0.0.0.0:11434
-      - OLLAMA_KEEP_ALIVE=24h
+      # 精审空闲后 1 分钟自动释放显存（共享 A10 24GB，不长期占卡）
+      - OLLAMA_KEEP_ALIVE=1m
+      # 并发推理限制为 1，避免与同事训练任务抢显存
+      - OLLAMA_NUM_PARALLEL=1
+      # 目标模型名（与平台「千问设置」中填写的保持一致即可）
+      - OLLAMA_QWEN_MODEL=${OLLAMA_QWEN_MODEL:-qwen3-vl:8b}
     volumes:
       - ollama-models:/root/.ollama
-    # 启动后自动拉取千问 VL 模型（已存在则跳过），随镜像持久化在卷里
+      # 千问 GGUF 源文件（主模型 + 视觉投影层），随项目部署目录携带，只读挂载
+      - ../deploy/qwen3-vl:/models:ro
+      # 离线构建脚本（本地 GGUF → ollama create；失败自动回退魔搭直连）
+      - ../deploy/ollama-init.sh:/usr/local/bin/ollama-init.sh:ro
+    # 启动后先由 init 脚本构建/拉取千问 VL 模型（已存在则秒过），构建产物持久化在卷里
     command: >
       /bin/sh -c "ollama serve &
                    sleep 5 &&
-                   (ollama list | grep -q '${OLLAMA_QWEN_MODEL:-qwen2.5-vl:7b}' ||
-                    ollama pull '${OLLAMA_QWEN_MODEL:-qwen2.5-vl:7b}')
+                   sh /usr/local/bin/ollama-init.sh
                    && wait"
     healthcheck:
       test: ["CMD", "ollama", "list"]
@@ -84,5 +129,9 @@ services:
 # 数据集持久化卷（重建容器不丢失数据）
 volumes:
   yolo-data:
+  # 训练输出（best.pt 权重/日志）持久化
+  yolo-runs:
+  # PostgreSQL 元数据库数据持久化
+  pg-data:
   # Ollama 模型卷：模型下载一次后不再重复拉取
   ollama-models:

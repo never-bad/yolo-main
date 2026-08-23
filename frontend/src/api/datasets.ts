@@ -82,3 +82,9 @@ export const exportOriginalDataset = async (datasetId: string, version: string =
   })
   return response.data
 }
+
+// B 系列：按模型滚动灌桶（A 包标注完成自动灌桶，桶满 SEAL_MIN_IMAGES 自动封板，幂等）
+export const advanceBuckets = async () => {
+  const { data } = await api.post('/datasets/advance-buckets')
+  return data
+}

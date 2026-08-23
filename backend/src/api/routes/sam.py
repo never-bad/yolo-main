@@ -10,6 +10,7 @@ sam_service = SAMService()
 
 class ConfigRequest(BaseModel):
     detector: Optional[str] = None            # yolo_world | grounding_dino | qwen_vl | none
+    detectors: Optional[List[str]] = None     # 多引擎同时使用：["grounding_dino","yolo_world","qwen_vl"]，空=沿用单引擎
     detector_weights: Optional[str] = None
     grounding_dino_model: Optional[str] = None  # Transformers 集成的 GD 模型名（如 IDEA-Research/grounding-dino-tiny）
     sam_enabled: Optional[bool] = None
@@ -28,6 +29,8 @@ class ConfigRequest(BaseModel):
     qwen_api_key: Optional[str] = None
     qwen_timeout: Optional[int] = None
     qwen_mock: Optional[bool] = None
+    qwen_keep_alive: Optional[str] = None       # ollama：模型驻留内存时长（"5m"/"-1"=常驻）
+    qwen_num_parallel: Optional[int] = None     # ollama：并行处理请求数（OLLAMA_NUM_PARALLEL）
 
 
 class AutoLabelRequest(BaseModel):
@@ -52,6 +55,12 @@ class InteractiveLabelRequest(BaseModel):
     conf: Optional[float] = None
     prompts: Optional[List[str]] = None  # 与 classes 一一对应的英文提示词
     region: Optional[dict] = None        # 用户框选的局部区域（图像坐标）{"x1","y1","x2","y2"}，缺省全图
+
+
+class AuditRequest(BaseModel):
+    task_id: str
+    image_id: str
+    boxes: Optional[List[dict]] = None   # 前端当前画布上的框（未保存也可审）；缺省时后端读已保存标注
 
 
 @router.get("/available")
@@ -124,6 +133,32 @@ async def interactive_label(request: InteractiveLabelRequest):
             request.task_id, request.image_id, request.classes,
             request.conf, request.prompts, request.region
         )
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+@router.post("/audit")
+async def audit_image(request: AuditRequest):
+    """千问 L2 审核：对当前图片标注框做中文语义二次审核（漏标/粘连/标签错误/框质量/合规）"""
+    try:
+        return await sam_service.audit_image(
+            request.task_id, request.image_id, request.boxes
+        )
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+@router.get("/audit/issues")
+async def audit_issues(task_id: str):
+    """问题图片检索：扫描任务全部已保存标注，返回带审核异议（reject/modify/split）的图片列表"""
+    try:
+        return await sam_service.list_audit_issues(task_id)
     except ValueError as e:
         raise HTTPException(404, str(e))
     except Exception as e:

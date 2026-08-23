@@ -5,6 +5,7 @@ from typing import Optional
 from src.services.model_service import ModelService
 from src.services.dataset_service import DatasetService
 from src.services.queue_service import ModelQueueService
+from src.db import meta_store
 from src.core.settings import settings
 import os
 import shutil
@@ -12,6 +13,12 @@ import shutil
 router = APIRouter(prefix="/models", tags=["models"])
 model_service = ModelService()
 queue_service = ModelQueueService()
+
+class CreateModelRequest(BaseModel):
+    display_name: str = ""
+    model_code: str
+    business: Optional[str] = ""
+    description: Optional[str] = ""
 
 class UpdateModelRequest(BaseModel):
     name: Optional[str] = None
@@ -43,6 +50,20 @@ async def list_models():
     """列出所有模型"""
     return await model_service.list_models()
 
+@router.post("")
+async def create_model(req: CreateModelRequest):
+    """首页「+ 新建模型库」：创建空白模型（空标签字典 + 采集库），code 已存在则返回现有模型"""
+    try:
+        meta = await model_service.create_empty_model(
+            req.model_code,
+            display_name=req.display_name or "",
+            business=req.business or "",
+            description=req.description or "",
+        )
+        return meta
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 @router.get("/custom")
 async def list_custom_models():
     """列出用户上传的自定义预训练模型（.pt 文件）"""
@@ -61,6 +82,72 @@ async def list_custom_models():
 async def list_queue_overview():
     """4.2 模型消息队列总览（查看各模型待打包数据包）"""
     return queue_service.list_queues()
+
+class LibraryRequest(BaseModel):
+    model_library_id: str = ""          # 库标识（小写+下划线，唯一；空则后端按时间戳生成）
+    display_name: Optional[str] = ""
+    description: Optional[str] = ""
+    business_scenario: Optional[str] = ""
+    base_algorithm: Optional[str] = ""
+    architecture_family: Optional[str] = ""
+    label_dict_id: Optional[str] = None
+
+@router.get("/libraries")
+async def list_libraries():
+    """模型库列表（逻辑容器：base_algorithm / 标签字典 / 当前生产模型指针）。
+
+    附加每个库挂接的模型数与生产模型名，供管理页展示归库情况。
+    """
+    libs = await meta_store.list_model_libraries()
+    models_list = await model_service.list_models()
+    by_lib: dict[str, list] = {}
+    prod: dict[str, str] = {}
+    for m in models_list if isinstance(models_list, list) else []:
+        lib_id = m.get("model_library_id")
+        if lib_id:
+            by_lib.setdefault(lib_id, []).append(m)
+            if m.get("status") == "production_ready":
+                prod[lib_id] = m.get("display_name") or m.get("model_id", "")
+    for lib in libs:
+        lib["model_count"] = len(by_lib.get(lib["model_library_id"], []))
+        lib["production_model_name"] = prod.get(lib["model_library_id"], "")
+    return {"libraries": libs}
+
+@router.post("/libraries")
+async def create_library(req: LibraryRequest):
+    """新建/覆盖模型库（upsert 语义：同 id 覆盖）"""
+    try:
+        import re
+        from datetime import datetime
+        lib_id = req.model_library_id.strip()
+        if not lib_id:
+            lib_id = f"lib_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        lib_id = re.sub(r"[^a-z0-9_]+", "_", lib_id.lower()).strip("_")
+        if not lib_id:
+            raise ValueError("model_library_id 非法：需为小写字母/数字/下划线")
+        await meta_store.upsert_model_library({
+            "model_library_id": lib_id,
+            "display_name": req.display_name or lib_id,
+            "description": req.description or "",
+            "business_scenario": req.business_scenario or "",
+            "base_algorithm": req.base_algorithm or "",
+            "architecture_family": req.architecture_family or "",
+            "label_dict_id": req.label_dict_id,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        return await meta_store.get_model_library(lib_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@router.delete("/libraries/{library_id}")
+async def delete_library(library_id: str):
+    """删除模型库（仅解绑记录，不删除挂接模型；模型 model_library_id 留空降级为独立模型）"""
+    existed = await meta_store.get_model_library(library_id)
+    if not existed:
+        raise HTTPException(404, "Model library not found")
+    await meta_store.delete_model_library(library_id)
+    return {"ok": True, "model_library_id": library_id}
 
 # 注意：静态路由必须定义在 /{model_id} 参数路由之前，否则会被参数路由拦截
 @router.get("/similar-scan")
@@ -101,6 +188,45 @@ async def rollback_merge(request: RollbackMergeRequest):
 async def list_production_models(business: Optional[str] = None):
     """列出当前在役的生产模型（status=production_ready），可按业务/算法类型过滤"""
     return await model_service.list_production_models(business)
+
+@router.get("/publish/pending")
+async def list_pending_publish(business: Optional[str] = None):
+    """P8 半自动发布：待确认发布的模型（守门员已通过，生产候选）"""
+    return await model_service.list_pending_publish(business)
+
+class ConfirmPublishRequest(BaseModel):
+    force: Optional[bool] = False   # 冷却期内强制确认（跳过冷却判定）
+
+@router.post("/publish/{model_id}")
+async def confirm_publish(model_id: str, request: Optional[ConfirmPublishRequest] = None):
+    """P8 半自动发布：管理员确认发布。冷却期（PUBLISH_CONFIRM_COOLDOWN_HOURS）内默认拒绝，
+    传 force=true 跳过冷却判定。确认后该模型为唯一生产版本，同业务其他已发布模型自动 superseded。
+    """
+    from datetime import datetime, timedelta
+    detail = await model_service.get_model(model_id)
+    if not detail:
+        raise HTTPException(404, "Model not found")
+    if detail.get("status") != "production_ready":
+        raise HTTPException(400, f"模型 {model_id} 当前状态 {detail.get('status')}，不可确认发布（需先通过守门员）")
+
+    cooldown_h = settings.PUBLISH_CONFIRM_COOLDOWN_HOURS
+    ready_at = detail.get("ready_at") or ""
+    force_confirm = bool((request or ConfirmPublishRequest()).force)
+    if cooldown_h > 0 and ready_at and not force_confirm:
+        try:
+            ready_dt = datetime.fromisoformat(ready_at.replace("Z", "+00:00"))
+            if datetime.now() - ready_dt < timedelta(hours=cooldown_h):
+                raise HTTPException(
+                    400,
+                    f"仍在 {cooldown_h} 小时冷却期内（ready_at={ready_at}），"
+                    f"确认发布需等待冷却期结束或传 force=true 强制确认",
+                )
+        except ValueError:
+            pass  # ready_at 解析失败不阻断（历史模型无冷却要求）
+    try:
+        return await model_service.confirm_publish(model_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 @router.get("/{model_id}")
 async def get_model(model_id: str):

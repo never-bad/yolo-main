@@ -59,14 +59,29 @@ def get_best_device() -> str:
     return str(best["index"])
 
 
-def get_device_summary() -> Dict:
-    """返回设备概要，供前端展示"""
-    gpus = get_available_gpus()
-    if not gpus:
-        return {"available": False, "device": "cpu", "gpus": []}
-    best = max(gpus, key=lambda g: g["memory_free_mb"])
-    return {
-        "available": True,
-        "device": str(best["index"]),
-        "gpus": gpus,
-    }
+def get_gpu_utilization(index: int = 0) -> int | None:
+    """查询指定 GPU 的实时利用率百分比（P6 GPU 熔断用）。
+
+    Returns:
+        int：0~100 的利用率；查询失败或无该 GPU 时返回 None（调用方跳过本轮采样）。
+    """
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu",
+                "--format=csv,noheader,nounits",
+                "-i", str(index),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode != 0:
+            return None
+        val = out.stdout.strip().splitlines()
+        if not val:
+            return None
+        return int(val[0].strip())
+    except Exception:
+        return None

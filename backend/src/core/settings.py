@@ -47,12 +47,46 @@ class Settings(BaseSettings):
     # 队列状态文件：data/queues/<model_id>/queue.json + 打包后的批次记录
     QUEUES_DIR: Path = DATA_DIR / "queues"
 
+    # P8 半自动发布冷却期（小时）：守门员通过 → 标记 production_ready（待确认），
+    # 冷却期过后管理员才能"确认发布"（0 关闭冷却期，立即确认）
+    PUBLISH_CONFIRM_COOLDOWN_HOURS: int = 24
+
     # 封板数量门槛：图片数未达该值默认拒绝封板（force 强制封板可放行；0 关闭）
-    # 用户确认暂定 1500，可按业务批量调整
-    SEAL_MIN_IMAGES: int = 1500
-    
+    # 用户要求暂定 5000，可按业务批量调整
+    SEAL_MIN_IMAGES: int = 5000
+
+    # P1 封板时间窗口兜底：数据集准备完成进入标注阶段后，超过该天数（未达数量门槛）自动封板；
+    # 数量门槛与时间窗口"先达者"生效。0 关闭时间窗口
+    SEAL_MAX_DAYS: int = 7
+    # 时间窗口兜底轮询间隔（秒）：后台定时扫描"超期未封板"数据集自动封板（0 关闭）
+    SEAL_POLL_SECONDS: int = 3600
+
+    # 桶灌自动轮询间隔（秒）：后台定时扫描"标注完成的 A 包"自动灌桶/封板（0 关闭）
+    BUCKET_POLL_SECONDS: int = 60
+
+    # ===== P6 GPU 熔断（2.3）：训练途中 GPU 利用率持续过低 → 判定 GPU 异常 → 自动停训 =====
+    # 利用率低于该百分比视为"异常空闲"（正常训练加载/推理时利用率通常 > 50%）
+    GPU_ABNORMAL_UTIL_PCT: int = 10
+    # 持续低利用率达到该秒数（默认 5 分钟）触发熔断：自动 stop_training + 状态设为 failed(reason=gpu_abnormal)
+    GPU_ABNORMAL_SECONDS: int = 300
+    # GPU 监控轮询间隔（秒）：后台定时采样各运行中任务的 GPU 利用率（0 关闭熔断监控）
+    GPU_WATCH_POLL_SECONDS: int = 30
+
+    # ===== PostgreSQL 元数据库（元数据入库；连接参数由 .env / 环境变量覆盖，服务器部署只改这里）=====
+    PG_HOST: str = "127.0.0.1"
+    PG_PORT: int = 5432
+    PG_USER: str = "postgres"
+    PG_PASSWORD: str = "postgres"
+    PG_DATABASE: str = "yolo"
+    # 是否启用数据库作为元数据源（false 则完全退回 JSON 文件模式，便于迁移期灰度）
+    PG_ENABLED: bool = True
+
+    # M5 状态机统一灰度开关：true 读取统一枚举列 unified_status，false 读取旧列（回滚安全）
+    USE_UNIFIED_STATUS: bool = False
+
     class Config:
-        env_file = ".env"
+        # 绝对路径加载 .env，无论从哪个目录启动都能读到（服务器部署只改 backend/.env）
+        env_file = str(Path(__file__).resolve().parent.parent.parent / ".env")
         
     def init_directories(self):
         """初始化所有必需的目录"""

@@ -18,6 +18,9 @@ debug.log
 backend/data
 backend/runs
 
+# ============ 模型目录内无用/损坏文件（其余模型文件需打进镜像） ============
+backend/models/**/*.corrupt
+
 # ============ 本地开发辅助文件（Dockerfile 只 COPY src/run.py/requirements，均不涉及） ============
 backend/_test_gd.py
 backend/_repro_sam.py
@@ -33,3 +36,8 @@ docs
 README.md
 README_AI.md
 API_DOCUMENTATION.md
+
+# ============ 部署目录（不进入镜像） ============
+# deploy/qwen3-vl: 千问 GGUF 源文件（5.9GB），仅服务器 bind-mount 使用，若进 context 会大幅拖慢构建
+# deploy/ollama-init.sh、OllamaSetup.exe 同理，不进镜像（由 compose bind-mount）
+deploy

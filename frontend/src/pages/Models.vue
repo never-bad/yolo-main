@@ -1,5 +1,36 @@
 <template>
   <div class="models">
+    <!-- 模型库（Phase 0.3：业务逻辑容器） -->
+    <div class="card lib-card">
+      <div class="lib-head">
+        <h2>模型库</h2>
+        <button class="upload-btn" @click="createLibraryDlg">＋ 新建模型库</button>
+      </div>
+      <p class="form-hint">模型库 = 业务逻辑容器（基座算法 / 标签字典 / 当前生产模型指针）。新建模型后可在模型详情中归入对应库。</p>
+      <div v-if="loadingLibraries" class="loading-state">
+        <span class="loading-spinner large"></span>
+        <span>加载模型库...</span>
+      </div>
+      <div v-else-if="libraries.length === 0" class="lib-empty">暂无模型库，点击「＋ 新建模型库」创建。</div>
+      <div v-else class="lib-grid">
+        <div v-for="lib in libraries" :key="lib.model_library_id" class="lib-item">
+          <div class="lib-item-head">
+            <span class="lib-name">{{ lib.display_name || lib.model_library_id }}</span>
+            <button class="mini-btn danger" @click="removeLibrary(lib)" title="仅删除库记录，挂接模型不受影响">删除</button>
+          </div>
+          <div class="lib-item-meta">
+            <div>ID：<code>{{ lib.model_library_id }}</code></div>
+            <div>业务场景：{{ lib.business_scenario || '—' }}</div>
+            <div>基座算法：{{ lib.base_algorithm || '—' }}</div>
+            <div>架构家族：{{ lib.architecture_family || '—' }}</div>
+            <div>标签字典：{{ lib.label_dict_id || '—' }}</div>
+            <div>库内模型：<b>{{ lib.model_count ?? 0 }}</b> 个</div>
+            <div>当前生产模型：<b>{{ lib.production_model_name || '—' }}</b></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- 模型管理 -->
     <div class="card">
       <h2>模型管理</h2>
@@ -32,82 +63,65 @@
         <span>加载模型列表...</span>
       </div>
       <div v-else-if="models.length > 0" class="models-list">
-        <div v-for="model in models" :key="model.model_id" class="model-item">
-          <div class="model-header">
-            <h3>
-              <span v-if="model.status" :class="'m-status m-' + model.status">{{ statusText(model) }}</span>
-              {{ model.display_name || model.model_id }}
-              <span v-if="model.model_code" class="m-code">{{ model.model_code }}</span>
-              <span v-else class="m-code m-code-unset" title="尚未配置模型唯一 code，可在「编辑」中配置（模型流转/自动关联依赖它）">未配置code</span>
-              <span v-if="model.version" class="m-version">版本 {{ model.version }}</span>
-            </h3>
-            <div class="model-actions">
-              <button @click="viewModelDetails(model)" class="secondary">详情</button>
-              <button @click="openLabelsDict(model)" class="secondary" title="维护该模型统一标签字典（index/english_code/中文名/中文描述）">标签字典</button>
-              <button 
-                @click="editModel(model)" 
-                class="secondary"
-                :disabled="editingModel === model.model_id"
-              >
-                <span v-if="editingModel === model.model_id" class="loading-spinner"></span>
-                {{ editingModel === model.model_id ? '保存中...' : '编辑' }}
-              </button>
-              <button 
-                @click="exportModelFile(model.model_id)" 
-                class="secondary"
-                :disabled="exportingModel === model.model_id"
-              >
-                <span v-if="exportingModel === model.model_id" class="loading-spinner"></span>
-                {{ exportingModel === model.model_id ? '导出中...' : '导出' }}
-              </button>
-              <button 
-                v-if="model.status !== 'production_ready'"
-                @click="overrideModelItem(model)" 
-                class="danger-outline"
-                :disabled="overridingModel === model.model_id"
-                title="人工强制覆盖：将被守门员拦截的模型手动设为生产版本（高级工程师操作，将记录原因）"
-              >
-                <span v-if="overridingModel === model.model_id" class="loading-spinner"></span>
-                {{ overridingModel === model.model_id ? '强制设置中...' : '强制设为生产' }}
-              </button>
-              <button 
-                @click="promoteModel(model.model_id)" 
-                class="primary"
-                :disabled="promotingModel === model.model_id"
-                title="在相同验证集上对比 mAP50-95 与标注速度，确认更优后自动切换为 AI 预标注检测模型"
-              >
-                <span v-if="promotingModel === model.model_id" class="loading-spinner"></span>
-                {{ promotingModel === model.model_id ? '评估对比中...' : '升级为预标注模型' }}
-              </button>
-              <button 
-                @click="deleteModelItem(model.model_id)" 
-                class="danger"
-                :disabled="deletingModel === model.model_id"
-              >
-                <span v-if="deletingModel === model.model_id" class="loading-spinner"></span>
-                {{ deletingModel === model.model_id ? '删除中...' : '删除' }}
-              </button>
-            </div>
-          </div>
-          <p v-if="model.business">业务场景: {{ bizLabel(model.business) }}</p>
-          <p v-if="model.classes">类别数: {{ model.classes.length }}</p>
-          <p v-if="model.base_model">基础模型: {{ model.base_model }}</p>
-          <p v-if="model.lineage && (model.lineage.dataset_id || model.lineage.parent_model_id || model.lineage.base_model)">
-            血缘:
-            <span v-if="model.lineage.base_model">基座 {{ model.lineage.base_model }}</span>
-            <template v-if="model.lineage.dataset_id"> · 数据集 {{ model.lineage.dataset_id }}</template>
-            <template v-if="model.lineage.parent_model_id"> · 上一代 {{ model.lineage.parent_model_id }}</template>
-          </p>
-          <p v-if="model.created_at">创建时间: {{ model.created_at }}</p>
-          <p v-if="model.description">描述: {{ model.description }}</p>
-          <details v-if="model.gatekeeper && model.gatekeeper.report" class="gk-report">
-            <summary>🛡️ 模型守门员评估报告</summary>
-            <div class="gk-report-text">{{ model.gatekeeper.report }}</div>
-            <div v-if="model.gatekeeper.regressed_classes?.length" class="gk-regressed">
-              退化类别: <span v-for="c in model.gatekeeper.regressed_classes" :key="c" class="gk-regressed-item">{{ c }}</span>
-            </div>
-          </details>
-        </div>
+        <!-- 规范 §2.1：模型列表表格化，只展示决策所需核心信息 -->
+        <table class="model-table">
+          <thead>
+            <tr>
+              <th>模型</th>
+              <th>算法架构</th>
+              <th>数据集 / 类别</th>
+              <th>核心指标</th>
+              <th>超参摘要</th>
+              <th>创建时间</th>
+              <th class="th-ops">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="model in models" :key="model.model_id" class="model-table-row">
+              <td class="cell-name">
+                <div class="m-title">
+                  <span v-if="model.status" :class="'m-status m-' + model.status">{{ statusText(model) }}</span>
+                  <b class="m-name">{{ model.display_name || model.model_id }}</b>
+                  <span v-if="model.version" class="m-version">版本 {{ model.version }}</span>
+                  <span v-if="model.gatekeeper?.report" class="gk-dot" title="守门员评估报告（详情页可查看全文）">🛡️</span>
+                </div>
+                <div class="m-sub">
+                  <code class="m-id">{{ model.model_id }}</code>
+                  <span v-if="model.model_code" class="m-code">{{ model.model_code }}</span>
+                  <span v-else class="m-code m-code-unset" title="尚未配置模型唯一 code（模型流转/自动关联依赖它）">未配置code</span>
+                </div>
+              </td>
+              <td class="cell-arch">{{ modelArch(model) }}</td>
+              <td class="cell-data">
+                <span class="d-data">{{ modelDatasetText(model) }}</span>
+                <span v-if="model.classes?.length" class="d-classes">{{ model.classes.length }} 类</span>
+              </td>
+              <td class="cell-map">
+                <template v-if="model.gatekeeper?.new_metrics?.mAP50_95 != null">
+                  <b>{{ modelMapText(model) }}</b><small class="map-lab"> mAP50-95</small>
+                </template>
+                <span v-else class="dim">—</span>
+              </td>
+              <td class="cell-hps">{{ modelHpsText(model) }}</td>
+              <td class="cell-time">{{ fmtDateTime(model.created_at) }}</td>
+              <td class="cell-ops">
+                <button @click="viewModelDetails(model)" class="primary small">详情</button>
+                <div class="more-menu-wrap" @mouseleave="moreOpenId = null">
+                  <button class="secondary small" @click.stop="moreOpenId = moreOpenId === model.model_id ? null : model.model_id" title="更多操作">⋯</button>
+                  <div v-if="moreOpenId === model.model_id" class="more-menu">
+                    <button class="menu-item" @click="exportModelFile(model.model_id); moreOpenId = null" :disabled="exportingModel === model.model_id">
+                      <span v-if="exportingModel === model.model_id" class="loading-spinner"></span>
+                      {{ exportingModel === model.model_id ? '导出中...' : '导出 PT' }}
+                    </button>
+                    <button class="menu-item menu-danger" @click="deleteModelItem(model.model_id); moreOpenId = null" :disabled="deletingModel === model.model_id">
+                      {{ deletingModel === model.model_id ? '删除中...' : '删除' }}
+                    </button>
+                  </div>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
       <div v-else class="empty-state">
         暂无模型，请先训练模型
@@ -116,6 +130,70 @@
         <span v-if="loadingModels" class="loading-spinner"></span>
         {{ loadingModels ? '加载中...' : '刷新模型列表' }}
       </button>
+    </div>
+
+    <!-- ===== P8 半自动发布：待确认发布（生产候选） ===== -->
+    <div class="card">
+      <div class="publish-head">
+        <h2>待确认发布（P8 半自动发布）</h2>
+        <button class="secondary" @click="loadPendingPublish" :disabled="pendingLoading || publishingModel !== null">
+          <span v-if="pendingLoading" class="loading-spinner"></span>
+          {{ pendingLoading ? '加载中...' : '刷新' }}
+        </button>
+      </div>
+      <p class="form-hint">
+        守门员通过后进入"待确认发布"（冷却期 {{ COOLDOWN_HOURS }} 小时），管理员确认后成为该业务唯一生产版本，同业务其他已发布模型自动退役（superseded）
+      </p>
+      <div v-if="pendingLoading" class="loading-state">
+        <span class="loading-spinner large"></span>
+        <span>加载待确认发布列表...</span>
+      </div>
+      <div v-else-if="pendingError" class="warning-state">{{ pendingError }}</div>
+      <div v-else-if="pendingModels.length === 0" class="empty-state">
+        暂无待确认发布的模型（守门员通过后自动出现在这里）
+      </div>
+      <div v-else class="pending-list">
+        <div v-for="m in pendingModels" :key="m.model_id" class="pending-item">
+          <div class="pending-head">
+            <div class="pending-title">
+              <span class="publish-badge">待确认发布</span>
+              <b>{{ m.display_name || m.model_id }}</b>
+              <span v-if="m.version" class="m-version">版本 {{ m.version }}</span>
+              <span v-if="m.migration?.enabled" class="migration-badge"
+                    :title="`跨代迁移训练产出：${m.migration.source} → ${m.migration.target}`">
+                🔄 迁移
+              </span>
+            </div>
+            <div class="pending-actions">
+              <span v-if="cooldownRemaining(m.ready_at) > 0" class="cooldown-hint"
+                    :title="`ready_at=${m.ready_at}，冷却结束后自动可确认`">
+                ⏳ 冷却中，剩 {{ cooldownRemaining(m.ready_at).toFixed(1) }}h
+              </span>
+              <button
+                @click="confirmPublishItem(m)"
+                class="primary"
+                :disabled="publishingModel === m.model_id"
+                :title="cooldownRemaining(m.ready_at) > 0
+                  ? '仍在冷却期内，点击将使用 force=true 强制确认发布'
+                  : '确认后该模型成为本业务唯一生产版本，同业务其他已发布模型自动退役'"
+              >
+                <span v-if="publishingModel === m.model_id" class="loading-spinner"></span>
+                {{ publishingModel === m.model_id ? '确认中...' : (cooldownRemaining(m.ready_at) > 0 ? '强制确认' : '确认发布') }}
+              </button>
+            </div>
+          </div>
+          <div class="pending-meta">
+            <span>业务: {{ bizLabel(m.business) }}</span>
+            <span>就绪时间: {{ fmtTime(m.ready_at) }}</span>
+            <span v-if="m.gatekeeper?.new_metrics?.mAP50_95 != null">
+              mAP50-95: <b>{{ (m.gatekeeper.new_metrics.mAP50_95 * 100).toFixed(1) }}%</b>
+            </span>
+            <span v-if="m.lineage?.base_model">基座: {{ m.lineage.base_model }}</span>
+            <span v-if="m.gatekeeper?.report" :title="'点击查看守门员报告'"
+                  class="publish-report-link" @click="viewModelDetails(m)">🛡️ 守门员报告</span>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- 2.7 相似模型排查与合并（人工工具） -->
@@ -169,7 +247,7 @@
         </button>
       </div>
       <div v-else-if="simScanned" class="empty-state">
-        未发现相似度 ≥ {{ simThreshold }} 的模型对（可在「标签字典」中完善 english_code / 中文名后再扫）
+        未发现相似度 ≥ {{ simThreshold }} 的模型对（可补充模型类别英文名后再扫）
       </div>
     </div>
 
@@ -271,15 +349,6 @@
                      </tr>
                    </table>
                  </details>
-                 <button
-                   v-if="detailModel?.status !== 'production_ready'"
-                   @click="overrideModelItem(detailModel)"
-                   class="danger-outline gk-override-btn"
-                   :disabled="overridingModel === detailModel.model_id"
-                 >
-                   <span v-if="overridingModel === detailModel.model_id" class="loading-spinner"></span>
-                   {{ overridingModel === detailModel.model_id ? '强制设置中...' : '强制设为生产（Override）' }}
-                 </button>
                </div>
              </div>
 
@@ -441,81 +510,11 @@
       </div>
     </div>
   </div>
-<!-- 标签字典弹窗（阶段0：模型统一标签字典四字段） -->
-<div v-if="showLabelsDict" class="modal-overlay" @click.self="closeLabelsDict">
-  <div class="modal-content modal-large">
-    <div class="modal-header">
-      <h3>标签字典：{{ labelsDictModel?.model_code || labelsDictModel?.model_id }}</h3>
-      <button @click="closeLabelsDict" class="close-btn">×</button>
-    </div>
-    <div class="modal-body">
-      <p class="form-hint">
-        四字段含义：<b>index</b>（YOLO 训练序号，保存后自动重排连续）· <b>english_code</b>（检测与 GD 预标注用，必填且唯一）·
-        <b>中文名</b>（界面显示）· <b>中文描述</b>（大模型预标注的语义描述）。训练时只会保留本字典内的标签。
-      </p>
-      <div v-if="labelsDictLoading" class="loading-state"><span class="loading-spinner"></span>加载中...</div>
-      <template v-else>
-        <table class="detail-table">
-          <thead>
-            <tr><th style="width:56px">index</th><th>english_code *</th><th>中文名</th><th>中文描述</th><th style="width:44px"></th></tr>
-          </thead>
-          <tbody>
-            <tr v-for="(lab, i) in labelsDictLabels" :key="i">
-              <td class="labels-index">{{ i }}</td>
-              <td><input v-model="lab.english_code" class="dict-input" placeholder="如 person" /></td>
-              <td><input v-model="lab.chinese_name" class="dict-input" placeholder="如 行人" /></td>
-              <td><input v-model="lab.chinese_desc" class="dict-input" placeholder="大模型预标注语义描述，可空" /></td>
-              <td><button class="danger-outline small" @click="removeLabelRow(i)" title="删除该标签（已被图片标注的标签保存时会被拒绝）">✕</button></td>
-            </tr>
-            <tr v-if="!labelsDictLabels.length"><td colspan="5" class="empty-state">暂无标签，请添加</td></tr>
-          </tbody>
-        </table>
-        <div class="form-actions">
-          <button class="secondary" @click="addLabelRow">+ 添加标签</button>
-          <button class="secondary" @click="prepareSuggest" title="用千问 VL 识别数据集中已知标签之外的新目标，给出候选标签（四字段），勾选后一键采纳追加">🤖 AI 识别新标签</button>
-          <button class="primary" @click="saveLabelsDict" :disabled="labelsDictSaving">
-            <span v-if="labelsDictSaving" class="loading-spinner"></span>
-            {{ labelsDictSaving ? '保存中...' : '保存字典' }}
-          </button>
-        </div>
-        <div v-if="suggestReady" class="suggest-box">
-          <div class="suggest-toolbar">
-            <select v-model="suggestDatasetId" class="dict-input" style="width:auto">
-              <option v-for="ds in suggestDatasets" :key="ds.dataset_id" :value="ds.dataset_id">{{ ds.dataset_id }}</option>
-            </select>
-            <button class="secondary" @click="runSuggest" :disabled="suggestRunning">
-              <span v-if="suggestRunning" class="loading-spinner"></span>
-              {{ suggestRunning ? '识别中...' : '识别' }}
-            </button>
-            <span class="suggest-msg">{{ suggestMsg }}</span>
-          </div>
-          <table v-if="suggestCandidates.length" class="detail-table">
-            <thead>
-              <tr><th style="width:32px"></th><th>english_code</th><th>中文名</th><th>中文描述</th><th>命中图</th></tr>
-            </thead>
-            <tbody>
-              <tr v-for="(c, i) in suggestCandidates" :key="i">
-                <td><input type="checkbox" v-model="suggestSelected" :value="c" /></td>
-                <td>{{ c.english_code }}</td>
-                <td>{{ c.chinese_name }}</td>
-                <td>{{ c.chinese_desc }}</td>
-                <td class="suggest-imgs">{{ (c.images || []).join(', ') }}</td>
-              </tr>
-            </tbody>
-          </table>
-          <div v-if="suggestCandidates.length" class="form-actions">
-            <button class="primary" @click="adoptSuggest" :disabled="!suggestSelected.length">采纳选中（{{ suggestSelected.length }}）</button>
-          </div>
-        </div>
-      </template>
-    </div>
-  </div>
-</div>
 </template>
 
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
-import { listModels, updateModel, deleteModel, getModel, uploadModel, exportModel, generateTrainingCharts, promoteToDetector, overrideModel, getLabelsDict, updateLabelsDict, getModelDatasets, suggestModelLabels, findSimilarModels, mergeModels, getMergeLogs, rollbackMerge, type ModelDetails } from '@/api/models'
+import { listModels, deleteModel, getModel, uploadModel, exportModel, generateTrainingCharts, findSimilarModels, mergeModels, getMergeLogs, rollbackMerge, listPendingPublish, confirmPublish, listLibraries, createLibrary, deleteLibrary, type ModelDetails } from '@/api/models'
 import { downloadFile } from '@/utils/download'
 import { showAlert, showConfirm, showPrompt } from '@/composables/useDialog'
 import VChart from 'vue-echarts'
@@ -552,106 +551,34 @@ use([
 
 const models = ref<any[]>([])
 
-// ===== 阶段0：标签字典弹窗 =====
-const showLabelsDict = ref(false)
-const labelsDictModel = ref<any>(null)
-const labelsDictLoading = ref(false)
-const labelsDictSaving = ref(false)
-const labelsDictLabels = ref<any[]>([])
-
-const openLabelsDict = async (model: any) => {
-  showLabelsDict.value = true
-  labelsDictModel.value = model
-  labelsDictLoading.value = true
-  labelsDictLabels.value = []
-  try {
-    const dic = await getLabelsDict(model.model_id)
-    labelsDictLabels.value = (dic.labels || []).map((l: any) => ({ ...l }))
-  } catch (e: any) {
-    alert('加载标签字典失败: ' + (e.response?.data?.detail || e.message))
-  } finally {
-    labelsDictLoading.value = false
-  }
+// ===== 规范 §2.1 模型列表展示辅助 =====
+const moreOpenId = ref<string | null>(null)
+// 算法架构：优先使用 M11 解析出的架构字段；存量模型按血缘/基座文件名兜底（如 yolov8n.pt → yolov8n）
+const modelArch = (m: any) => {
+  if (m?.architecture_name) return m.model_scale ? `${m.architecture_name}${m.model_scale}` : m.architecture_name
+  const src = m?.lineage?.base_model || m?.base_model || m?.model_name || ''
+  const mm = /(yolov?\d+[a-z]*?)([nslmxbce])\.pt/i.exec(src)
+  return mm ? mm[0].replace(/\.pt$/i, '') : '—'
 }
-const closeLabelsDict = () => {
-  showLabelsDict.value = false
-  labelsDictModel.value = null
+// 核心指标：守门员评估的 mAP50-95
+const modelMapText = (m: any) => {
+  const v = m?.gatekeeper?.new_metrics?.mAP50_95
+  return v == null ? '—' : (v * 100).toFixed(1) + '%'
 }
-const addLabelRow = () => {
-  labelsDictLabels.value.push({ index: labelsDictLabels.value.length, english_code: '', chinese_name: '', chinese_desc: '' })
+const modelDatasetText = (m: any) => m?.lineage?.dataset_id || '—'
+// 超参摘要：Epochs / Batch / Size（列表字段缺失时兜底 training_metrics.job_config）
+const modelHpsText = (m: any) => {
+  const jc = m?.training_metrics?.job_config || {}
+  const parts: string[] = []
+  const e = m?.epochs ?? jc.epochs
+  const b = jc.batch
+  const s = m?.imgsz ?? jc.imgsz
+  if (e != null) parts.push(`Epochs: ${e}`)
+  if (b != null) parts.push(`Batch: ${b}`)
+  if (s != null) parts.push(`Size: ${s}`)
+  return parts.length ? parts.join(' / ') : '—'
 }
-const removeLabelRow = async (i: number) => {
-  const ok = await showConfirm('确认删除该标签？\n已被图片标注使用的标签在保存时会被平台拒绝（追加禁删保护）。')
-  if (ok) labelsDictLabels.value.splice(i, 1)
-}
-
-// ---- AI 识别新类别（千问 VL 看图 → 候选标签 → 一键采纳追加）----
-const suggestReady = ref(false)
-const suggestDatasets = ref<any[]>([])
-const suggestDatasetId = ref('')
-const suggestRunning = ref(false)
-const suggestMsg = ref('')
-const suggestCandidates = ref<any[]>([])
-const suggestSelected = ref<any[]>([])
-
-const prepareSuggest = async () => {
-  suggestReady.value = true
-  suggestMsg.value = ''
-  suggestCandidates.value = []
-  suggestSelected.value = []
-  try {
-    const res = await getModelDatasets(labelsDictModel.value.model_id)
-    suggestDatasets.value = res.datasets || []
-    suggestDatasetId.value = suggestDatasets.value[0]?.dataset_id || ''
-    if (!suggestDatasets.value.length) suggestMsg.value = '该模型暂无绑定数据集，请先绑定后再 AI 识别'
-  } catch (e: any) {
-    suggestMsg.value = '加载模型数据集失败：' + (e.response?.data?.detail || e.message)
-  }
-}
-const runSuggest = async () => {
-  if (!suggestDatasetId.value) { suggestMsg.value = '请先选择数据集'; return }
-  suggestRunning.value = true
-  suggestMsg.value = ''
-  try {
-    const res = await suggestModelLabels(labelsDictModel.value.model_id, suggestDatasetId.value, 3)
-    if (!res.ok) { suggestMsg.value = res.message || '识别失败'; suggestCandidates.value = []; return }
-    suggestCandidates.value = res.candidates || []
-    suggestMsg.value = res.message || ''
-  } catch (e: any) {
-    suggestMsg.value = 'AI 识别失败：' + (e.response?.data?.detail || e.message)
-  } finally {
-    suggestRunning.value = false
-  }
-}
-const adoptSuggest = () => {
-  const exist = new Set(labelsDictLabels.value.map((l: any) => (l.english_code || '').toLowerCase()))
-  let added = 0
-  for (const c of suggestSelected.value) {
-    const code = (c.english_code || '').trim()
-    if (!code || exist.has(code.toLowerCase())) continue
-    labelsDictLabels.value.push({ index: labelsDictLabels.value.length, english_code: code, chinese_name: c.chinese_name || '', chinese_desc: c.chinese_desc || '' })
-    exist.add(code.toLowerCase())
-    added++
-  }
-  suggestSelected.value = []
-  showAlert(added ? `已追加 ${added} 个标签到字典末尾（index 递增，已标注数据不受影响），检查后点「保存字典」即可生效` : '选中的标签已存在于字典或为空，未追加')
-}
-const saveLabelsDict = async () => {
-  if (!labelsDictLabels.value.length) { alert('标签字典不能为空'); return }
-  for (const lab of labelsDictLabels.value) {
-    if (!lab.english_code || !lab.english_code.trim()) { alert('english_code 不能为空'); return }
-  }
-  labelsDictSaving.value = true
-  try {
-    await updateLabelsDict(labelsDictModel.value.model_id, labelsDictLabels.value)
-    showAlert('标签字典已保存!')
-    closeLabelsDict()
-  } catch (e: any) {
-    alert('保存失败: ' + (e.response?.data?.detail || e.message))
-  } finally {
-    labelsDictSaving.value = false
-  }
-}
+const fmtDateTime = (s?: string) => (s ? s.replace('T', ' ').slice(0, 19).replace('Z', '') : '—')
 
 // ===== 模型仓库 / 守门员辅助 =====
 const businessScenes: { value: string; label: string }[] = [
@@ -667,6 +594,9 @@ const statusText = (meta?: any, overrideInfo?: any) => {
   const s = overrideInfo?.to_status || overrideInfo?.from_status || meta?.status
   switch (s) {
     case 'production_ready': return meta?.override || overrideInfo?.to_status ? '生产就绪（人工覆盖）' : '✅ 生产就绪'
+    case 'production': return '🏭 生产中'
+    case 'active': return '已发布'
+    case 'archived': return '已归档'
     case 'rejected': return '❌ 已淘汰'
     case 'superseded': return '⚠️ 已退役'
     case 'training': return '⏳ 训练中'
@@ -679,39 +609,8 @@ const gkVerdictText = (gk: any) => {
   switch (gk?.result) {
     case 'promoted': return '✅ 判定结果：晋升（Promote）—— 新模型已通过守门员校验，正式成为生产版本'
     case 'first_version': return '✅ 判定结果：首版直晋 —— 该业务首个模型，无旧基准可对比，直接设为生产版本 v1.0'
-    case 'rejected': return '❌ 判定结果：淘汰（Reject）—— 未通过守门员校验，已归档为失败实验，旧模型继续服役（可强制覆盖）'
+    case 'rejected': return '❌ 判定结果：淘汰（Reject）—— 未通过守门员校验，已归档为失败实验，旧模型继续服役'
     default: return '🔍 判定结果：' + (gk?.result || '未知')
-  }
-}
-
-const overridingModel = ref<string | null>(null)
-// 人工强制覆盖（Override）：高级工程师手动将被守门员拦截的模型强制设为生产版本
-const overrideModelItem = async (model: any) => {
-  if (!(await showConfirm(
-    `确定将模型 ${model.model_id} 强制设为生产版本吗？\n\n` +
-    `该操作会绕过模型守门员的自动评估（仅建议在数据质量已确认、线上紧急修复等特殊情况下使用），\n` +
-    `系统会记录操作记录与原因，便于审计追溯。`
-  ))) return
-
-  const reason = await showPrompt('请填写强制覆盖原因（用于审计，可选）:', '')
-  if (reason === null) return  // 用户取消
-
-  overridingModel.value = model.model_id
-  try {
-    const res = await overrideModel(model.model_id, {
-      business: model.business || undefined,
-      reason: reason || undefined
-    })
-    const superseded = (res.superseded || []).length
-    alert(
-      `✅ 已强制设为生产就绪！\n${res.meta?.version || ''}` +
-      (superseded ? `\n同时退役了 ${superseded} 个原生产模型（已标记为"已退役"）。` : '')
-    )
-    loadModels()
-  } catch (error: any) {
-    alert('强制覆盖失败: ' + (error.response?.data?.detail || error.message))
-  } finally {
-    overridingModel.value = null
   }
 }
 
@@ -722,11 +621,9 @@ const loadingDetails = ref(false)
 
 // Loading 状态
 const loadingModels = ref(false)
-const editingModel = ref<string | null>(null)
 const deletingModel = ref<string | null>(null)
 const exportingModel = ref<string | null>(null)
 const downloadingChart = ref<string | null>(null)
-const promotingModel = ref<string | null>(null)
 
 // 模型上传
 const selectedModelFile = ref<File | null>(null)
@@ -741,6 +638,99 @@ const loadModels = async () => {
     alert('加载模型失败: ' + (error.response?.data?.detail || error.message))
   } finally {
     loadingModels.value = false
+  }
+}
+
+// ===== 模型库（Phase 0.3：业务逻辑容器） =====
+const libraries = ref<any[]>([])
+const loadingLibraries = ref(false)
+const loadLibraries = async () => {
+  loadingLibraries.value = true
+  try {
+    const res = await listLibraries()
+    libraries.value = res.libraries || []
+  } catch (e: any) {
+    alert('加载模型库失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    loadingLibraries.value = false
+  }
+}
+const createLibraryDlg = async () => {
+  const name = await showPrompt('模型库名称（将自动生成小写标识 id）:', '')
+  if (!name) return
+  try {
+    await createLibrary({ display_name: name })
+    await loadLibraries()
+  } catch (e: any) {
+    alert('创建模型库失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+const removeLibrary = async (lib: any) => {
+  if (!(await showConfirm(`确定删除模型库「${lib.display_name || lib.model_library_id}」吗？\n仅删除库记录，挂接模型不受影响。`))) return
+  try {
+    await deleteLibrary(lib.model_library_id)
+    await loadLibraries()
+  } catch (e: any) {
+    alert('删除模型库失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+// ===== P8 半自动发布：待确认发布（守门员通过 → 管理员确认 → 唯一生产版本） =====
+const COOLDOWN_HOURS = 24                           // 与后端 PUBLISH_CONFIRM_COOLDOWN_HOURS 对齐
+const pendingModels = ref<any[]>([])
+const pendingLoading = ref(false)
+const pendingError = ref('')
+const publishingModel = ref<string | null>(null)
+
+const fmtTime = (s?: string) => (s ? s.replace('T', ' ').slice(0, 19).replace('Z', '') : '-')
+
+// 冷却剩余小时（ready_at + 24h vs 现在）；无 ready_at（历史模型）视为冷却完成
+const cooldownRemaining = (readyAt?: string) => {
+  if (!readyAt) return 0
+  const t = new Date(readyAt).getTime()
+  if (isNaN(t)) return 0
+  const remain = (t + COOLDOWN_HOURS * 3_600_000 - Date.now()) / 3_600_000
+  return remain > 0 ? remain : 0
+}
+
+const loadPendingPublish = async () => {
+  pendingLoading.value = true
+  pendingError.value = ''
+  try {
+    const res = await listPendingPublish()
+    pendingModels.value = res.models || []
+  } catch (e: any) {
+    pendingError.value = '加载待确认发布失败: ' + (e.response?.data?.detail || e.message)
+  } finally {
+    pendingLoading.value = false
+  }
+}
+
+const confirmPublishItem = async (m: any) => {
+  const force = cooldownRemaining(m.ready_at) > 0
+  const ok = await showConfirm(
+    `确认发布模型 ${m.model_id}（版本 ${m.version || '-'}）？\n\n` +
+    `发布后将成为该业务（${bizLabel(m.business)}）唯一生产版本，` +
+    `同业务其他已发布生产模型将自动退役（superseded）。` +
+    (force ? `\n\n⚠ 模型仍在 ${COOLDOWN_HOURS} 小时冷却期内，本次将使用"强制确认"（跳过冷却判定）。` : ''),
+    '确认发布'
+  )
+  if (!ok) return
+  publishingModel.value = m.model_id
+  try {
+    const res = await confirmPublish(m.model_id, { force })
+    const superseded = (res.superseded || []).length
+    showAlert(
+      `✅ 已确认发布 ${m.model_id}！\n` +
+      `publish_status=published（${res.meta?.published_at || ''}）` +
+      (superseded ? `\n同时退役了 ${superseded} 个原生产模型（已标记为"已退役"）。` : '')
+    )
+    await loadPendingPublish()
+    await loadModels()
+  } catch (e: any) {
+    alert('确认发布失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    publishingModel.value = null
   }
 }
 
@@ -1572,40 +1562,6 @@ const heatmapChartOption = computed(() => {
   }
 })
 
-const editModel = async (model: any) => {
-  const code = await showPrompt('模型唯一 code（小写字母+下划线，如 safety_helmet；模型流转/自动关联依赖它，留空则不修改）:', model.model_code || '')
-  if (code === null) return
-
-  const displayName = await showPrompt('模型中文名（界面显示用，可选）:', model.display_name || '')
-  if (displayName === null) return
-
-  const name = await showPrompt('请输入模型名称（可选）:', model.name || model.model_id)
-  if (name === null) return
-  
-  const description = await showPrompt('请输入模型描述（可选）:', model.description || '')
-  if (description === null) return
-  
-  const tagsInput = await showPrompt('请输入标签（逗号分隔，可选）:', model.tags ? model.tags.join(',') : '')
-  const tags = tagsInput ? tagsInput.split(',').map((t: string) => t.trim()).filter((t: string) => t) : undefined
-  
-  editingModel.value = model.model_id
-  try {
-    await updateModel(model.model_id, {
-      model_code: code.trim() || undefined,
-      display_name: displayName.trim() || undefined,
-      name: name || undefined,
-      description: description || undefined,
-      tags: tags
-    })
-    alert('更新成功!')
-    loadModels()
-  } catch (error: any) {
-    alert('更新失败: ' + (error.response?.data?.detail || error.message))
-  } finally {
-    editingModel.value = null
-  }
-}
-
 const deleteModelItem = async (modelId: string) => {
   if (!(await showConfirm(`确定要删除模型 ${modelId} 吗？此操作不可恢复！`))) return
   
@@ -1618,51 +1574,6 @@ const deleteModelItem = async (modelId: string) => {
     alert('删除失败: ' + (error.response?.data?.detail || error.message))
   } finally {
     deletingModel.value = null
-  }
-}
-
-// 升级为预标注检测模型（热切换）
-const promoteModel = async (modelId: string) => {
-  if (!(await showConfirm(`确定将模型 ${modelId} 升级为 AI 预标注检测模型吗？\n\n将在相同验证集上对比 mAP50-95 与标注速度，确认更优后才会自动切换。`))) return
-
-  promotingModel.value = modelId
-  try {
-    const res = await promoteToDetector(modelId)
-    const nm = res.new_model || {}
-    const om = res.old_model || {}
-    const fmt = (v: any) => (v == null ? '—' : (v * 100).toFixed(1) + '%')
-    const fmtSpeed = (v: any) => (v == null ? '—' : v + ' ms/张')
-    const speedNote = nm.speed_ms != null && om.speed_ms != null
-      ? (nm.speed_ms < om.speed_ms ? '（新模型标注速度更快）' : '（新模型标注速度更慢）')
-      : ''
-    if (res.switched) {
-      alert(
-        `✅ 已自动切换为预标注模型！${speedNote}\n\n` +
-        `对比结果（同一验证集）：\n` +
-        `  新模型  mAP50-95: ${fmt(nm.mAP50_95)}  P: ${fmt(nm.precision)}  R: ${fmt(nm.recall)}\n` +
-        `  新模型  标注速度: ${fmtSpeed(nm.speed_ms)}\n` +
-        `  旧模型  mAP50-95: ${fmt(om.mAP50_95)}  P: ${fmt(om.precision)}  R: ${fmt(om.recall)}\n` +
-        `  旧模型  标注速度: ${fmtSpeed(om.speed_ms)}\n` +
-        `AI 预标注将使用新模型。`
-      )
-    } else {
-      const reason = (nm.mAP50_95 != null && om.mAP50_95 != null && nm.mAP50_95 <= om.mAP50_95 + 0.01 &&
-        !(nm.speed_ms != null && om.speed_ms != null && nm.speed_ms < om.speed_ms))
-        ? '新模型在 mAP50-95 与标注速度上均未显著优于当前检测模型'
-        : '新模型 mAP50-95 未显著超过当前检测模型'
-      alert(
-        `未切换。${reason}。\n\n` +
-        `  新模型  mAP50-95: ${fmt(nm.mAP50_95)}  P: ${fmt(nm.precision)}  R: ${fmt(nm.recall)}\n` +
-        `  新模型  标注速度: ${fmtSpeed(nm.speed_ms)}\n` +
-        `  旧模型  mAP50-95: ${fmt(om.mAP50_95)}  P: ${fmt(om.precision)}  R: ${fmt(om.recall)}\n` +
-        `  旧模型  标注速度: ${fmtSpeed(om.speed_ms)}\n` +
-        (om.error ? `\n旧模型评估提示：${om.error}` : '')
-      )
-    }
-  } catch (error: any) {
-    alert('升级失败: ' + (error.response?.data?.detail || error.message))
-  } finally {
-    promotingModel.value = null
   }
 }
 
@@ -1707,6 +1618,8 @@ const exportModelFile = async (modelId: string) => {
 
 onMounted(() => {
   loadModels()
+  loadLibraries()
+  loadPendingPublish()
 })
 
 // ===== 2.7 相似模型排查与合并 =====
@@ -2286,6 +2199,32 @@ button {
   color: #b7950b;
 }
 
+/* 补充状态配色：训练中（蓝）、评估中（蓝紫）、待确认发布（橙）、旧态 active（灰） */
+.m-training {
+  background: #eaf2f8;
+  border: 1px solid #aed6f1;
+  color: #2471a3;
+}
+
+.m-evaluating {
+  background: #f4ecf7;
+  border: 1px solid #d2b4de;
+  color: #7d3c98;
+}
+
+.m-pending_production {
+  background: #fef5e7;
+  border: 1px solid #f5cba7;
+  color: #ca6f1e;
+}
+
+.m-active,
+.m-archived {
+  background: #f2f3f4;
+  border: 1px solid #d5d8dc;
+  color: #616a6b;
+}
+
 .m-version {
   display: inline-block;
   margin-left: 0.4rem;
@@ -2312,6 +2251,236 @@ button {
   color: #c0392b;
   background: #fdedec;
   border-color: #f5b7b1;
+}
+
+/* ===== 规范 §2.1 模型列表表格 ===== */
+.model-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.model-table th {
+  text-align: left;
+  padding: 0.5rem 0.6rem;
+  border-bottom: 2px solid #ddd;
+  color: #7f8c8d;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.model-table td {
+  padding: 0.55rem 0.6rem;
+  border-bottom: 1px solid #eee;
+  vertical-align: top;
+}
+
+.model-table .th-ops {
+  width: 150px;
+}
+
+.model-table .m-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.1rem;
+  margin-bottom: 0.2rem;
+}
+
+.model-table .m-name {
+  font-size: 0.95rem;
+}
+
+.model-table .m-sub {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.2rem;
+}
+
+.model-table .m-id {
+  font-family: Consolas, Monaco, monospace;
+  font-size: 0.72rem;
+  color: #95a5a6;
+  background: #f8f9f9;
+  padding: 0 0.3rem;
+  border-radius: 3px;
+}
+
+.model-table .gk-dot {
+  cursor: help;
+  font-size: 0.85rem;
+  margin-left: 0.2rem;
+}
+
+.model-table .cell-map b {
+  font-size: 0.95rem;
+  color: #1e8449;
+}
+
+.model-table .map-lab,
+.model-table .dim {
+  color: #95a5a6;
+}
+
+.model-table .cell-data .d-data {
+  word-break: break-all;
+}
+
+.model-table .cell-data .d-classes {
+  display: block;
+  margin-top: 0.15rem;
+  color: #7f8c8d;
+  font-size: 0.78rem;
+}
+
+.model-table .cell-ops {
+  white-space: nowrap;
+  position: relative;
+}
+
+.model-table .cell-ops .small {
+  padding: 0.15rem 0.55rem;
+  font-size: 0.78rem;
+}
+
+/* ⋯ 更多操作下拉菜单 */
+.more-menu-wrap {
+  position: relative;
+  display: inline-block;
+  margin-left: 0.35rem;
+  vertical-align: middle;
+}
+
+.more-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 30;
+  min-width: 120px;
+  background: #fff;
+  border: 1px solid #d5d8dc;
+  border-radius: 8px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+  padding: 0.25rem 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.more-menu .menu-item {
+  background: none;
+  border: none;
+  width: 100%;
+  text-align: left;
+  padding: 0.45rem 0.8rem;
+  cursor: pointer;
+  font-size: 0.82rem;
+  color: #2c3e50;
+}
+
+.more-menu .menu-item:hover {
+  background: #f4f6f7;
+}
+
+.more-menu .menu-item:disabled {
+  color: #bdc3c7;
+  cursor: not-allowed;
+}
+
+.more-menu .menu-danger {
+  color: #c0392b;
+}
+
+.more-menu .menu-danger:hover {
+  background: #fdecea;
+}
+
+/* ===== P8 半自动发布：待确认发布卡片 ===== */
+.publish-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.warning-state {
+  padding: 1rem;
+  color: #c0392b;
+  background: #fdf0ec;
+  border: 1px solid #f0a08a;
+  border-radius: 8px;
+}
+.publish-badge {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  background: #fef3e2;
+  border: 1px solid #f5c97b;
+  border-radius: 10px;
+  color: #b9770e;
+  font-size: 0.75rem;
+  font-weight: bold;
+}
+/* 2.4 跨代迁移徽标（待发布列表） */
+.migration-badge {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.1rem 0.5rem;
+  background: #eef3fd;
+  border: 1px solid #9dbff2;
+  border-radius: 10px;
+  color: #1f5fbf;
+  font-size: 0.75rem;
+  font-weight: bold;
+}
+.pending-list {
+  margin-top: 0.5rem;
+}
+.pending-item {
+  padding: 0.8rem 1rem;
+  margin-bottom: 0.6rem;
+  background: #fff;
+  border: 1px solid #e0e6ec;
+  border-left: 4px solid #f5c97b;
+  border-radius: 8px;
+}
+.pending-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+.pending-title {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.pending-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.cooldown-hint {
+  font-size: 0.78rem;
+  color: #b9770e;
+  background: #fef9e7;
+  border: 1px solid #f9e79f;
+  padding: 0.15rem 0.5rem;
+  border-radius: 10px;
+  white-space: nowrap;
+}
+.pending-meta {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-top: 0.45rem;
+  font-size: 0.82rem;
+  color: #566573;
+}
+.publish-report-link {
+  cursor: pointer;
+  color: #2471a3;
+  text-decoration: underline dotted;
 }
 
 .dict-input {
@@ -2423,6 +2592,71 @@ button {
   font-weight: bold;
 }
 
+/* ===== 模型库（Phase 0.3） ===== */
+.lib-card {
+  margin-bottom: 1rem;
+}
+.lib-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.lib-empty {
+  padding: 1rem 0;
+  color: #8a94a6;
+  font-size: 0.85rem;
+}
+.lib-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.6rem;
+}
+.lib-item {
+  border: 1px solid #d7dde4;
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  background: #fafbfc;
+}
+.lib-item-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.4rem;
+}
+.lib-name {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+.mini-btn {
+  border: 1px solid #d7dde4;
+  border-radius: 5px;
+  background: #fff;
+  padding: 2px 8px;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+.mini-btn.danger {
+  color: #e74c3c;
+  border-color: #f5b7b1;
+}
+.mini-btn.danger:hover {
+  background: #fdecea;
+}
+.lib-item-meta {
+  font-size: 0.78rem;
+  color: #4a5568;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.lib-item-meta code {
+  background: #eef1f5;
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
 /* 详情弹窗守门员面板 */
 .gk-panel {
   border: 1px solid #d7dde4;
@@ -2491,10 +2725,6 @@ button {
   background: #fdecea;
   border: 1px solid #f5b7b1;
   border-radius: 8px;
-}
-
-.gk-override-btn {
-  margin-top: 0.6rem;
 }
 
 /* ===== 2.7 相似模型排查与合并 ===== */

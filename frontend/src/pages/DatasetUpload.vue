@@ -4,6 +4,10 @@
       <h2>上传数据集</h2>
       <div class="form-group">
         <label>选择压缩包文件（支持 .zip / .tar / .tar.gz / .tgz）</label>
+        <small class="form-hint">
+          内置标准化引擎：VOC(XML) / COCO(JSON) 标注自动转换 YOLO 格式；文件夹结构不统一时自动扫描重组（图片与同名标签自动配对）。
+          仅原图无标注时直接入池（status=unlabeled），随后到标注页画框。
+        </small>
         <div v-if="selectedFile" class="selected-file">
           <span class="selected-file-icon">📦</span>
           <span class="selected-file-name">{{ selectedFile.name }}</span>
@@ -53,14 +57,38 @@
         <span v-if="loading" class="loading-spinner"></span>
         {{ loading ? '加载中...' : '刷新' }}
       </button>
+      <div v-if="bucketNotice" class="bucket-notice" @click="bucketNotice = ''" title="点击关闭">{{ bucketNotice }}<span class="bucket-notice-close">✕</span></div>
+      <div v-if="bucketBars.length" class="bucket-progress">
+        <div class="bucket-progress-title">桶进度（每桶满 {{ sealMinImages }} 张自动封板，标完的 A 包自动灌入）</div>
+        <div v-for="bar in bucketBars" :key="bar.model_id" class="bucket-model">
+          <span class="bucket-model-tag">{{ modelName(bar.model_id) }}</span>
+          <span v-for="s in bar.sealed" :key="s.version" class="bucket-sealed" :title="'已封板 ' + s.images + ' 张（' + formatTime(s.sealed_at) + '）'">B{{ String(s.version).replace('v', '') }} 已封板</span>
+          <span class="bucket-recv">
+            接收 B{{ bar.curIndex }}：
+            <span class="bar"><span class="bar-fill" :style="{ width: bar.pct + '%' }"></span></span>
+            <span class="bar-num">{{ bar.poured }} / {{ bar.cap || '--' }}</span>
+          </span>
+        </div>
+      </div>
       <div v-if="loading" class="loading-state">
         <span class="loading-spinner large"></span>
         <span>加载数据集列表...</span>
       </div>
       <div v-else class="dataset-list">
-        <div v-for="dataset in datasets" :key="dataset.dataset_id" class="dataset-item">
+        <!-- 数据池 ↔ 训练仓库分离（数据模块规范 §3）：未封板数据在池中可编辑，封板后为只读快照 -->
+        <div v-for="section in datasetSections" :key="section.key" class="ds-section">
+          <div class="ds-section-head">
+            <span class="ds-section-title">{{ section.title }}</span>
+            <small class="ds-section-desc">{{ section.desc }}</small>
+            <span class="ds-section-count">{{ section.items.length }} 个</span>
+          </div>
+          <div v-if="!section.items.length" class="empty-state mini">{{ section.emptyText }}</div>
+          <div v-for="dataset in section.items" :key="dataset.dataset_id" class="dataset-item">
           <div class="dataset-header">
-            <h3 class="dataset-name" @click="viewDataset(dataset)" title="点击查看数据集文件夹结构">{{ dataset.dataset_id }}</h3>
+            <h3 class="dataset-name" @click="viewDataset(dataset)" title="点击查看数据集文件夹结构">
+              {{ dataset.display_name || dataset.dataset_id }}
+              <span v-if="bucketBadge(dataset).text" :class="'badge ' + bucketBadge(dataset).cls">{{ bucketBadge(dataset).text }}</span>
+            </h3>
             <div class="dataset-actions">
               <button 
                 @click="viewDataset(dataset)" 
@@ -127,10 +155,18 @@
           </div>
           <p>文件名: {{ dataset.filename }}</p>
           <p>大小: {{ (dataset.size / 1024 / 1024).toFixed(2) }} MB</p>
-          <p>阶段:
-            <span :class="'status-badge stage-' + (dataset.stage || 'annotating')">{{ stageLabel(dataset.stage) }}</span>
-            <span v-if="dataset.training_status" :class="'status-badge train-' + dataset.training_status" :title="'training_status'">{{ trainingLabel(dataset.training_status) }}</span>
+          <p class="life-row">
+            <span class="life-pill" :class="'life-' + lifecycleOf(dataset).key" :title="lifecycleOf(dataset).hint">{{ lifecycleOf(dataset).text }}</span>
+            <span v-if="['training', 'completed'].includes(dataset.stage) && dataset.training_status" class="life-sub" :title="'training_status'">{{ trainingLabel(dataset.training_status) }}</span>
+            <span v-if="dataset.stage === 'sealed'" class="life-lock" title="封板后为不可变快照（硬链接共享数据，仅供训练调用，不允许修改/删除）">🔒 不可变快照</span>
           </p>
+          <!-- 生命周期进度条（数据模块 §3 状态机：入池 → 标注 → 审核 → 封板） -->
+          <div class="life-track" :class="{ sk: lifecycleOf(dataset).skip }">
+            <div v-for="(seg, i) in lifeSegments" :key="seg" class="life-seg" :class="{ on: i < lifecycleOf(dataset).idx, cur: i === lifecycleOf(dataset).idx }">
+              <span class="life-dot"></span>
+              <span class="life-seg-label">{{ seg }}</span>
+            </div>
+          </div>
           <p v-if="dataset.sealed_at">封板时间: {{ formatTime(dataset.sealed_at) }}</p>
           <p v-if="dataset.image_count">图片数: {{ dataset.image_count }}<span v-if="dataset.stage === 'annotating' && sealMinImages > 0" style="color:#b26a00;font-size:0.8rem">（待封板 {{ dataset.image_count }} / {{ sealMinImages }} 张{{ dataset.image_count < sealMinImages ? `，还差 ${sealMinImages - dataset.image_count} 张` : '' }}）</span></p>
           <p v-if="dataset.label_count">标签数: {{ dataset.label_count }}</p>
@@ -140,7 +176,8 @@
             </p>
           <p v-if="dataset.description">描述: {{ dataset.description }}</p>
           <p v-if="dataset.tags && dataset.tags.length">标签: {{ dataset.tags.join(', ') }}</p>
-        </div>
+          </div><!-- /dataset-item -->
+          </div><!-- /ds-section -->
         <div v-if="datasets.length === 0" class="empty-state">
           暂无数据集，请上传数据集
         </div>
@@ -265,7 +302,7 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted } from 'vue'
-import { uploadDataset, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset } from '@/api/datasets'
+import { uploadDataset, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets } from '@/api/datasets'
 import { listModels } from '@/api/models'
 import { addHardSamples, addBackgroundSamples } from '@/api/samplePool'
 import { downloadFile } from '@/utils/download'
@@ -280,6 +317,8 @@ const uploading = ref(false)
 const uploadResult = ref<any>(null)
 const sealMinImages = ref(0)  // #6 封板数量门槛（来自后端），列表展示待封板进度
 const datasets = ref<any[]>([])
+const buckets = ref<any[]>([])      // B 系列：按模型桶进度（receiving + sealed）
+const bucketNotice = ref('')        // 灌桶/封板结果提示（点击关闭）
 const loading = ref(false)
 const preparingNew = ref(false)  // 正在准备新上传的数据集
 const editingDataset = ref<string | null>(null)  // 正在编辑的数据集ID
@@ -477,28 +516,97 @@ const formatTime = (t: any) => {
   return d.toLocaleString('zh-CN')
 }
 
-// ===== 数据集生命周期状态（MLOps 1.1）=====
-const STAGE_LABELS: Record<string, string> = {
-  collecting: '采集中',
-  annotating: '标注中',
-  sealed: '已封板',
-  training: '训练中',
-  completed: '已完成训练',
-  failed: '训练失败',
-}
+// ===== 数据集生命周期状态（MLOps 1.1）：文字由 lifecycleOf 胶囊提供；训练子状态单独展示 =====
 const TRAIN_STATUS_LABELS: Record<string, string> = {
   incomplete: '未完成训练',
   completed: '已完成训练',
 }
-const stageLabel = (stage?: string) => STAGE_LABELS[stage || 'annotating'] || stage || '标注中'
 const trainingLabel = (s?: string) => TRAIN_STATUS_LABELS[s || ''] || s || ''
 
-// 是否可封板：已准备 且 未进入 sealed/training/completed/failed 阶段
+// ===== B 系列：A包/归档/成品 标识 + 桶进度 =====
+const modelName = (mid: string) => {
+  const m = allModels.value.find(x => x.model_id === mid)
+  return m ? (m.display_name || m.name || m.model_code || mid) : mid
+}
+
+// 卡片徽标：素材袋=A包，已归档=已归档→B{N}，桶成品=成品 B{N}（恒返回对象，便于模板直接用）
+const bucketBadge = (d: any) => {
+  if (!d) return { text: '', cls: '' }
+  if (d.is_bucket_snapshot) return { text: `成品 B${d.bucket_index ?? ''}`, cls: 'badge-b' }
+  if (d.bucket_archived) return { text: `已归档 → B${d.bucket_index ?? ''}`, cls: 'badge-archived' }
+  if (d.model_id && d.stage && ['annotating', 'collecting'].includes(d.stage)) return { text: 'A包', cls: 'badge-a' }
+  return { text: '', cls: '' }
+}
+
+// 桶进度条（每个模型一行：已封板版本 + 接收桶已灌/容量）
+const bucketBars = computed(() => buckets.value.map(b => {
+  const recv = b.receiving || { index: 1, poured: 0 }
+  const cap = sealMinImages.value || 0
+  const poured = Number(recv.poured) || 0
+  return {
+    model_id: b.model_id,
+    sealed: b.sealed || [],
+    curIndex: recv.index,
+    poured,
+    cap,
+    pct: cap > 0 ? Math.min(100, Math.round((poured / cap) * 100)) : 0,
+  }
+}))
+
+// 是否可封板：已准备 且 未进入 sealed/training/completed/failed 阶段 且 未归档（已归档的包已灌入桶）
 const canSeal = (d: any) => {
   if (!d) return false
+  if (d.bucket_archived) return false
   const s = d.stage
   if (['sealed', 'training', 'completed', 'failed'].includes(s)) return false
   return d.status === 'prepared'
+}
+
+// ===== 数据池 ↔ 训练仓库双分区（数据模块 §3/§4：未封板=池，封板=不可变快照） =====
+const poolDatasets = computed(() =>
+  datasets.value.filter((d: any) => !['sealed', 'training', 'completed'].includes(d.stage))
+)
+const frozenDatasets = computed(() =>
+  datasets.value.filter((d: any) => ['sealed', 'training', 'completed'].includes(d.stage))
+)
+const datasetSections = computed(() => [
+  {
+    key: 'pool',
+    title: '🌊 数据池（未封板 · 可编辑）',
+    desc: '上传即入池：标注完成后达到封板阈值 → 点击「封板」生成不可变快照',
+    emptyText: '数据池为空，请先在上方上传数据集',
+    items: poolDatasets.value
+  },
+  {
+    key: 'frozen',
+    title: '🧊 训练数据集（已封板快照 · 只读）',
+    desc: '封板后为不可变数据集版本，可被多个训练任务同时复用（硬链接零额外存储）',
+    emptyText: '暂无已封板数据集：完成标注后在数据池中点击「封板」',
+    items: frozenDatasets.value
+  }
+])
+
+// 生命周期状态机（数据模块 §4.3）：Raw 入池 → 标注 → 审核待封板 → Frozen 封板
+const lifeSegments = ['入池', '标注', '审核', '封板']
+const lifecycleOf = (d: any) => {
+  const s = d?.stage
+  if (['sealed', 'training', 'completed'].includes(s)) {
+    const text = s === 'sealed' ? '已封板' : s === 'training' ? '训练中' : '已完成训练'
+    return { key: 'sealed', text, idx: 3, hint: '数据已封板为不可变快照，仅供训练任务调用', skip: false }
+  }
+  if (s === 'failed') {
+    return { key: 'failed', text: '训练失败', idx: 2, hint: '该数据集训练未通过，保持未完成状态，可重新标注/封板参与下一轮训练', skip: true }
+  }
+  if (!d?.model_id && !d?.bucket_archived) {
+    return { key: 'unassigned', text: '未分配', idx: 0, hint: '尚未挂载到任何模型库，可在模型详情页绑定后使用', skip: false }
+  }
+  if (s === 'collecting') {
+    return { key: 'todo', text: '待标注', idx: 0, hint: '数据已导入数据池，尚未开始标注', skip: false }
+  }
+  if (canSeal(d)) {
+    return { key: 'pending', text: '待封板', idx: 2, hint: '标注完成且达到封板门槛（或准备就绪），等待封板确认', skip: false }
+  }
+  return { key: 'annotating', text: '标注中', idx: 1, hint: '标注工作正在进行', skip: false }
 }
 
 // 封板（标注不完整时后端拒绝，可走强制封板 = 时间窗口兜底）
@@ -594,9 +702,23 @@ const uploadFile = async () => {
 const loadDatasets = async () => {
   loading.value = true
   try {
+    // B 系列：先触发按模型滚动灌桶（幂等，标注完成返回列表时自动执行），再拉取最新列表
+    try {
+      const adv = await advanceBuckets()
+      const sealedN = (adv.sealed || []).length
+      const pouredN = (adv.poured || []).length
+      if (sealedN > 0) {
+        bucketNotice.value = `自动灌桶完成：${pouredN} 个 A 包已入池，${sealedN} 个桶已封板`
+      } else if (pouredN > 0) {
+        bucketNotice.value = `已自动灌桶 ${pouredN} 个 A 包`
+      }
+    } catch (e) {
+      // 灌桶失败不阻塞列表展示
+    }
     const result = await listDatasets()
     datasets.value = result.datasets
     sealMinImages.value = result.seal_min_images || 0
+    buckets.value = result.buckets || []
   } catch (error: any) {
     alert('加载失败: ' + (error.response?.data?.detail || error.message))
   } finally {
@@ -850,6 +972,118 @@ onMounted(() => {
   padding: 0.15rem 0.5rem;
   display: inline-block;
   font-size: 0.8rem;
+}
+
+/* ===== B 系列：A包/归档/成品徽标 + 桶进度 ===== */
+.badge {
+  display: inline-block;
+  font-size: 0.72rem;
+  font-weight: 600;
+  border-radius: 10px;
+  padding: 0.1rem 0.55rem;
+  margin-left: 0.5rem;
+  vertical-align: middle;
+}
+.badge-a {
+  background: #e8d9f5;
+  color: #6c3483;
+  border: 1px solid #c9a8e0;
+}
+.badge-archived {
+  background: #eee5d5;
+  color: #8a6d1b;
+  border: 1px solid #d8c490;
+}
+.badge-b {
+  background: #d4efdf;
+  color: #1e7e4a;
+  border: 1px solid #9ed4b4;
+}
+
+.bucket-notice {
+  margin-top: 0.75rem;
+  padding: 0.5rem 0.9rem;
+  background: #fdf3d8;
+  border: 1px solid #ead9a8;
+  border-radius: 6px;
+  color: #8a6d1b;
+  font-size: 0.85rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.bucket-notice-close {
+  margin-left: 0.75rem;
+  font-weight: bold;
+  color: #b39d5e;
+}
+
+.bucket-progress {
+  margin-top: 0.9rem;
+  padding: 0.75rem 1rem;
+  background: #f7f9fb;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+}
+.bucket-progress-title {
+  font-size: 0.8rem;
+  color: #5a6a7a;
+  margin-bottom: 0.5rem;
+  font-weight: 600;
+}
+.bucket-model {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  padding: 0.3rem 0;
+}
+.bucket-model-tag {
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: #2c3e50;
+  background: #eaf0f6;
+  border-radius: 10px;
+  padding: 0.1rem 0.6rem;
+  white-space: nowrap;
+}
+.bucket-sealed {
+  font-size: 0.75rem;
+  color: #1e7e4a;
+  background: #d4efdf;
+  border: 1px solid #9ed4b4;
+  border-radius: 10px;
+  padding: 0.08rem 0.5rem;
+  white-space: nowrap;
+}
+.bucket-recv {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.8rem;
+  color: #5a6a7a;
+  white-space: nowrap;
+}
+.bar {
+  width: 120px;
+  height: 8px;
+  background: #e3e8ee;
+  border-radius: 4px;
+  overflow: hidden;
+  display: inline-block;
+}
+.bar-fill {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #8e44ad, #a569bd);
+  border-radius: 4px;
+  transition: width 0.3s;
+}
+.bar-num {
+  font-size: 0.75rem;
+  color: #7f8c8d;
+  font-variant-numeric: tabular-nums;
 }
 
 .loading-state {
@@ -1142,5 +1376,143 @@ button {
   white-space: pre-wrap;
   word-break: break-all;
   color: #2c3e50;
+}
+
+/* ===== 数据池 ↔ 训练仓库双分区（数据模块 §3） ===== */
+.ds-section {
+  margin-top: 0.6rem;
+  padding: 0.75rem 0.9rem;
+  background: #fbfcfe;
+  border: 1px solid #e7ecf2;
+  border-radius: 8px;
+}
+.ds-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.55rem;
+}
+.ds-section-title {
+  font-weight: 700;
+  font-size: 0.95rem;
+  color: #2c3e50;
+}
+.ds-section-desc {
+  font-size: 0.75rem;
+  color: #95a5a6;
+  flex: 1 1 auto;
+  min-width: 200px;
+}
+.ds-section-count {
+  font-size: 0.75rem;
+  color: #7f8c8d;
+  background: #eef0f3;
+  border-radius: 10px;
+  padding: 0.1rem 0.55rem;
+  white-space: nowrap;
+}
+.empty-state.mini {
+  padding: 0.8rem;
+  font-size: 0.82rem;
+}
+
+/* ===== 生命周期状态胶囊（3.3 六色：灰/蓝/橙/绿/白/红，与模型库详情页一致） ===== */
+.life-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.life-pill {
+  font-size: 0.75rem;
+  padding: 3px 10px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  display: inline-block;
+  font-weight: 600;
+}
+.life-todo { background: #eef0f3; color: #6b7c93; }
+.life-annotating { background: #e3f2fd; color: #1565c0; }
+.life-pending { background: #fff3e0; color: #b26a00; border-color: #ffd9a0; font-weight: 700; }
+.life-sealed { background: #e8f5e9; color: #2e7d32; border-color: #c8e6c9; }
+.life-unassigned { background: #fff; color: #9aa7b6; border-color: #eaedf1; }
+.life-failed { background: #ffebee; color: #c62828; border-color: #ffcdd2; }
+.life-sub {
+  font-size: 0.72rem;
+  color: #7f8c8d;
+  background: #f4f6f8;
+  border-radius: 8px;
+  padding: 2px 8px;
+}
+.life-lock {
+  font-size: 0.72rem;
+  color: #2e7d32;
+  background: #e8f5e9;
+  border: 1px solid #c8e6c9;
+  border-radius: 8px;
+  padding: 2px 8px;
+  font-weight: 600;
+}
+
+/* ===== 生命周期进度条（Raw → 标注 → 审核 → 封板） ===== */
+.life-track {
+  display: flex;
+  margin: 0.4rem 0 0.2rem;
+  max-width: 420px;
+}
+.life-seg {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  position: relative;
+}
+.life-seg:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  top: 4px;
+  left: 50%;
+  width: 100%;
+  height: 2px;
+  background: #e3e8ee;
+}
+.life-dot {
+  position: relative;
+  z-index: 1;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #e3e8ee;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px #e3e8ee;
+}
+.life-seg-label {
+  font-size: 0.7rem;
+  color: #aab5c0;
+}
+.life-seg.on .life-dot {
+  background: #8e44ad;
+  box-shadow: 0 0 0 1px #8e44ad;
+}
+.life-seg.on .life-seg-label {
+  color: #6c2d82;
+  font-weight: 600;
+}
+.life-seg.on:not(:last-child)::after {
+  background: #c9a8e0;
+}
+.life-seg.cur .life-dot {
+  background: #6c2d82;
+  box-shadow: 0 0 0 3px rgba(108, 45, 130, 0.25);
+}
+.life-track.sk .life-seg.cur .life-dot {
+  background: #e74c3c;
+  box-shadow: 0 0 0 3px rgba(231, 76, 60, 0.25);
+}
+.life-track.sk .life-seg.cur .life-seg-label {
+  color: #c0392b;
 }
 </style>

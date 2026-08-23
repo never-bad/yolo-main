@@ -18,7 +18,7 @@
             @click="selectDataset(ds)"
           >
             <div class="ds-card-header">
-              <span class="ds-name">{{ ds.dataset_id }} <span v-if="trainForm.dataset_id === ds.dataset_id" class="ds-main-tag">主</span></span>
+              <span class="ds-name">{{ ds.display_name || ds.dataset_id }} <span v-if="trainForm.dataset_id === ds.dataset_id" class="ds-main-tag">主</span></span>
               <span :class="'status-badge status-' + ds.status">{{ getDatasetStatus(ds) }}</span>
             </div>
             <div class="ds-card-info">
@@ -38,76 +38,125 @@
         </label>
       </div>
       <div class="form-group">
-        <label>业务场景</label>
+        <label>优化目标</label>
         <select v-model="trainForm.business" :disabled="training">
           <option v-for="b in businessScenes" :key="b.value" :value="b.value">{{ b.label }}</option>
         </select>
         <small v-if="autoAssignedBiz">
-          ✓ 已按数据类别自动分配为「{{ autoAssignedBiz }}」—— 新模型只会与同业务上一代生产模型对比；识别不准可手动调整
+          ✓ 已按数据类别自动分配为「{{ autoAssignedBiz }}」—— 新模型只会与同优化目标上一代生产模型对比；识别不准可手动调整
         </small>
-        <small v-else>选择数据集后，系统将按类别自动分配业务场景（可分业务隔离存储与对比）</small>
+        <small v-else>选择优化目标：以通用检测为默认；选择「高精度质检 / 实时视频流」等目标后系统自动锁定对应黄金超参模板</small>
       </div>
-      <div class="form-group">
-        <label>
-          <input type="checkbox" v-model="useFineTune" :disabled="training" />
-          基于已有模型微调
+      <div class="form-group pretrain-block">
+        <label class="check-line">
+          <input type="checkbox" v-model="pretrainEnabled" :disabled="training" />
+          启用预训练权重（推荐）
         </label>
-      </div>
-      <div v-if="!useFineTune" class="form-group">
-        <label class="model-label">预训练模型</label>
-        <div class="model-selector">
-          <div class="version-select">
-            <label>YOLO版本</label>
-            <select v-model="selectedVersion" :disabled="training">
-              <option v-for="(config, key) in yoloVersions" :key="key" :value="key">
-                {{ config.name }}
-              </option>
-            </select>
+        <div v-if="pretrainEnabled" class="pretrain-source">
+          <div class="source-radios">
+            <label class="source-radio">
+              <input type="radio" value="universal" v-model="pretrainSource" :disabled="training" />
+              通用预训练
+            </label>
+            <label class="source-radio">
+              <input type="radio" value="business" v-model="pretrainSource" :disabled="training" />
+              指定业务模型（历史最佳）
+            </label>
           </div>
-          <div class="size-select">
-            <label>模型大小</label>
-            <select v-model="selectedModelSize" :disabled="training">
-              <option v-for="model in currentVersionModels" :key="model.size" :value="model.size">
-                {{ model.size.toUpperCase() }} - {{ model.name }}
-              </option>
-            </select>
+          <!-- 通用预训练：内置 YOLO / 自定义导入 -->
+          <div v-if="pretrainSource === 'universal'" class="form-group">
+            <label class="model-label">预训练模型</label>
+            <div class="model-selector">
+              <div class="version-select">
+                <label>YOLO版本</label>
+                <select v-model="selectedVersion" :disabled="training">
+                  <option v-for="(config, key) in yoloVersions" :key="key" :value="key">
+                    {{ config.name }}
+                  </option>
+                </select>
+              </div>
+              <div class="size-select">
+                <label>模型大小</label>
+                <select v-model="selectedModelSize" :disabled="training">
+                  <option v-for="model in currentVersionModels" :key="model.size" :value="model.size">
+                    {{ model.size.toUpperCase() }} - {{ model.name }}
+                  </option>
+                </select>
+              </div>
+            </div>
+            <div class="custom-model-block">
+              <label class="custom-model-label">
+                <button type="button" class="add-model-btn" @click="ptFile?.click()" :disabled="uploadingPt">
+                  <span v-if="uploadingPt" class="loading-spinner"></span>
+                  {{ uploadingPt ? '导入中...' : '添加' }}
+                </button>
+                自定义导入的模型
+              </label>
+              <select v-if="customModels.length" v-model="customSelectedPath" :disabled="training" @change="onSelectCustomModel">
+                <option value="">-- 使用上方 YOLO 预训练模型 --</option>
+                <option v-for="cm in customModels" :key="cm.path" :value="cm.path">
+                  {{ cm.filename }} ({{ (cm.size / 1024 / 1024).toFixed(1) }} MB)
+                </option>
+              </select>
+              <small v-else>尚未导入自定义模型，可点「添加」上传 .pt 权重文件</small>
+              <input ref="ptFile" type="file" accept=".pt" class="pt-file-input" @change="handlePtFile" />
+            </div>
+            <small>当前选择: {{ trainForm.model_name }}</small>
+          </div>
+          <!-- 指定业务模型：模型库选择 + 跨代迁移入口二（§3.2.2） -->
+          <div v-else class="form-group">
+            <label>选择已有模型继续训练</label>
+            <div class="select-with-refresh">
+              <select v-model="trainForm.base_model_id" :disabled="loadingModels || training">
+                <option value="">-- 请选择模型 --</option>
+                <option v-for="model in models" :key="model.model_id" :value="model.model_id">
+                  {{ model.model_id }} ({{ model.classes?.length || 0 }} 类)
+                </option>
+              </select>
+              <button type="button" @click="loadModels" class="refresh-btn" :disabled="loadingModels">
+                <span v-if="loadingModels" class="loading-spinner"></span>
+                {{ loadingModels ? '加载中...' : '刷新' }}
+              </button>
+            </div>
+            <small v-if="autoPickInfo" class="auto-pick-info">{{ autoPickInfo }}</small>
+            <small v-else>将所选模型作为预训练权重继续训练；若与数据集优化目标匹配到已训练模型会自动默认选中</small>
+            <!-- 2.4 跨代迁移训练（高级）：位于"启用预训练权重（指定业务模型）"内 -->
+            <div class="migration-block">
+              <label class="migration-toggle">
+                <input type="checkbox" v-model="migrationEnabled" :disabled="training || !trainForm.base_model_id" />
+                跨代迁移训练（高级）：训练到不同的 YOLO 架构
+              </label>
+              <small>从所选源模型迁移到下方目标架构（如 yolov5s → yolov8s）；系统自动 strict=False 复用 Backbone 层、lr0 降 10 倍</small>
+              <div v-if="migrationEnabled" class="model-selector migration-selector">
+                <div class="version-select">
+                  <label>目标 YOLO 版本</label>
+                  <select v-model="migrationTargetVersion" :disabled="training">
+                    <option v-for="(config, key) in yoloVersions" :key="key" :value="key">
+                      {{ config.name }}
+                    </option>
+                  </select>
+                </div>
+                <div class="size-select">
+                  <label>目标模型大小</label>
+                  <select v-model="migrationTargetSize" :disabled="training">
+                    <option v-for="model in yoloVersions[migrationTargetVersion as keyof typeof yoloVersions]?.models || []" :key="model.size" :value="model.size">
+                      {{ model.size.toUpperCase() }} - {{ model.name }}
+                    </option>
+                  </select>
+                </div>
+                <small v-if="selectedBaseArch && selectedBaseArch + '.pt' !== migrationTargetName" class="migration-hint">
+  ⟶ 将执行跨代迁移：{{ selectedBaseArch }} → {{ migrationTargetName }}
+</small>
+<small v-else-if="selectedBaseArch && selectedBaseArch + '.pt' === migrationTargetName" class="migration-hint warn">
+  ⚠ {{ migrationTargetName }} 与源模型架构一致，将按普通微调处理（不会执行迁移）
+</small>
+              </div>
+            </div>
           </div>
         </div>
-        <div class="custom-model-block">
-          <label class="custom-model-label">
-            <button type="button" class="add-model-btn" @click="ptFile?.click()" :disabled="uploadingPt">
-              <span v-if="uploadingPt" class="loading-spinner"></span>
-              {{ uploadingPt ? '导入中...' : '添加' }}
-            </button>
-            自定义导入的模型
-          </label>
-          <select v-if="customModels.length" v-model="customSelectedPath" :disabled="training" @change="onSelectCustomModel">
-            <option value="">-- 使用上方 YOLO 预训练模型 --</option>
-            <option v-for="cm in customModels" :key="cm.path" :value="cm.path">
-              {{ cm.filename }} ({{ (cm.size / 1024 / 1024).toFixed(1) }} MB)
-            </option>
-          </select>
-          <small v-else>尚未导入自定义模型，可点「添加」上传 .pt 权重文件</small>
-          <input ref="ptFile" type="file" accept=".pt" class="pt-file-input" @change="handlePtFile" />
+        <div v-else class="from-scratch-note">
+          ⚠️ 已按「强制从零初始化」配置：<b>不使用任何预训练权重</b>，模型权重将随机初始化后开始训练。
         </div>
-        <small>当前选择: {{ trainForm.model_name }}</small>
-      </div>
-      <div v-else class="form-group">
-        <label>选择已有模型进行微调</label>
-        <div class="select-with-refresh">
-          <select v-model="trainForm.base_model_id" :disabled="loadingModels || training">
-            <option value="">-- 请选择模型 --</option>
-            <option v-for="model in models" :key="model.model_id" :value="model.model_id">
-              {{ model.model_id }} ({{ model.classes?.length || 0 }} 类)
-            </option>
-          </select>
-          <button type="button" @click="loadModels" class="refresh-btn" :disabled="loadingModels">
-            <span v-if="loadingModels" class="loading-spinner"></span>
-            {{ loadingModels ? '加载中...' : '刷新' }}
-          </button>
-        </div>
-        <small v-if="autoPickInfo" class="auto-pick-info">{{ autoPickInfo }}</small>
-        <small v-else>勾选后将从所选模型继续训练；若与数据集业务匹配到已训练模型会自动默认选中</small>
       </div>
       <div class="form-group">
         <label>训练节点（GPU）</label>
@@ -120,32 +169,71 @@
         <small v-if="!cudaAvailable">当前服务器未检测到 GPU，将使用 CPU 训练</small>
         <small v-else>选择用于训练的显卡；不确定时保持"自动选择"</small>
       </div>
-      <div class="grid" style="grid-template-columns: repeat(3, 1fr);">
-        <div class="form-group">
-          <label>训练轮数</label>
-          <input v-model.number="trainForm.epochs" type="number" :disabled="training" />
+      <!-- L2 智能推荐区（三层分档：基准/白银/黄金，点击应用） -->
+      <div v-if="suggestGolden || suggestReason" class="l2-panel">
+        <div class="l2-head">
+          <span class="l2-title">L2 智能推荐 —— 系统按硬件与数据量自动计算，点击档位一键应用</span>
         </div>
-        <div class="form-group">
-          <label>图片尺寸</label>
-          <input v-model.number="trainForm.imgsz" type="number" :disabled="training" />
+        <!-- 三层分档卡片：基准（稳定优先）/ 白银（均衡）/ 黄金（效率最优） -->
+        <div v-if="suggestTiers.length" class="tier-row">
+          <button
+            v-for="t in suggestTiers"
+            :key="t.key"
+            class="tier-card"
+            :class="{ 'tier-active': activeTier === t.key }"
+            @click="applyTier(t)"
+            type="button"
+          >
+            <span class="tier-label">{{ t.label }}</span>
+            <span class="tier-vals">Batch <b>{{ t.batch }}</b> · LR <b>{{ t.lr0 }}</b> · <b>{{ t.epochs }}</b>轮</span>
+            <span class="tier-desc">{{ t.desc }}</span>
+          </button>
         </div>
-        <div class="form-group">
-          <label>批次大小</label>
-          <input v-model.number="trainForm.batch" type="number" placeholder="-1 表示自动" :disabled="training" />
-          <small>提示：-1 表示根据显存自动计算最佳值（推荐），或手动设置如 24、32、48</small>
+        <div v-if="suggestGolden" class="l2-body">
+          <div class="l2-values">
+            <div class="l2-value"><span>Batch</span><b>{{ suggestGolden.batch }}</b></div>
+            <div class="l2-value"><span>LR</span><b>{{ suggestGolden.lr0 }}</b></div>
+            <div class="l2-value"><span>Epochs</span><b>{{ suggestGolden.epochs }}</b></div>
+            <div class="l2-value"><span>Img</span><b>{{ suggestParamsRes?.imgsz ?? 640 }}</b></div>
+            <div class="l2-value"><span>Workers</span><b>{{ workersValue }}</b></div>
+          </div>
+          <div v-if="resourceEstimate.imageCount > 0" class="l2-resource">
+            <span class="res-item">⏱ 预计耗时：约 {{ resourceEstimate.time }}</span>
+            <span class="res-item">🖥 显存占用：约 {{ resourceEstimate.mem }}GB<template v-if="resourceEstimate.totalGpu"> / {{ resourceEstimate.totalGpu }}GB 可用</template></span>
+          </div>
+          <div class="l2-formulas">
+            <div v-for="(f, k) in suggestGolden.formulas" :key="k" class="l2-formula">{{ f }}</div>
+          </div>
         </div>
+        <div v-if="suggestReason" class="l2-reason">{{ suggestReason }}</div>
       </div>
       <div class="form-group adv-block">
         <label class="adv-toggle">
           <input type="checkbox" v-model="showAdvanced" :disabled="training" />
-          高级参数（学习率 / 优化器 / 训练增强）
+          自定义参数（L3 专家微调：批次 / 轮数 / 学习率 / 优化器 / 训练增强）
         </label>
         <span v-if="suggesting" class="suggest-status">
           <span class="loading-spinner"></span> 分析环境并推荐参数...
         </span>
-        <span v-else-if="suggestReason" class="suggest-status">✓ 已自动推荐（可手动修改）</span>
+        <span v-else-if="suggestReason" class="suggest-status">✓ 已自动推荐（展开可手动微调）</span>
       </div>
-      <div v-if="showAdvanced" class="grid adv-grid" style="grid-template-columns: repeat(4, 1fr);">
+      <div v-if="showAdvanced">
+        <div class="grid" style="grid-template-columns: repeat(3, 1fr);">
+          <div class="form-group">
+            <label>训练轮数</label>
+            <input v-model.number="trainForm.epochs" type="number" :disabled="training" />
+          </div>
+          <div class="form-group">
+            <label>图片尺寸</label>
+            <input v-model.number="trainForm.imgsz" type="number" :disabled="training" />
+          </div>
+          <div class="form-group">
+            <label>批次大小</label>
+            <input v-model.number="trainForm.batch" type="number" placeholder="-1 表示自动" :disabled="training" />
+            <small>提示：-1 表示根据显存自动计算最佳值（推荐），或手动设置如 24、32、48</small>
+          </div>
+        </div>
+        <div class="grid adv-grid" style="grid-template-columns: repeat(4, 1fr);">
         <div class="form-group">
           <label>学习率 lr0</label>
           <input v-model.number="trainForm.lr0" type="number" step="0.0001" :disabled="training" />
@@ -172,24 +260,32 @@
           <small>验证指标连续 N 轮不涨则停止（0 = 关闭）</small>
         </div>
       </div>
-      <div v-if="showAdvanced" class="adv-enhance">
+      <div class="adv-enhance">
         <div class="form-group">
           <label class="check-line">
             <input type="checkbox" v-model="trainForm.recall_enabled" :disabled="training" />
             回忆集混训（增量训练防遗忘）
           </label>
-          <small>训练时自动混入同业务已完成旧数据少量样本（每集 ≤20 张），防止灾难性遗忘</small>
+          <small>从历史难例库抽取 {{ Math.round(recallRatio * 100) }}% 数据，防止模型遗忘旧场景。</small>
+          <input id="recall_ratio" v-model.number="recallRatio" type="range" min="0.05" max="0.3" step="0.05" :disabled="training || !trainForm.recall_enabled" />
         </div>
         <div class="form-group">
-          <label for="hard_ratio">困难样本抽样比例 {{ trainForm.hard_sample_ratio }}</label>
+          <label for="hard_ratio">困难样本比例 {{ trainForm.hard_sample_ratio }}</label>
           <input id="hard_ratio" v-model.number="trainForm.hard_sample_ratio" type="range" min="0" max="0.5" step="0.01" :disabled="training" />
-          <small>从该模型困难样本库按比例抽样并入训练（0 = 关闭，默认 10%）</small>
+          <small>从该模型困难样本库按比例抽样并入训练（0 = 关闭，默认）</small>
         </div>
         <div class="form-group">
           <label for="bg_ratio">空白样本抽样比例 {{ trainForm.background_sample_ratio }}</label>
           <input id="bg_ratio" v-model.number="trainForm.background_sample_ratio" type="range" min="0" max="0.5" step="0.01" :disabled="training" />
           <small>空白样本库（负样本）抽样比例（0 = 关闭，默认 5%）</small>
         </div>
+      </div>
+      <!-- §3.2.1 从零训练入口：仅 L3 高级模式底部提供 -->
+      <div class="l3-block">
+        <a class="scratch-link" href="javascript:void(0)" @click="confirmScratchInit">
+          强制从零初始化
+        </a>
+      </div>
       </div>
       <div v-if="suggestReason" class="suggest-reason">{{ suggestReason }}</div>
       <button @click="startTraining" :disabled="training || preparingWeight || !trainForm.dataset_id">
@@ -210,13 +306,20 @@
       </div>
       <div v-else class="jobs-list">
         <div v-for="job in jobs" :key="job.job_id" class="job-item">
-          <h3 class="job-name" @click="openJobFiles(job.job_id)" title="点击查看任务文件">{{ job.job_id }}</h3>
-          <p>数据集: {{ job.dataset_id }}</p>
-          <p>模型: {{ job.model_name }}</p>
-          <p>轮数: {{ job.epochs }} | 图片尺寸: {{ job.imgsz }} | 批次: {{ job.batch }}</p>
-          <p>节点: {{ job.gpu_index != null && job.gpu_index !== undefined ? 'GPU ' + job.gpu_index : '自动选择' }}</p>
-          <p>启动时间: {{ new Date(job.created_at).toLocaleString() }}</p>
-          <p>状态: <span :class="'status-badge status-' + job.status">{{ job.status }}</span> <span v-if="job.early_stopped" class="early-stop-badge" title="模型已收敛，系统自动提前停止训练以节省资源">✓ 已完成（早停）</span></p>
+          <div class="job-head">
+            <h3 class="job-name" @click="openJobFiles(job.job_id)" title="点击查看任务文件">{{ job.job_id }}</h3>
+            <span class="job-pill" :class="'jp-' + jobPillKey(job.status)">{{ jobStatusText(job.status) }}</span>
+          </div>
+          <p>数据集: {{ job.dataset_id }}&nbsp;|&nbsp;模型: {{ job.model_name }}&nbsp;|&nbsp;{{ job.epochs }} 轮&nbsp;|&nbsp;Img {{ job.imgsz }}&nbsp;|&nbsp;Batch {{ job.batch }}</p>
+          <p>节点: {{ job.gpu_index != null && job.gpu_index !== undefined ? 'GPU ' + job.gpu_index : '自动选择' }}&nbsp;|&nbsp;启动: {{ new Date(job.created_at).toLocaleString() }}</p>
+          <p class="job-badges">
+            <span v-if="job.gpu_abnormal" class="gpu-abnormal-badge" title="GPU 利用率持续过低，系统自动停止训练">⚠️ GPU 异常熔断</span>
+            <span v-if="job.early_stopped" class="early-stop-badge" title="模型已收敛，系统自动提前停止训练以节省资源">✓ 已完成（早停）</span>
+            <span v-if="job.migration?.enabled" class="migration-badge"
+                  :title="`跨代迁移训练：${job.migration.source_architecture} → ${job.migration.target_architecture}`">
+              🔄 迁移 {{ job.migration.source_architecture }} → {{ job.migration.target_architecture }}
+            </span>
+          </p>
           <div v-if="job.status === 'running'" class="job-progress">
             <div class="progress-bar">
               <div class="progress-fill" :style="{ width: jobProgress[job.job_id]?.percent + '%' }">
@@ -236,6 +339,14 @@
               <span class="progress-last" :class="{ warn: isStale(job.job_id) }">
                 {{ lastActivityText(job.job_id) }}
               </span>
+            </div>
+            <!-- 迷你曲线（Sparkline）：实时渲染 mAP 走势，无需进入详情页 -->
+            <div v-if="sparkPts(job)" class="spark-wrap">
+              <span class="spark-label">mAP 走势</span>
+              <svg class="spark" :viewBox="'0 0 100 26'" preserveAspectRatio="none">
+                <polyline :points="sparkPts(job)" fill="none" stroke="#8e44ad" stroke-width="1.4" />
+                <circle v-for="(pt, i) in sparkDots(job)" :key="i" :cx="pt.x" :cy="pt.y" r="1.5" fill="#6c2d82" />
+              </svg>
             </div>
             <div v-if="jobProgress[job.job_id]?.lossLine" class="loss-line">{{ jobProgress[job.job_id].lossLine }}</div>
           </div>
@@ -263,54 +374,43 @@
           <p v-if="job.status === 'stopped'" style="color: #2ecc71; font-weight: bold;">✓ 可恢复训练</p>
           <p v-else-if="job.resume_count > 0" style="color: #2ecc71; font-weight: bold;">✓ 已恢复训练</p>
           <div class="job-actions">
-            <!-- 失败原因（任务卡左边） -->
-            <button 
-              v-if="job.status === 'failed' || job.status === 'crashed'" 
-              @click="showFailureDialog(job)" 
-              type="button"
-              class="danger-outline"
-            >
-              失败原因
-            </button>
-            <button 
-              v-if="job.status === 'running'" 
-              @click="stopJob(job.job_id)" 
-              type="button"
-              class="secondary"
+            <!-- 主按钮（每行唯一，最高频操作） -->
+            <button
+              v-if="job.status === 'running'"
+              @click="stopJob(job.job_id)" type="button" class="secondary"
               :disabled="stoppingJob === job.job_id"
             >
               <span v-if="stoppingJob === job.job_id" class="loading-spinner"></span>
               {{ stoppingJob === job.job_id ? '停止中...' : '停止' }}
             </button>
-            <button 
-              v-if="job.status !== 'running' && (job.status === 'stopped' || job.status === 'failed' || job.status === 'crashed' || job.can_resume)" 
-              @click="resumeJob(job.job_id)" 
-              type="button"
-              class="secondary"
+            <button
+              v-else-if="job.status !== 'running' && (job.status === 'stopped' || job.status === 'failed' || job.status === 'crashed' || job.can_resume)"
+              @click="resumeJob(job.job_id)" type="button" class="secondary"
               :disabled="resumingJob === job.job_id"
             >
               <span v-if="resumingJob === job.job_id" class="loading-spinner"></span>
               {{ resumingJob === job.job_id ? '恢复中...' : '继续训练' }}
             </button>
-            <button 
-              v-if="job.status === 'failed' || job.status === 'crashed' || job.status === 'stopped'" 
-              @click="retrainJob(job)" 
-              type="button"
-              class="primary"
+            <button
+              v-else-if="job.status === 'failed' || job.status === 'crashed'"
+              @click="retrainJob(job)" type="button" class="primary"
               :disabled="retrainingJob === job.job_id"
             >
               <span v-if="retrainingJob === job.job_id" class="loading-spinner"></span>
               {{ retrainingJob === job.job_id ? '重新训练中...' : '重新训练' }}
             </button>
-            <button 
-              @click="deleteJobItem(job.job_id)" 
-              type="button"
-              class="danger"
-              :disabled="deletingJob === job.job_id"
-            >
-              <span v-if="deletingJob === job.job_id" class="loading-spinner"></span>
-              {{ deletingJob === job.job_id ? '删除中...' : '删除' }}
-            </button>
+            <!-- 次要操作收纳至 ⋯ 菜单（§2.2 操作收敛） -->
+            <div class="job-more">
+              <button type="button" class="ghost job-more-btn" @click="toggleJobMore(job.job_id)">⋯</button>
+              <div v-if="jobMoreOpen === job.job_id" class="job-more-menu" @click.self="jobMoreOpen = ''">
+                <button v-if="job.status === 'failed' || job.status === 'crashed'" type="button" class="job-more-item" @click="showFailureDialog(job)">失败原因</button>
+                <button type="button" class="job-more-item" @click="openJobFiles(job.job_id)">查看文件</button>
+                <router-link v-if="job.model_id" :to="`/models/${job.model_id}`" class="job-more-item link">查看模型</router-link>
+                <button type="button" class="job-more-item danger" @click="deleteJobItem(job.job_id)" :disabled="deletingJob === job.job_id">
+                  {{ deletingJob === job.job_id ? '删除中...' : '删除' }}
+                </button>
+              </div>
+            </div>
           </div>
         </div>
         <div v-if="jobs.length === 0" class="empty-state">
@@ -411,15 +511,20 @@ const trainForm = ref<TrainJobRequest>({
   model_name: 'yolov8n.pt',
   epochs: 10,
   imgsz: 640,
-  batch: -1,  // -1 表示根据显存自动计算最佳 batch size
+  batch: 32,  // 默认批次 32；-1 表示自动（后端归一化也为 32）
   base_model_id: undefined,
   business: 'general',
   gpu_index: null,  // null = 自动选择 GPU
   // 1.5/1.6 训练增强：样本池抽样 + 回忆集混训
-  hard_sample_ratio: 0.1,
+  hard_sample_ratio: 0,   // 困难样本抽样默认关闭（0），用户按需开启
   background_sample_ratio: 0.05,
-  recall_enabled: true
+  // 2.4 跨代迁移训练：目标架构（如 yolov8s.pt），与源模型架构不同时自动迁移
+  migration_target_model: undefined,
+  recall_enabled: false  // 回忆集混训默认关闭，需在 L3 专家微调中手动开启
 })
+
+// 回忆集混训抽取比例（L3 滑块 5%~30%，默认 10%）
+const recallRatio = ref(0.1)
 
 // 阶段1.3（训练任务聚合）：多选数据集 → 聚合为同一训练任务（第一个选中者为主数据集）
 const selectedDatasetIds = ref<string[]>([])
@@ -437,9 +542,64 @@ const businessScenes = [
 ]
 const bizLabel = (v: string) => businessScenes.find(b => b.value === v)?.label || v
 
+// 任务状态中文文案（§2.2 任务列表状态色块）
+const JOB_STATUS_TEXT: Record<string, string> = {
+  running: '训练中', queued: '排队中', completed: '已完成',
+  failed: '失败', crashed: '崩溃', stopped: '已停止',
+  ready: '就绪', evaluating: '评估中'
+}
+const jobStatusText = (s: string) => JOB_STATUS_TEXT[s] || s
+// 四色状态映射：done(绿 完成) / run(蓝 训练·排队) / fail(红 失败·崩溃) / stop(橙 已停止)
+const jobPillKey = (status: string): string => {
+  if (status === 'completed' || status === 'ready') return 'done'
+  if (status === 'failed' || status === 'crashed') return 'fail'
+  if (status === 'stopped') return 'stop'
+  return 'run'
+}
+
 // 任务卡守门员状态：通过 job.model_id 在模型列表中找到对应模型入库状态
 const modelMetaOf = (modelId: string) => {
   return models.value.find((m: any) => m.model_id === modelId)
+}
+
+// ===== 任务卡 Sparkline（§2.2：mAP 走势迷你曲线，无需进详情页） =====
+// 数据源：任务/关联模型的 training_metrics.training_history.metrics_mAP50_95
+const sparkHistory = (job: any): number[] => {
+  const th = job?.training_metrics?.training_history
+    || job?.training_history
+    || modelMetaOf(job.model_id)?.training_metrics?.training_history
+  const arr = th?.metrics_mAP50_95 || th?.metrics_mAP50 || []
+  return (Array.isArray(arr) ? arr : []).filter((v: any) => typeof v === 'number' && isFinite(v))
+}
+const sparkRange = (vals: number[]) => {
+  const min = Math.min(...vals)
+  const max = Math.max(...vals)
+  return { min, max, span: (max - min) || 1 }
+}
+const sparkPts = (job: any): string => {
+  const vals = sparkHistory(job)
+  if (vals.length < 2) return ''
+  const { min, span } = sparkRange(vals)
+  return vals.map((v, i) => {
+    const x = (i / (vals.length - 1)) * 100
+    const y = 24 - ((v - min) / span) * 22
+    return `${x.toFixed(1)},${y.toFixed(1)}`
+  }).join(' ')
+}
+const sparkDots = (job: any) => {
+  const vals = sparkHistory(job)
+  if (vals.length < 2) return []
+  const { min, span } = sparkRange(vals)
+  return vals.map((v, i) => ({
+    x: (i / (vals.length - 1)) * 100,
+    y: 24 - ((v - min) / span) * 22
+  }))
+}
+
+// ⋯ 更多操作菜单（§2.2 操作收敛）：每次仅展开一个任务
+const jobMoreOpen = ref('')
+const toggleJobMore = (jobId: string) => {
+  jobMoreOpen.value = jobMoreOpen.value === jobId ? '' : jobId
 }
 const gkReportOf = (modelId: string) => {
   return modelMetaOf(modelId)?.gatekeeper
@@ -471,13 +631,89 @@ const loadGpus = async () => {
   }
 }
 
-// 高级参数：默认展开（勾选）；选中数据集+模型后会自动推荐并回填，专家可手动微调
-const showAdvanced = ref(true)
+// 高级参数：L3 专家微调默认折叠；选中数据集+模型后 L2 会自动推荐并回填，展开可手动微调
+const showAdvanced = ref(false)
+// §3.2.1 强制从零初始化：仅 L3 高级模式底部提供入口，需二次确认；
+// 确认后关闭预训练权重开关（不提交新字段，后端仍以 model_name 作为架构参考）
+const confirmScratchInit = async () => {
+  if (training.value) return
+  const ok = await showConfirm(
+    '强制从零初始化后，将不使用任何预训练权重，模型权重随机初始化开始训练。\n收敛更慢、最终精度可能偏低，仅当迁移/微调出现问题时使用。确定继续？',
+    '从零初始化'
+  )
+  if (ok) {
+    pretrainEnabled.value = false
+    pretrainSource.value = 'universal'
+    migrationEnabled.value = false
+    trainForm.value.base_model_id = undefined
+    trainForm.value.migration_target_model = undefined
+  }
+}
 const suggesting = ref(false)
 const suggestReason = ref('')
+// 2.2 黄金参数（L2 只读展示）：公式结果 + 推荐参数快照
+const suggestGolden = ref<any | null>(null)
+const suggestParamsRes = ref<any | null>(null)
+// 三层分档（基准/白银/黄金）：点击某档即应用其 批次/学习率/轮数 到表单
+const suggestTiers = ref<any[]>([])
+const activeTier = ref('golden')
+const applyTier = (tier: any) => {
+  if (!tier) return
+  activeTier.value = tier.key
+  trainForm.value.batch = tier.batch
+  trainForm.value.epochs = tier.epochs
+  if (trainForm.value.lr0 !== undefined) trainForm.value.lr0 = tier.lr0
+  alert('已应用「' + tier.label + '」档参数（可继续手动微调）')
+}
 let suggestTimer: any = null
 
-const useFineTune = ref(false)
+// ===== L2 资源预估（§2.1 智能推荐区：Workers / 预计耗时 / 显存占用） =====
+// 显存锚点（yolov8n@640@batch32 ≈ 4GB，按规格/批次/尺寸线性外推）
+const SCALE_MEM: Record<string, number> = { t: 0.7, n: 1, s: 1.5, m: 2.5, b: 2, c: 3, l: 4, e: 8, x: 6 }
+const resourceEstimate = computed(() => {
+  const res = suggestParamsRes.value
+  const cnt: number = res?.dataset?.image_count ?? 0
+  const epochs = trainForm.value.epochs || 10
+  const batch = trainForm.value.batch && trainForm.value.batch > 0 ? trainForm.value.batch : 32
+  const imgsz = trainForm.value.imgsz || 640
+  const m = /(?:yolo)(\d+)([a-z]*?)([tnslmxbce])\.pt/i.exec(trainForm.value.model_name || '') || []
+  const scale = (m[3] || 'n').toLowerCase()
+  const isGpu = res?.device?.type === 'cuda'
+  // 显存 ≈ 锚点 × 规格系数 × (batch/32) × (imgsz/640)²
+  const mem = Math.max(1, Math.round((4 * (SCALE_MEM[scale] ?? 1) * (batch / 32) * Math.pow(imgsz / 640, 2)) * 10) / 10)
+  // 耗时 ≈ 轮数 × 每轮步数 × 单步耗时（GPU≈0.18s / CPU≈1.2s）
+  const steps = Math.max(1, Math.ceil(cnt / batch))
+  const secPerStep = isGpu ? 0.18 : 1.2
+  return {
+    imageCount: cnt,
+    time: fmtDuration(steps * epochs * secPerStep),
+    mem,
+    totalGpu: isGpu ? (res?.device?.vram_gb ?? 0) : 0
+  }
+})
+function fmtDuration(sec: number): string {
+  const s = Math.max(1, Math.round(sec))
+  if (s >= 3600) return `约 ${Math.floor(s / 3600)} 小时 ${Math.round((s % 3600) / 60)} 分`
+  if (s >= 60) return `约 ${Math.round(s / 60)} 分钟`
+  return `约 ${s} 秒`
+}
+// Workers：YOLO 数据加载工作进程数（后端未直接返回，按图片规模推导）
+const workersValue = computed(() => {
+  const cnt = resourceEstimate.value.imageCount
+  return Math.min(8, Math.max(2, Math.floor(cnt / 256) || 2))
+})
+
+// ===== 预训练权重开关（§3.2.1 从零训练 / §3.2.2 跨代迁移入口二） =====
+// 勾选「启用预训练权重」→ 二选一来源：
+//   universal（通用预训练）= 内置 YOLO 权重 / 自定义导入 .pt
+//   business（指定业务模型）= 从模型库历史最佳继续训练（含跨代迁移入口）
+// 关闭开关 = 强制从零初始化（随机权重，无任何预训练）
+const pretrainEnabled = ref(true)
+const pretrainSource = ref<'universal' | 'business'>('universal')
+const isBusinessPretrain = computed(
+  () => pretrainEnabled.value && pretrainSource.value === 'business'
+)
+
 const models = ref<any[]>([])
 const datasets = ref<any[]>([])
 const loadingDatasets = ref(false)
@@ -545,6 +781,14 @@ const yoloVersions = {
 
 const selectedVersion = ref<keyof typeof yoloVersions>('v8')
 const selectedModelSize = ref('n')
+// 2.4 跨代迁移训练：目标架构选择（仅微调模式展示）+ 源架构提示
+const migrationEnabled = ref(false)
+const migrationTargetVersion = ref<keyof typeof yoloVersions>('v8')
+const migrationTargetSize = ref('n')
+const migrationTargetName = computed(() => {
+  const v = migrationTargetVersion.value === 'v11' ? 'yolo11' : `yolo${migrationTargetVersion.value}`
+  return `${v}${migrationTargetSize.value}.pt`
+})
 
 // 自定义导入的 .pt 预训练模型
 const customModels = ref<any[]>([])
@@ -567,10 +811,32 @@ const generateModelName = () => {
   return `yolo${version}${size}.pt`
 }
 
-// 监听版本和大小变化，更新 model_name
+// 监听版本和大小变化，更新 model_name（或迁移目标架构）
 watch([selectedVersion, selectedModelSize], () => {
-  if (!useFineTune.value) {
+  if (pretrainSource.value === 'universal') {
     trainForm.value.model_name = generateModelName()
+  }
+})
+watch([migrationTargetVersion, migrationTargetSize], () => {
+  if (migrationEnabled.value) {
+    trainForm.value.migration_target_model = migrationTargetName.value
+  }
+})
+// 指定业务模型：已选源模型的架构（如 yolov5s），用于迁移提示；computed 保证自动选中也能生效
+const selectedBaseArch = computed(() => {
+  if (!isBusinessPretrain.value || !trainForm.value.base_model_id) return ''
+  const m = models.value.find((x: any) => x.model_id === trainForm.value.base_model_id)
+  if (m?.architecture_name) return `${m.architecture_name}${m.model_scale || ''}`
+  // 兜底：从血缘/基座文件名提取架构（如 yolov8n.pt → yolov8n），与后端 _model_architecture 一致
+  const src = m?.lineage?.base_model || m?.model_name || m?.filename || ''
+  return (/(yolov?\d+[a-z]*?)([nslmxbce])\.pt/i.exec(src) || []).slice(1, 3).join('') || ''
+})
+// 退出"指定业务模型"来源（切回通用预训练 / 关闭预训练）时，清空源模型与迁移设置（§3.2.2）
+watch(isBusinessPretrain, (on) => {
+  if (!on) {
+    migrationEnabled.value = false
+    trainForm.value.migration_target_model = undefined
+    trainForm.value.base_model_id = undefined
   }
 })
 
@@ -591,7 +857,11 @@ const fetchSuggest = async () => {
     const res = await suggestTrainParams(
       trainForm.value.dataset_id,
       trainForm.value.version || 'v1',
-      useFineTune.value ? trainForm.value.base_model_id : undefined
+      isBusinessPretrain.value ? trainForm.value.base_model_id : undefined,
+      // 2.4 迁移训练：按目标架构（大小）套用黄金参数 Batch/LR 公式
+      isBusinessPretrain.value
+        ? (migrationEnabled.value ? trainForm.value.migration_target_model : undefined)
+        : trainForm.value.model_name
     )
     if (res?.params) {
       const p = res.params
@@ -603,6 +873,19 @@ const fetchSuggest = async () => {
       trainForm.value.weight_decay = p.weight_decay
       trainForm.value.patience = p.patience
       suggestReason.value = res.reason || ''
+      // 2.2：黄金参数 L2 只读展示（CPU/不可用时为 null）
+      suggestGolden.value = res.golden || null
+      // 三层分档（基准/白银/黄金）：后端 golden.tiers 为计算快照
+      const tiersObj = res.golden?.tiers || null
+      suggestTiers.value = tiersObj ? Object.values(tiersObj) : []
+      // 表单当前值对应哪一档（batch 最接近者），用于默认高亮
+      if (suggestTiers.value.length) {
+        const cur = p.batch
+        activeTier.value = suggestTiers.value
+          .slice().sort((a: any, b: any) =>
+            Math.abs(a.batch - cur) - Math.abs(b.batch - cur))[0]?.key || 'golden'
+      }
+      suggestParamsRes.value = res.params || null
     }
   } catch (e: any) {
     // 推荐失败不打断用户操作，保留当前值
@@ -621,7 +904,9 @@ watch(
     () => trainForm.value.version,
     () => trainForm.value.model_name,
     () => trainForm.value.base_model_id,
-    useFineTune
+    // 2.4 迁移目标架构变化 → 重新推荐（黄金参数按目标模型大小计算）
+    () => trainForm.value.migration_target_model,
+    isBusinessPretrain
   ],
   () => {
     clearTimeout(suggestTimer)
@@ -672,7 +957,7 @@ const numOfVersion = (ver: any) => {
 const autoPickBaseModel = async () => {
   const datasetId = trainForm.value.dataset_id
   const version = trainForm.value.version || 'v1'
-  if (!useFineTune.value || !datasetId) return
+  if (!isBusinessPretrain.value || !datasetId) return
   const biz = trainForm.value.business || (await (async () => {
     try {
       const res = await inferBusiness(datasetId, version)
@@ -699,7 +984,7 @@ const autoPickBaseModel = async () => {
   }
 }
 watch(
-  [useFineTune, () => trainForm.value.dataset_id, () => trainForm.value.version],
+  [isBusinessPretrain, () => trainForm.value.dataset_id, () => trainForm.value.version],
   () => {
     clearTimeout(autoPickTimer)
     autoPickTimer = setTimeout(autoPickBaseModel, 300)
@@ -761,7 +1046,7 @@ const loadCustomModels = async () => {
     const result = await listCustomModels()
     customModels.value = result.models || []
     // 默认用客户上传的模型（仅页面进入第一次生效，后续尊重用户手动选择）
-    if (!autoPickedCustom && !useFineTune.value && customModels.value.length) {
+    if (!autoPickedCustom && !isBusinessPretrain.value && customModels.value.length) {
       autoPickedCustom = true
       customSelectedPath.value = customModels.value[0].path
       trainForm.value.model_name = customModels.value[0].path
@@ -845,8 +1130,8 @@ const startTraining = async () => {
     return
   }
   
-  if (useFineTune.value && !trainForm.value.base_model_id) {
-    alert('请选择要微调的模型')
+  if (isBusinessPretrain.value && !trainForm.value.base_model_id) {
+    alert('请选择要用作预训练权重的业务模型')
     return
   }
   
@@ -854,11 +1139,17 @@ const startTraining = async () => {
   try {
     // 训练前先确保预训练权重已本地化（镜像下载缓存），避免启动阶段联网下载卡顿。
     // 自定义导入/微调模型本就是本地路径，命中缓存秒返；下载失败不阻断（训练脚本内仍有镜像/官方兜底）。
-    if (!useFineTune.value && trainForm.value.model_name?.endsWith('.pt') &&
-        !trainForm.value.model_name.includes('/') && !trainForm.value.model_name.includes('\\')) {
+    // 2.4 跨代迁移：预下载"目标架构"权重（迁移训练将以目标架构建模）
+    const toPrepare =
+      (!isBusinessPretrain.value && trainForm.value.model_name?.endsWith('.pt') &&
+       !trainForm.value.model_name.includes('/') && !trainForm.value.model_name.includes('\\'))
+        ? trainForm.value.model_name
+        : (migrationEnabled.value && trainForm.value.migration_target_model?.endsWith('.pt')
+            ? trainForm.value.migration_target_model : undefined)
+    if (toPrepare) {
       preparingWeight.value = true
       try {
-        await prepareWeights(trainForm.value.model_name)
+        await prepareWeights(toPrepare)
       } catch (e: any) {
         console.warn('权重预下载失败，将由训练脚本兜底:', e?.message || e)
       } finally {
@@ -867,7 +1158,10 @@ const startTraining = async () => {
     }
     const params: TrainJobRequest = {
       ...trainForm.value,
-      base_model_id: useFineTune.value ? trainForm.value.base_model_id : undefined,
+      base_model_id: isBusinessPretrain.value ? trainForm.value.base_model_id : undefined,
+      // 2.4 跨代迁移训练：仅指定业务模型且开启迁移时透传目标架构
+      migration_target_model: (isBusinessPretrain.value && migrationEnabled.value)
+        ? trainForm.value.migration_target_model : undefined,
       // 阶段1.3/1.4：多选聚合 + 未完成回收
       dataset_ids: selectedDatasetIds.value.length > 1 ? [...selectedDatasetIds.value] : undefined,
       aggregate_incomplete: aggregateIncomplete.value ? true : undefined
@@ -913,15 +1207,19 @@ const startTraining = async () => {
       model_name: 'yolov8n.pt',
       epochs: 10,
       imgsz: 640,
-      batch: 16,
+      batch: 32,
       base_model_id: undefined,
       business: trainForm.value.business || 'general',
       gpu_index: null,
-      hard_sample_ratio: 0.1,
+      hard_sample_ratio: 0,
       background_sample_ratio: 0.05,
-      recall_enabled: true
+      migration_target_model: undefined,
+      recall_enabled: false
     }
-    useFineTune.value = false
+    pretrainEnabled.value = true
+    pretrainSource.value = 'universal'
+    recallRatio.value = 0.1
+    migrationEnabled.value = false
   } catch (error: any) {
     alert('启动失败: ' + (error.response?.data?.detail || error.message))
   } finally {
@@ -942,8 +1240,11 @@ const retrainJob = async (job: any) => {
       model_name: job.model_name || 'yolov8n.pt',
       epochs: job.epochs ?? 10,
       imgsz: job.imgsz ?? 640,
-      batch: job.batch ?? 16,
+      batch: job.batch ?? 32,
       base_model_id: job.base_model_id || undefined,
+      // 2.4 迁移训练任务重跑保持迁移语义（源模型 + 目标架构）
+      ...(job.migration?.enabled && job.migration.target_model
+        ? { migration_target_model: job.migration.target_model } : {}),
       business: job.business || 'general',
       lr0: job.lr0 ?? undefined,
       optimizer: job.optimizer || undefined,
@@ -1319,6 +1620,19 @@ const getFailureAdvice = (error: string = ''): { title: string; reason: string; 
     }
   }
 
+  // 10. P6 GPU 熔断（2.3）：GPU 利用率持续过低自动停训
+  if (e.includes('gpu_abnormal') || (e.includes('gpu') && (e.includes('熔断') || e.includes('利用率')))) {
+    return {
+      title: 'GPU 异常，已自动停止训练（熔断）',
+      reason: '训练所用显卡的利用率长时间过低，系统判定 GPU 异常或训练卡死，已自动停止训练以保护资源。',
+      steps: [
+        '在服务器上执行 nvidia-smi 查看显卡状态、驱动与显存占用',
+        '确认 GPU 恢复正常后，点击"重新训练"或"继续训练"重新发起',
+        '若频繁熔断：检查是否多个训练任务挤占同一块 GPU（可在训练页分别指定不同训练节点）'
+      ]
+    }
+  }
+
   // 默认：未知错误
   return {
     title: '训练没有成功',
@@ -1625,6 +1939,137 @@ onUnmounted(() => {
   color: #1e7e46;
   line-height: 1.5;
 }
+
+/* ===== 2.2 黄金参数 L2 智能推荐区（只读高亮） ===== */
+.l2-panel {
+  margin: 0.5rem 0 0.75rem;
+  border: 1px solid #c3d4f2;
+  border-radius: 6px;
+  background: linear-gradient(180deg, #f2f7ff, #eaf1fb);
+  overflow: hidden;
+}
+
+/* 三层分档卡片：基准（稳定优先）/ 白银（均衡）/ 黄金（效率最优） */
+.tier-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.5rem;
+  padding: 0.6rem 0.8rem;
+}
+
+.tier-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid #d3dff5;
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.15s ease;
+}
+
+.tier-card:hover {
+  border-color: #7ba3e8;
+  box-shadow: 0 1px 4px rgba(44, 90, 160, 0.12);
+}
+
+.tier-card.tier-active {
+  border: 2px solid #2c5aa0;
+  background: #e8f0ff;
+  box-shadow: 0 1px 5px rgba(44, 90, 160, 0.2);
+  transform: translateY(-1px);
+}
+
+.tier-label {
+  font-weight: bold;
+  font-size: 0.85rem;
+  color: #2c5aa0;
+}
+
+.tier-vals {
+  font-size: 0.78rem;
+  color: #44506a;
+}
+
+.tier-vals b {
+  color: #1c3a6e;
+}
+
+.tier-desc {
+  font-size: 0.72rem;
+  color: #7d8799;
+  line-height: 1.4;
+}
+
+.l2-head {
+  padding: 0.45rem 0.8rem;
+  border-bottom: 1px dashed #c3d4f2;
+}
+
+.l2-title {
+  font-size: 0.82rem;
+  font-weight: bold;
+  color: #2c5aa0;
+}
+
+.l2-body {
+  padding: 0.6rem 0.8rem 0.7rem;
+}
+
+.l2-values {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.45rem;
+}
+
+.l2-value {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  background: #fff;
+  border: 1px solid #d6e2f5;
+  border-radius: 6px;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.85rem;
+  color: #4a6fa5;
+}
+
+.l2-value b {
+  color: #8e44ad;
+  font-size: 1.05rem;
+  font-weight: 800;
+}
+
+.l2-formulas {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.l2-formula {
+  font-size: 0.75rem;
+  color: #5a7cb0;
+  font-family: 'Courier New', monospace;
+  line-height: 1.5;
+}
+
+.l2-reason {
+  padding: 0.4rem 0.8rem 0.6rem;
+  font-size: 0.78rem;
+  color: #3d6ca8;
+  border-top: 1px dashed #d0dff2;
+  line-height: 1.5;
+}
+
+.l2-panel + .adv-block .adv-toggle {
+  font-weight: bold;
+  color: #2c3e50;
+}
+
+/* L3 区块分隔（展开专家微调时） */
 
 .progress-meta {
   display: flex;
@@ -2072,6 +2517,70 @@ button {
   white-space: nowrap;
 }
 
+/* P6 GPU 熔断徽标（2.3） */
+.gpu-abnormal-badge {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.1rem 0.5rem;
+  background: #fdf0ec;
+  border: 1px solid #f0a08a;
+  border-radius: 10px;
+  color: #c0392b;
+  font-size: 0.75rem;
+  font-weight: bold;
+  white-space: nowrap;
+}
+
+/* 2.4 跨代迁移徽标（任务卡） */
+.migration-badge {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.1rem 0.5rem;
+  background: #eef3fd;
+  border: 1px solid #9dbff2;
+  border-radius: 10px;
+  color: #1f5fbf;
+  font-size: 0.75rem;
+  font-weight: bold;
+  white-space: nowrap;
+}
+
+/* ===== 2.4 跨代迁移训练区（微调模式） ===== */
+.migration-block {
+  margin-top: 0.75rem;
+  padding: 0.6rem 0.75rem;
+  background: #f6f9ff;
+  border: 1px dashed #9dbff2;
+  border-radius: 8px;
+}
+.migration-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  color: #1f5fbf;
+}
+.migration-block > small {
+  display: block;
+  margin: 0.3rem 0 0.4rem;
+  color: #7f8c8d;
+}
+.migration-selector {
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid #e3ebfa;
+}
+.migration-hint {
+  display: block;
+  margin-top: 0.4rem;
+  color: #1f5fbf;
+  font-weight: bold;
+}
+.migration-hint.warn {
+  color: #e67e22;
+}
+
 /* ===== 训练失败原因弹窗（面向客户） ===== */
 .failure-dialog {
   max-width: 560px;
@@ -2233,5 +2742,179 @@ button {
   border: 1px solid #f5b7b1;
   border-radius: 8px;
   font-weight: bold;
+}
+
+/* ===== 预训练权重开关 / 从零初始化（§3.2.1 / §3.2.2） ===== */
+.pretrain-block {
+  padding: 0.75rem 1rem;
+  background: #f8f6fc;
+  border: 1px solid #e8dff2;
+  border-radius: 8px;
+}
+.check-line {
+  font-weight: 700;
+}
+.pretrain-source {
+  margin-top: 0.6rem;
+  padding-top: 0.6rem;
+  border-top: 1px dashed #dccfe8;
+}
+.source-radios {
+  display: flex;
+  gap: 1.25rem;
+  margin-bottom: 0.5rem;
+}
+.source-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+  color: #4a5568;
+  cursor: pointer;
+}
+.source-radio input {
+  width: auto;
+}
+.from-scratch-note {
+  margin-top: 0.6rem;
+  padding: 0.55rem 0.75rem;
+  background: #fff8e6;
+  border: 1px solid #f5dc9a;
+  border-radius: 6px;
+  font-size: 0.82rem;
+  color: #8a6d1a;
+  line-height: 1.5;
+}
+.from-scratch-note b {
+  font-weight: bold;
+}
+/* 强制从零初始化链接（L3 高级模式底部） */
+.l3-block {
+  margin-top: 0.4rem;
+  text-align: right;
+}
+.scratch-link {
+  font-size: 0.78rem;
+  color: #c0392b;
+  text-decoration: underline dashed;
+  cursor: pointer;
+}
+.scratch-link:hover {
+  color: #922b21;
+}
+
+/* ===== L2 资源预估（§2.1：预计耗时 / 显存占用） ===== */
+.l2-resource {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.45rem;
+}
+.res-item {
+  font-size: 0.8rem;
+  color: #34495e;
+  background: #fff;
+  border: 1px solid #d6e2f5;
+  border-radius: 6px;
+  padding: 0.25rem 0.6rem;
+}
+
+/* ===== 任务列表卡片（§2.2：状态色块 / Sparkline） ===== */
+.job-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin-bottom: 0.5rem;
+}
+.job-head h3 {
+  margin-bottom: 0;
+}
+.job-pill {
+  flex-shrink: 0;
+  font-size: 0.72rem;
+  font-weight: bold;
+  padding: 0.15rem 0.6rem;
+  border-radius: 10px;
+  color: #fff;
+  white-space: nowrap;
+}
+.jp-done { background: #27ae60; }
+.jp-run { background: #3498db; }
+.jp-fail { background: #e74c3c; }
+.jp-stop { background: #e67e22; }
+.job-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+.job-badges span {
+  margin-left: 0;
+}
+.spark-wrap {
+  margin-top: 0.4rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.spark-label {
+  font-size: 0.72rem;
+  color: #9b7ab8;
+  white-space: nowrap;
+}
+.spark {
+  flex: 1;
+  height: 26px;
+  border: 1px dashed #e3d8ee;
+  border-radius: 4px;
+  background: #fbf9fd;
+}
+
+/* ⋯ 更多操作菜单（§2.2 操作收敛） */
+.job-more {
+  position: relative;
+}
+.job-more-btn {
+  padding: 0.3rem 0.6rem;
+  font-size: 1rem;
+  line-height: 1;
+}
+.job-more-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 30;
+  min-width: 130px;
+  background: #fff;
+  border: 1px solid #d7dde4;
+  border-radius: 6px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+  padding: 0.3rem;
+  display: flex;
+  flex-direction: column;
+}
+.job-more-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.82rem;
+  color: #34495e;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.job-more-item:hover {
+  background: #f2f5f9;
+}
+.job-more-item.link {
+  color: #2c6fbb;
+}
+.job-more-item.danger {
+  color: #e74c3c;
+}
+.job-more-item.danger:hover {
+  background: #fdf0ee;
 }
 </style>

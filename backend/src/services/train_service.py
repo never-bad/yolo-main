@@ -6,6 +6,7 @@ import subprocess
 import signal
 import shutil
 import asyncio
+import time
 import yaml
 from pathlib import Path
 from datetime import datetime
@@ -13,7 +14,8 @@ import psutil
 from src.core.settings import settings
 from src.utils.fs_tree import build_tree
 from src.yolo.gatekeeper import infer_business, _normalize_classes
-from src.yolo.train_script import ensure_local_base_weights
+from src.yolo.train_script import ensure_local_base_weights, parse_architecture
+from src.services.device_manager import get_gpu_utilization, get_available_gpus
 from src.services.dataset_service import (
     STAGE_TRAINING, STAGE_COMPLETED, STAGE_FAILED,
     TRAIN_STATUS_INCOMPLETE, TRAIN_STATUS_COMPLETED,
@@ -131,6 +133,9 @@ class TrainService:
         self.datasets_dir = settings.DATASETS_DIR
         self.registry_dir = settings.REGISTRY_DIR
         self.running_processes = {}
+        # P6 GPU 熔断（2.3）：任务 → GPU 索引；任务 → 首次低利用率时间戳
+        self._job_gpu_index = {}
+        self._gpu_low_since = {}
 
     @staticmethod
     def _count_images(path: Path) -> int:
@@ -144,22 +149,102 @@ class TrainService:
 
     @staticmethod
     def _default_batch() -> int:
-        """按当前 GPU 显存返回安全批次大小（避免 -1 自动校准在容器内触发 [Errno 22]）"""
-        try:
-            import torch
-            if torch.cuda.is_available():
-                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-                if vram_gb >= 40:
-                    return 32
-                if vram_gb >= 20:
-                    return 16
-                return 8
-            return 4
-        except Exception:
-            return 16
+        """统一默认批次大小 32（避免 -1 自动校准在容器内触发 [Errno 22]，按默认 32 稳定训练）"""
+        return 32
+
+    # ---- 黄金参数模板（2.2，训练模块规范 §3.1）----
+    # 各 scale 预训练权重近似体积（MB），用于 Batch 公式的"Model_Size"
+    GOLDEN_ARCH_MB = {
+        "n": 6.2, "s": 22.5, "m": 49.7, "l": 83.7, "x": 131.0,
+        "t": 8.0, "b": 25.0, "c": 42.0, "e": 75.0,
+    }
+    GOLDEN_MODEL_GB_DEFAULT = 0.05   # 无法识别 scale 时的兜底模型体积
+    GOLDEN_BASE_LR = 0.01            # 线性缩放基准学习率
+    GOLDEN_BATCH_MIN, GOLDEN_BATCH_MAX = 4, 128
+    # g5 GPU 熔断：OOM 恢复建议（写入任务失败元数据，前端"失败原因"弹窗展示可操作步骤）
+    OOM_RECOVERY_HINT = (
+        "训练因显存不足（OOM）被系统熔断停止。建议在「重新训练」前降低批次大小"
+        "（如 32 → 16/8）、图片尺寸（如 640 → 512），或改选更小的预训练模型，"
+        "避免再次占满显存。"
+    )
+
+    @staticmethod
+    def _golden_params(vram_gb: float, model_name: str, image_count: int) -> dict:
+        """黄金参数公式计算（训练模块规范 §3.1）：
+          - Batch = (GPU_Mem - 2GB) / (Model_Size * 1.5)，向下取 2 的幂（钳制 [4,128]）
+          - LR = Base_LR * (Batch / 64)（线性缩放）
+          - Epochs = Max(300, 500000 / Total_Images)（防小数据过拟合，钳制 [10,1000]）
+        返回 {batch, lr0, epochs, model_gb, formulas, tiers}：
+          tiers = 三层分档（基准/白银/黄金）——黄金档即公式最优值，
+          白银/基准档按 2 的幂逐级收缩 Batch 并线性缩放 LR、按档位调整 Epochs，
+          供前端 L2 面板"分档展示与一键选择"。
+        """
+        import re as _re
+        fname = (model_name or "").strip().split("/")[-1].replace(".pt", "").lower()
+        m = _re.search(r"([nsmlxcbe])$", fname)
+        scale = m.group(1) if m else ""
+        model_mb = TrainService.GOLDEN_ARCH_MB.get(scale, 0.0)
+        model_gb = (model_mb / 1024.0) if model_mb else TrainService.GOLDEN_MODEL_GB_DEFAULT
+
+        if vram_gb > 2:
+            raw_batch = (vram_gb - 2.0) / (model_gb * 1.5)
+            # 向下取 2 的幂：如 raw=24.7 → 16；raw=33.5 → 32
+            pow2 = 1 << (max(1, int(raw_batch)).bit_length() - 1)
+            golden_batch = max(TrainService.GOLDEN_BATCH_MIN,
+                               min(TrainService.GOLDEN_BATCH_MAX, pow2))
+        else:
+            golden_batch = TrainService.GOLDEN_BATCH_MIN
+        golden_lr = round(TrainService.GOLDEN_BASE_LR * (golden_batch / 64.0), 5)
+        n = max(image_count, 1)
+        golden_epochs = max(10, min(1000, max(300, round(500000 / n))))
+
+        def _pow2_down(val: int) -> int:
+            """向下取 2 的幂（钳制 [4,128]）"""
+            v = max(1, val)
+            return max(TrainService.GOLDEN_BATCH_MIN,
+                       min(TrainService.GOLDEN_BATCH_MAX, 1 << (v.bit_length() - 1)))
+
+        # 三层分档：golden = 公式最优；silver = Batch 收缩一档（显存/机时均衡）；
+        # baseline = 再收缩一档（稳健兜底，小 Batch 补足 Epochs）
+        silver_batch = max(TrainService.GOLDEN_BATCH_MIN, _pow2_down(golden_batch // 2))
+        baseline_batch = max(TrainService.GOLDEN_BATCH_MIN, _pow2_down(silver_batch // 2))
+        silver_lr = round(TrainService.GOLDEN_BASE_LR * (silver_batch / 64.0), 5)
+        baseline_lr = round(TrainService.GOLDEN_BASE_LR * (baseline_batch / 64.0), 5)
+        baseline_epochs = max(30, min(1000, round(golden_epochs * 1.5)))  # 小 Batch 需更多轮收敛
+
+        tiers = {
+            "baseline": {
+                "key": "baseline", "label": "基准（稳定优先）",
+                "desc": "Batch 收缩 + 轮数补足，稳健兜底，适合数据噪声大/新手",
+                "batch": baseline_batch, "lr0": baseline_lr, "epochs": baseline_epochs,
+            },
+            "silver": {
+                "key": "silver", "label": "白银（均衡）",
+                "desc": "Batch/LR 相对黄金收缩一档，显存与机时均衡的常规选择",
+                "batch": silver_batch, "lr0": silver_lr, "epochs": golden_epochs,
+            },
+            "golden": {
+                "key": "golden", "label": "黄金（效率最优）",
+                "desc": "§3.1 公式最优：理论 Batch 上限 + 线性 LR，适合显存充裕",
+                "batch": golden_batch, "lr0": golden_lr, "epochs": golden_epochs,
+            },
+        }
+        return {
+            "batch": golden_batch,
+            "lr0": golden_lr,
+            "epochs": golden_epochs,
+            "model_gb": round(model_gb, 4),
+            "scale": scale,
+            "formulas": {
+                "batch": f"Batch = (GPU_Mem({vram_gb:.1f}GB) - 2) / (Model({model_gb * 1024:.1f}MB 权重)×1.5) → 取 2 的幂 = {golden_batch}",
+                "lr": f"LR = Base_LR(0.01) × (Batch({golden_batch}) / 64) = {golden_lr}",
+                "epochs": f"Epochs = Max(300, 500000 / {n} 图) = {golden_epochs}",
+            },
+            "tiers": tiers,
+        }
 
     async def suggest_params(self, dataset_id: str, version: str = "v1",
-                             base_model_id: str = None) -> dict:
+                             base_model_id: str = None, model_name: str = None) -> dict:
         """根据当前硬件（GPU显存）与数据集规模，自动推荐训练参数。
 
         推荐范围：epochs / imgsz / batch（基础）+ lr0 / optimizer / weight_decay / patience（高级）。
@@ -186,7 +271,7 @@ class TrainService:
         # ---------- 2. 数据集统计 ----------
         image_count = 0
         class_count = 0
-        yaml_path = self.datasets_dir / dataset_id / version / "data.yaml"
+        yaml_path = self._resolve_dataset_yaml(dataset_id, version)
         if yaml_path.exists():
             try:
                 data_cfg = await asyncio.to_thread(self._load_yaml, yaml_path)
@@ -206,19 +291,11 @@ class TrainService:
                 pass
 
         # ---------- 3. 推荐规则 ----------
-        # 批次大小按显存档位估算（CPU 保守给最小档）
+        # 批次大小默认 32（大显存机型直接可用；小显存可手动调小）
         if cuda_ok:
-            vram = device_info.get("vram_gb", 0)
-            if vram >= 40:
-                batch, imgsz = 32, 640     # A100 / 4090 / 5090 等大显存
-            elif vram >= 20:
-                batch, imgsz = 16, 640
-            elif vram >= 10:
-                batch, imgsz = 8, 640
-            else:
-                batch, imgsz = 4, 512
+            batch, imgsz = 32, 640
         else:
-            batch, imgsz = 4, 512
+            batch, imgsz = 32, 512
 
         # 训练轮数随数据量反比：数据少多轮、数据多少轮；
         # CPU 环境自动调低轮数（无 GPU 时训练慢，200 轮耗时不可接受），有 GPU 才给足轮数
@@ -248,11 +325,27 @@ class TrainService:
         weight_decay = 0.0005
         patience = 50
 
+        # 黄金参数（2.2，训练模块规范 §3.1）：GPU 环境按公式计算，
+        # 覆盖批次/学习率/轮数推荐（CPU 不套公式——300 轮在 CPU 上不可用）
+        golden = None
+        if cuda_ok:
+            golden = self._golden_params(
+                device_info["vram_gb"],
+                model_name or "yolov8n.pt",
+                image_count,
+            )
+            batch = golden["batch"]
+            lr0 = golden["lr0"]
+            epochs = golden["epochs"]
+
         mode = "全新训练"
         if base_model_id:
-            # 微调模式：更小的学习率 → 更稳；早停更早避免过拟合；轮数减半
+            # 微调模式：更小的学习率 → 更稳；早停更早避免过拟合；轮数减半（黄金公式轮数/2）
             mode = "基于已有模型微调"
-            lr0 = 0.001
+            if golden:
+                lr0 = round(max(0.0005, golden["lr0"] / 10), 6)  # 微调 lr 再降一档，保护已有权重
+            else:
+                lr0 = 0.001
             optimizer = "AdamW"
             patience = max(20, patience // 2)
             epochs = max(30, epochs // 2)
@@ -267,13 +360,19 @@ class TrainService:
             "patience": patience,
         }
 
-        # ---------- 4. 说明文案 ----------
+        # ---------- 4. 说明文案（L2 展示黄金公式推导） ----------
         cpu_hint = "；当前为 CPU 环境，已自动调低训练轮数以节省时间" if not cuda_ok else ""
+        golden_hint = ""
+        if golden:
+            _f = golden["formulas"]
+            golden_hint = (
+                f"；【黄金参数 L2 推荐】{_f['batch']}；{_f['lr']}；{_f['epochs']}"
+            )
         reason = (
             f"检测到 {device_info['name']}"
             f"（{'CUDA 显存 ' + str(device_info['vram_gb']) + 'GB' if cuda_ok else 'CPU'}），"
             f"数据集约 {image_count} 张图 / {class_count} 类，"
-            f"已按{mode}场景推荐参数（可手动修改）{cpu_hint}。"
+            f"已按{mode}场景推荐参数（可手动修改）{cpu_hint}{golden_hint}。"
         )
 
         return {
@@ -281,8 +380,28 @@ class TrainService:
             "dataset": {"image_count": image_count, "class_count": class_count},
             "mode": mode,
             "params": params,
+            "golden": golden,   # 2.2：黄金参数公式（L2 只读展示；CPU/不可用为 None）
+            "level": "L2",
             "reason": reason,
         }
+
+    def _resolve_dataset_yaml(self, dataset_id: str, version: str = "v1") -> Path:
+        """定位数据集训练用 data.yaml：
+        封板快照 sealed/v{N} > 根目录 data.yaml（数据集一律为 datasets/{dataset_id}，无 version 子目录）"""
+        ds_dir = self.datasets_dir / dataset_id
+        try:
+            meta = _load_json(ds_dir / "meta.json") or {}
+            sv = str(meta.get("sealed_version") or "")
+            if sv:
+                cand = ds_dir / "sealed" / sv / "data.yaml"
+                if cand.exists():
+                    return cand
+        except Exception:
+            pass
+        root = ds_dir / "data.yaml"
+        if root.exists():
+            return root
+        return root
 
     def _load_yaml(self, path: Path) -> dict:
         with open(path, "r", encoding="utf-8") as f:
@@ -293,7 +412,7 @@ class TrainService:
 
         供前端选中数据集后自动分配业务场景使用；识别不出返回 general（通用）。
         """
-        yaml_path = self.datasets_dir / dataset_id / version / "data.yaml"
+        yaml_path = self._resolve_dataset_yaml(dataset_id, version)
         if not await asyncio.to_thread(lambda: yaml_path.exists()):
             return {"business": "general", "names": [], "error": "data.yaml 不存在"}
         try:
@@ -356,6 +475,29 @@ class TrainService:
             return float(str(ver)[1:])
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _model_architecture(meta: dict, fallback_name: str) -> dict:
+        """读取模型元数据的 architecture 三字段（M11 标准字段），缺失时从文件名兜底解析。
+
+        仅当兜底名称可识别为 YOLO 命名（含 yolo 前缀，如 yolov5s/yolo11n）时才返回，
+        避免旧模型（M11 之前，无 architecture 字段）被解析出垃圾架构名 → 2.4 迁移误触发。
+        不可识别时返回空架构（调用方据此跳过跨代检测，按普通微调处理）。
+        返回 {"architecture_family", "architecture_name", "model_scale"}。
+        """
+        meta = meta or {}
+        arch = meta.get("architecture_name") or ""
+        if arch:
+            return {
+                "architecture_family": meta.get("architecture_family") or "ultralytics",
+                "architecture_name": arch,
+                "model_scale": meta.get("model_scale") or "",
+            }
+        fallback = parse_architecture(fallback_name)
+        if str(fallback.get("architecture_name", "")).lower().startswith("yolo"):
+            return fallback
+        # 无法识别架构 → 空架构（跨代检测跳过，保持普通微调语义）
+        return {"architecture_family": "", "architecture_name": "", "model_scale": ""}
 
     def _pick_baseline(self, business: str):
         """模型守门员：自动选择同业务"上一代生产模型"作为对比基准。
@@ -693,7 +835,7 @@ class TrainService:
             if meta.get("stage") not in TRAINABLE_STAGES:
                 continue
             ver = meta.get("version", "v1")
-            yaml_p = d / ver / "data.yaml"
+            yaml_p = self._resolve_dataset_yaml(d.name, ver)
             if not yaml_p.exists():
                 continue
             try:
@@ -731,7 +873,7 @@ class TrainService:
             if meta.get("training_status") != TRAIN_STATUS_COMPLETED:
                 continue
             ver = meta.get("version", "v1")
-            yaml_p = d / ver / "data.yaml"
+            yaml_p = self._resolve_dataset_yaml(d.name, ver)
             if not yaml_p.exists():
                 continue
             try:
@@ -932,7 +1074,7 @@ class TrainService:
                          gpu_index: int = None, business: str = None,
                          dataset_ids: list = None, aggregate_incomplete: bool = False,
                          hard_sample_ratio: float = 0.1, background_sample_ratio: float = 0.05,
-                         recall_enabled: bool = True):
+                         migration_target_model: str = None, recall_enabled: bool = True):
         """创建训练任务（支持高级训练参数与训练节点选择、业务/算法类型隔离）
 
         阶段1.3（训练任务聚合）：支持多数据集聚合训练。
@@ -942,6 +1084,9 @@ class TrainService:
             （stage∈{sealed,failed} 且 training_status=incomplete）一并聚合进本轮训练。
           - 训练开始前，所有参与数据集置 stage=training，结果由 train_script 回写
             （合格→completed/已完成训练；不合格→failed/保持未完成，参与下一轮雪球）。
+        2.4 跨代迁移训练（训练模块规范 §3.2.2）：base_model_id（源模型）+
+          migration_target_model（目标架构，如 yolov8s.pt）且源/目标架构不同 →
+          strict=False 加载 + lr0 自动降 10 倍 + [Migration] 日志 + weight_mappings 溯源。
         """
         job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -954,7 +1099,7 @@ class TrainService:
                 return
             use_ver = ds_version or version
             d_dir = self.datasets_dir / ds_id / use_ver
-            d_yaml = d_dir / "data.yaml"
+            d_yaml = self._resolve_dataset_yaml(ds_id, use_ver)
             if not d_yaml.exists():
                 raise ValueError(f"Dataset {ds_id}/{use_ver} not prepared")
             seen_ids.add(ds_id)
@@ -1000,6 +1145,7 @@ class TrainService:
 
         # 处理模型路径：如果提供了 base_model_id，使用已有模型的权重
         actual_model_path = model_name
+        migration = None          # 2.4 跨代迁移训练信息（None = 常规微调/全新训练）
         if base_model_id:
             base_model_dir = self.registry_dir / base_model_id
             base_model_file = base_model_dir / "model.json"
@@ -1016,6 +1162,30 @@ class TrainService:
             
             actual_model_path = str(weights_path)
             model_name = f"{base_model_id}_fine_tuned"
+
+            # 2.4 跨代迁移训练：用户显式指定目标架构（如 yolov5s 源 → yolov8s 目标），
+            # 源/目标架构不同 → 进入迁移模式（strict=False 加载 + lr0 降 10 倍 + [Migration] 日志）
+            if migration_target_model:
+                src = self._model_architecture(base_model_meta, base_model_id)
+                tgt = parse_architecture(migration_target_model)
+                if (src.get("architecture_name") and tgt.get("architecture_name")
+                        and src["architecture_name"] != tgt["architecture_name"]):
+                    migration = {
+                        "enabled": True,
+                        "source_model_id": base_model_id,
+                        "source_architecture":
+                            f"{src['architecture_name']}{src.get('model_scale', '')}",
+                        "target_model": migration_target_model,
+                        "target_architecture":
+                            f"{tgt['architecture_name']}{tgt.get('model_scale', '')}",
+                        "strict": False,
+                        # lr0 未显式指定 → 自动降 10 倍（在默认为 0.001 后执行）
+                        "auto_lr0": lr0 is None,
+                    }
+                    model_name = f"{base_model_id}_migrate_to_{migration['target_architecture']}"
+                    print(f"[create_job] 2.4 跨代迁移训练: {migration['source_architecture']}"
+                          f" → {migration['target_architecture']}"
+                          f"（源模型 {base_model_id}，strict=False，lr0 降 10 倍）")
         
         # 并发训练数限制：防止 CPU/GPU 资源被过多训练任务占满
         max_concurrent = settings.MAX_CONCURRENT_TRAIN_JOBS
@@ -1037,6 +1207,18 @@ class TrainService:
             optimizer = optimizer or "auto"
             weight_decay = weight_decay if weight_decay is not None else 0.0005
             patience = patience if patience is not None else 50
+
+        # 2.4 跨代迁移训练：lr0 自动降 10 倍（Backbone 已有强特征提取能力，防破坏已有知识）。
+        # 用户未显式传 lr0 → 系统默认的微调 lr0(0.001) 再降 10 倍 → 0.0001；
+        # 用户在 L3 高级模式显式指定 → 尊重用户覆盖值（训练模块规范 §3.2.2 待确认事项 3）。
+        if migration:
+            migration["lr0"] = lr0  # 降级前的值（记录溯源自用）
+            if migration.pop("auto_lr0", False):
+                lr0 = round(lr0 / 10, 6)   # 0.001 → 0.0001
+                migration["lr0_degraded"] = True
+                print(f"[create_job] 2.4 迁移训练 lr0 自动降 10 倍: 0.001 → {lr0}（可在 L3 高级参数覆盖）")
+            else:
+                migration["lr0_degraded"] = False
 
         # 批次大小归一化：-1/0(自动) 会触发 ultralytics 的 auto-batch 校准 + 多进程数据加载，
         # 在 Docker 容器环境里极易报 [Errno 22] Invalid argument 直接失败。
@@ -1116,7 +1298,11 @@ class TrainService:
             "gpu_index": gpu_index,
             "business": business,
             "baseline_model_id": baseline_model_id,   # 守门员对比基准（上一代同业务生产模型）
+            # 2.4 跨代迁移训练信息（非迁移任务为 None；前端/守门员报告/模型血缘据此标记）
+            "migration": migration,
             "status": "running",
+            # g6 M5 状态机统一：创建即规范化落库（旧 status 保留兼容）
+            "unified_status": "Running",
             "created_at": datetime.now().isoformat(),
             "log_file": str(self.jobs_dir / f"{job_id}.log")
         }
@@ -1130,7 +1316,11 @@ class TrainService:
             await asyncio.to_thread(
                 self._start_training, job_id, actual_data_yaml, actual_model_path, epochs, imgsz, batch, False,
                 lr0, optimizer, weight_decay, patience, gpu_index,
-                business, baseline_path, baseline_model_id
+                business, baseline_path, baseline_model_id,
+                # 2.4 迁移训练：目标架构 + 迁移来源 + lr0 是否自动降级
+                migration.get("target_model") if migration else None,
+                f"{migration['source_model_id']} [{migration['source_architecture']}]" if migration else None,
+                bool(migration and migration.get("lr0_degraded"))
             )
         except Exception as e:
             try:
@@ -1183,14 +1373,153 @@ class TrainService:
         for jid in dead:
             del self.running_processes[jid]
         return len(self.running_processes)
-    
+
+    # ------------------------------------------------------------------
+    # P6 GPU 熔断（2.3）：GPU 利用率 < 阈值持续 N 秒 → 自动停训 + failed(gpu_abnormal)
+    # ------------------------------------------------------------------
+    async def gpu_watch_loop(self):
+        """后台 GPU 熔断监控（随 FastAPI lifespan 启动）。
+
+        采样各运行中任务的 GPU 利用率：利用率 < GPU_ABNORMAL_UTIL_PCT 开始计时，
+        持续满 GPU_ABNORMAL_SECONDS（默认 5 分钟）判定 GPU 异常 → 自动停止训练，
+        任务状态置 failed(reason="gpu_abnormal")，写入完整错误信息（前端失败弹窗可见）。
+        恢复后由用户人工确认（重新训练/继续训练）方可重新排队——本监控不做自动重排。
+        """
+        if settings.GPU_WATCH_POLL_SECONDS <= 0:
+            return
+        while True:
+            try:
+                await asyncio.to_thread(self._gpu_watch_once)
+            except Exception as e:
+                print(f"[gpu-watch] 熔断监控异常（忽略继续）: {e}")
+            await asyncio.sleep(settings.GPU_WATCH_POLL_SECONDS)
+
+    def _resolve_job_gpu(self, job_id: str, job_meta: dict) -> int | None:
+        """确定任务使用的 GPU 索引：优先任务显式指定；否则首次采样时按全部 GPU
+        实时利用率推断（训练为计算密集，取利用率最高者）。返回 None 表示 CUDA 不可用。"""
+        idx = job_meta.get("gpu_index")
+        if idx is not None:
+            return int(idx)
+        if job_id in self._job_gpu_index:
+            return self._job_gpu_index[job_id]
+        gpus = get_available_gpus()
+        if not gpus:
+            return None
+        best_idx, best_util = 0, -1
+        for g in gpus:
+            u = get_gpu_utilization(g["index"])
+            if u is None:
+                continue
+            if u > best_util:
+                best_idx, best_util = g["index"], u
+        self._job_gpu_index[job_id] = best_idx if best_util >= 0 else gpus[0]["index"]
+        return self._job_gpu_index[job_id]
+
+    def _gpu_watch_once(self):
+        """单轮熔断采样（同步，线程内执行）"""
+        threshold = settings.GPU_ABNORMAL_UTIL_PCT
+        warn_seconds = settings.GPU_ABNORMAL_SECONDS
+        if not self.running_processes:
+            return
+        now = time.time()
+        alive = {jid: proc for jid, proc in self.running_processes.items() if proc.poll() is None}
+
+        for job_id in list(self._gpu_low_since.keys()):
+            if job_id not in alive:
+                self._gpu_low_since.pop(job_id, None)
+                self._job_gpu_index.pop(job_id, None)
+
+        for job_id, proc in alive.items():
+            job_file = self.jobs_dir / f"{job_id}.json"
+            if not job_file.exists():
+                continue
+            try:
+                job_meta = _load_json(job_file)
+            except Exception:
+                continue
+            if job_meta.get("status") != "running":
+                continue
+
+            gpu_idx = self._resolve_job_gpu(job_id, job_meta)
+            if gpu_idx is None:
+                continue  # 无 CUDA → 无法做 GPU 熔断判断
+            util = get_gpu_utilization(gpu_idx)
+            if util is None:
+                continue  # 采样失败本轮跳过（如 GPU 暂不可查询）
+
+            if util < threshold:
+                if job_id not in self._gpu_low_since:
+                    self._gpu_low_since[job_id] = now
+                    print(f"[gpu-watch] {job_id} GPU{gpu_idx} 利用率 {util}%"
+                          f"< {threshold}%，开始计时（{warn_seconds}s 后熔断）")
+                elif (now - self._gpu_low_since[job_id]) >= warn_seconds:
+                    self._circuit_break(job_id, proc, gpu_idx, util)
+            else:
+                if job_id in self._gpu_low_since:
+                    print(f"[gpu-watch] {job_id} GPU{gpu_idx} 利用率恢复 {util}%，计时清零")
+                self._gpu_low_since.pop(job_id, None)
+
+    def _circuit_break(self, job_id: str, proc, gpu_idx: int, util: int):
+        """触发熔断：停止训练进程 → 任务状态 failed(reason=gpu_abnormal) → 写日志"""
+        reason = (
+            f"GPU 异常熔断：训练所在 GPU{gpu_idx} 利用率持续低于 "
+            f"{settings.GPU_ABNORMAL_UTIL_PCT}%（当前 {util}%）超过 "
+            f"{settings.GPU_ABNORMAL_SECONDS // 60} 分钟，判定 GPU 异常/训练卡死，"
+            f"系统已自动停止训练。请检查显卡状态（nvidia-smi）、驱动或显存占用，"
+            f"确认恢复后人工重新发起训练（本平台不做自动重排队）。"
+        )
+        print(f"[gpu-watch] ⚡ 熔断 {job_id}: {reason}")
+        try:
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        # 从运行中进程表移除，避免残留；保留 job 文件与状态供人工处置
+        self.running_processes.pop(job_id, None)
+        self._gpu_low_since.pop(job_id, None)
+        self._job_gpu_index.pop(job_id, None)
+
+        job_file = self.jobs_dir / f"{job_id}.json"
+        try:
+            job_meta = _load_json(job_file)
+            job_meta["status"] = "failed"
+            job_meta["reason"] = "gpu_abnormal"
+            job_meta["error"] = reason
+            job_meta["gpu_abnormal"] = True
+            job_meta["failed_at"] = datetime.now().isoformat()
+            # g6 M5 状态机统一：失败 → Rejected（查询回填同值）
+            job_meta["unified_status"] = "Rejected"
+            _save_json(job_file, job_meta)
+        except Exception as e:
+            print(f"[gpu-watch] 状态回写失败: {e}")
+
+        # 熔断原因写入任务日志（前端日志面板可查）
+        try:
+            log_file = self.jobs_dir / f"{job_id}.log"
+            with open(log_file, "a", encoding="utf-8", errors="replace") as f:
+                f.write(f"\n[{datetime.now().isoformat()}] [GPU-WATCH] ⚡ {reason}\n")
+        except Exception:
+            pass
+
     def _start_training(self, job_id: str, data_yaml: Path, model_name: str,
                        epochs: int, imgsz: int, batch: int, resume: bool = False,
                        lr0: float = None, optimizer: str = None,
                        weight_decay: float = None, patience: int = None,
                        gpu_index: int = None, business: str = "general",
-                       baseline_path: str = None, baseline_model_id: str = None):
-        """启动训练进程（同步方法，在线程中调用）"""
+                       baseline_path: str = None, baseline_model_id: str = None,
+                       migration_target: str = None, migration_source: str = None,
+                       migration_lr0_degraded: bool = False):
+        """启动训练进程（同步方法，在线程中调用）
+
+        2.4 迁移训练参数（训练模块规范 §3.2.2）：
+          - migration_target: 目标架构（如 yolov8s.pt），跨代迁移时启动脚本加载目标架构并
+            strict=False 复用源模型 Backbone 层（按层名/形状匹配），Head 重新初始化；
+          - migration_source: 源模型描述（"model_id [架构]"），写入 [Migration] 日志与模型血缘；
+          - migration_lr0_degraded: 是否已由后端自动降 10 倍（仅做日志展示，不改变真值）。
+        """
         log_file = self.jobs_dir / f"{job_id}.log"
         job_file = self.jobs_dir / f"{job_id}.json"
         
@@ -1222,6 +1551,14 @@ class TrainService:
             cmd += ["--baseline", str(baseline_path)]
         if baseline_model_id:
             cmd += ["--baseline-model-id", str(baseline_model_id)]
+        
+        # 2.4 跨代迁移训练：目标架构 / 迁移来源 / lr0 自动降级标记（写入 [Migration] 日志）
+        if migration_target:
+            cmd += ["--migration-target", str(migration_target)]
+        if migration_source:
+            cmd += ["--migration-source", str(migration_source)]
+        if migration_lr0_degraded:
+            cmd.append("--migration-lr0-degraded")
         
         if resume:
             cmd.append("--resume")
@@ -1293,9 +1630,24 @@ class TrainService:
                     if job_id in self.running_processes:
                         process = self.running_processes[job_id]
                         if process.poll() is not None:
-                            # 进程已死，但状态还是 running，标记为崩溃
-                            job_meta["status"] = "crashed"
-                            job_meta["crashed_at"] = datetime.now().isoformat()
+                            # 进程已死，但状态还是 running，标记为崩溃。
+                            # g5：先扫描日志尾部识别 OOM（进程被显存不足强杀、未走脚本 except 分支
+                            # 落盘），命中则按 failed(reason=oom) 归档，前端可给降配恢复建议。
+                            oom_hint = self._scan_oom_hint(job_id)
+                            if oom_hint:
+                                job_meta["status"] = "failed"
+                                job_meta["reason"] = "oom"
+                                job_meta["oom"] = True
+                                job_meta["oom_recovery"] = self.OOM_RECOVERY_HINT
+                                job_meta["error"] = oom_hint
+                                job_meta["failed_at"] = datetime.now().isoformat()
+                                # g6 M5 状态机统一：失败 → Rejected
+                                job_meta["unified_status"] = "Rejected"
+                            else:
+                                job_meta["status"] = "crashed"
+                                job_meta["crashed_at"] = datetime.now().isoformat()
+                                # g6 M5 状态机统一：崩溃 → Archived
+                                job_meta["unified_status"] = "Archived"
                             # 清理进程记录
                             del self.running_processes[job_id]
                             # 保存更新后的状态
@@ -1305,9 +1657,22 @@ class TrainService:
                         # 检查是否有 checkpoint，如果有则标记为可恢复
                         train_dir = self.jobs_dir / job_id / "train"
                         checkpoint = train_dir / "weights" / "last.pt"
-                        if checkpoint.exists():
+                        oom_hint = self._scan_oom_hint(job_id)
+                        if oom_hint:
+                            job_meta["status"] = "failed"
+                            job_meta["reason"] = "oom"
+                            job_meta["oom"] = True
+                            job_meta["oom_recovery"] = self.OOM_RECOVERY_HINT
+                            job_meta["error"] = oom_hint
+                            job_meta["failed_at"] = datetime.now().isoformat()
+                            # g6 M5 状态机统一：失败 → Rejected
+                            job_meta["unified_status"] = "Rejected"
+                            _save_json(job_file, job_meta)
+                        elif checkpoint.exists():
                             job_meta["status"] = "crashed"
                             job_meta["crashed_at"] = datetime.now().isoformat()
+                            # g6 M5 状态机统一：崩溃 → Archived
+                            job_meta["unified_status"] = "Archived"
                             _save_json(job_file, job_meta)
                 
                 # 检查是否有 checkpoint 但状态不是可恢复状态
@@ -1322,12 +1687,51 @@ class TrainService:
                         # 保存更新
                         _save_json(job_file, job_meta)
                 
+                # g6 M5 状态机统一：查询回填 unified_status（真实 status → 统一枚举），
+                # 前端/下游按统一枚举消费，旧 status 字段保留兼容
+                try:
+                    from src.db.status import task_unified
+                    job_meta["unified_status"] = task_unified(job_meta)
+                except Exception:
+                    job_meta["unified_status"] = job_meta.get("status", "")
+                
                 jobs.append(job_meta)
             
             return jobs
         
         jobs = await asyncio.to_thread(_list_jobs_sync)
         return {"jobs": sorted(jobs, key=lambda x: x.get("created_at", ""), reverse=True)}
+
+    # g5 GPU 熔断：扫描任务日志尾部识别 OOM（进程被强杀时唯一取证来源）
+    def _scan_oom_hint(self, job_id: str) -> str:
+        """扫描任务日志尾部是否含 CUDA OOM 特征（进程被强杀时唯一取证来源）。
+
+        命中返回可读的 OOM 摘要行；未命中返回空串。日志超大时只读尾部 64KB，
+        避免每次任务列表轮询都在读大文件。
+        """
+        try:
+            log_file = self.jobs_dir / f"{job_id}.log"
+            if not log_file.exists():
+                return ""
+            size = log_file.stat().st_size
+            with open(log_file, "rb") as f:
+                if size > 65536:
+                    f.seek(size - 65536)
+                tail = f.read().decode("utf-8", errors="replace")
+            low = tail.lower()
+            if ("out of memory" in low or "cuda error" in low
+                    or "outofmemoryerror" in low or "memoryerror" in low):
+                # 返回日志中命中的原始行（截断），便于技术人员定位
+                hit = ""
+                for line in tail.splitlines():
+                    if ("out of memory" in line.lower() or "cuda error" in line.lower()
+                            or "outofmemoryerror" in line.lower() or "memoryerror" in line.lower()):
+                        hit = line.strip()[:300]
+                        break
+                return hit or "CUDA out of memory detected in training log tail"
+        except Exception:
+            pass
+        return ""
 
     async def get_job_tree(self, job_id: str):
         """获取训练任务输出目录树（权重/图表/日志等文件）"""
@@ -1379,7 +1783,14 @@ class TrainService:
         if not await asyncio.to_thread(lambda: job_file.exists()):
             return None
         
-        return await asyncio.to_thread(_load_json, job_file)
+        meta = await asyncio.to_thread(_load_json, job_file)
+        # g6 M5 状态机统一：详情同样回填 unified_status
+        try:
+            from src.db.status import task_unified
+            meta["unified_status"] = task_unified(meta)
+        except Exception:
+            meta["unified_status"] = meta.get("status", "")
+        return meta
     
     async def stop_job(self, job_id: str):
         """停止训练任务"""
@@ -1401,6 +1812,8 @@ class TrainService:
                     job_meta = _load_json(job_file)
                     job_meta["status"] = "stopped"
                     job_meta["stopped_at"] = datetime.now().isoformat()
+                    # g6 M5 状态机统一：手动停止 → Archived
+                    job_meta["unified_status"] = "Archived"
                     _save_json(job_file, job_meta)
             
             await asyncio.to_thread(_update_status)
@@ -1544,7 +1957,7 @@ class TrainService:
         
         # 检查数据集（恢复优先使用训练时保存的 data.yaml，可能是标签过滤副本）
         saved_yaml = job_meta.get("data_yaml")
-        data_yaml = Path(saved_yaml) if saved_yaml else (self.datasets_dir / job_meta["dataset_id"] / job_meta["version"] / "data.yaml")
+        data_yaml = Path(saved_yaml) if saved_yaml else self._resolve_dataset_yaml(job_meta["dataset_id"], job_meta["version"])
 
         if not await asyncio.to_thread(lambda: data_yaml.exists()):
             raise ValueError(f"Dataset {job_meta['dataset_id']}/{job_meta['version']} not found")
@@ -1567,6 +1980,8 @@ class TrainService:
         job_meta["status"] = "running"
         job_meta["resumed_at"] = datetime.now().isoformat()
         job_meta["resume_count"] = job_meta.get("resume_count", 0) + 1
+        # g6 M5 状态机统一：恢复训练 → Running
+        job_meta["unified_status"] = "Running"
         
         # 如果之前是崩溃（状态为 running 但进程已死），记录崩溃恢复
         if was_crashed:
@@ -1581,6 +1996,10 @@ class TrainService:
         resume_baseline_path, resume_baseline_id = self._pick_baseline(resume_business)
 
         # 启动训练进程
+        resume_mig = job_meta.get("migration") or {}
+        # 2.4 恢复训练保持迁移语义：仅当无 checkpoint（从源模型权重重启）时执行迁移覆盖；
+        # 从 checkpoint（last.pt/best.pt）恢复时权重已是目标架构，无需再 overlay
+        need_mig = (not use_resume) and resume_mig.get("enabled")
         await asyncio.to_thread(
             self._start_training,
             job_id, 
@@ -1597,7 +2016,11 @@ class TrainService:
             job_meta.get("gpu_index"),
             resume_business,
             resume_baseline_path,
-            resume_baseline_id
+            resume_baseline_id,
+            resume_mig.get("target_model") if need_mig else None,
+            f"{resume_mig.get('source_model_id')} [{resume_mig.get('source_architecture')}]"
+            if need_mig else None,
+            bool(resume_mig.get("lr0_degraded"))
         )
         
         return {"job_id": job_id, "status": "running", "message": "Training resumed from checkpoint"}

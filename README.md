@@ -11,14 +11,15 @@
 - **多格式上传**：支持 `.zip` / `.tar` / `.tar.gz` / `.tgz` 压缩包，上传后**自动准备**（解压 → 自动识别或重组为 YOLO 标准结构 `images/` + `labels/` → 统计），全程无需手动操作
 - **按模型归属**：上传时可手动指定归属模型；也可由平台根据「包内类别 → 模型标签字典覆盖率」**自动匹配**（完全覆盖立即命中，覆盖 ≥ 0.6 兜底绑定），未匹配的数据集保持未归属并提示
 - **txt 标注包导入**：导入类别按模型标签字典**过滤冗余类 + class_id 重映射**，保留源 txt 与重叠框最紧化处理，过滤后的数据进入该模型的等待队列
-- **全生命周期状态机**：`collecting（采集）→ annotating（标注中）→ sealed（已封板）→ training / completed / failed`，每个阶段一目了然
+- **全生命周期状态机**：`collecting（采集）→ annotating（标注中）→ sealed（已封板）→ training / completed / failed`，内部统一为枚举状态（Running / Ready / Rejected / Archived），前端展示与后端判定一套口径
 - **封板（Seal）机制**：一键封板 = 一次性划分 train/val/test + 转 txt + 生成 `data.yaml`，封板时按模型补全类别；封板后数据生成 **v{N} 只读快照**（训练不再受后续标注改动影响）
 - **数据血缘**：每个数据集记录 `display_name` + `parent_dataset_id`，封板快照可追溯到源头数据集
-- **封板门槛**：默认需达到 `SEAL_MIN_IMAGES = 1500` 张标注图片才允许封板（前端有进度提示），确有需要时支持强制封板兜底
+- **封板门槛**：默认需达到 `SEAL_MIN_IMAGES = 5000` 张标注图片才允许封板（前端有进度提示）；同时支持**时间窗口兜底**（`SEAL_MAX_DAYS = 7` 天超期自动封板，先达者生效），确有需要时支持强制封板兜底
 
 ### 2. 🖱️ AI 智能标注
 
 - **GroundingDINO + SAM**：输入类别名（中英文均可，逗号分隔）→ GroundingDINO 开放词汇检测出目标框，可选开启 SAM 精修分割；支持单图与整数据集批量预标注
+- **千问 L2 精审**：预标注结果可按批提交本地千问 VL 二次审核，逐框给出保持 / 拒收 / 修改结论并识别漏标，异常框自动汇总为问题清单，人工在标注页复核修正
 - **框合并策略**：同类紧邻框自动合并（IoU / 中心距阈值），高度重叠的框保留**最紧框**，避免误检框互相堆积
 - **手动加框**：人工补框自动标记为「困难样本」，进入该模型的困难样本库（训练时 1:1 并入，专治难例）
 - **千问 VL 新类识别**：本地部署 Ollama（零 token 成本），对标注中的图片自动判读疑似新类别 → 生成候选标签 → 一键采纳追加到模型标签字典
@@ -28,7 +29,8 @@
 ### 3. 🏋️ 模型训练
 
 - 可选 **YOLOv8 全新训练 / 基于已有模型微调**（n/s/m/l/x 多种规格预训练权重本地化）
-- **参数自动推荐**：按 GPU/CPU 与数据集规模自动推荐轮次、图片尺寸、批次、学习率、早停耐心值等，专家可手动覆盖
+- **黄金参数三层分档**：按 GPU 显存（`Batch = (显存-2GB)/(模型×1.5)`，取 2 的幂）与数据规模（`Epochs = Max(300, 500000/图片数)`）计算理论最优值，按 Batch 收缩档位生成 **黄金（效率最优）/ 白银（均衡）/ 基准（稳定优先）** 三档参数，前端一键选用，专家可继续手动覆盖
+- **GPU 熔断**：后台监控训练中 GPU 利用率，持续过低（默认 < 10% 达 5 分钟）判定 GPU 异常 → 自动停训并标记失败原因，避免无效空跑占用机时
 - 训练节点（GPU）选择、早停机制（触发时标记「已完成（早停）」）、任务卡实时进度与百分比显示
 - **困难样本 / 空白样本并池**：训练抽样时困难样本（hard/{model_id}）按 1:1 并入，空白样本库（background，全局共享）按 0:N 随机并入，提升鲁棒性
 - 训练稳定性保障：AMP 失败自动降级 FP32、容器单进程数据加载、失败原因中文提示 + 一键重训
@@ -45,6 +47,8 @@
 - **微调模型自动匹配**：勾选「基于已有模型微调」时，自动默认选中**同业务、已训练、版本最高**的生产模型（以 `best.pt` 为基座继续训练），用户仍可手动改选
 - **自动拉取对比基准**：训练完成后自动选取同业务、版本最高的上一代生产模型，在**相同验证/测试集**上对比
 - **多维判定**（同时满足才晋升）：新模型 `mAP50-95` 严格更优；逐类别 AP 无关键退化（相对跌幅 > 5% 拦截）；记录 FPS / 单张推理耗时供参考
+- **末轮权重智能选择**：最后一轮权重 `last.pt` 与最优权重 `best.pt` 指标在 2% 容忍范围内时，优先采用收敛末尾权重（稳定、不易过拟合），超限则保留指标更优的 `best.pt`
+- **早停耐心自动推断**：按训练过程 loss / 指标波动情况自动给出早停 patience 建议，替代固定默认值
 - **晋升 / 淘汰 / 首版**：通过 → 版本号 +0.1 递增并标记 `production_ready`；未通过 → 归档为 `rejected` 失败实验（附中文诊断报告）且不污染生产；首版训练自动直接晋升 `v1.0`
 - **人工强制覆盖**：高级工程师可对被拦截模型强制晋升为生产版本（记录原因，旧生产版本自动退役）
 - **血缘管理**：每个模型附带 `lineage`（父模型、基座模型、数据集、训练任务），版本可追溯
@@ -52,6 +56,7 @@
 ### 5. 🗂️ 模型仓库（以模型为中心）
 
 - **一个模型一个卡片**：采集/上传的数据挂靠到对应模型下，点击卡片查看其数据集、状态分布、队列与待封板进度
+- **模型库分组**：模型按业务域归入模型库（model_libraries），支持创建 / 删除与一键迁移，仓库页按库归类展示
 - **标签字典管理**：每个模型维护类别标签字典（english_code / 中文名 / 描述），支持追加与删除保护（已被标注使用的标签不可删）
 - **数据等待队列**：txt 包导入与归集的数据进入该模型的等待队列，后台定时（5 分钟）自动打包进入标注页，实现「采集 → 标注」无人值守衔接
 - **相似模型扫描与合并**：按标签字典相似度扫描重复模型，勾选合并（差集类别自动并入主模型、数据集重归属、日志可回滚）
@@ -61,35 +66,53 @@
 
 ## 技术栈
 
-- 后端：Python 3.11 · FastAPI · Ultralytics YOLOv8 · PyTorch · GroundingDINO · SAM · Transformers
+- 后端：Python 3.11 · FastAPI · Ultralytics YOLOv8 · PyTorch (CUDA 12.8) · GroundingDINO · SAM · Transformers · PostgreSQL 17（元数据库）
 - 前端：Vue 3 · Vite · TypeScript · ECharts（vue-echarts）
-- AI 新类识别：Ollama 本地部署千问 VL（`qwen2.5-vl:7b`，零 token 成本）
-- 部署：Docker 单镜像（Nginx + Uvicorn + Supervisor）+ 独立 Ollama 服务，数据/模型独立挂载卷
+- AI 新类识别 / 精审：Ollama 本地部署千问 VL（`qwen3-vl:8b`，零 token 成本，模型随项目离线携带）
+- 部署：Docker 分层镜像（环境层 + 代码层）+ PostgreSQL + Ollama，数据/模型独立挂载卷
 
 ## 快速开始
 
-### Docker 部署（生产，含 Ollama 千问）
+### 部署（生产，含 Ollama 千问与 PostgreSQL）
+
+**服务器零配置一键部署**（自动安装 Docker / NVIDIA Container Toolkit，拉取镜像并启动）：
 
 ```bash
 cd docker
+sudo bash deploy.sh
+```
 
-# 国内拉取 ollama 镜像慢时，先设置加速变量：
-#   export OLLAMA_IMAGE=docker.m.daocloud.io/ollama/ollama
-# 换模型（默认 qwen2.5-vl:7b）：
-#   export OLLAMA_QWEN_MODEL=qwen2.5-vl:7b
+**分层镜像构建与推送**（环境层与代码层分开上传，日常代码更新只重建代码层）：
 
+```bash
+bash docker/build_push.sh            # 全量：环境层 + 代码层（首次 / 依赖变更时）
+bash docker/build_push.sh --app-only # 仅代码层（日常更新推荐）
+bash docker/build_push.sh --env-only # 仅环境层（Python 依赖变更时）
+```
+
+**直接启动**（compose 默认指向阿里云仓库，无需配置）：
+
+```bash
+cd docker
 docker compose up -d
 ```
 
 - 前端：`http://<服务器IP>:3000`
 - 后端 API：`http://<服务器IP>:8000`
-- Ollama：`http://<服务器IP>:11434`（首次启动自动拉取千问模型，约 6GB）
+- Ollama：`http://<服务器IP>:11434`（首次启动自动用本地 GGUF 离线构建千问模型；失败自动回退魔搭直连，约 6GB）
+- **端口冲突规避**：与同事端口冲突时用环境变量覆盖：
+
+```bash
+PORT_WEB=3100 PORT_API=8100 PORT_OLLAMA=12434 docker compose up -d
+```
+
 - 部署后在「标注页 → 千问设置」勾选启用，endpoint 默认指向 `http://ollama:11434`
+- PostgreSQL 为平台内部元数据库，端口不暴露宿主机，无需配置
 
 ### 本地开发
 
 ```bash
-# 后端（建议使用 conda 环境）
+# 后端（建议使用 conda 环境；元数据库使用本机 PostgreSQL，无库时自动回退 JSON 文件模式）
 cd backend
 pip install -r requirements.txt
 python run.py   # uvicorn, http://localhost:8000
@@ -105,13 +128,17 @@ npm run dev     # http://localhost:3000
 ```
 backend/
   src/
-    api/routes/       # REST 接口（数据集 / 标注 / 训练 / 模型 / 样本池 / 队列）
-    services/         # 核心服务（数据集、AI 标注、训练、模型仓库、队列、样本池）
+    api/routes/       # REST 接口（数据集 / 标注 / 训练 / 模型 / 样本池 / 队列 / 日志）
+    services/         # 核心服务（数据集、AI 标注、训练、模型仓库、队列、样本池、日志）
     yolo/             # 训练脚本与守门员（gatekeeper）
+    db/               # PostgreSQL 元数据库（engine / models / status / meta_store）
+    core/             # 配置中心（settings，.env 可覆盖）
+  scripts/            # 运维工具（数据迁移 migrate_to_pg、模型库迁移、数据集整理 fix_dataset）
   data/               # 运行数据（数据集、标注、队列，挂载卷，不入库）
-  models/             # 模型文件（权重 / 模型仓库，不入库）
+  models/             # 模型文件（权重 / 模型仓库 / SAM，构建时打进镜像）
 frontend/
   src/pages/          # 数据集 / 标注 / 训练 / 模型 / 模型详情页面
   src/components/     # 标注画布、日志面板、文件树等组件
-docker/               # 镜像构建、docker-compose（含 Ollama）、Nginx 配置
+deploy/               # 千问 VL 模型 GGUF 源文件 + ollama 离线初始化脚本（部署资产）
+docker/               # 分层镜像 Dockerfile、build_push.sh、deploy.sh、docker-compose（平台 + PostgreSQL + Ollama）、Nginx 配置
 ```

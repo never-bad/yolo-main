@@ -27,6 +27,9 @@ class TrainJobRequest(BaseModel):
     # 阶段1.5/1.6（训练增强）：回忆集混训 + 样本池抽样并入（缺省开启，池为空时自动跳过）
     hard_sample_ratio: float = 0.1       # 困难样本库抽样比例（针对 base_model_id）
     background_sample_ratio: float = 0.05  # 空白负样本库抽样比例
+    # 2.4 跨代迁移训练（训练模块规范 §3.2.2）：指定目标架构（如 yolov8s.pt），
+    # 与 base_model_id（源模型）架构不同时自动执行迁移训练（strict=False + lr0 降 10 倍）
+    migration_target_model: Optional[str] = None
     recall_enabled: bool = True          # 增量训练时是否混入已完成旧数据（回忆集）
 
 @router.get("/gpus")
@@ -35,9 +38,10 @@ async def list_gpus():
     return await train_service.list_gpus()
 
 @router.get("/suggest")
-async def suggest_train_params(dataset_id: str, version: str = "v1", base_model_id: str = None):
-    """自动推荐训练参数（基础 + 高级），根据硬件与数据集规模"""
-    return await train_service.suggest_params(dataset_id, version, base_model_id)
+async def suggest_train_params(dataset_id: str, version: str = "v1", base_model_id: str = None,
+                               model_name: str = None):
+    """自动推荐训练参数（基础 + 高级 + 黄金参数 L2 公式），根据硬件与数据集规模"""
+    return await train_service.suggest_params(dataset_id, version, base_model_id, model_name)
 
 @router.get("/business")
 async def infer_business(dataset_id: str, version: str = "v1"):
@@ -75,6 +79,7 @@ async def create_train_job(request: TrainJobRequest):
             aggregate_incomplete=request.aggregate_incomplete,
             hard_sample_ratio=request.hard_sample_ratio,
             background_sample_ratio=request.background_sample_ratio,
+            migration_target_model=request.migration_target_model,
             recall_enabled=request.recall_enabled
         )
         return result

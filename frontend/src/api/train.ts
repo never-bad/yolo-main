@@ -21,6 +21,9 @@ export interface TrainJobRequest {
   // 训练增强（1.5/1.6）：样本池抽样 + 回忆集混训
   hard_sample_ratio?: number      // 困难样本库按比例抽样并入训练（0=关闭，默认 0.1）
   background_sample_ratio?: number // 空白样本库抽样（负样本，默认 0.05）
+  // 2.4 跨代迁移训练（训练模块规范 §3.2.2）：指定目标架构（如 yolov8s.pt），
+  // 与 base_model_id（源模型）架构不同时自动执行迁移（strict=False + lr0 自动降 10 倍）
+  migration_target_model?: string
   recall_enabled?: boolean        // 回忆集混训：增量训练时混入同业务旧数据防遗忘（默认 true）
 }
 
@@ -87,15 +90,16 @@ export const inferBusiness = async (dataset_id: string, version: string = 'v1') 
 }
 
 /**
- * 根据当前硬件与数据集自动推荐训练参数（基础 + 高级，可手动覆盖）
+ * 根据当前硬件与数据集自动推荐训练参数（基础 + 高级 + 黄金参数 L2，可手动覆盖）
  */
 export const suggestTrainParams = async (
   dataset_id: string,
   version: string = 'v1',
-  base_model_id?: string
+  base_model_id?: string,
+  model_name?: string
 ) => {
   const { data } = await api.get('/train/suggest', {
-    params: { dataset_id, version, base_model_id: base_model_id || undefined }
+    params: { dataset_id, version, base_model_id: base_model_id || undefined, model_name: model_name || undefined }
   })
   return data
 }
