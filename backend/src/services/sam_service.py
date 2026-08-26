@@ -1296,7 +1296,7 @@ class SAMService:
         from PIL import Image as PILImage
         import urllib.request
         sys_msg = (
-            "你是一个视觉数据标注助手。给定图片与已知类别清单，找出图片中出现的、"
+            "你是一个视觉数据标注助手。给定图片与已知类别清单（含中文名及描述），找出图片中出现的、"
             "**不属于已知类别清单** 的物体类别，为每个新类别给出规范化的标签建议。\n"
             "输出严格为 JSON 数组（不要任何解释文字）：\n"
             '[{"english_code": "唯一英文标识(小写字母数字下划线)", "chinese_name": "中文名", "chinese_desc": "一句中文描述"}]'
@@ -1304,7 +1304,14 @@ class SAMService:
         )
         endpoint = (cfg.get("qwen_endpoint") or "http://localhost:11434").rstrip("/")
         api_key = cfg.get("qwen_api_key") or ""
-        known_text = ", ".join(known) if known else "（无）"
+        
+        # ✅ 增强：将已知类别加入中文名+描述，帮助模型更好理解哪些类别已存在
+        known_texts = []
+        for c in (known_codes or []):
+            cn = str(c).strip()
+            if cn:
+                known_texts.append(cn)
+        known_text = "; ".join(known_texts) if known_texts else "（无已知类别）"
         user_msg = f"已知类别清单：{known_text}\n请识别这张图片中已知类别之外的新目标类别。"
         agg = {}  # code -> {meta, images}
         for img_abs in image_paths:

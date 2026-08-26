@@ -10,7 +10,7 @@ dataset_service = DatasetService()
 model_service = ModelService()
 
 class PrepareRequest(BaseModel):
-    split_ratio: Optional[Dict[str, float]] = {"train": 0.8, "val": 0.2}
+    split_ratio: Optional[Dict[str, float]] = {"train": 0.7, "val": 0.2, "test": 0.1}
     classes: Optional[list[str]] = None
 
 class UpdateDatasetRequest(BaseModel):
