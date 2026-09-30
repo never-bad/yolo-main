@@ -28,4 +28,4 @@ deploy/
 平台细节说明.md
 # 已解除跟踪的文档（git rm --cached 后防 git add . 重新加入）
 backend/INSTALL_PYTORCH.md
-docs/
+# docs/ 于 2026-09-30 恢复入库（内网协作库需要跟踪文档；平台细节说明.md 仍排除）
