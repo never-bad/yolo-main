@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import asyncio
@@ -19,10 +20,15 @@ class CreateTaskRequest(BaseModel):
 
 class BBox(BaseModel):
     class_id: int
-    x1: float
-    y1: float
-    x2: float
-    y2: float
+    # 矩形四坐标改为可选：分割目标只提交轮廓点（方框是给 SAM 圈范围的中间产物，用完就扔），
+    # 只有纯检测目标必须带矩形；由服务端 clean_polygon / ensure_box_bbox 统一校验与补算。
+    x1: Optional[float] = None
+    y1: Optional[float] = None
+    x2: Optional[float] = None
+    y2: Optional[float] = None
+    # 分割轮廓（像素坐标 [[x,y],...]）；类型放宽为 list，由服务端 clean_polygon 统一校验，
+    # 避免个别坏点导致整张图的标注保存失败
+    polygon: Optional[list] = None
     confidence: Optional[float] = None  # AI 置信度（仅 AI 标注携带）
     source: Optional[str] = None        # manual | ai | ai_qwen | import
     audit: Optional[dict] = None        # L2 千问/人工审核结论，随框落盘（供问题图片检索）
@@ -32,6 +38,7 @@ class SaveAnnotationRequest(BaseModel):
     ai_annotated: bool = False
     sample_type: Optional[str] = None      # 人工覆盖样本类型：normal / hard / background
     sample_reason: Optional[str] = None    # 覆盖时附带判据（如 manual）
+    reviewed: bool = False                 # 人工复核标记：画布上编辑过标注后保存才为 True（粘性）
 
 @router.post("/tasks")
 async def create_annotation_task(request: CreateTaskRequest):
@@ -69,6 +76,7 @@ async def save_annotation(task_id: str, image_id: str, request: SaveAnnotationRe
         request.ai_annotated,
         request.sample_type,
         request.sample_reason,
+        request.reviewed,
     )
     return result
 
@@ -99,6 +107,20 @@ async def export_annotations(task_id: str, format: str = "yolo"):
         raise HTTPException(500, result.get("error", "Export failed"))
     return result
 
+@router.get("/tasks/{task_id}/export-reviewed")
+async def export_reviewed_annotations(task_id: str):
+    """单独提取"人工修过"的图片 + YOLO 标签（含分割轮廓），打包成 zip 直接下载"""
+    result = await annotation_service.export_reviewed_zip(task_id)
+    if not result.get("ok", False):
+        raise HTTPException(400, result.get("error", "Export failed"))
+    name = result["filename"]
+    return FileResponse(
+        result["zip_path"],
+        media_type="application/zip",
+        filename=name,
+        headers={"Content-Disposition": f"attachment; filename={name}"}
+    )
+
 @router.post("/tasks/{task_id}/clear-ai")
 async def clear_ai_annotations(task_id: str):
     """清除该任务所有 AI 预标注（批量误标过多时一键清理，便于重新标注）"""
@@ -106,6 +128,18 @@ async def clear_ai_annotations(task_id: str):
     if not result.get("ok", False):
         raise HTTPException(404, result.get("error", "Task not found"))
     return result
+
+@router.post("/tasks/{task_id}/clear-all")
+async def clear_all_annotations(task_id: str):
+    """清除该任务数据集的全部标注框（AI 标注 + 人工标注一视同仁）。
+
+    清空前自动打包备份到 annotations/backups/，误清可解压回退；
+    已封板 / 已入桶 / 已归档的数据集拒绝执行。
+    """
+    try:
+        return await annotation_service.clear_all_annotations(task_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 @router.post("/tasks/{task_id}/clean-overlaps")
 async def clean_task_overlaps(task_id: str):

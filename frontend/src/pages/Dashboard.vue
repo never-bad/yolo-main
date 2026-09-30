@@ -7,15 +7,15 @@
         <p class="repo-sub">以模型为中心：一个模型一个卡片，采集/上传的数据挂靠到对应模型下，点击卡片查看详情</p>
       </div>
       <div class="toolbar-right">
-        <input v-model="searchText" class="search-input" placeholder="搜索模型库..." @input="menuId = null" />
-        <button class="primary" @click="createDialogOpen = true">+ 新建模型库</button>
+        <input v-model="searchText" class="search-input" placeholder="搜索算法库..." @input="menuId = null" />
+        <button class="primary" @click="createDialogOpen = true">+ 新建算法库</button>
       </div>
     </div>
 
     <!-- A. 顶部统计栏三格（含待办提醒） -->
     <div class="stats-bar">
       <div class="stat-box">
-        <span class="stat-label">总模型库</span>
+        <span class="stat-label">总算法库</span>
         <b>{{ filteredModels.length }}</b>
       </div>
       <div class="stat-box">
@@ -56,21 +56,21 @@
 
     <!-- 模型对比（勾选 2~3 个后出现） -->
     <div v-if="compareIds.length >= 2" class="compare-bar">
-      <span>已选 <b>{{ compareIds.length }}</b> 个模型库（最多 3 个）</span>
+      <span>已选 <b>{{ compareIds.length }}</b> 个算法库（最多 3 个）</span>
       <button class="primary small" @click="compareOpen = true">对比所选模型</button>
       <span class="compare-close" @click="compareIds = []">✕ 取消选择</span>
     </div>
 
     <div v-if="loading" class="loading-state"><span class="loading-spinner"></span>加载模型仓库...</div>
 
-    <div v-else-if="!models.length" class="empty-state">
+    <div v-else-if="!libraryModels.length" class="empty-state">
       <h3>欢迎使用 AI 模型管理平台</h3>
-      <p>仓库还没有模型库。按下面三步开始你的第一个检测模型：</p>
+      <p>仓库还没有算法库。按下面三步开始你的第一个检测模型：</p>
       <div class="guide-steps">
         <div class="guide-step">
           <span class="step-no">1</span>
           <b>上传数据</b>
-          <small>上传图片/标注压缩包，归属到模型库下的数据集</small>
+          <small>上传图片/标注压缩包，归属到算法库下的数据集</small>
         </div>
         <div class="guide-step">
           <span class="step-no">2</span>
@@ -84,7 +84,7 @@
         </div>
       </div>
       <div class="empty-actions">
-        <button class="primary" @click="createDialogOpen = true">+ 新建模型库</button>
+        <button class="primary" @click="createDialogOpen = true">+ 新建算法库</button>
         <router-link to="/models"><button class="secondary">去模型管理</button></router-link>
       </div>
     </div>
@@ -153,46 +153,15 @@
       </div>
     </div>
 
-    <!-- 新建模型库弹窗 -->
-    <div v-if="createDialogOpen" class="modal-mask" @click.self="createDialogOpen = false">
-      <div class="modal create-modal">
-        <h3>新建模型库</h3>
-        <p class="modal-sub">唯一标识用于生成底层路径，创建后写死不可修改</p>
-        <div class="form-field">
-          <label>模型库名称 <i>*</i></label>
-          <input v-model="createForm.display_name" placeholder="如：安全帽检测" />
-        </div>
-        <div class="form-field">
-          <label>唯一标识 <i>*</i></label>
-          <input v-model="createForm.model_code" placeholder="如：helmet_detect（小写+下划线）" />
-        </div>
-        <div class="form-field">
-          <label>业务线</label>
-          <select v-model="createForm.business">
-            <option value="">未指定</option>
-            <option v-for="(label, key) in BIZ_OPTIONS" :key="key" :value="key">{{ label }}</option>
-          </select>
-        </div>
-        <div class="form-field">
-          <label>业务场景描述</label>
-          <textarea v-model="createForm.description" rows="2" placeholder="告诉团队成员这个模型的用途"></textarea>
-        </div>
-        <div v-if="createError" class="form-error">{{ createError }}</div>
-        <div class="modal-actions">
-          <button class="secondary" @click="createDialogOpen = false">取消</button>
-          <button class="primary" @click="submitCreate" :disabled="creating">
-            {{ creating ? '创建中...' : '创建并进入详情' }}
-          </button>
-        </div>
-      </div>
-    </div>
+    <!-- 新建算法库弹窗（组件与数据集导入页共用同一套逻辑） -->
+    <LibraryCreateModal v-model:open="createDialogOpen" @created="onLibraryCreated" />
 
     <!-- 编辑信息弹窗 -->
     <div v-if="editDialogOpen" class="modal-mask" @click.self="editDialogOpen = false">
       <div class="modal edit-modal">
-        <h3>编辑模型库信息</h3>
+        <h3>编辑算法库信息</h3>
         <div class="form-field">
-          <label>模型库名称</label>
+          <label>算法库名称</label>
           <input v-model="editForm.display_name" />
         </div>
         <div class="form-field">
@@ -212,11 +181,11 @@
     <!-- 模型对比弹窗 -->
     <div v-if="compareOpen" class="modal-mask" @click.self="compareOpen = false">
       <div class="modal compare-modal">
-        <h3>模型库对比（{{ compareModels.length }} 个）</h3>
+        <h3>算法库对比（{{ compareModels.length }} 个）</h3>
         <table class="compare-table">
           <thead>
             <tr>
-              <th>模型库</th>
+              <th>算法库</th>
               <th>mAP50-95</th>
               <th>参数量</th>
               <th>推理速度</th>
@@ -248,8 +217,9 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { listModels, createModel, updateModel, deleteModel, exportModel } from '@/api/models'
+import { listModels, updateModel, deleteModel, exportModel } from '@/api/models'
 import { listDatasets } from '@/api/datasets'
+import LibraryCreateModal from '@/components/LibraryCreateModal.vue'
 
 const router = useRouter()
 const loading = ref(true)
@@ -282,11 +252,26 @@ function modelArch(m: any): string {
   return mm ? mm[0].replace(/\.pt$/i, '') : ''
 }
 
-const archOptions = computed(() => Array.from(new Set(models.value.map(modelArch).filter(Boolean))))
-const bizOptions = computed(() => Array.from(new Set(models.value.map((m) => bizLabel(m.business || '')).filter(Boolean))))
+// ---- 首页只列「算法库」这一层 ----
+// 后端 listModels 返回的是模型仓库里全部记录（库根 + 库内训练版本 + 上传的模型），
+// 不加这层判据就会把一条模型记录画成一张算法库卡片，顶部「总算法库」也会虚高。
+// 判据：empty=新建的库根；没有任何库归属的（历史）记录按独立模型保留可见；
+// 已归库的上传模型与库内训练产出版本不进首页，去库详情/模型管理看。
+function isLibraryCard(m: any): boolean {
+  if (!m) return false
+  if (m.empty === true) return true
+  if (m.model_library_id) return false
+  const root = m.library_root_id
+  return !(root && root !== m.model_id)
+}
+
+const libraryModels = computed(() => models.value.filter(isLibraryCard))
+
+const archOptions = computed(() => Array.from(new Set(libraryModels.value.map(modelArch).filter(Boolean))))
+const bizOptions = computed(() => Array.from(new Set(libraryModels.value.map((m) => bizLabel(m.business || '')).filter(Boolean))))
 
 const filteredModels = computed(() =>
-  models.value.filter((m) => {
+  libraryModels.value.filter((m) => {
     const kw = searchText.value.trim().toLowerCase()
     if (kw) {
       const hay = `${m.display_name || ''} ${m.name || ''} ${m.model_code || ''} ${m.model_id || ''}`.toLowerCase()
@@ -418,7 +403,7 @@ async function exportModelItem(m: any) {
   }
 }
 async function deleteModelItem(m: any) {
-  if (!confirm(`确认删除模型库「${m.display_name || m.name || m.model_id}」？该操作不可恢复。`)) return
+  if (!confirm(`确认删除算法库「${m.display_name || m.name || m.model_id}」？该操作不可恢复。`)) return
   deleting.value = true
   try {
     await deleteModel(m.model_id)
@@ -431,40 +416,11 @@ async function deleteModelItem(m: any) {
   }
 }
 
-// ---- 新建模型库 ----
+// ---- 新建算法库（表单逻辑在 LibraryCreateModal 组件内，导入页复用同一组件）----
 const createDialogOpen = ref(false)
-const createForm = ref({ display_name: '', model_code: '', business: '', description: '' })
-const createError = ref('')
-const creating = ref(false)
-async function submitCreate() {
-  createError.value = ''
-  const name = createForm.value.display_name.trim()
-  const code = createForm.value.model_code.trim()
-  if (!name) {
-    createError.value = '请填写模型库名称'
-    return
-  }
-  if (!code) {
-    createError.value = '请填写唯一标识（英文小写+下划线）'
-    return
-  }
-  creating.value = true
-  try {
-    const meta = await createModel({
-      display_name: name,
-      model_code: code,
-      business: createForm.value.business,
-      description: createForm.value.description.trim()
-    })
-    createDialogOpen.value = false
-    createForm.value = { display_name: '', model_code: '', business: '', description: '' }
-    await load()
-    router.push(`/models/${meta.model_id}`)
-  } catch (e: any) {
-    createError.value = e?.response?.data?.detail || '创建失败'
-  } finally {
-    creating.value = false
-  }
+async function onLibraryCreated(meta: any) {
+  await load()
+  if (meta?.model_id) router.push(`/models/${meta.model_id}`)
 }
 
 // ---- 模型对比 ----
@@ -480,7 +436,7 @@ function toggleCompare(id: string) {
   } else if (compareIds.value.length < 3) {
     compareIds.value.push(id)
   } else {
-    alert('最多同时对比 3 个模型库')
+    alert('最多同时对比 3 个算法库')
   }
 }
 const compareModels = computed(() => compareIds.value.map((id) => models.value.find((m) => m.model_id === id)).filter(Boolean))

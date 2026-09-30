@@ -112,9 +112,13 @@ def ensure_local_base_weights(weights: str, timeout: int = 300) -> str:
     return weights
 
 
-def next_model_version(registry_dir: str, business: str) -> str:
-    """计算该业务下一个模型版本号：扫描模型仓库中同业务已有版本，最大值 + 0.1；首版 v1.0"""
-    best = 0.99  # best + 0.1 = 1.0 → 首版 v1.0
+def next_model_version(registry_dir: str, business: str, library_root_id: str = None) -> str:
+    """计算下一个模型版本号：取已有版本号最大值 + 0.1。
+
+    归属某算法库的产出按"库内已有版本"递增（同一库 v1.0 → v1.1 …，不受其它同业务库干扰）；
+    无库归属的独立模型退回按业务线递增。
+    """
+    best = 0.99  # 与历史保持一致：库内无任何版本时首版为 v1.1
     registry = Path(registry_dir)
     if registry.exists():
         for model_dir in registry.iterdir():
@@ -126,7 +130,10 @@ def next_model_version(registry_dir: str, business: str) -> str:
             try:
                 with open(model_file, "r", encoding="utf-8") as f:
                     meta = json.load(f)
-                if meta.get("business") != business:
+                if library_root_id:
+                    if meta.get("library_root_id") != library_root_id:
+                        continue
+                elif meta.get("business") != business:
                     continue
                 ver = meta.get("version", "")
                 if isinstance(ver, str) and ver.startswith("v"):
@@ -164,6 +171,9 @@ def parse_architecture(base_model: str) -> dict:
     fname = name.split("/")[-1]                       # 去掉路径只取文件名
     fname = fname.replace(".pt", "").replace(".yaml", "").lower()
     import re
+    # 任务后缀先剥掉：否则 "yolov8n-seg" 结尾是 g，规模（n/s/m）匹配不到，
+    # 架构名会整串落进 architecture_name、model_scale 为空
+    fname = re.sub(r"-(seg|pose|cls|obb|track)$", "", fname)
     m = re.match(r"^(.*?)([nsmlx])$", fname)
     if m and len(m.group(1)) > 1:
         arch, scale = m.group(1), m.group(2)
@@ -239,6 +249,8 @@ def main():
     parser.add_argument("--business", type=str, default="general", help="业务/算法类型（守门员按此隔离对比）")
     parser.add_argument("--baseline", type=str, default=None, help="上一代同业务生产模型 best.pt（守门员对比基准，可空=首版）")
     parser.add_argument("--baseline-model-id", type=str, default=None, help="上一代生产模型的 model_id（写入血缘）")
+    parser.add_argument("--library-root-id", type=str, default=None,
+                        help="所属算法库根记录 model_id：产出版本写入该字段，库详情据此聚合版本")
     # 2.4 跨代迁移训练（训练模块规范 §3.2.2）：源/目标架构不同时 strict=False 加载
     parser.add_argument("--migration-target", type=str, default=None,
                         help="目标架构（如 yolov8s.pt）：跨代迁移以目标架构建模型，strict=False 复用源 Backbone 层")
@@ -350,7 +362,7 @@ def main():
             except Exception as mig_e:
                 print(f"[Migration] 源权重复用失败（{mig_e}），"
                       f"使用目标架构预训练权重继续训练")
-            print(f"[Migration] Transfer complete. Proceeding with training.")
+            print("[Migration] Transfer complete. Proceeding with training.")
         else:
             model = YOLO(resume_path)
         
@@ -420,7 +432,7 @@ def main():
                   f"直接以 FP32 精度训练（跳过 AMP 自检，加快启动）")
 
         try:
-            results = _run_training(dict(train_kwargs))
+            _run_training(dict(train_kwargs))
         except Exception as amp_e:
             err_text = str(amp_e).lower()
             if ("invalid argument" in err_text or "errno 22" in err_text or "amp" in err_text
@@ -434,7 +446,7 @@ def main():
                 print(f"[{datetime.now().isoformat()}] AMP 检查未通过（{amp_e}），"
                       f"自动降级为 FP32 精度（amp=False）重新训练，避免任务直接失败...")
                 train_kwargs["amp"] = False
-                results = _run_training(train_kwargs)
+                _run_training(train_kwargs)
             else:
                 raise amp_e
         
@@ -490,7 +502,6 @@ def main():
                                                normalize_class_names(data_config.get("names", [])))
                 adopted_pt = Path(best_sel["weights"])
             except Exception as _sel_e:
-                import traceback as _tb
                 print(f"[{datetime.now().isoformat()}] 最优模型选择异常（回退 best.pt）: {_sel_e}")
                 best_sel = None
                 adopted_pt = best_pt
@@ -578,15 +589,23 @@ def main():
             gk["weight_selection"] = weight_selection_note
 
         status = "production_ready" if gk.get("promoted") else "rejected"
-        version = next_model_version(args.registry_dir, args.business)
+        version = next_model_version(args.registry_dir, args.business, args.library_root_id)
         print(f"[{datetime.now().isoformat()}] 守门员决策: {gk.get('result')} → 状态={status}, 版本={version}")
         print(f"[{datetime.now().isoformat()}] 守门员报告: {gk.get('report', '')}")
+
+        # 训练任务类型：ultralytics 按基座权重自动识别（yolov8n-seg.pt → segment）。
+        # 这里以前无条件写死 "detect"，导致分割模型档案被误标成检测，
+        # 后续按任务展示/筛选/导出全部会串，故改为取模型真实任务，取不到再按文件名兜底。
+        train_task = str(getattr(model, "task", "") or "").strip().lower()
+        if train_task not in ("detect", "segment", "pose", "classify", "obb"):
+            train_task = "segment" if "-seg" in str(args.model).lower() else "detect"
+        print(f"[{datetime.now().isoformat()}] 模型任务类型: {train_task}（基座: {args.model}）")
 
         model_meta = {
             "model_id": model_id,
             "job_id": args.job_id,
             "base_model": args.model,
-            "task": "detect",
+            "task": train_task,
             "classes": normalize_class_names(data_config.get("names", [])),
             "imgsz": args.imgsz,
             "epochs": args.epochs,
@@ -598,6 +617,8 @@ def main():
             "business": args.business,
             "status": status,
             "version": version,
+            # 算法库归属：继承基座模型所在库；无继承（直接用官方权重训练）时产出自身即库根
+            "library_root_id": args.library_root_id or model_id,
             "lineage": {
                 "parent_model_id": args.baseline_model_id,
                 "base_model": args.model,

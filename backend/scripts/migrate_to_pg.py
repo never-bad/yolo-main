@@ -4,10 +4,13 @@
     python scripts/migrate_to_pg.py            # 迁移 datasets/tasks/items/models/buckets
     python scripts/migrate_to_pg.py --dry       # 仅统计待迁移，不写库
     python scripts/migrate_to_pg.py --only tasks # 只迁移指定类别（datasets|tasks|models|buckets）
+    python scripts/migrate_to_pg.py --prune      # 迁移后删除真值文件已消失的 PG 行
 
 说明：
 - 迁移只涉及"元数据"，一图一 JSON 的标注内容文件保持不动
 - 服务器部署时同样在目标机执行本脚本即可完成元数据入库
+- --prune 的判据与 upsert 完全同源（按真值文件里的 *_id 取主键，目录名只作兜底），
+  因此"双写后的库"与"重灌+prune 后的库"逐行等价；不加 prune 时本脚本只增改不删。
 """
 import argparse
 import json

@@ -32,6 +32,16 @@
         </div>
         <small v-if="selectedDatasetIds.length > 1">✓ 已选 {{ selectedDatasetIds.length }} 个数据集，将聚合为同一训练任务（统一类别命名空间，自动按已标注导出训练）</small>
         <small v-else>提示：仅显示已标注的数据集；点击卡片可多选聚合训练（单数据集训练保持不变）</small>
+        <small v-if="!presetLibraryRootId && primaryLibraryId" class="lib-pick-info">
+          主数据集归属算法库「{{ libraryNameOf(primaryLibraryId) }}」——训练产出会作为该库的新版本
+        </small>
+        <small v-else-if="!presetLibraryRootId && selectedDatasetIds.length && !primaryLibraryId" class="lib-pick-info warn">
+          ⚠ 主数据集尚未归属算法库，产出库将由基座模型推断；建议先到「数据集」页点「去归属」补选
+        </small>
+        <small v-if="crossLibraryDatasets.length" class="lib-pick-info warn">
+          ⚠ 所选数据集中有 {{ crossLibraryDatasets.length }} 个属于其它算法库（{{ crossLibraryDatasets.map((d: any) => libraryNameOf(datasetLibraryId(d)) || '未归属').join('、') }}），
+          本次产出只归入主数据集所在的库
+        </small>
         <label class="aggregate-opt">
           <input type="checkbox" v-model="aggregateIncomplete" :disabled="training" />
           自动带入同业务「未完成训练」数据集（阶段1.4 雪球：上一轮不合格的一并合训）
@@ -103,13 +113,13 @@
             </div>
             <small>当前选择: {{ trainForm.model_name }}</small>
           </div>
-          <!-- 指定业务模型：模型库选择 + 跨代迁移入口二（§3.2.2） -->
+          <!-- 指定业务模型：算法库选择 + 跨代迁移入口二（§3.2.2） -->
           <div v-else class="form-group">
             <label>选择已有模型继续训练</label>
             <div class="select-with-refresh">
               <select v-model="trainForm.base_model_id" :disabled="loadingModels || training">
                 <option value="">-- 请选择模型 --</option>
-                <option v-for="model in models" :key="model.model_id" :value="model.model_id">
+                <option v-for="model in baseModelOptions" :key="model.model_id" :value="model.model_id">
                   {{ model.model_id }} ({{ model.classes?.length || 0 }} 类)
                 </option>
               </select>
@@ -158,6 +168,9 @@
           ⚠️ 已按「强制从零初始化」配置：<b>不使用任何预训练权重</b>，模型权重将随机初始化后开始训练。
         </div>
       </div>
+      <p v-if="effectiveLibraryName" class="auto-pick-info">
+        本次训练产出将归入算法库「{{ effectiveLibraryName }}」，训练完成后作为该库的新版本出现在库详情的「模型版本」中
+      </p>
       <div class="form-group">
         <label>训练节点（GPU）</label>
         <select v-model="trainForm.gpu_index" :disabled="training || !cudaAvailable">
@@ -706,15 +719,49 @@ const workersValue = computed(() => {
 // ===== 预训练权重开关（§3.2.1 从零训练 / §3.2.2 跨代迁移入口二） =====
 // 勾选「启用预训练权重」→ 二选一来源：
 //   universal（通用预训练）= 内置 YOLO 权重 / 自定义导入 .pt
-//   business（指定业务模型）= 从模型库历史最佳继续训练（含跨代迁移入口）
+//   business（指定业务模型）= 从算法库历史最佳继续训练（含跨代迁移入口）
 // 关闭开关 = 强制从零初始化（随机权重，无任何预训练）
 const pretrainEnabled = ref(true)
 const pretrainSource = ref<'universal' | 'business'>('universal')
+// 从算法库详情页「发起训练」跳转时带入的库 id（?library_root_id=xxx）：
+// 优先级最高；未带入时由主数据集的归属推导（见 effectiveLibraryRootId）
+const presetLibraryRootId = ref('')
 const isBusinessPretrain = computed(
   () => pretrainEnabled.value && pretrainSource.value === 'business'
 )
 
 const models = ref<any[]>([])
+// 数据集归属的算法库（库根记录 id）：导入页必选；老数据没写过该字段时退化到它挂的模型 id。
+// 悬空 id（模型记录已删除）不认，交给后端按基座模型推导，避免凭空生成一个新库
+const datasetLibraryId = (ds: any): string => {
+  const id = ds?.library_root_id || ds?.model_id || ''
+  if (!id) return ''
+  return models.value.some((m: any) => (m.library_root_id || m.model_id) === m.model_id && m.model_id === id)
+    ? id : ''
+}
+const libraryNameOf = (id: string): string => {
+  if (!id) return ''
+  const m = models.value.find((x: any) => x.model_id === id)
+  return m?.display_name || m?.model_code || id
+}
+// 主数据集（trainForm.dataset_id）归属的库
+const primaryLibraryId = computed(() => {
+  const main = datasets.value.find((d: any) => d.dataset_id === trainForm.value.dataset_id)
+  return main ? datasetLibraryId(main) : ''
+})
+// 本次产出的归属库：库详情页带入的库优先，其次按主数据集归属推导
+const effectiveLibraryRootId = computed(() => presetLibraryRootId.value || primaryLibraryId.value)
+const effectiveLibraryName = computed(() => libraryNameOf(effectiveLibraryRootId.value))
+// 多数据集聚合训练时，归属以主数据集为准；列出属于其它库的数据集用于页面提示
+const crossLibraryDatasets = computed(() => {
+  const root = effectiveLibraryRootId.value
+  if (!root || selectedDatasetIds.value.length <= 1) return []
+  return datasets.value.filter(
+    (d: any) => selectedDatasetIds.value.includes(d.dataset_id) && datasetLibraryId(d) !== root
+  )
+})
+// 可作为"继续训练的已有模型"的选项：排除算法库的空白占位记录（它没有权重文件，选了必然报错）
+const baseModelOptions = computed(() => models.value.filter((m: any) => !m.empty))
 const datasets = ref<any[]>([])
 const loadingDatasets = ref(false)
 const loadingModels = ref(false)
@@ -973,14 +1020,20 @@ const autoPickBaseModel = async () => {
   if (!models.value.length) {
     try { await loadModels() } catch (e) { return }
   }
+  // 从算法库详情页进来时，只在本库的版本里挑基座（产出会归入本库，不该借别的库的权重）
+  const inScope = (m: any) => presetLibraryRootId.value
+    ? (m.library_root_id || m.model_id) === presetLibraryRootId.value
+    : m.business === biz
   const candidates = models.value.filter(
-    (m: any) => m.business === biz && m.status === 'production_ready'
+    (m: any) => !m.empty && inScope(m) && m.status === 'production_ready'
   ).sort((a: any, b: any) => numOfVersion(b.version) - numOfVersion(a.version))
   if (candidates.length) {
     trainForm.value.base_model_id = candidates[0].model_id
-    autoPickInfo.value = `✓ 已自动匹配同业务「${bizLabel(biz)}」的已训练模型 ${candidates[0].model_id}（可改选其它）`
+    autoPickInfo.value = `✓ 已自动匹配${presetLibraryRootId.value ? '本算法库' : `同业务「${bizLabel(biz)}」`}的已训练模型 ${candidates[0].model_id}（可改选其它）`
   } else {
-    autoPickInfo.value = `同业务「${bizLabel(biz)}」暂无已训练的生产模型，可手动选择任意模型`
+    autoPickInfo.value = presetLibraryRootId.value
+      ? '本算法库暂无可选为基座的版本，将直接以官方预训练权重训练并归入本库'
+      : `同业务「${bizLabel(biz)}」暂无已训练的生产模型，可手动选择任意模型`
   }
 }
 watch(
@@ -1164,7 +1217,9 @@ const startTraining = async () => {
         ? trainForm.value.migration_target_model : undefined,
       // 阶段1.3/1.4：多选聚合 + 未完成回收
       dataset_ids: selectedDatasetIds.value.length > 1 ? [...selectedDatasetIds.value] : undefined,
-      aggregate_incomplete: aggregateIncomplete.value ? true : undefined
+      aggregate_incomplete: aggregateIncomplete.value ? true : undefined,
+      // 算法库归属：库详情页发起训练时带入，否则由主数据集的归属推导，使产出成为该库的新版本
+      library_root_id: effectiveLibraryRootId.value || undefined
     }
     
     const result = await createTrainJob(params)
@@ -1254,7 +1309,9 @@ const retrainJob = async (job: any) => {
       // 阶段1.3：聚合任务重跑时带原始数据集列表
       ...(Array.isArray(job.dataset_ids) && job.dataset_ids.length > 1
         ? { dataset_ids: job.dataset_ids }
-        : {})
+        : {}),
+      // 重跑保持原任务的算法库归属（产出仍落在同一个库下）
+      library_root_id: job.library_root_id || undefined
     }
     const result = await createTrainJob(params)
     restoreScroll(prevScrollY)
@@ -1780,6 +1837,9 @@ const loadJobs = async () => {
 onMounted(async () => {
   loadJobs()
   loadModels()
+  // 算法库详情页「发起训练」跳转：记住归属库，产出自动成为该库的新版本
+  const libQ = route.query.library_root_id
+  if (typeof libQ === 'string' && libQ) presetLibraryRootId.value = libQ
   // 1.7 模型仓库跳转：/train?dataset_ids=ds1,ds2 自动预选聚合
   const q = route.query.dataset_ids
   if (typeof q === 'string' && q) {
@@ -1888,6 +1948,19 @@ onUnmounted(() => {
 .auto-pick-info {
   font-size: 0.8rem;
   color: #27ae60;
+}
+
+/* 数据集归属算法库提示（产出归库 / 跨库聚合 / 未归属） */
+.lib-pick-info {
+  display: block;
+  margin-top: 0.3rem;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  color: #27ae60;
+}
+
+.lib-pick-info.warn {
+  color: #e67e22;
 }
 
 .adv-grid .form-group {

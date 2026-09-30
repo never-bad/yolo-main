@@ -21,6 +21,8 @@ from pathlib import Path
 from PIL import Image
 
 from src.core.settings import settings
+# 分割轮廓工具：导入外部标注包时必须保留轮廓，否则会被静默截成矩形框
+from src.services.annotation_service import clean_polygon, strip_ann_bbox
 
 # 支持的图片后缀（与 dataset_service 保持一致）
 IMG_SUFFIX = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -150,7 +152,8 @@ def _write_ann(root: Path, image_id: str, image_abs: Path, width: int, height: i
         "ai_annotated": False,
     }
     # dataset_id / version / model_id 由 prepare 阶段回填
-    _save_json(root / "annotations" / f"{image_id}.json", data)
+    # 带轮廓的框只留轮廓点（与平台内标注同一存储形态：分割不存矩形）
+    _save_json(root / "annotations" / f"{image_id}.json", strip_ann_bbox(data))
     return True
 
 
@@ -207,10 +210,23 @@ def _import_coco(root: Path) -> dict:
             if "bbox" not in ann or "category_id" not in ann:
                 continue
             x, y, w, h = [float(v) for v in ann["bbox"]]
-            rec["boxes"].append({
+            box = {
                 "class_id": cat_id_to_idx.get(int(ann["category_id"]), 0),
                 "x1": x, "y1": y, "x2": x + w, "y2": y + h,
-            })
+            }
+            # 分割轮廓：COCO 的 segmentation 是"按图片宽高归一化"的扁平坐标
+            # polygon 形式 [[x1,y1,x2,y2,...], ...]；RLE（iscrowd=1）需要额外依赖，按矩形导入
+            iw, ih = rec["width"], rec["height"]
+            seg = ann.get("segmentation")
+            if iw > 0 and ih > 0 and isinstance(seg, list) and seg and isinstance(seg[0], list):
+                # 同一目标被拆成多块时取点数最多的主块（RLE/噪点块不在此列）
+                flat = [float(v) for v in max(seg, key=lambda s: len(s))]
+                pts = [[round(flat[i] * iw, 2), round(flat[i + 1] * ih, 2)]
+                       for i in range(0, len(flat) - 1, 2)]
+                poly = clean_polygon(pts)
+                if poly:
+                    box["polygon"] = poly
+            rec["boxes"].append(box)
 
     # 写盘 & 统计
     annotated = 0
@@ -296,11 +312,18 @@ def _import_labelme(root: Path) -> dict:
                 continue
             xs = [pt[0] for pt in pts]
             ys = [pt[1] for pt in pts]
-            boxes.append({
+            box = {
                 "class_id": classes.index(label),
                 "x1": min(xs), "y1": min(ys),
                 "x2": max(xs), "y2": max(ys),
-            })
+            }
+            # 多边形标注（labelme 的分割）必须保留轮廓；line/linestrip 是开折线，不能当闭合轮廓
+            stype = str(shp.get("shape_type", "")).lower()
+            if len(pts) >= 3 and stype in ("polygon", ""):
+                poly = clean_polygon([[float(pt[0]), float(pt[1])] for pt in pts])
+                if poly:
+                    box["polygon"] = poly
+            boxes.append(box)
 
         matched_images += 1
         if _write_ann(root, img_abs.stem, img_abs, w, h, boxes, classes_known=bool(classes)):

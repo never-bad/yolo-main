@@ -5,14 +5,12 @@ export interface UpdateDatasetRequest {
   tags?: string[]
 }
 
-export const uploadDataset = async (file: File, modelId?: string | null, modelCode?: string | null) => {
+/** 上传数据集压缩包；modelId 为归属的算法库（必填，后端会换算成库根记录） */
+export const uploadDataset = async (file: File, modelId: string) => {
   const formData = new FormData()
   formData.append('file', file)
-  const params: Record<string, string> = {}
-  if (modelCode) params.model_code = modelCode
-  else if (modelId) params.model_id = modelId
   const { data } = await api.post('/datasets/upload', formData, {
-    params: Object.keys(params).length ? params : undefined
+    params: { model_id: modelId }
   })
   return data
 }
@@ -50,15 +48,45 @@ export const sealDataset = async (datasetId: string, force: boolean = false, spl
   return data
 }
 
+// 审核通过：人工确认标注无误后标记，之后才允许自动灌桶/封板
+export const approveDatasetReview = async (datasetId: string) => {
+  const { data } = await api.post(`/datasets/${datasetId}/approve`)
+  return data
+}
+
+// 撤回：把已灌入接收桶但未封板的图片退回，恢复可编辑
+export const unpourDatasetBucket = async (datasetId: string) => {
+  const { data } = await api.post(`/datasets/${datasetId}/unpour`)
+  return data
+}
+
 // 2.1 入料校验：手动重新执行标注格式校验
 export const validateDataset = async (datasetId: string) => {
   const { data } = await api.post(`/datasets/${datasetId}/validate`)
   return data
 }
 
-// 1.7 模型仓库：绑定/解绑数据集到模型（model_id 传 null 表示解绑）
-export const bindDatasetModel = async (datasetId: string, modelId: string | null) => {
-  const { data } = await api.put(`/datasets/${datasetId}/model`, { model_id: modelId })
+// 挂载前校验：数据集换绑到某算法库后，已标注类别的序号会不会错位（同类别排不同序号 = 会串号）
+export interface BindCheckResult {
+  dataset_id: string
+  target_library_id: string
+  target_names: string[]
+  annotated_images: number
+  verifiable: boolean
+  conflict: boolean
+  summary: string
+  blocking: { class_id: number | string; english_code: string; want_index: number | null; actual_index: number; images: number; boxes: number; reason: string }[]
+  warnings: { class_id: number | string; english_code: string; images: number; boxes: number; reason: string }[]
+}
+
+export const checkDatasetBind = async (datasetId: string, modelId: string): Promise<BindCheckResult> => {
+  const { data } = await api.get(`/datasets/${datasetId}/bind-check`, { params: { model_id: modelId } })
+  return data
+}
+
+// 1.7 模型仓库：绑定/解绑数据集到模型（model_id 传 null 表示解绑；force 用于确认串号风险后放行）
+export const bindDatasetModel = async (datasetId: string, modelId: string | null, force = false) => {
+  const { data } = await api.put(`/datasets/${datasetId}/model`, { model_id: modelId, force })
   return data
 }
 

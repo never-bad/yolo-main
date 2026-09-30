@@ -18,7 +18,12 @@ from typing import Optional
 from fastapi import UploadFile
 from src.core.settings import settings
 from src.utils.fs_tree import build_tree
+from src.utils.class_labels import model_class_names, merge_classes_with_model
+from src.utils.class_labels import is_placeholder_classes as _is_placeholder_names
 from src.services.annotation_importers import import_external_annotations
+from src.services.annotation_service import (
+    decode_yolo_line, yolo_label_line, clean_polygon, polygon_to_bbox, strip_ann_bbox, boxes_with_bbox,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -320,10 +325,12 @@ class DatasetService:
         self.uploads_dir = settings.UPLOADS_DIR
         self._bucket_state = None  # advance 期间持有的桶账本（跨 _seal_receiving_bucket 使用）
 
-    async def upload_dataset(self, file: UploadFile, model_id: str = None):
+    async def upload_dataset(self, file: UploadFile, model_id: str = None, library_root_id: str = None):
         """上传数据集压缩包（zip / tar / tar.gz / tgz）
 
         model_id: 归属模型（1.7 模型仓库：数据挂到对应模型下）；为空则由后续采集/绑定流程归属
+        library_root_id: 归属算法库的根记录 id；训练产出未显式指定库时以此为准。
+                         为空时由调用方按 model_id 反查（模型自身即库根时取自身）
         """
         dataset_id = f"ds_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         dataset_dir = self.datasets_dir / dataset_id
@@ -353,13 +360,33 @@ class DatasetService:
             "trained_at": None,
             "last_trained_round": 0,
             "model_id": model_id,
+            # 归属算法库（库根记录 id）：训练未显式指定库时，产出继承这个库
+            "library_root_id": library_root_id,
         }
         
         meta_path = dataset_dir / "meta.json"
         await asyncio.to_thread(_save_json, meta_path, meta)
         
+        from src.db import shadow
+        await shadow.sync_dataset(dataset_id)
         return meta
     
+    async def _rollback_model_binding_on_prepare_failure(self, meta_path: Path):
+        """准备失败 → 解除数据集与模型的挂载（失败的不留半成品在算法库，省去手动删）。"""
+        try:
+            if not await asyncio.to_thread(lambda: meta_path.exists()):
+                return
+            meta = await asyncio.to_thread(_load_json, meta_path)
+            if meta.get("model_id"):
+                meta["model_id"] = None
+                await asyncio.to_thread(_save_json, meta_path, meta)
+                if settings.PG_ENABLED:
+                    from src.db import meta_store
+                    await meta_store.upsert_dataset(meta)
+                logger.info("prepare failed: unbound dataset from model (clean rollback)")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"prepare failure rollback unbind failed: {e}")
+
     async def prepare_dataset(self, dataset_id: str, split_ratio: dict, classes: list = None):
         """准备数据集"""
         t0 = time.time()
@@ -397,7 +424,11 @@ class DatasetService:
         # 按 meta 记录的文件名找到上传的压缩包并解压（兼容旧版本固定 .zip 命名）
         archive_name = meta.get("archive") or f"{dataset_id}.zip"
         archive_path = self.uploads_dir / archive_name
-        await asyncio.to_thread(_extract_archive, archive_path, version_dir)
+        try:
+            await asyncio.to_thread(_extract_archive, archive_path, version_dir)
+        except Exception:
+            await self._rollback_model_binding_on_prepare_failure(meta_path)
+            raise
         t_extract = time.time()
         logger.info(f"prepare {dataset_id}: extract took {t_extract - t0:.1f}s")
         
@@ -406,38 +437,48 @@ class DatasetService:
         #    产物 images/（平铺）+ annotations/{image_id}.json + classes.txt，跳过重组
         detected_classes = classes or []
         model_id_ds = str(meta.get("model_id", "") or "")
+        # 归属算法库兜底：老数据只写了 model_id，这里按库根补齐 library_root_id，
+        # 使「从训练页发起的训练」也能识别产出应归入哪个库
+        if model_id_ds and not meta.get("library_root_id"):
+            meta["library_root_id"] = self._library_root_id_of(model_id_ds)
         # 目标模型标签空间（模型标签字典英文码），用于 txt 类名重映射 / 冗余类过滤
         model_labels = self._labels_from_model(model_id_ds) if model_id_ds else []
         # 类别是否来自包内（用户显式传 / 包内类别文件 / 标签推断）：
         # 只有包内来源才是可信的"源类名列表"，可与模型标签做交集过滤；模型回填不算
         classes_from_package = bool(classes)
-        import_result = await asyncio.to_thread(
-            import_external_annotations, version_dir, dataset_id, version, model_id_ds
-        )
-        external_format = import_result["format"]
-        if external_format:
-            has_labels = import_result["annotated"] > 0
-            logger.info(
-                f"prepare {dataset_id}: external format '{external_format}' imported "
-                f"annotated={import_result['annotated']}/{import_result['images']}"
+        # 解压内容导入/重组统一兜底：任一步失败 → 解除模型挂载（准备失败不留半成品挂载）
+        has_labels = None
+        try:
+            import_result = await asyncio.to_thread(
+                import_external_annotations, version_dir, dataset_id, version, model_id_ds
             )
-            if import_result["errors"]:
-                logger.warning(f"prepare {dataset_id}: import errors={len(import_result['errors'])}")
-        else:
-            # 1) 已符合 images/{train,val,test}(+labels) 标准结构 → 保持原样
-            # 2) 其他任意目录（图片与标注同目录 / labels 子目录 / 原始无标注数据集等）
-            #    → 自动重组为 images/{train,val,test} + labels/{train,val,test} 标准结构
-            is_standard = await asyncio.to_thread(self._is_standard_structure, version_dir)
-            if not is_standard:
-                # 重组前先从解压内容中读取类别（zip 自带的 classes.txt / data.yaml），
-                # 供重组阶段写 classes.txt 使用（重组会清理原目录）
-                if not detected_classes:
-                    detected_classes = await asyncio.to_thread(self._load_classes_from_files, version_dir) or []
-                    classes_from_package = True
-                has_labels = await asyncio.to_thread(self._reorganize_dataset, version_dir, split_ratio, detected_classes)
-                logger.info(f"reorganized dataset {dataset_id}: standard structure, has_labels={has_labels}")
+            external_format = import_result["format"]
+            if external_format:
+                has_labels = import_result["annotated"] > 0
+                logger.info(
+                    f"prepare {dataset_id}: external format '{external_format}' imported "
+                    f"annotated={import_result['annotated']}/{import_result['images']}"
+                )
+                if import_result["errors"]:
+                    logger.warning(f"prepare {dataset_id}: import errors={len(import_result['errors'])}")
             else:
-                has_labels = None  # 标准结构：标注情况由下方 label_count 决定
+                # 1) 已符合 images/{train,val,test}(+labels) 标准结构 → 保持原样
+                # 2) 其他任意目录（图片与标注同目录 / labels 子目录 / 原始无标注数据集等）
+                #    → 自动重组为 images/{train,val,test} + labels/{train,val,test} 标准结构
+                is_standard = await asyncio.to_thread(self._is_standard_structure, version_dir)
+                if not is_standard:
+                    # 重组前先从解压内容中读取类别（zip 自带的 classes.txt / data.yaml），
+                    # 供重组阶段写 classes.txt 使用（重组会清理原目录）
+                    if not detected_classes:
+                        detected_classes = await asyncio.to_thread(self._load_classes_from_files, version_dir) or []
+                        classes_from_package = True
+                    has_labels = await asyncio.to_thread(self._reorganize_dataset, version_dir, split_ratio, detected_classes)
+                    logger.info(f"reorganized dataset {dataset_id}: standard structure, has_labels={has_labels}")
+                else:
+                    has_labels = None  # 标准结构：标注情况由下方 label_count 决定
+        except Exception:
+            await self._rollback_model_binding_on_prepare_failure(meta_path)
+            raise
         t_reorganize = time.time()
         logger.info(f"prepare {dataset_id}: reorganize/scan took {t_reorganize - t_extract:.1f}s")
         
@@ -446,6 +487,7 @@ class DatasetService:
         labels_dir = await asyncio.to_thread(self._find_labels_dir, version_dir)
         
         if not images_dir:
+            await self._rollback_model_binding_on_prepare_failure(meta_path)
             raise ValueError("No images directory found in dataset")
         
         # 统计图片和标签（在线程中执行；单遍遍历，避免三次 rglob 全盘扫描）
@@ -485,6 +527,26 @@ class DatasetService:
             if detected_classes:
                 logger.info(f"prepare {dataset_id}: classes backfilled from model {model_id_ds}: {detected_classes}")
 
+        # 包内只有类别号、没有类名（平台编的占位名 class_N）时，用归属模型的标签字典补真名。
+        # 不补的后果是连锁的：占位名被当成"包内可信类名"去和模型标签做名称匹配，
+        # 而 "class_0" 永远撞不上字典里的 "fall" → class_map 为 None → 不重映射、
+        # 类别空间也不收敛，于是数据集明明归在跌倒库下、classes 却还是 ["class_0"]。
+        # 只有类数对得上才按位置对齐（_detect_classes 会把空洞补成 0..max，位置即类号）；
+        # 对不齐就宁可留占位名等人工改名，绝不猜——猜错等于把整批标注挂到别的标签上。
+        if self._is_placeholder_classes(detected_classes) and model_labels:
+            if len(detected_classes) == len(model_labels):
+                logger.info(
+                    f"prepare {dataset_id}: placeholder classes {detected_classes} "
+                    f"replaced by model {model_id_ds} labels {model_labels}"
+                )
+                detected_classes = list(model_labels)
+            else:
+                logger.warning(
+                    f"prepare {dataset_id}: 包内无类名（{len(detected_classes)} 个占位类），"
+                    f"与模型 {model_id_ds} 的 {len(model_labels)} 个标签数量对不上，"
+                    f"保留占位名等待人工改名"
+                )
+
         # 多模型上传自动匹配（#3）：未归属 + 包内类别可信（txt/yaml/classes.txt 来源）→
         # 按类名匹配已有模型（先分配后过滤：后续 class_map 只保留本模型标签空间）；
         # 匹配不到 → 保持未归属进入「未归属数据集」列表（兜底，可在模型详情页手动绑定）
@@ -498,6 +560,8 @@ class DatasetService:
                     mcfg = {}
                 meta["model_id"] = matched_id
                 model_id_ds = matched_id
+                from src.services.model_service import ModelService
+                meta["library_root_id"] = ModelService().resolve_library_root_id(matched_id)
                 model_labels = self._labels_from_model(matched_id) or []
                 auto_match = {
                     "model_id": matched_id,
@@ -584,6 +648,9 @@ class DatasetService:
                     ModelService().init_labels_from_classes, model_id_ds, detected_classes
                 )
                 if wrote:
+                    # 影子库收口：init_labels_from_classes 同时改写 model.json 与 labels_dict.json
+                    from src.db import shadow
+                    await shadow.sync_model(model_id_ds)
                     logger.info(
                         f"prepare {dataset_id}: model {model_id_ds} labels dict "
                         f"auto-generated: {detected_classes}"
@@ -628,6 +695,8 @@ class DatasetService:
         meta["annotation_task_id"] = (auto_task or {}).get("task_id")
 
         await asyncio.to_thread(_save_json, meta_path, meta)
+        from src.db import shadow
+        await shadow.sync_dataset(dataset_id)
 
         logger.info(f"prepare {dataset_id} done: total {time.time() - t0:.1f}s, images={image_count}, labels={label_count}")
 
@@ -835,18 +904,30 @@ class DatasetService:
             except:
                 continue
         
-        # 生成默认类别名
-        max_id = max(class_ids) if class_ids else 0
+        # 一个类别号都没扫到（labels 目录为空 / txt 全是空文件）时必须返回空列表：
+        # 这里若兜底成 ["class_0"]，无标签的数据集就会被判定成"包内有一个可信类别
+        # class_0"，从而跳过后面按归属模型补类别的分支，类别空间被假名字占死。
+        if not class_ids:
+            return []
+        max_id = max(class_ids)
         return [f"class_{i}" for i in range(max_id + 1)]
 
-    def _check_yolo_line(self, parts: list, nc: int):
-        """校验单行 YOLO 标注（class x y w h），返回 (ok, err_msg)
+    @staticmethod
+    def _is_placeholder_classes(classes: list) -> bool:
+        """类别列表全是平台编出来的占位名（class_0…）→ True，说明包内根本没带类名。"""
+        return _is_placeholder_names(classes)
 
-        - 必须恰好 5 列；class 为 [0, nc) 内整数；坐标均为 [0,1] 归一化浮点
+    def _check_yolo_line(self, parts: list, nc: int):
+        """校验单行 YOLO 标注，返回 (ok, err_msg)
+
+        - 检测行：恰好 5 列 (class cx cy w h)
+        - 分割行：类别之后全是成对顶点，即 7/9/11… 列（总列数必须是奇数且 ≥7）
+          平台历史导出的 "class cx cy w h + 顶点" 同样是奇数列，一并放行（读入口兼容）
+        - class 为 [0, nc) 内整数；坐标均为 [0,1] 归一化浮点
         - 允许 1e-3 数值容差（第三方工具常有 -0.0001 / 1.0001 这类边界抖动）
         """
-        if len(parts) != 5:
-            return False, f"{len(parts)} 列 ≠ 5 列(class x y w h)"
+        if len(parts) != 5 and (len(parts) < 7 or len(parts) % 2 == 0):
+            return False, f"{len(parts)} 列非法（应为 5 列检测行，或 ≥7 列的奇数列分割行）"
         try:
             cid = int(float(parts[0]))
         except ValueError:
@@ -909,12 +990,17 @@ class DatasetService:
         }
     
     def _resolve_real_classes(self, dataset_dir: Path, meta: dict) -> list:
-        """将占位类别名（class_N）回填为真实类别名
+        """解析数据集对外展示的类别清单：算法库标签字典（实时）> 包内类别文件 > 快照。
 
-        历史数据 prepare 时可能因未读到类别文件而生成了 class_0/class_1 等占位名。
-        若目录中存在真实类别文件（classes.txt / coco.names / names.txt），则按行读取并回填。
+        - 归属算法库的标签字典是实时源（#6）：库侧新增/改名标签后页面立即跟随，
+          不需要重新准备数据集，也不回写存量快照（按 index 合并、绝不截断）。
+        - 历史数据 prepare 时可能因未读到类别文件而生成了 class_0/class_1 等占位名，
+          若目录中存在真实类别文件（classes.txt / coco.names / names.txt）则按行回填。
         """
         classes = meta.get("classes") or []
+        live = merge_classes_with_model(classes, model_class_names(meta.get("model_id") or ""))
+        if live != classes:
+            return live
         if not classes:
             return classes
         # 仅当全部是占位名时才回填（避免覆盖用户自定义的真实类别名）
@@ -989,15 +1075,11 @@ class DatasetService:
                 with open(lp, "r", encoding="utf-8") as f:
                     for line in f:
                         parts = line.strip().split()
-                        if len(parts) < 5:
-                            continue
-                        cid = int(float(parts[0]))
-                        cx, cy, bw, bh = [float(v) for v in parts[1:5]]
-                        boxes.append({
-                            "class_id": cid,
-                            "x1": (cx - bw / 2) * w, "y1": (cy - bh / 2) * h,
-                            "x2": (cx + bw / 2) * w, "y2": (cy + bh / 2) * h,
-                        })
+                        # decode_yolo_line 同时认"官方分割行（类别后全是顶点）/ 检测行 /
+                        # 平台旧导出行"，轮廓必须带进 JSON，否则外部包会被静默截成矩形框
+                        box = decode_yolo_line(parts, w, h)
+                        if box:
+                            boxes.append(box)
             except Exception:
                 continue
             if boxes:
@@ -1065,7 +1147,7 @@ class DatasetService:
                 "sample_reasons": [],
                 "boxes": boxes,  # class_id 数字索引（已映射到目标模型空间）+ 像素框
             }
-            _save_json(ann_dir / f"{rec['image_id']}.json", doc)
+            _save_json(ann_dir / f"{rec['image_id']}.json", strip_ann_bbox(doc))
             converted += 1
         return {"converted": converted, "dropped_boxes": dropped_boxes}
 
@@ -1093,6 +1175,28 @@ class DatasetService:
             return 0
         return len(list(ann_dir.glob("*.json")))
 
+    def _annotation_stats(self, dataset_dir: Path) -> tuple:
+        """一次遍历标注目录，返回 (有框图片数, 标注文件总数)。
+
+        封板要同时知道两件事：能不能封板（有框/有标签文件）和
+        有没有可转换的标注源（存在标注文件即可，空白标注也要转成 0 字节 txt）。
+        合并成一次扫描，避免 seal 路径上重复遍历。
+        """
+        ann_dir = dataset_dir / "annotations"
+        if not ann_dir.exists():
+            return 0, 0
+        with_boxes = 0
+        total = 0
+        for p in ann_dir.glob("*.json"):
+            total += 1
+            try:
+                data = _load_json(p)
+            except Exception:
+                continue
+            if data.get("boxes"):
+                with_boxes += 1
+        return with_boxes, total
+
     def _labels_from_model(self, model_id: str) -> list:
         """从模型标签字典（labels_dict.json）读取类别英文码列表（按 index 排序）。
 
@@ -1112,6 +1216,14 @@ class DatasetService:
         except Exception as e:
             logger.warning(f"_labels_from_model {model_id} failed: {e}")
             return []
+
+    @staticmethod
+    def _library_root_id_of(model_id: str):
+        """模型 id → 所属算法库根记录 id（换算规则由 ModelService 统一维护）。"""
+        if not model_id:
+            return None
+        from src.services.model_service import ModelService
+        return ModelService().resolve_library_root_id(model_id)
 
     @staticmethod
     def _norm_cls(name: str) -> str:
@@ -1139,14 +1251,13 @@ class DatasetService:
                 continue
             try:
                 labels = self._labels_from_model(model_dir.name)
-                mcfg = _load_json(mf)
             except Exception:
                 continue
             label_set = {self._norm_cls(c) for c in labels if str(c).strip()}
             if not label_set:
-                continue
-            if mcfg.get("empty"):
-                continue  # 空白模型无标签空间，不参与自动匹配
+                continue  # 无标签空间（含刚建好还没配标签的算法库）不参与自动匹配
+            # 判据只看标签字典是否为空，不要按 empty 跳过：empty 的语义是
+            # 「算法库占位记录」，而库根恰恰是数据集应当归属的对象（见 library_root_id）。
             cover = len(base & label_set) / len(base)
             if cover >= 1.0:
                 return model_dir.name  # 完全覆盖：立即命中
@@ -1157,30 +1268,182 @@ class DatasetService:
         return None
 
     def _resolve_seal_names(self, meta: dict) -> list:
-        """解析封板 data.yaml 的类别名：优先模型标签字典英文码，缺省回退 meta.classes"""
-        model_id = meta.get("model_id") or ""
-        if model_id:
-            try:
-                dic = _load_json(settings.REGISTRY_DIR / model_id / "labels_dict.json")
-                labels = dic.get("labels") or []
-                if labels:
-                    names = [
-                        (lbl.get("english_code") or lbl.get("chinese_name") or "").strip()
-                        for lbl in sorted(labels, key=lambda x: x.get("index", 0))
-                    ]
-                    if any(names):
-                        return names
-            except Exception:
-                pass
-        return meta.get("classes") or []
+        """解析封板 data.yaml 的类别名：优先模型标签字典英文码，缺省回退 meta.classes。
 
-    def _build_training_artifacts(self, dataset_dir: Path, meta: dict, split_ratio: dict, out_dir: Path = None) -> dict:
+        - 走 class_labels.model_class_names：按 index 定位（缺名补占位、绝不跳行），
+          自身目录无字典时回退到所属算法库根，与页面展示同一口径（#6）。
+        - 字典比数据集快照短时不截断，尾部沿用 meta.classes
+          （截断会让已落盘的 class_id 越界）。
+        - 字典全是占位名（未配真名）时不覆盖数据集里的真实类名。
+        """
+        names = model_class_names(meta.get("model_id") or "")
+        if not names or _is_placeholder_names(names):
+            return meta.get("classes") or []
+        return merge_classes_with_model(meta.get("classes") or [], names)
+
+    # ---------- 跨库挂载校验（同类别但序号不同 → 封板会静默串号） ----------
+    def _label_shift_report(self, triples: list, names: list, old_classes: list) -> tuple:
+        """比对「标注框已落盘的类别序号」与「目标类别顺序」，找出会串号的类别。
+
+        原理：每图标注 JSON 里每个框同时存了 class_id（数字序号，封板时原样写进 YOLO txt）
+        与 english_code（标注当时的语义）。YOLO 只认数字，数字代表哪一类完全由
+        data.yaml 的 names 顺序决定 —— 所以只要换到一个「有同名类别但排在不同序号」的
+        算法库，框就会被认成别的类，而且不报错。
+
+        triples:     [(class_id, english_code, image_id), ...]  每个标注框一条
+        names:       目标顺序的类别名列表（下标即 YOLO 类别号）
+        old_classes: 数据集自己的 classes（数字序号当初就是按它排的），
+                     框上没有 english_code 的老数据用它兜底判语义
+
+        返回 (blocking, unknown)：
+        - blocking: 可证明错位（序号越界 / 同名类别两边序号不同 / 名字类找不到位置）→ 需确认才放行
+        - unknown:  框上的类别名在目标字典里根本不存在 → 训练时会被剔除，只提醒不拦
+        """
+        names = [str(n or "").strip() for n in (names or [])]
+        old_classes = [str(n or "").strip() for n in (old_classes or [])]
+        pos = {}  # 归一化类名 → 目标序号
+        for i, nm in enumerate(names):
+            if nm:
+                pos.setdefault(self._norm_cls(nm), i)
+        lower_names = {str(nm).lower() for nm in names if nm}
+
+        # 按「YOLO 序号」聚合（一个序号一条结论），统计受影响的图片数与框数
+        groups = {}
+        for cid, ec, img_id in triples:
+            numeric = isinstance(cid, int) or (isinstance(cid, str) and str(cid).isdigit())
+            key = (numeric, int(cid) if numeric else str(cid or ""))
+            g = groups.setdefault(key, {"codes": set(), "images": set(), "boxes": 0})
+            if (ec or "").strip():
+                g["codes"].add(str(ec).strip())
+            g["images"].add(img_id)
+            g["boxes"] += 1
+
+        def _sort_key(k):
+            return (0, k[1], "") if k[0] else (1, 0, k[1])
+
+        blocking, unknown = [], []
+        for (numeric, cid) in sorted(groups, key=_sort_key):
+            g = groups[(numeric, cid)]
+            n_images, n_boxes = len(g["images"]), g["boxes"]
+            if not numeric:
+                # 框上存的是类别名（历史 JSON）：按名字找位置，找不到会被写成第 0 类
+                if str(cid).lower() in lower_names:
+                    continue
+                blocking.append({
+                    "class_id": str(cid), "english_code": str(cid), "want_index": None,
+                    "actual_index": 0, "images": n_images, "boxes": n_boxes,
+                    "reason": f"标注里的类别「{cid}」在新库字典里找不到位置，封板会被写成第 0 类"
+                              f"（即「{names[0] if names else '空'}」），影响 {n_images} 张图 / {n_boxes} 个框",
+                })
+                continue
+            idx = cid
+            srcs = sorted(g["codes"]) or (
+                [old_classes[idx]] if idx < len(old_classes) and old_classes[idx] else [])
+            if idx >= len(names) or not names[idx]:
+                blocking.append({
+                    "class_id": idx, "english_code": "、".join(srcs), "want_index": None,
+                    "actual_index": idx, "images": n_images, "boxes": n_boxes,
+                    "reason": f"第 {idx} 类「{'、'.join(srcs) or '未知'}」超出新库字典范围"
+                              f"（新库只有 {len(names)} 类），影响 {n_images} 张图 / {n_boxes} 个框",
+                })
+                continue
+            if not srcs:
+                continue  # 老数据既没英文名也没 classes：语义无从考证，不冤枉拦
+            wants = {s: pos.get(self._norm_cls(s)) for s in srcs}
+            shift = [w for w in wants.values() if w is not None and w != idx]
+            if shift:
+                blocking.append({
+                    "class_id": idx, "english_code": "、".join(srcs), "want_index": shift[0],
+                    "actual_index": idx, "images": n_images, "boxes": n_boxes,
+                    "reason": f"类别「{'、'.join(srcs)}」在这个数据集里是第 {idx} 类，"
+                              f"新库字典里排第 {shift[0]} 类；封板会原样写 {idx}，"
+                              f"训练时这 {n_images} 张图的框会被当成「{names[idx]}」",
+                })
+            missing = [s for s, w in wants.items() if w is None]
+            if missing:
+                unknown.append({
+                    "class_id": idx, "english_code": "、".join(missing),
+                    "images": n_images, "boxes": n_boxes,
+                    "reason": f"类别「{'、'.join(missing)}」在新库字典里不存在，训练时这些框会被剔除",
+                })
+        return blocking, unknown
+
+    @staticmethod
+    def _conflict_summary(blocking: list, unknown: list) -> str:
+        """把校验结果拼成大白话（弹窗确认文案 / 后端拒绝提示都用它）"""
+        lines = []
+        if blocking:
+            lines.append(f"有 {len(blocking)} 个类别的序号会对不上（封板后这些框会被认成别的类）：")
+            for it in blocking[:3]:
+                lines.append("· " + it["reason"])
+            if len(blocking) > 3:
+                lines.append(f"· ……另有 {len(blocking) - 3} 个类别同样对不上")
+        if unknown:
+            codes = "、".join(str(it.get("english_code") or it.get("class_id")) for it in unknown[:5])
+            lines.append(f"提示：{codes} 在新库字典里没有，训练时这些框会被自动剔除")
+        return "\n".join(lines)
+
+    def _collect_label_triples(self, dataset_dir: Path) -> tuple:
+        """扫描每图标注 JSON → ([(class_id, english_code, image_id), ...], 有框图片数)"""
+        triples, imgs = [], set()
+        ann_dir = dataset_dir / "annotations"
+        if ann_dir.is_dir():
+            for p in ann_dir.glob("*.json"):
+                try:
+                    data = _load_json(p)
+                except Exception:
+                    continue
+                boxes = data.get("boxes")
+                if not boxes:
+                    continue
+                img_id = data.get("image_id") or p.stem
+                imgs.add(img_id)
+                for b in boxes:
+                    triples.append((b.get("class_id"), b.get("english_code") or "", img_id))
+        return triples, len(imgs)
+
+    def _bind_conflict_sync(self, dataset_dir: Path, meta: dict, root_id: str) -> dict:
+        """挂载冲突检查（同步实现）：把数据集已有标注对到目标库字典的序号上比一遍。"""
+        names = self._resolve_seal_names({"model_id": root_id, "classes": meta.get("classes") or []})
+        triples, n_imgs = self._collect_label_triples(dataset_dir)
+        out = {
+            "dataset_id": meta.get("dataset_id") or dataset_dir.name,
+            "target_library_id": root_id,
+            "target_names": names,
+            "annotated_images": n_imgs,
+            "verifiable": bool(names and triples),
+            "blocking": [], "warnings": [], "conflict": False, "summary": "",
+        }
+        if not names:
+            out["summary"] = "目标算法库还没有标签字典，无法比对类别序号（挂载后建议先补齐字典再标注）"
+            return out
+        if not triples:
+            return out  # 该数据集还没有任何标注框：换库不会串号
+        blocking, unknown = self._label_shift_report(triples, names, meta.get("classes") or [])
+        out["blocking"], out["warnings"] = blocking, unknown
+        out["conflict"] = bool(blocking)
+        out["summary"] = self._conflict_summary(blocking, unknown)
+        return out
+
+    async def check_bind_target(self, dataset_id: str, model_id: str) -> dict:
+        """挂载前校验：数据集换绑到 model_id（算法库根记录）后，类别序号会不会错位。"""
+        dataset_dir = self.datasets_dir / dataset_id
+        meta_path = dataset_dir / "meta.json"
+        if not await asyncio.to_thread(lambda: meta_path.exists()):
+            raise ValueError(f"Dataset {dataset_id} not found")
+        meta = await asyncio.to_thread(_load_json, meta_path)
+        return await asyncio.to_thread(self._bind_conflict_sync, dataset_dir, meta, model_id)
+
+    def _build_training_artifacts(self, dataset_dir: Path, meta: dict, split_ratio: dict,
+                                  out_dir: Path = None, label_guard: bool = False) -> dict:
         """封板一次性产出：划分 train/val/test + 每图 JSON → YOLO txt + 生成 data.yaml（数据链路阶段E）
 
         标注数据源：dataset_dir/annotations/{image_id}.json（像素坐标框）
         图片源：dataset_dir/images/ 平铺目录
         out_dir：产物输出目录（缺省 = dataset_dir 原地）。数据血缘方案 A 下每个封板
         版本输出到数据集下 sealed/v{N}/ 只读快照，旧版本不被覆盖、版本号逐次递增。
+        label_guard：True 时封板前校验「标注序号 vs 目标字典序号」，对不上直接拒绝
+        （只在手动封板链路开启；自动灌桶封板是后台定时流程，拦住会静默中断灌桶，故不启用）。
         data.yaml 类别名：模型标签字典英文码（缺省回退 meta.classes）
         返回 {total, counts, ratios, nc, names}；无已标注图片时抛 ValueError。
         """
@@ -1212,12 +1475,21 @@ class DatasetService:
                     data = _load_json(p)
                 except Exception:
                     continue
-                boxes = data.get("boxes") or []
-                if not boxes:
-                    continue
+                # 读取兜底：分割框只存轮廓点，需要矩形的下游由外接框现算
+                boxes = boxes_with_bbox(data.get("boxes"))
                 img_id = data.get("image_id", p.stem)
                 img_abs = img_index.get(img_id)
                 if img_abs is None:
+                    continue
+                if not boxes:
+                    # 空白标注（无框）也收集，作为独立分层参与划分
+                    annotated.append({
+                        "image_id": img_id,
+                        "img_abs": img_abs,
+                        "width": data.get("width") or 1,
+                        "height": data.get("height") or 1,
+                        "boxes": [],
+                    })
                     continue
                 s_type = data.get("sample_type")
                 if s_type in sample_stats:
@@ -1234,31 +1506,80 @@ class DatasetService:
             annotated = self._collect_legacy_txt_annotations(dataset_dir)
         if not annotated:
             raise ValueError("没有已标注的图片可封板（annotations/*.json 与 labels/*.txt 均为空）")
+        if not any(rec.get("boxes") for rec in annotated):
+            # 全是空白标注（人工确认无目标 / AI 困难样本）：照样产出划分与 0 字节 txt，
+            # 这类背景负样本集有训练价值，封板不该因为"一个框都没有"而空转（#3）。
+            logger.warning(
+                f"dataset {dataset_dir.name} 标注全部无框：封板产物只含背景样本（0 字节标签文件）"
+            )
 
-        # 2) 划分（确定性打乱，保证可复现）
-        tr = float(split_ratio.get("train", 0.8))
-        vr = float(split_ratio.get("val", 0.2))
-        te = float(split_ratio.get("test", 0.0))
+        # data.yaml 类别名（英文码）提前确定：分层统计与 txt 的 class 索引都依赖它
+        names = self._resolve_seal_names(meta)
+        _cls_idx = {str(nm).lower(): i for i, nm in enumerate(names)}
+
+        # 封板兜底校验：txt 里的类别号直接沿用标注 JSON 的 class_id（标注当时的顺序写死的），
+        # 若该数据集被换挂到「有同名类别但序号不同」的算法库，这里不拦就会静默串号。
+        if label_guard:
+            _triples = [
+                (b.get("class_id"), b.get("english_code") or "", rec["image_id"])
+                for rec in annotated for b in (rec.get("boxes") or [])
+            ]
+            _blocking, _unknown = self._label_shift_report(_triples, names, meta.get("classes") or [])
+            if _blocking:
+                raise ValueError(
+                    "封板中止：下列类别的序号与归属算法库的标签字典对不上，"
+                    "直接封板会把框标成别的类。\n"
+                    + self._conflict_summary(_blocking, _unknown)
+                    + "\n请先到该算法库里把类别顺序调成和上面一致（或改挂到顺序一致的算法库）再重试。"
+                )
+
+        def _norm_cid(cid):
+            """框 class_id → 标准类别名（数字索引按 names 解析，英文名回退索引）"""
+            if isinstance(cid, int) or (isinstance(cid, str) and cid.isdigit()):
+                i = int(cid)
+                return names[i] if 0 <= i < len(names) else str(i)
+            s = str(cid).lower()
+            return names[_cls_idx[s]] if s in _cls_idx else str(cid)
+
+        # 2) 划分（确定性打乱，保证可复现）：先统计每类框数与空白图数，
+        #    再按"类别组合"分层，每层各自按 ratio（默认 7:1.5:1.5）切分，
+        #    保证 train/val/test 中各类别占比接近。样本 ≤2 的稀缺层全进 train。
+        tr = float(split_ratio.get("train", 0.7))
+        vr = float(split_ratio.get("val", 0.15))
+        te = float(split_ratio.get("test", 0.15))
         total = tr + vr + te
         if total <= 0:
-            tr, vr, te = 0.8, 0.2, 0.0
+            tr, vr, te = 0.7, 0.15, 0.15
         else:
             tr, vr, te = tr / total, vr / total, te / total
         random.Random(42).shuffle(annotated)
         n = len(annotated)
-        n_train = int(round(n * tr))
-        n_val = int(round(n * vr))
-        if n_train + n_val > n:
-            n_train = n - n_val
-        n_test = n - n_train - n_val
+        class_box_stats = {}
+        blank_images = 0
+        strata = {}
+        for rec in annotated:
+            names_in_img = sorted({_norm_cid(b["class_id"]) for b in rec["boxes"]})
+            for nm in names_in_img:
+                cnt = sum(1 for b in rec["boxes"] if _norm_cid(b["class_id"]) == nm)
+                class_box_stats[nm] = class_box_stats.get(nm, 0) + cnt
+            key = "+".join(names_in_img) if names_in_img else "__blank__"
+            if not names_in_img:
+                blank_images += 1
+            strata.setdefault(key, []).append(rec)
         splits = {"train": [], "val": [], "test": []}
-        for i, rec in enumerate(annotated):
-            if i < n_train:
-                splits["train"].append(rec)
-            elif i < n_train + n_val:
-                splits["val"].append(rec)
-            else:
-                splits["test"].append(rec)
+        for key in sorted(strata):
+            recs = strata[key]
+            m = len(recs)
+            if m <= 2:
+                splits["train"].extend(recs)
+                continue
+            a = int(round(m * tr))
+            b = int(round(m * vr))
+            if a + b > m:
+                a = m - b
+            splits["train"].extend(recs[:a])
+            splits["val"].extend(recs[a:a + b])
+            splits["test"].extend(recs[a + b:])
 
         # 3) 清空旧划分产物并重建 images/{split} + labels/{split}（输出到 out_dir）
         #    注意：标准结构下 images/train 等目录就是源图，重建会误删 → 先复制源图到 staging 过场
@@ -1274,11 +1595,11 @@ class DatasetService:
                     shutil.rmtree(dd, ignore_errors=True)
                 dd.mkdir(parents=True, exist_ok=True)
 
-        # data.yaml 类别名（英文码）提前确定：txt 的 class 索引需与 names 顺序一致
-        names = self._resolve_seal_names(meta)
-        _cls_idx = {str(n).lower(): i for i, n in enumerate(names)}
-
         counts = {}
+        # 分割/检测行数统计：用于判断本次封板产物是不是分割数据集
+        seg_lines = 0
+        rect_lines = 0
+        split_class_stats = {s: {"images": 0, "boxes": {}} for s in ("train", "val", "test")}
         for split, recs in splits.items():
             counts[split] = 0
             for rec in recs:
@@ -1287,31 +1608,46 @@ class DatasetService:
                 w = rec["width"] or 1
                 h = rec["height"] or 1
                 lines = []
-                for b in rec["boxes"]:
-                    x1, y1, x2, y2 = float(b["x1"]), float(b["y1"]), float(b["x2"]), float(b["y2"])
-                    cx = (x1 + x2) / 2 / w
-                    cy = (y1 + y2) / 2 / h
-                    bw = max(x2 - x1, 0.0) / w
-                    bh = max(y2 - y1, 0.0) / h
+                # 有轮廓的框写分割行（只写顶点，不带框前缀），无轮廓的写检测行；
+                # 同一文件混有分割行时，无轮廓的框退化成 4 角点分割行
+                box_polys = [clean_polygon(b.get("polygon")) for b in rec["boxes"]]
+                any_poly = any(box_polys)
+                for b, poly in zip(rec["boxes"], box_polys):
+                    if poly:
+                        x1, y1, x2, y2 = polygon_to_bbox(poly)
+                    else:
+                        x1, y1, x2, y2 = float(b["x1"]), float(b["y1"]), float(b["x2"]), float(b["y2"])
                     cid = b["class_id"]
                     if isinstance(cid, int) or (isinstance(cid, str) and cid.isdigit()):
                         cls_id = int(cid)  # 旧数据数字索引直接使用
                     else:
                         cls_id = _cls_idx.get(str(cid).lower(), 0)  # JSON 英文名 → YOLO 索引
-                    lines.append(f"{cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+                    lines.append(yolo_label_line(cls_id, (x1, y1, x2, y2), poly, w, h,
+                                                 rect_as_poly=any_poly))
+                    if poly:
+                        seg_lines += 1
+                    else:
+                        rect_lines += 1
                 (labels_dir / split / f"{rec['image_id']}.txt").write_text(
                     "\n".join(lines), encoding="utf-8"
                 )
                 counts[split] += 1
+                scs = split_class_stats[split]
+                scs["images"] += 1
+                for b in rec["boxes"]:
+                    nm = _norm_cid(b["class_id"])
+                    scs["boxes"][nm] = scs["boxes"].get(nm, 0) + 1
 
         # 4) 生成 data.yaml（names 用模型标签字典英文码，缺省回退 meta.classes；已在导出前确定）
         yaml_data = {
-            "path": str(out_dir.absolute()),
+            "path": str(dataset_dir),
             "train": "images/train",
             "val": "images/val",
             "nc": len(names),
             "names": names,
         }
+        # 只要有一条分割轮廓就标 segment（ultralytics 按行内列数自适应，纯检测行仍当检测框学）
+        yaml_data["task"] = "segment" if seg_lines > 0 else "detect"
         if counts["test"] > 0:
             yaml_data["test"] = "images/test"
         _save_yaml(out_dir / "data.yaml", yaml_data)
@@ -1325,15 +1661,27 @@ class DatasetService:
         # 清掉源图过场目录（图片已复制到划分产物）
         shutil.rmtree(staging, ignore_errors=True)
 
-        logger.info(f"seal artifacts: total={n} splits={counts} nc={len(names)}")
+        logger.info(
+            f"seal artifacts: total={n} splits={counts} nc={len(names)} "
+            f"class_boxes={class_box_stats} blank={blank_images} "
+            f"task={yaml_data['task']} seg_lines={seg_lines} rect_lines={rect_lines}"
+        )
         return {
             "total": n,
             "counts": counts,
+            "class_stats": {"boxes_by_class": class_box_stats, "blank_images": blank_images},
+            "split_class_stats": split_class_stats,
             "ratios": {"train": round(tr, 3), "val": round(vr, 3), "test": round(te, 3)},
             "nc": len(names),
             "names": names,
             "label_validation": label_validation,
             "sample_type_stats": sample_stats,
+            # 分割标注情况：has_segment=本批产物里是否有轮廓；mixed=分割与纯框共存
+            "task": yaml_data["task"],
+            "has_segment": seg_lines > 0,
+            "segment_boxes": seg_lines,
+            "rect_boxes": rect_lines,
+            "mixed": seg_lines > 0 and rect_lines > 0,
         }
 
     async def list_datasets(self):
@@ -1418,6 +1766,10 @@ class DatasetService:
             return datasets
         
         datasets = await asyncio.to_thread(_list_datasets_sync)
+        # 影子库收口（读侧自愈）：训练子进程 train_script.py 会绕过本进程直接改 meta.json
+        # （trained_at / last_trained_round / stage），列表页按 mtime 水位补齐差集。
+        from src.db import shadow
+        await shadow.refresh_datasets(d.get("dataset_id") for d in datasets)
         # 桶灌进度（B 系列）：每个模型当前接收桶累计量 + 已封板版本，供前端展示
         def _bucket_summary():
             out = []
@@ -1441,8 +1793,13 @@ class DatasetService:
             "buckets": _bucket_summary(),
         }
 
-    async def bind_model(self, dataset_id: str, model_id: str):
+    async def bind_model(self, dataset_id: str, model_id: str, library_root_id: str = None,
+                         force: bool = False):
         """绑定数据集到模型（1.7 模型仓库：数据归属模型，合并/采集复用）
+
+        library_root_id: 归属算法库根记录 id（解绑时传 None 一并清空）；
+                         由调用方按 model_id 反查，保证「库详情—挂载数据集」与训练继承一致。
+        force: 换库时已知「类别序号对不上」仍坚持挂载（默认 False：有冲突直接拒绝）。
 
         绑定成功后数据集全部图片自动流入模型消息队列（阶段D），
         队列达到阈值或定时后自动打包进入标注页。
@@ -1452,31 +1809,82 @@ class DatasetService:
         if not await asyncio.to_thread(lambda: meta_path.exists()):
             raise ValueError(f"Dataset {dataset_id} not found")
 
+        # 换库校验：目标库与当前归属不同才比对（解绑、原地重绑不打扰）
+        if model_id:
+            meta_now = await asyncio.to_thread(_load_json, meta_path)
+            if (meta_now.get("model_id") or "") != model_id:
+                report = await asyncio.to_thread(
+                    self._bind_conflict_sync, dataset_dir, meta_now, model_id
+                )
+                if report.get("conflict") and not force:
+                    raise ValueError(
+                        "挂载已阻止：该数据集已标注的类别序号与目标算法库不一致。\n"
+                        + (report.get("summary") or "")
+                        + "\n确认后请勾选强制挂载，或先到目标算法库把标签顺序调整一致。"
+                    )
+
         def _bind_sync():
             meta = _load_json(meta_path)
             meta["model_id"] = model_id
-            # 绑定后补类别：数据集 classes 为空（纯图片包）时，从模型标签字典回填，
-            # 并同步写 classes.txt 到版本目录（重新 prepare 时可直接读到真实类别）
-            if not meta.get("classes"):
-                labels = self._labels_from_model(model_id)
-                if labels:
-                    meta["classes"] = labels
+            meta["library_root_id"] = library_root_id
+            
+            # 读取模型标签字典（包含中文别名和描述）；解绑时 model_id 为空，跳过
+            labels_dict = None
+            if model_id:
+                labels_file = settings.REGISTRY_DIR / model_id / "labels_dict.json"
+                if labels_file.exists():
                     try:
-                        # 数据集一律为 datasets/{dataset_id}（无 version 子目录）
-                        if dataset_dir.exists():
-                            (dataset_dir / "classes.txt").write_text(
-                                "\n".join(labels) + "\n", encoding="utf-8"
-                            )
-                            logger.info(f"bind {dataset_id}->{model_id}: classes.txt written: {labels}")
+                        labels_dict = _load_json(labels_file)
                     except Exception:
                         pass
+            
+            # ✅ 新增：同步中文标签信息到 meta.json，供 AI 标注参考
+            if labels_dict and labels_dict.get("labels"):
+                # 提取每个类别的中文别名和描述
+                chinese_labels = []
+                codes = []
+                for label in labels_dict.get("labels"):
+                    ec = label.get("english_code", "")
+                    cn = label.get("chinese_name", "")
+                    desc = label.get("chinese_desc", "")
+                    chinese_labels.append({
+                        "english_code": ec,
+                        "chinese_name": cn,
+                        "chinese_desc": desc,
+                    })
+                    if ec:
+                        codes.append(ec)
+                meta["chinese_labels"] = chinese_labels
+                
+                # 绑定后补类别：数据集 classes 为空、或只有平台编的占位名（class_0…）时，
+                # 从模型标签字典回填真名。只判"空"会漏掉占位名这条路径——数据集通常是
+                # 先导入（包内没类名，被填成 class_0）后绑库，绑定时 classes 已非空，
+                # 于是库里明明是 fall，数据集还挂着 class_0，导出/训练的标签名全错。
+                existing = meta.get("classes") or []
+                if codes and (not existing or self._is_placeholder_classes(existing)):
+                    meta["classes"] = codes
+                    try:
+                        if dataset_dir.exists():
+                            (dataset_dir / "classes.txt").write_text(
+                                "\n".join(codes) + "\n", encoding="utf-8"
+                            )
+                            logger.info(f"bind {dataset_id}->{model_id}: classes.txt written: {codes}")
+                    except Exception:
+                        pass
+                
+                logger.info(f"bind {dataset_id}->{model_id}: synced {len(chinese_labels)} chinese labels")
+            
             _save_json(meta_path, meta)
             return meta
 
         meta = await asyncio.to_thread(_bind_sync)
+        from src.db import shadow
+        await shadow.sync_dataset(dataset_id)
 
-        # 阶段D：数据流入模型消息队列（阈值/定时自动打包进入标注页）
+        # 阶段D：数据流入模型消息队列（阈值/定时自动打包进入标注页）；解绑不入队
         try:
+            if not model_id:
+                return meta
             from src.services.queue_service import ModelQueueService
             await ModelQueueService().enqueue_dataset(
                 model_id, dataset_id, meta.get("version", "v1")
@@ -1559,6 +1967,8 @@ class DatasetService:
         meta["updated_at"] = datetime.now().isoformat()
         
         await asyncio.to_thread(_save_json, meta_path, meta)
+        from src.db import shadow
+        await shadow.sync_dataset(dataset_id)
         
         return meta
     
@@ -1579,7 +1989,8 @@ class DatasetService:
         """封板：先标注后封板，封板 = 数量✓ + 标注✓ + 校验✓（数据链路阶段E）
         
         - 标注✓ 判定：每图 JSON 标注（annotations/*.json）有框，或旧数据 labels/*.txt 存在；
-          未标注时默认拒绝封板，force=True 提供时间窗口兜底（强制封板，跳过产物生成）
+          未标注时默认拒绝封板，force=True 提供时间窗口兜底（强制封板）
+        - 只要有标注文件就生成产物：空白标注（无框）转成 0 字节 txt 作为背景负样本参与划分
         - P1 时间窗口兜底：数量未达门槛但 prepared 超过 SEAL_MAX_DAYS 天也可自动封板
         - 封板瞬间完成三件事：train/val/test 划分 + 每图 JSON→YOLO txt + 生成 data.yaml（names=标签字典英文码）
         - 封板后只读：stage=sealed，sealed_at 落库；版本号沿用当前版本（v1 只读快照）
@@ -1593,19 +2004,27 @@ class DatasetService:
         _ensure_stage_fields(meta)
 
         if meta["stage"] == STAGE_SEALED:
-            return meta  # 幂等：已封板直接返回当前状态
+            # 幂等：已封板直接返回。例外——force 且产物缺失（历史数据只打了 sealed 标、
+            # 没生成 data.yaml/划分目录）时补生成一次，否则"再点一次封板"永远无效。
+            if not force or (dataset_dir / "data.yaml").exists():
+                return meta
+            return await self._backfill_seal_artifacts(dataset_dir, meta_path, meta)
 
         if meta.get("status") != "prepared":
             raise ValueError("数据集尚未准备（需先执行准备操作），无法封板")
 
         # 标注✓判定：优先每图 JSON 标注（数据集一律为 datasets/{dataset_id}，无 version 子目录）
-        json_annotated = await asyncio.to_thread(self._count_json_annotations, dataset_dir)
+        # 两个独立概念（#3 的病灶就是把它们混成一个布尔量）：
+        #   annotated           —— 有没有"带框"的标注，决定能不能封板（force 兜底）
+        #   ann_files           —— 有多少标注文件，空白标注也要转成 0 字节 txt 参与产物生成
+        boxes_annotated, ann_files = await asyncio.to_thread(self._annotation_stats, dataset_dir)
         annotated = (
-            json_annotated > 0
+            boxes_annotated > 0
             or meta.get("has_labels", False)
             or bool(meta.get("label_count"))
             or await asyncio.to_thread(self._is_annotated_exported, dataset_dir, meta.get("version", "v1"))
         )
+        has_artifact_source = annotated or ann_files > 0
         if not annotated and not force:
             raise ValueError(
                 "标注不完整：该数据集暂无可用标注（需先完成人工/AI标注，"
@@ -1641,8 +2060,10 @@ class DatasetService:
             )
 
         # 封板瞬间：划分 + 转 YOLO txt + 生成 data.yaml（无标注的 force 兜底仅打标，跳过产物生成）
-        # 数据血缘（方案A）：每个封板版本输出为 sealed/v{N} 只读快照，版本号逐次递增（v1→v2…），
-        # 不覆盖 v1 源版本目录；display_name 按 {模型code}_{封板时间戳}_v{N} 自动命名（追踪血缘，含批次时序）
+        # 封板产物直接输出到 dataset_dir，符合标准 YOLO 数据集格式：
+        #   {dataset_dir}/data.yaml
+        #   {dataset_dir}/images/{train,val,test}/
+        #   {dataset_dir}/labels/{train,val,test}/
         model_code = meta.get("model_id") or ""
         if model_code:
             try:
@@ -1651,26 +2072,34 @@ class DatasetService:
             except Exception:
                 pass
         seal_payload = None
-        if annotated:
-            ratio = split_ratio or meta.get("split_ratio") or {"train": 0.8, "val": 0.2, "test": 0.0}
+        if has_artifact_source:
+            ratio = split_ratio or meta.get("split_ratio") or {"train": 0.7, "val": 0.15, "test": 0.15}
             sv = int(meta.get("sealed_version_count") or 0) + 1
-            seal_out = dataset_dir / "sealed" / f"v{sv}"
-            await asyncio.to_thread(shutil.rmtree, seal_out, ignore_errors=True)
-            seal_payload = await asyncio.to_thread(
-                self._build_training_artifacts, dataset_dir, meta, ratio, seal_out
-            )
-            meta["sealed_version_count"] = sv
-            meta["sealed_version"] = f"v{sv}"
-            meta["sealed_out"] = str(seal_out.absolute())
-            meta["parent_dataset_id"] = meta.get("parent_dataset_id") or dataset_id
-            seal_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            meta["display_name"] = f"{model_code}_{seal_ts}_v{sv}" if model_code else f"ds_v{sv}"
-            meta["sealed_split"] = seal_payload
-            meta["label_validation"] = seal_payload.get("label_validation")
-            if seal_payload.get("counts"):
-                meta["split_counts"] = seal_payload["counts"]
-            if seal_payload.get("sample_type_stats"):
-                meta["sample_type_stats"] = seal_payload["sample_type_stats"]
+            # 封板产物直接输出到 dataset_dir（标准 YOLO 格式）
+            try:
+                seal_payload = await asyncio.to_thread(
+                    self._build_training_artifacts, dataset_dir, meta, ratio, dataset_dir, True
+                )
+            except ValueError as e:
+                if not force:
+                    raise
+                # force 是"时间窗口兜底"语义：产物生成失败时不阻断封板打标
+                logger.warning(f"dataset {dataset_id} 封板产物生成失败（force 放行）: {e}")
+                meta["seal_skipped_reason"] = str(e)
+            if seal_payload is not None:
+                meta.pop("seal_skipped_reason", None)
+                meta["sealed_version_count"] = sv
+                meta["sealed_version"] = f"v{sv}"
+                meta["sealed_out"] = str(dataset_dir.relative_to(settings.DATA_DIR))
+                meta["parent_dataset_id"] = meta.get("parent_dataset_id") or dataset_id
+                seal_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                meta["display_name"] = f"{model_code}_{seal_ts}_v{sv}" if model_code else f"ds_v{sv}"
+                meta["sealed_split"] = seal_payload
+                meta["label_validation"] = seal_payload.get("label_validation")
+                if seal_payload.get("counts"):
+                    meta["split_counts"] = seal_payload["counts"]
+                if seal_payload.get("sample_type_stats"):
+                    meta["sample_type_stats"] = seal_payload["sample_type_stats"]
 
         meta["stage"] = STAGE_SEALED
         meta["sealed_at"] = datetime.now().isoformat()
@@ -1690,8 +2119,47 @@ class DatasetService:
         if new_id and new_id != dataset_id:
             meta = await self._rename_dataset_identity(dataset_id, new_id)
             logger.info(f"dataset {dataset_id} renamed -> {new_id} on seal")
+        else:
+            from src.db import shadow
+            await shadow.sync_dataset(dataset_id)
 
-        logger.info(f"dataset {dataset_id} sealed: has_labels={annotated} force={force} split={seal_payload and seal_payload.get('counts')}")
+        logger.info(f"dataset {dataset_id} sealed: has_labels={annotated} ann_files={ann_files} force={force} split={seal_payload and seal_payload.get('counts')}")
+        return meta
+
+    async def _backfill_seal_artifacts(self, dataset_dir: Path, meta_path: Path, meta: dict) -> dict:
+        """补生成封板产物（#3 自愈通道）。
+
+        历史数据里有一批"已标记 sealed 但目录内没有 data.yaml/划分"的数据集
+        （早期 force 封板、或封板时产物生成被跳过）。这里只做产物补齐：
+        不改 stage、不改 display_name、不递增 sealed_version_count，
+        避免触发封板更名（名=id）把目录/PG 记录/桶账本整体改名。
+        """
+        dataset_id = meta.get("dataset_id") or dataset_dir.name
+        ratio = meta.get("split_ratio") or {"train": 0.7, "val": 0.15, "test": 0.15}
+        try:
+            # label_guard=False：走到这里说明是 force 补救，序号冲突不重复拦
+            payload = await asyncio.to_thread(
+                self._build_training_artifacts, dataset_dir, meta, ratio, dataset_dir, False
+            )
+        except Exception as e:
+            logger.warning(f"dataset {dataset_id} 补生成封板产物失败: {e}")
+            meta["seal_artifacts_error"] = str(e)
+            await asyncio.to_thread(_save_json, meta_path, meta)
+            from src.db import shadow
+            await shadow.sync_dataset(dataset_id)
+            return meta
+        meta.pop("seal_artifacts_error", None)
+        meta["sealed_out"] = str(dataset_dir.relative_to(settings.DATA_DIR))
+        meta["sealed_split"] = payload
+        meta["label_validation"] = payload.get("label_validation")
+        if payload.get("counts"):
+            meta["split_counts"] = payload["counts"]
+        if payload.get("sample_type_stats"):
+            meta["sample_type_stats"] = payload["sample_type_stats"]
+        await asyncio.to_thread(_save_json, meta_path, meta)
+        from src.db import shadow
+        await shadow.sync_dataset(dataset_id)
+        logger.info(f"dataset {dataset_id} seal artifacts backfilled: split={payload.get('counts')}")
         return meta
 
     async def _rename_dataset_identity(self, old_id: str, new_id: str) -> dict:
@@ -1700,13 +2168,37 @@ class DatasetService:
         返回更名后的 meta。
         """
         new_meta = await asyncio.to_thread(self._rename_dataset_identity_sync, old_id, new_id)
-        try:
-            from src.db import meta_store
-
-            await meta_store.upsert_dataset(new_meta)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"rename {old_id}: pg upsert failed: {e}")
+        # 影子库收口：更名 = 删旧行 + 写新行（只 upsert 新行会留下旧 id 的孤儿记录），
+        # 且任务绑定的 dataset_id、桶账本引用都在同步侧改过，这里按真值文件重灌。
+        from src.db import shadow
+        await shadow.drop_dataset(old_id)
+        await shadow.sync_dataset(new_id)
+        await shadow.sync_buckets()
+        for tid in await asyncio.to_thread(self._tasks_bound_to, new_id):
+            await shadow.sync_task(tid)
         return new_meta
+
+    @staticmethod
+    def _tasks_bound_to(dataset_id: str) -> list:
+        """扫描标注任务真值文件，返回绑定到该数据集的 task_id 列表。"""
+        out = []
+        try:
+            root = settings.ANNOTATIONS_DIR
+            if not root.exists():
+                return out
+            for tdir in root.iterdir():
+                tf = tdir / "task.json"
+                if not tf.is_file():
+                    continue
+                try:
+                    m = _load_json(tf)
+                except Exception:  # noqa: BLE001
+                    continue
+                if m.get("dataset_id") == dataset_id:
+                    out.append(m.get("task_id") or tdir.name)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"scan tasks bound to {dataset_id} failed: {e}")
+        return out
 
     def _rename_dataset_identity_sync(self, old_id: str, new_id: str) -> dict:
         old_dir = self.datasets_dir / old_id
@@ -1766,6 +2258,37 @@ class DatasetService:
         except Exception as e:  # noqa: BLE001
             logger.warning(f"rename {old_id}: bucket ledger update failed: {e}")
 
+        # 5) 路径引用跟随（治本）：更名后新目录内所有 data.yaml 的 path 前缀、
+        #    及 meta 中记录的旧绝对路径字段（sealed_out 等）一并替换，
+        #    否则封板产物 data.yaml 仍指向旧目录，训练/导出会报 images not found
+        old_prefix = str(old_dir.relative_to(settings.DATA_DIR))
+        new_prefix = str(new_dir.relative_to(settings.DATA_DIR))
+        try:
+            for yf in new_dir.rglob("data.yaml"):
+                try:
+                    yd = _load_yaml(yf)
+                    if yd and str(yd.get("path", "")).startswith(old_prefix):
+                        yd["path"] = new_prefix + str(yd["path"])[len(old_prefix):]
+                        _save_yaml(yf, yd)
+                except Exception:  # noqa: BLE001
+                    continue
+
+            def _fix_path_refs(obj):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if isinstance(v, str) and v.startswith(old_prefix):
+                            obj[k] = new_prefix + v[len(old_prefix):]
+                        elif isinstance(v, (dict, list)):
+                            _fix_path_refs(v)
+                elif isinstance(obj, list):
+                    for it in obj:
+                        _fix_path_refs(it)
+
+            _fix_path_refs(meta)
+            _save_json(mp, meta)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"rename {old_id}: path refs update failed: {e}")
+
         logger.info(f"dataset identity renamed: {old_id} -> {new_id}")
         return meta
     
@@ -1795,25 +2318,74 @@ class DatasetService:
             _save_json(meta_path, meta)
             return validation
 
-        return await asyncio.to_thread(_run)
+        validation = await asyncio.to_thread(_run)
+        from src.db import shadow
+        await shadow.sync_dataset(dataset_id)
+        return validation
 
     async def delete_dataset(self, dataset_id: str):
-        """删除数据集：目录改名标记 + 专用后台线程删磁盘，接口立即返回"""
+        """删除数据集：目录改名标记 + 专用后台线程删磁盘，接口立即返回。
+        同步清理桶账本（buckets.json）中该数据集的灌桶进度，防止只增不减。
+        """
         dataset_dir = self.datasets_dir / dataset_id
 
         if not await asyncio.to_thread(lambda: dataset_dir.exists()):
             return None
 
-        # 读 meta 拿到上传压缩包名（先读，改名后目录名已变）
+        # 读 meta 拿到上传压缩包名 + 桶灌信息（先读，改名后目录名已变）
         meta_path = dataset_dir / "meta.json"
         archive_name = None
+        model_id = None
+        bucket_pending = 0
+        bucket_sealed = 0
         if await asyncio.to_thread(lambda: meta_path.exists()):
             try:
-                archive_name = await asyncio.to_thread(
-                    lambda: _load_json(meta_path).get("archive")
-                )
+                meta = await asyncio.to_thread(lambda: _load_json(meta_path))
+                archive_name = meta.get("archive")
+                model_id = meta.get("model_id") or ""
+                bucket_pending = int(meta.get("bucket_pending") or 0)
+                bucket_sealed = int(meta.get("bucket_sealed") or 0)
             except Exception:
                 pass
+
+        # 清理桶账本：从 receiving.members 移除该数据集，减少 poured 计数
+        if model_id and (bucket_pending > 0 or bucket_sealed > 0):
+            try:
+                bf = settings.DATA_DIR / "buckets.json"
+                if bf.exists():
+                    state = _load_json(bf) or {"models": {}}
+                    models = state.get("models") or {}
+                    mst = models.get(model_id)
+                    if mst:
+                        recv = mst.get("receiving") or {}
+                        # 从 members 中移除该数据集
+                        members = recv.get("members") or []
+                        removed_count = 0
+                        new_members = []
+                        for m in members:
+                            if isinstance(m, dict) and m.get("dataset_id") == dataset_id:
+                                removed_count += int(m.get("count") or 0)
+                            else:
+                                new_members.append(m)
+                        recv["members"] = new_members
+                        # 减少 poured 计数
+                        if removed_count > 0:
+                            recv["poured"] = max(0, int(recv.get("poured") or 0) - removed_count)
+                        # 清理 sealed 快照中的引用
+                        for snap in mst.get("sealed") or []:
+                            if isinstance(snap, dict):
+                                snap_members = snap.get("members") or []
+                                snap["members"] = [
+                                    m for m in snap_members
+                                    if not (isinstance(m, dict) and m.get("dataset_id") == dataset_id)
+                                ]
+                    _save_json(bf, state)
+                    logger.info(
+                        f"delete {dataset_id}: bucket cleanup model={model_id} "
+                        f"removed={removed_count} poured={recv.get('poured', 0) if mst else 0}"
+                    )
+            except Exception as e:
+                logger.warning(f"delete {dataset_id}: bucket cleanup failed: {e}")
 
         # 1) 同一卷内改名（瞬时元数据操作）→ 前端列表立刻看不到该数据集
         renamed = dataset_dir.with_name(f"{dataset_id}__deleting")
@@ -1825,6 +2397,11 @@ class DatasetService:
             targets.append(self.uploads_dir / archive_name)
         targets.append(self.uploads_dir / f"{dataset_id}.zip")
         _enqueue_deletion(targets)
+
+        # 影子库收口：数据集行删除 + 桶账本按真值文件重灌（上方 members/poured 已就地改过）
+        from src.db import shadow
+        await shadow.drop_dataset(dataset_id)
+        await shadow.sync_buckets()
 
         return {"ok": True, "message": f"Dataset {dataset_id} deleted"}
 
@@ -1904,9 +2481,18 @@ class DatasetService:
                 "deleted": True,
                 "image_id": stem,
                 "image_count": int(meta["image_count"]),
+                # 供影子库收口使用（对外响应前会剔除）
+                "annotation_task_id": meta.get("annotation_task_id"),
             }
 
-        return await asyncio.to_thread(_sync)
+        result = await asyncio.to_thread(_sync)
+        # 影子库收口：image_count 变化 + 关联标注任务里该图行移除
+        from src.db import shadow
+        await shadow.sync_dataset(dataset_id)
+        tid = result.pop("annotation_task_id", None)
+        if tid:
+            await shadow.remove_task_item(tid, result.get("image_id") or image_id)
+        return result
 
     @staticmethod
     def _iter_same_stem(scan_dir, stem, suffixes):
@@ -2121,7 +2707,7 @@ class DatasetService:
         ds_dir = self.datasets_dir / ds_id
         ds_dir.mkdir(parents=True, exist_ok=True)
 
-        ratio = {"train": 0.8, "val": 0.2, "test": 0.0}
+        ratio = {"train": 0.7, "val": 0.15, "test": 0.15}
         names = self._resolve_seal_names({"model_id": model_id, "classes": fallback_classes}) or fallback_classes
         if not names:
             names = ["class_0"]
@@ -2151,6 +2737,8 @@ class DatasetService:
             "trained_at": None,
             "last_trained_round": 0,
             "model_id": model_id,
+            # 快照继承来源模型的算法库归属，保证训练产出仍能定位到库
+            "library_root_id": self._library_root_id_of(model_id),
             "image_count": payload.get("total", 0),
             "label_count": payload.get("total", 0),
             "has_labels": True,
@@ -2162,7 +2750,7 @@ class DatasetService:
             "sample_type_stats": payload.get("sample_type_stats"),
             "sealed_version": f"v{sv}",
             "sealed_version_count": 1,
-            "sealed_out": str(ds_dir.absolute()),
+            "sealed_out": str(ds_dir.relative_to(settings.DATA_DIR)),
             "display_name": f"{code}_{seal_ts}_v{sv}",
             "is_bucket_snapshot": True,
             "bucket_index": sv,
@@ -2246,6 +2834,7 @@ class DatasetService:
         self._bucket_state = state
         models_state = state.setdefault("models", {})
         poured_events, sealed_events = [], []
+        pending_review = []  # 标完但未按「审核通过」的包：不灌桶，前端据此展示待审核
         skipped = 0
         try:
             # 1) 候选源包：已准备、标注阶段、归属模型、未归档
@@ -2288,6 +2877,11 @@ class DatasetService:
                     if annotated < total:
                         skipped += 1
                         continue  # 未全部标注完成（存在标注 JSON 的图不足），等下一轮
+                    if not meta.get("review_approved"):
+                        # 人工审核门槛：标注完成但未点「审核通过」→ 暂不灌桶，保持可编辑
+                        pending_review.append(dataset_id)
+                        skipped += 1
+                        continue
                     sealed_n = int(meta.get("bucket_sealed") or 0)
                     pending_n = int(meta.get("bucket_pending") or 0)
                     if sealed_n + pending_n >= total:
@@ -2327,16 +2921,100 @@ class DatasetService:
         finally:
             self._save_bucket_state(state)
             self._bucket_state = None
-        return {"poured": poured_events, "sealed": sealed_events, "skipped": skipped}
+        return {"poured": poured_events, "sealed": sealed_events, "skipped": skipped,
+                "pending_review": pending_review}
 
     async def advance_buckets(self) -> dict:
-        """按模型滚动灌桶（幂等）：A 包标完自动灌桶，满 1500 自动封板出成品数据集。
+        """按模型滚动灌桶（幂等）：A 包「标完 + 审核通过」后灌桶，满 1500 自动封板出成品数据集。
         供前端在数据集页加载 / 标注完成返回时调用。
         """
         def _locked():
             with _BUCKET_LOCK:
                 return self._advance_buckets_sync()
-        return await asyncio.to_thread(_locked)
+        events = await asyncio.to_thread(_locked)
+        # 影子库收口：灌桶/封板会改桶账本 + 源包 meta + 新建快照数据集，
+        # 同步侧拿不到受影响 id，用 mtime 水位扫一遍（未变动的文件不写库）
+        from src.db import shadow
+        await shadow.sync_buckets()
+        await shadow.refresh_all_datasets()
+        return events
+
+    async def approve_review(self, dataset_id: str) -> dict:
+        """审核通过：人工确认标注无误后标记，之后才允许自动灌桶/封板。
+        标注完成的包在未确认前保持可编辑（不被灌桶归档）。
+        """
+        def _approve_sync():
+            ds_dir = self.datasets_dir / dataset_id
+            meta_path = ds_dir / "meta.json"
+            if not meta_path.exists():
+                raise ValueError(f"数据集 {dataset_id} 不存在")
+            meta = _load_json(meta_path)
+            _ensure_stage_fields(meta)
+            if meta.get("bucket_archived"):
+                raise ValueError("该数据集已灌桶归档，无需审核确认；如需修改请使用「撤回」")
+            if meta.get("review_approved"):
+                return meta
+            total = int(meta.get("image_count") or 0)
+            annotated = self._count_annotated_files(ds_dir)
+            if total and annotated < total:
+                raise ValueError(f"标注未完成（{annotated}/{total}），请全部标注后再确认审核")
+            meta["review_approved"] = True
+            meta["review_approved_at"] = datetime.now().isoformat()
+            _save_json(meta_path, meta)
+            logger.info(f"review: {dataset_id} approved -> eligible for bucket pour")
+            return meta
+        result = await asyncio.to_thread(_approve_sync)
+        from src.db import shadow
+        await shadow.sync_dataset(dataset_id)
+        return result
+
+    async def unpour_bucket(self, dataset_id: str) -> dict:
+        """撤回（解封 A 包）：把「已灌入接收桶但尚未封板」的图片从桶账本退回，
+        数据集恢复可编辑状态。已有图片封入快照（bucket_sealed>0）的包不可撤回。
+        """
+        def _unpour_sync():
+            ds_dir = self.datasets_dir / dataset_id
+            meta_path = ds_dir / "meta.json"
+            if not meta_path.exists():
+                raise ValueError(f"数据集 {dataset_id} 不存在")
+            meta = _load_json(meta_path)
+            sealed_n = int(meta.get("bucket_sealed") or 0)
+            if sealed_n > 0:
+                raise ValueError(
+                    f"该数据集已有 {sealed_n} 张图封入快照（不可变），无法撤回；"
+                    f"仅未封板的灌桶量可退回编辑"
+                )
+            model_id = str(meta.get("model_id") or "")
+            with _BUCKET_LOCK:
+                state = self._load_bucket_state()
+                mst = (state.get("models") or {}).get(model_id) if model_id else None
+                if mst:
+                    recv = mst.get("receiving") or {}
+                    members = recv.get("members") or []
+                    keep = [m for m in members if m.get("dataset_id") != dataset_id]
+                    removed = (
+                        sum(int(m.get("count") or 0) for m in members)
+                        - sum(int(m.get("count") or 0) for m in keep)
+                    )
+                    if removed > 0:
+                        recv["members"] = keep
+                        recv["poured"] = max(0, int(recv.get("poured") or 0) - removed)
+                        mst["receiving"] = recv
+                        logger.info(f"unpour: {dataset_id} 退回 {removed} 张（B{recv.get('index')}）")
+                self._save_bucket_state(state)
+            meta["bucket_pending"] = 0
+            meta["bucket_archived"] = False
+            meta.pop("bucket_archived_at", None)
+            meta["review_approved"] = False
+            meta.pop("review_approved_at", None)
+            _save_json(meta_path, meta)
+            return meta
+        result = await asyncio.to_thread(_unpour_sync)
+        # 影子库收口：撤回同时改了桶账本与数据集 meta
+        from src.db import shadow
+        await shadow.sync_buckets()
+        await shadow.sync_dataset(dataset_id)
+        return result
 
     async def bucket_poll_loop(self, poll_seconds: int | None = None) -> None:
         """后台自动调整（B 系列）轮询：定时扫描标完未归档的 A 包 → 自动灌桶/封板。
@@ -2406,6 +3084,9 @@ class DatasetService:
             if meta.get("stage") == STAGE_SEALED or meta.get("sealed_at"):
                 continue
             if meta.get("status") != "prepared":
+                continue
+            if not meta.get("review_approved"):
+                # 人工审核门槛：未点「审核通过」的数据集不因超期被自动封板
                 continue
             prepared_at = meta.get("prepared_at") or ""
             if not self._seal_due(prepared_at):

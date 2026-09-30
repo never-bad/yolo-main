@@ -2,13 +2,15 @@ import json
 import yaml
 import asyncio
 import logging
+import os
 import shutil
+import tempfile
 import zipfile
-import re
 from pathlib import Path
 from datetime import datetime
 from PIL import Image
 from src.core.settings import settings
+from src.utils.class_labels import model_class_names, merge_classes_with_model
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +19,19 @@ def _load_json(path: Path):
     """同步加载 JSON 文件"""
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def live_classes(snapshot_classes: list, model_id: str) -> list:
+    """算法库标签字典实时类别覆盖数据集/任务快照（#6 标签不同步）。
+
+    库侧新增/改名标签后，无需重新准备数据集或重建标注任务：读取时按 index 合并。
+    不落盘、不迁移存量数据；无归属模型或字典为空时原样返回快照（行为与改动前一致）。
+    """
+    try:
+        return merge_classes_with_model(snapshot_classes or [], model_class_names(model_id or ""))
+    except Exception as e:
+        logger.warning(f"live_classes({model_id}) 读取库标签字典失败，回退快照: {e}")
+        return [str(c) for c in (snapshot_classes or [])]
 
 
 def _save_json(path: Path, data: dict):
@@ -41,6 +56,202 @@ def _save_yaml(path: Path, data: dict):
     """同步保存 YAML 文件"""
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+
+# ----------------------------------------------------------------------
+# 分割轮廓（polygon）工具：像素坐标 [[x, y], ...]
+# 有 polygon 的框 = 分割标注；没有的仍是普通检测框（两类数据可共存于同一数据集）
+# ----------------------------------------------------------------------
+# 顶点数上限，防止手工/AI 结果把 JSON 撑爆。必须 >= SAM 侧的 sam_polygon_max_points，
+# 否则 AI 描出来的轮廓会在落盘/导出时被这里悄悄砍掉。
+MAX_POLYGON_POINTS = 3000
+BBOX_KEYS = ("x1", "y1", "x2", "y2")  # 矩形四坐标：检测目标才落盘，分割目标由轮廓现算
+
+
+def clean_polygon(poly) -> list:
+    """校验并规范化多边形顶点：只接受 [x, y] 数字对，至少 3 个点，坐标非负、保留两位小数。
+
+    非法输入一律返回 []（当作没有轮廓处理），保证落盘数据永远可用。
+    """
+    if not poly or not isinstance(poly, (list, tuple)):
+        return []
+    pts = []
+    for p in poly:
+        if isinstance(p, dict):
+            xy = (p.get("x"), p.get("y"))
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            xy = (p[0], p[1])
+        else:
+            return []
+        try:
+            x, y = float(xy[0]), float(xy[1])
+        except (TypeError, ValueError):
+            return []
+        if x != x or y != y:  # NaN
+            return []
+        pts.append([round(max(x, 0.0), 2), round(max(y, 0.0), 2)])
+    if len(pts) < 3:
+        return []
+    # 首尾重复点去掉（前端可能闭合回起点）
+    if len(pts) > 3 and pts[0] == pts[-1]:
+        pts = pts[:-1]
+    if len(pts) > MAX_POLYGON_POINTS:
+        # 超限时按索引等距抽稀，绝不能从中间截断：截断会把后半圈整段丢掉，
+        # 再用一根横跨画面的弦把首尾连上，多边形变成"缺一大块"的畸形形状（实测
+        # 900 点的圆截到 500 点后只剩约 200° 的弧）。抽稀只是变稀疏，形状仍闭合完整。
+        step = len(pts) / float(MAX_POLYGON_POINTS)
+        pts = [pts[int(i * step)] for i in range(MAX_POLYGON_POINTS)]
+    return pts if len(pts) >= 3 else []
+
+
+def polygon_to_bbox(poly: list) -> tuple:
+    """由多边形顶点求外接框 (x1, y1, x2, y2)，供矩形字段与轮廓保持一致。"""
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def ensure_box_bbox(box: dict) -> dict:
+    """读取兜底：分割框没存矩形时，用轮廓外接框现算补回。
+
+    分割目标在磁盘上只有轮廓点（方框是给 SAM 圈范围的中间产物，用完就扔），
+    但画布/千问审核/导出前 5 列等几十处下游都按矩形取坐标，
+    所以统一在读取口补算，保证下游零改动且"框与轮廓永远一致"。
+    """
+    if box.get("x1") is None and len(box.get("polygon") or []) >= 3:
+        x1, y1, x2, y2 = polygon_to_bbox(box["polygon"])
+        return {**box, "x1": x1, "y1": y1, "x2": x2, "y2": y2}
+    return box
+
+
+def boxes_with_bbox(boxes: list) -> list:
+    """批量读取兜底（见 ensure_box_bbox）"""
+    return [ensure_box_bbox(b) for b in (boxes or [])]
+
+
+def ann_with_bbox(data: dict) -> dict:
+    """整份每图 JSON 的读取兜底"""
+    if isinstance(data, dict) and data.get("boxes"):
+        return {**data, "boxes": boxes_with_bbox(data["boxes"])}
+    return data
+
+
+def strip_ann_bbox(data: dict) -> dict:
+    """落盘前统一剥离：带轮廓的框只保留轮廓点，不再重复存矩形。
+
+    放在唯一写盘口，保证任何路径（保存/清理重合/外部导入）写入的分割标注
+    都是"只存点"的干净形态；需要矩形时由 ensure_box_bbox 现算。
+    """
+    if isinstance(data, dict) and data.get("boxes"):
+        return {**data, "boxes": [
+            {k: v for k, v in b.items() if k not in BBOX_KEYS}
+            if b.get("polygon") else b
+            for b in data["boxes"]
+        ]}
+    return data
+
+
+def _looks_like_bbox_prefix(nums: list) -> bool:
+    """判断一串归一化数字是否以 "cx cy w h" 开头（平台历史导出写法）。
+
+    判据：把前 4 个当 (cx,cy,w,h)，若其余坐标全部落在该框内 → 认定带框前缀。
+    官方分割行的前 4 个数字只是第 1、2 个顶点，几乎不可能把整圈轮廓包进去，
+    因此这个判别足够稳。
+    """
+    if len(nums) < 10 or (len(nums) - 4) % 2 != 0:
+        return False
+    cx, cy, bw, bh = nums[:4]
+    if bw <= 0 or bh <= 0 or cx <= 0 or cy <= 0:
+        return False
+    x1, y1, x2, y2 = cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2
+    tol = 0.02
+    rest = nums[4:]
+    for i in range(0, len(rest), 2):
+        if not (x1 - tol <= rest[i] <= x2 + tol and y1 - tol <= rest[i + 1] <= y2 + tol):
+            return False
+    return True
+
+
+def decode_yolo_line(parts: list, img_w: float, img_h: float):
+    """解析一行 YOLO 标签 → {class_id, x1, y1, x2, y2[, polygon]}；非法行返回 None。
+
+    三种写法都认（读入口必须向后兼容，否则历史导出的 zip 全废）：
+      检测    class cx cy w h
+      分割    class x1 y1 x2 y2 ...       ← ultralytics 官方口径：类别之后全是顶点
+      旧导出  class cx cy w h x1 y1 ...    ← 顶点前多 4 列框参数，仅供读历史包
+    """
+    if len(parts) < 5:
+        return None
+    try:
+        cls_id = int(float(parts[0]))
+        nums = [float(p) for p in parts[1:]]
+    except (TypeError, ValueError):
+        return None
+
+    def _to_pixels(seq):
+        return clean_polygon([[round(seq[i] * img_w, 2), round(seq[i + 1] * img_h, 2)]
+                              for i in range(0, len(seq) - 1, 2)])
+
+    head = 4 if _looks_like_bbox_prefix(nums) else 0
+    if head:
+        cx, cy, bw, bh = nums[:4]
+        box = {
+            "class_id": cls_id,
+            "x1": round((cx - bw / 2) * img_w, 2),
+            "y1": round((cy - bh / 2) * img_h, 2),
+            "x2": round((cx + bw / 2) * img_w, 2),
+            "y2": round((cy + bh / 2) * img_h, 2),
+        }
+        poly = _to_pixels(nums[4:])
+        if poly:
+            box["polygon"] = poly
+        return box
+    if len(nums) == 4:  # 纯检测行
+        cx, cy, bw, bh = nums
+        return {
+            "class_id": cls_id,
+            "x1": round((cx - bw / 2) * img_w, 2),
+            "y1": round((cy - bh / 2) * img_h, 2),
+            "x2": round((cx + bw / 2) * img_w, 2),
+            "y2": round((cy + bh / 2) * img_h, 2),
+        }
+    if len(nums) >= 6 and len(nums) % 2 == 0:  # 官方分割行：矩形由顶点外接框现算
+        poly = _to_pixels(nums)
+        if not poly:
+            return None
+        x1, y1, x2, y2 = polygon_to_bbox(poly)
+        return {"class_id": cls_id, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "polygon": poly}
+    return None
+
+
+def yolo_label_line(cls_id: int, bbox: tuple, poly: list, img_w: float, img_h: float,
+                    rect_as_poly: bool = False) -> str:
+    """生成一行 YOLO 标签文本（唯一写入口，所有导出路径必须走这里）。
+
+    ultralytics 的读法（data/utils.py）是"类别之后的数字两两一组当顶点"，
+    所以分割行绝不能带 cx cy w h 前缀：宽高会被读成第 2 个顶点，在每个轮廓上
+    凭空插一根指向画面左上角的尖刺（曾经把 139 张训练图全污染成这个形状）。
+      分割行： class x1 y1 x2 y2 ...
+      检测行： class cx cy w h
+    rect_as_poly：整份标签里只要有一条分割行就传 True，此时没有轮廓的框退化成
+    4 个角点的分割行 —— 否则混合文件里检测行的 4 列会被当成顶点读成垃圾形状。
+    """
+    pts = poly
+    if not pts and rect_as_poly:
+        bx1, by1, bx2, by2 = bbox
+        pts = [[bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]]
+    if pts:
+        flat = []
+        for px, py in pts:
+            flat.append(f"{min(max(px / img_w, 0.0), 1.0):.6f}")
+            flat.append(f"{min(max(py / img_h, 0.0), 1.0):.6f}")
+        return f"{cls_id} " + " ".join(flat)
+    x1, y1, x2, y2 = bbox
+    cx = (x1 + x2) / 2 / img_w
+    cy = (y1 + y2) / 2 / img_h
+    w = max(x2 - x1, 0.0) / img_w
+    h = max(y2 - y1, 0.0) / img_h
+    return f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}"
 
 
 class AnnotationService:
@@ -71,6 +282,7 @@ class AnnotationService:
     #       "class_id": 0, "english_code": "person",
     #       "chinese_name": "人", "chinese_desc": "行人/人体",   # 标签四字段
     #       "x1": 120, "y1": 80, "x2": 240, "y2": 320,          # 像素坐标
+    #       "polygon": [[130, 80], ...],                         # 可选：分割轮廓（像素坐标，≥3 点）
     #       "confidence": 0.86, "source": "ai_qwen"             # 可选：AI 置信度/来源
     #     }
     #   ]
@@ -83,14 +295,14 @@ class AnnotationService:
     def _load_image_ann(self, dataset_id: str, version: str, image_id: str) -> dict:
         p = self._image_ann_path(dataset_id, version, image_id)
         try:
-            return _load_json(p)
+            return ann_with_bbox(_load_json(p))
         except Exception:
             return {}
 
     def _save_image_ann(self, dataset_id: str, version: str, image_id: str, data: dict):
         p = self._image_ann_path(dataset_id, version, image_id)
         p.parent.mkdir(parents=True, exist_ok=True)
-        _save_json(p, data)
+        _save_json(p, strip_ann_bbox(data))
 
     def _delete_image_ann(self, dataset_id: str, version: str, image_id: str):
         p = self._image_ann_path(dataset_id, version, image_id)
@@ -107,7 +319,7 @@ class AnnotationService:
             return out
         for p in ann_dir.glob("*.json"):
             try:
-                data = _load_json(p)
+                data = ann_with_bbox(_load_json(p))
                 out[data.get("image_id", p.stem)] = data
             except Exception:
                 continue
@@ -195,9 +407,19 @@ class AnnotationService:
                 "english_code": eng,
                 "chinese_name": meta.get("chinese_name") or eng,
                 "chinese_desc": meta.get("chinese_desc") or "",
-                "x1": float(b["x1"]), "y1": float(b["y1"]),
-                "x2": float(b["x2"]), "y2": float(b["y2"]),
             }
+            poly = clean_polygon(b.get("polygon"))
+            if poly:
+                # 分割目标：方框只是 Grounding→SAM 圈定范围的中间产物，用完就扔，
+                # 数据里只保留轮廓点（矩形由读取口 ensure_box_bbox 现算，永远和轮廓一致）
+                nb["polygon"] = poly
+            else:
+                # 检测目标：只有矩形可用，必须落 4 个坐标
+                try:
+                    nb.update({"x1": float(b["x1"]), "y1": float(b["y1"]),
+                               "x2": float(b["x2"]), "y2": float(b["y2"])})
+                except (KeyError, TypeError):
+                    continue  # 既无轮廓也无坐标 → 无法定位，丢弃脏框
             confidence = b.get("confidence")
             if confidence is None:
                 confidence = b.get("score")
@@ -220,7 +442,7 @@ class AnnotationService:
         idx_map = {str(c).lower(): i for i, c in enumerate(classes or [])}
         out = []
         for b in boxes:
-            nb = dict(b)
+            nb = dict(ensure_box_bbox(b))
             cid = b.get("class_id", 0)
             if not (isinstance(cid, int) or (isinstance(cid, str) and cid.isdigit())):
                 nb["class_id"] = idx_map.get(str(cid).lower(), cid)
@@ -298,7 +520,11 @@ class AnnotationService:
                         auto_classes = [str(n) for n in names]
             except Exception:
                 pass
-            
+
+            # 类别跟随算法库标签字典（#6）：meta.classes 是 prepare 当时的快照，
+            # 库侧新增/改名标签后按 index 合并，建任务即拿到最新类别清单
+            auto_classes = live_classes(auto_classes, model_id)
+
             # 类别合并：数据集 meta.classes 在前（真实类别名，class_id 顺序与已有标注对齐），
             # 用户输入中的新增类别追加在后；两者合并去重。避免标注任务无类别导致 AI 预标注不可用
             manual = classes or []
@@ -342,24 +568,32 @@ class AnnotationService:
                         # 尝试找到对应的标签文件
                         label_path = self._find_label_file(img_path, images_dir, labels_dir)
                         if label_path and label_path.exists():
-                            # 加载 YOLO 格式标签 → 以像素坐标写入每图 JSON
-                            boxes = self._load_yolo_labels(label_path, width, height)
-                            if boxes:
-                                ann_data = {
-                                    "image_id": image_id,
-                                    "image_path": self._calculate_image_path(img_path),
-                                    "width": width,
-                                    "height": height,
-                                    "model_id": model_id,
-                                    "dataset_id": dataset_id,
-                                    "version": version,
-                                    "boxes": boxes,
-                                    "updated_at": datetime.now().isoformat(),
-                                    "ai_annotated": False,
-                                }
-                                self._save_image_ann(dataset_id, version, image_id, ann_data)
-                                has_annotation = True
-                                loaded_count += 1
+                            # 每图 JSON 才是标注的权威来源。这里绝不能用 labels/*.txt
+                            # 覆盖已存在的 JSON：否则在平台上画好、微调过的标注（尤其是
+                            # 分割轮廓）会在"重新创建标注任务"时被 txt 里的旧内容整体冲掉，
+                            # 属于静默丢数据，且丢完再也找不回来。
+                            existing = self._load_image_ann(dataset_id, version, image_id)
+                            if existing:
+                                has_annotation = bool(existing.get("boxes"))
+                            else:
+                                # 首次建任务（如导入外部分割包）才用 txt 播种
+                                boxes = self._load_yolo_labels(label_path, width, height)
+                                if boxes:
+                                    ann_data = {
+                                        "image_id": image_id,
+                                        "image_path": self._calculate_image_path(img_path),
+                                        "width": width,
+                                        "height": height,
+                                        "model_id": model_id,
+                                        "dataset_id": dataset_id,
+                                        "version": version,
+                                        "boxes": boxes,
+                                        "updated_at": datetime.now().isoformat(),
+                                        "ai_annotated": False,
+                                    }
+                                    self._save_image_ann(dataset_id, version, image_id, ann_data)
+                                    has_annotation = True
+                                    loaded_count += 1
                     
                     # 计算图片路径，相对于 DATA_DIR（静态文件服务的根目录）
                     image_path = self._calculate_image_path(img_path)
@@ -396,7 +630,13 @@ class AnnotationService:
                 "classes": task_classes
             }
         
-        return await asyncio.to_thread(_create_task_sync)
+        result = await asyncio.to_thread(_create_task_sync)
+        # 影子库收口：仅新建任务时整表写 items（此后 has_label 由标注/导入路径逐行回填，
+        # task.json 快照不带该字段，再用快照覆盖会把 PG 已标注标记冲掉）
+        if result.get("task_id"):
+            from src.db import shadow
+            await shadow.sync_task(result["task_id"], with_items=True)
+        return result
     
     def find_task_by_dataset(self, dataset_id: str, version: str = "v1"):
         """按数据集查找已存在的标注任务（自动建任务去重用 / 标注页直达用）。
@@ -461,6 +701,9 @@ class AnnotationService:
             _save_json(task_dir / "task.json", meta)
 
         await asyncio.to_thread(_save)
+        # 影子库收口：任务图片删除后同步移除 task_items 行，避免列表残留
+        from src.db import shadow
+        await shadow.remove_task_item(task_id, removed_id)
         result["total_images"] = len(items)
         return result
     
@@ -530,27 +773,11 @@ class AnnotationService:
                         continue
                     
                     parts = line.split()
-                    if len(parts) >= 5:
-                        class_id = int(parts[0])
-                        # YOLO 格式: class_id cx cy w h (归一化坐标)
-                        cx = float(parts[1])
-                        cy = float(parts[2])
-                        w = float(parts[3])
-                        h = float(parts[4])
-                        
-                        # 转换为绝对坐标 (x1, y1, x2, y2)
-                        x1 = (cx - w / 2) * img_width
-                        y1 = (cy - h / 2) * img_height
-                        x2 = (cx + w / 2) * img_width
-                        y2 = (cy + h / 2) * img_height
-                        
-                        boxes.append({
-                            "class_id": class_id,
-                            "x1": x1,
-                            "y1": y1,
-                            "x2": x2,
-                            "y2": y2
-                        })
+                    # decode_yolo_line 统一处理"检测行 / 官方分割行 / 平台旧导出分割行"，
+                    # 分割轮廓必须保留，否则外部分割包导进来会被静默截成矩形框
+                    box = decode_yolo_line(parts, img_width, img_height)
+                    if box:
+                        boxes.append(box)
         except Exception as e:
             print(f"Error loading label file {label_path}: {e}")
         
@@ -602,11 +829,17 @@ class AnnotationService:
                 item["sample_type"] = ann.get("sample_type", "")
                 # P2：has_label=该图标注是否存在有内容的框（approved 且 has_label 联合完成判定）
                 item["has_label"] = bool(ann.get("boxes"))
+                # 轮廓质量筛选用：是否人工复核过 / 图上是否存在分割轮廓
+                item["reviewed"] = bool(ann.get("reviewed", False))
+                item["has_polygon"] = any(
+                    isinstance(b, dict) and b.get("polygon") for b in (ann.get("boxes") or [])
+                )
                 unique_items.append(item)
             
             return {
                 "items": unique_items,
-                "classes": task_meta.get("classes", []),
+                # 类别下拉跟随算法库标签字典实时值（#6），不落盘、不改任务快照
+                "classes": live_classes(task_meta.get("classes") or [], task_meta.get("model_id") or ""),
                 "dataset_id": task_meta.get("dataset_id", ""),
                 "model_id": task_meta.get("model_id", ""),
                 "imported_annotations": task_meta.get("imported_annotations", 0)
@@ -645,9 +878,11 @@ class AnnotationService:
                         annotation = _load_json(legacy_file).get(image_id, {})
                 except Exception:
                     annotation = {}
+            # 类别清单跟随算法库（#6）：下拉框与框下标必须同源，否则前端渲染错位
+            view_classes = live_classes(task_meta.get("classes") or [], task_meta.get("model_id") or "")
             boxes = annotation.get("boxes", [])
             # JSON 落盘 class_id 为英文名，响应层映射回任务类别下标（前端渲染用）
-            boxes = self._boxes_for_view(boxes, task_meta.get("classes") or [])
+            boxes = self._boxes_for_view(boxes, view_classes)
             
             return {
                 "image_id": image_id,
@@ -657,18 +892,24 @@ class AnnotationService:
                 "boxes": boxes,
                 "sample_type": annotation.get("sample_type", ""),
                 "sample_reasons": annotation.get("sample_reasons", []),
-                "classes": task_meta.get("classes", [])
+                # 人工复核标记（前端切图时回读，决定"轮廓质量"归属）
+                "reviewed": bool(annotation.get("reviewed", False)),
+                "classes": view_classes
             }
         
         return await asyncio.to_thread(_get_image_annotation_sync)
     
     @staticmethod
     def _box_iou(a: dict, b: dict) -> float:
-        """两个框的 IoU（框需含 x1/y1/x2/y2，缺字段按 0 兜底）。"""
-        ax1, ay1 = float(a.get("x1", 0)), float(a.get("y1", 0))
-        ax2, ay2 = float(a.get("x2", 0)), float(a.get("y2", 0))
-        bx1, by1 = float(b.get("x1", 0)), float(b.get("y1", 0))
-        bx2, by2 = float(b.get("x2", 0)), float(b.get("y2", 0))
+        """两个框的 IoU（框需含 x1/y1/x2/y2，缺字段或为 None 按 0 兜底）。
+
+        分割目标落盘只有轮廓点（矩形不存），调用方应先经 ensure_box_bbox 补算；
+        这里再用 `or 0` 兜一层，避免 None 直接 float() 抛 TypeError。
+        """
+        ax1, ay1 = float(a.get("x1") or 0), float(a.get("y1") or 0)
+        ax2, ay2 = float(a.get("x2") or 0), float(a.get("y2") or 0)
+        bx1, by1 = float(b.get("x1") or 0), float(b.get("y1") or 0)
+        bx2, by2 = float(b.get("x2") or 0), float(b.get("y2") or 0)
         ix1, iy1 = max(ax1, bx1), max(ay1, by1)
         ix2, iy2 = min(ax2, bx2), min(ay2, by2)
         inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
@@ -678,7 +919,7 @@ class AnnotationService:
         return inter / ua if ua > 0 else 0.0
 
     async def save_annotation(self, task_id: str, image_id: str, boxes: list, ai_annotated: bool = False,
-                              sample_type: str = None, sample_reason: str = None):
+                              sample_type: str = None, sample_reason: str = None, reviewed: bool = False):
         """保存图片标注（写入一图一 JSON 标注文件）。
 
         boxes 可选携带 confidence/score/source；保存时按任务类别+模型标签字典
@@ -700,6 +941,9 @@ class AnnotationService:
             existing = self._load_image_ann(dataset_id, version, image_id)
             prev_ai = existing.get("ai_annotated", False)
             created_at = existing.get("created_at") or datetime.now().isoformat()
+            # "人工复核过"粘性标记：画布上真正编辑过标注再保存才传 True（AI 预标注不会传），
+            # 一旦置真永不清除——供标注页按"轮廓质量"筛选挑图
+            rev = bool(existing.get("reviewed", False)) or bool(reviewed)
             
             # 查找图片信息（首次写入时补充元数据）
             info = next((it for it in task_meta.get("items", []) if it.get("image_id") == image_id), {})
@@ -719,10 +963,14 @@ class AnnotationService:
             # 视为人工发现 AI 漏检，强制标为困难查证（用户显式指定类型时以用户为准）
             existing_boxes = existing.get("boxes", []) if isinstance(existing, dict) else []
             if ai and sample_type is None and s_type != self.SAMPLE_BACKGROUND:
+                # 比对必须用规范化后的框：原始 boxes 是接口模型对象（没有 .get），
+                # 且分割框只带轮廓点不带矩形，直接取坐标会整张图保存失败。
+                cur = [ensure_box_bbox(b) for b in norm_boxes]
+                old = [ensure_box_bbox(pb) for pb in existing_boxes]
                 manual_added = [
-                    b for b in boxes
-                    if str(b.get("source", "")).lower().startswith("manual")
-                    and not any(self._box_iou(b, pb) >= 0.7 for pb in existing_boxes)
+                    b for b in cur
+                    if str(b.get("source") or "").lower().startswith("manual")
+                    and not any(self._box_iou(b, pb) >= 0.7 for pb in old)
                 ]
                 if manual_added and "manual_add" not in (s_reasons or []):
                     s_type = self.SAMPLE_HARD
@@ -744,6 +992,7 @@ class AnnotationService:
                 "created_at": created_at,
                 "updated_at": datetime.now().isoformat(),
                 "ai_annotated": ai,
+                "reviewed": rev,
             }
             
             self._save_image_ann(dataset_id, version, image_id, ann_data)
@@ -801,6 +1050,127 @@ class AnnotationService:
 
         return await asyncio.to_thread(_clear_sync)
 
+    async def clear_all_annotations(self, task_id: str):
+        """清除该任务数据集的全部标注框（AI 标注与人工标注一视同仁）。
+
+        与 clear-ai 的差别：不按 ai_annotated 过滤，所有图片的 boxes 一律清空。
+        安全措施：
+        - 已封板 / 已入桶 / 已归档的数据集拒绝执行（与「删除图片」同一套拦截）；
+        - 清空前把 annotations/*.json + labels/*.txt + meta.json 打包备份到
+          ANNOTATIONS_DIR/backups/，误清可解压回退；
+        - 只清框，保留每图 JSON 的样本类型标记（normal/hard/background）与 created_at；
+        - 同步删除派生的 labels/*.txt（txt 由标注 JSON 派生，留着会造成两份真相），
+          并回退 meta 的标注计数与「审核通过」状态 —— 否则一个空标注集会绕过人工复核直接灌桶。
+
+        与 clear-ai / clean-overlaps 一致，不回填 PG 影子库（一图一 JSON 才是唯一权威）。
+        """
+        def _sync():
+            task_dir = self.annotations_dir / task_id
+            task_file = task_dir / "task.json"
+            if not task_file.exists():
+                raise ValueError(f"标注任务 {task_id} 不存在")
+            task_meta = _load_json(task_file)
+            dataset_id, version = self._task_to_ds(task_meta)
+            if not dataset_id:
+                raise ValueError("标注任务未绑定数据集，无法清除标注")
+
+            dataset_dir = self.datasets_dir / dataset_id
+            meta_path = dataset_dir / "meta.json"
+            if not meta_path.exists():
+                raise ValueError(f"数据集 {dataset_id} 不存在")
+            meta = _load_json(meta_path)
+            if meta.get("status") != "prepared":
+                raise ValueError("数据集尚未准备（prepare），无法清除标注")
+            if meta.get("stage") == "sealed":
+                raise ValueError("数据集已封板（只读），无法清除标注")
+            if meta.get("bucket_archived"):
+                raise ValueError("数据集已归档入桶，无法清除标注（需先解除归档）")
+            if int(meta.get("bucket_pending") or 0) + int(meta.get("bucket_sealed") or 0) > 0:
+                raise ValueError("数据集已部分入桶，无法清除标注（需先解除归档）")
+
+            # labels 目录只做有限深度探测（平铺 / {version}/labels），
+            # 不 rglob 整棵数据集树——万张图的数据集那样会慢到卡住请求线程
+            labels_dirs = [d for d in list(dataset_dir.glob("labels")) + list(dataset_dir.glob("*/labels")) if d.is_dir()]
+            anns = self._load_all_image_anns(dataset_id, version)
+            has_any_box = any(a.get("boxes") for a in anns.values())
+            has_txt = any(
+                f.name != "classes.txt"
+                for d in labels_dirs
+                for f in d.rglob("*.txt")
+            )
+
+            # 1) 先备份（无内容可备份时跳过，避免留下一堆空 zip）
+            backup_path = ""
+            if has_any_box or has_txt:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_dir = self.annotations_dir / "backups"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                backup_path = str(backup_dir / f"{dataset_id}_annotations_{ts}.zip")
+                with zipfile.ZipFile(backup_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    ann_dir = dataset_dir / "annotations"
+                    if ann_dir.is_dir():
+                        for f in sorted(ann_dir.glob("*.json")):
+                            zf.write(f, f"annotations/{f.name}")
+                    for d in labels_dirs:
+                        for f in sorted(d.rglob("*.txt")):
+                            zf.write(f, f"{d.relative_to(dataset_dir).as_posix()}/{f.name}")
+                    if meta_path.exists():
+                        zf.write(meta_path, "meta.json")
+
+            # 2) 清空每图 JSON 的框与 AI/人工复核标记（保留样本类型等元数据）
+            cleared_images = cleared_boxes = 0
+            for image_id, ann in anns.items():
+                boxes = ann.get("boxes") or []
+                if not (boxes or ann.get("ai_annotated") or ann.get("reviewed")):
+                    continue
+                cleared_boxes += len(boxes)
+                cleared_images += 1
+                self._save_image_ann(dataset_id, version, image_id, {
+                    **ann,
+                    "boxes": [],
+                    "ai_annotated": False,
+                    "reviewed": False,
+                    "updated_at": datetime.now().isoformat(),
+                })
+
+            # 3) 历史任务集中式标注文件一并清空，避免旧数据回灌
+            legacy_file = task_dir / "annotations.json"
+            if legacy_file.exists():
+                _save_json(legacy_file, {})
+
+            # 4) 删除派生的 YOLO txt（classes.txt 是类别表，不属于标注，保留）
+            removed_txt = 0
+            for d in labels_dirs:
+                for f in list(d.rglob("*.txt")):
+                    if f.name == "classes.txt":
+                        continue
+                    try:
+                        f.unlink()
+                        removed_txt += 1
+                    except OSError:
+                        pass
+
+            # 5) 回退数据集 meta 的标注计数与审核通过状态
+            meta["label_count"] = 0
+            meta["has_labels"] = False
+            meta["review_approved"] = False
+            meta.pop("review_approved_at", None)
+            _save_json(meta_path, meta)
+
+            logger.info(
+                f"clear-all annotations {dataset_id} (task={task_id}): "
+                f"images={cleared_images} boxes={cleared_boxes} txt={removed_txt} backup={backup_path}"
+            )
+            return {
+                "ok": True,
+                "cleared_images": cleared_images,
+                "cleared_boxes": cleared_boxes,
+                "removed_label_files": removed_txt,
+                "backup": backup_path,
+            }
+
+        return await asyncio.to_thread(_sync)
+
     async def export_to_yolo(self, task_id: str):
         """导出标注为YOLO格式"""
         def _export_to_yolo_sync():
@@ -844,6 +1214,7 @@ class AnnotationService:
                             (labels_dir / subdir).mkdir(exist_ok=True)
                 
                 exported_count = 0
+                seg_boxes = 0  # 带分割轮廓的框数，用于回显「本次导出含 N 条分割标注」
                 errors = []
                 # class_id（英文名）→ YOLO 数字索引（与任务类别列表顺序一致）
                 _cls_idx = {str(c).lower(): i for i, c in enumerate(task_meta.get("classes") or [])}
@@ -862,21 +1233,23 @@ class AnnotationService:
                         if not boxes:
                             continue
                         
-                        # 转换为YOLO格式（归一化的 cx cy w h）
+                        # 逐框写行：有轮廓 → 分割行（只写顶点），无轮廓 → 检测行；
+                        # 同一文件里混有分割行时，无轮廓的框退化成 4 角点分割行
+                        polys = [clean_polygon(box.get("polygon")) for box in boxes]
+                        has_seg = any(polys)
                         yolo_lines = []
-                        for box in boxes:
-                            x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
-                            cx = (x1 + x2) / 2 / width
-                            cy = (y1 + y2) / 2 / height
-                            w = (x2 - x1) / width
-                            h = (y2 - y1) / height
+                        for box, poly in zip(boxes, polys):
                             class_id = box["class_id"]
                             if isinstance(class_id, int) or (isinstance(class_id, str) and class_id.isdigit()):
                                 cls_id = int(class_id)  # 旧数据数字索引直接使用
                             else:
                                 cls_id = _cls_idx.get(str(class_id).lower(), 0)
-                            
-                            yolo_lines.append(f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+
+                            yolo_lines.append(yolo_label_line(
+                                cls_id, (box["x1"], box["y1"], box["x2"], box["y2"]),
+                                poly, width, height, rect_as_poly=has_seg))
+                            if poly:
+                                seg_boxes += 1
                         
                         # 确定标签文件路径
                         label_path = self._determine_label_path(item, images_dir, labels_dir, image_id)
@@ -893,7 +1266,7 @@ class AnnotationService:
                         errors.append(error_msg)
                         continue
                 
-                result = {"ok": True, "exported_count": exported_count}
+                result = {"ok": True, "exported_count": exported_count, "segment_boxes": seg_boxes}
                 if errors:
                     result["errors"] = errors
                 return result
@@ -905,6 +1278,115 @@ class AnnotationService:
                 return {"ok": False, "error": error_msg}
         
         return await asyncio.to_thread(_export_to_yolo_sync)
+
+    async def export_reviewed_zip(self, task_id: str):
+        """单独提取"人工修过"（reviewed=true 且有标注框）的图片 + YOLO 标签，打包成临时 zip。
+
+        与 export_to_yolo 的区别：不写数据集目录，直接产出可下载的压缩包
+        （images/ + labels/ + classes.txt + data.yaml），用户在标注页挑图精修后
+        一键提取，无需自己去文件夹里翻。labels 为 YOLO 分割格式（轮廓点写在行尾）。
+        """
+        def _export_reviewed_zip_sync():
+            try:
+                task_dir = self.annotations_dir / task_id
+                task_file = task_dir / "task.json"
+                if not task_file.exists():
+                    return {"ok": False, "error": "Task not found"}
+
+                task_meta = _load_json(task_file)
+                dataset_id, version = self._task_to_ds(task_meta)
+                annotations = self._load_all_image_anns(dataset_id, version)
+                legacy_file = task_dir / "annotations.json"
+                try:
+                    if legacy_file.exists():
+                        for img_id, ann in _load_json(legacy_file).items():
+                            annotations.setdefault(img_id, ann)
+                except Exception:
+                    pass
+
+                dataset_dir = self.datasets_dir / dataset_id
+                images_dir = self._find_images_dir(dataset_dir) if dataset_dir.exists() else None
+                classes = [str(c) for c in (task_meta.get("classes") or [])]
+                cls_idx = {c.lower(): i for i, c in enumerate(classes)}
+
+                exported = 0
+                seg_boxes = 0
+                skipped_no_image = []
+
+                temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+                temp_zip.close()
+                zip_path = temp_zip.name
+                try:
+                    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+                        for item in task_meta["items"]:
+                            image_id = item["image_id"]
+                            ann = annotations.get(image_id)
+                            # 只提取人工修过且目前有框的图（reviewed 为粘性标记，见 save_annotation）
+                            if not ann or not ann.get("reviewed") or not ann.get("boxes"):
+                                continue
+                            width = item["width"]
+                            height = item["height"]
+                            yolo_lines = []
+                            r_polys = [clean_polygon(b.get("polygon")) for b in ann["boxes"]]
+                            r_has_seg = any(r_polys)
+                            for box, poly in zip(ann["boxes"], r_polys):
+                                class_id = box["class_id"]
+                                if isinstance(class_id, int) or (isinstance(class_id, str) and class_id.isdigit()):
+                                    cls_id = int(class_id)  # 旧数据数字索引直接使用
+                                else:
+                                    cls_id = cls_idx.get(str(class_id).lower(), 0)
+                                yolo_lines.append(yolo_label_line(
+                                    cls_id, (box["x1"], box["y1"], box["x2"], box["y2"]),
+                                    poly, width, height, rect_as_poly=r_has_seg))
+                                if poly:
+                                    seg_boxes += 1
+                            # 定位原图文件（与 _determine_label_path 相同的扩展名探测方式）
+                            image_file = None
+                            if images_dir:
+                                for ext in [".jpg", ".png", ".jpeg", ".webp", ".bmp"]:
+                                    candidates = list(images_dir.rglob(f"{image_id}{ext}"))
+                                    if candidates:
+                                        image_file = candidates[0]
+                                        break
+                            if image_file is None:
+                                skipped_no_image.append(image_id)
+                                continue
+                            zipf.write(image_file, f"images/{image_file.name}")
+                            zipf.writestr(f"labels/{image_file.stem}.txt", "\n".join(yolo_lines))
+                            exported += 1
+                        # 类别清单与最小 data.yaml，解压后可直接喂给 ultralytics 训练
+                        if classes:
+                            zipf.writestr("classes.txt", "\n".join(classes))
+                            zipf.writestr(
+                                "data.yaml",
+                                yaml.dump(
+                                    {"path": "", "train": "images", "val": "images", "nc": len(classes), "names": classes},
+                                    allow_unicode=True,
+                                ),
+                            )
+                    if exported == 0:
+                        os.unlink(zip_path)
+                        return {"ok": False, "error": "还没有\"已修过\"的图片可提取：请先修几张图（画/改一下轮廓并自动保存），列表筛子里\"轮廓·已修过\"有数量后再点"}
+                except Exception:
+                    if os.path.exists(zip_path):
+                        os.unlink(zip_path)
+                    raise
+                return {
+                    "ok": True,
+                    "zip_path": zip_path,
+                    "filename": f"{task_id}_reviewed.zip",
+                    "exported_count": exported,
+                    "segment_boxes": seg_boxes,
+                    "skipped_no_image": skipped_no_image,
+                }
+            except Exception as e:
+                error_msg = f"Export reviewed zip failed: {str(e)}"
+                print(error_msg)
+                import traceback
+                traceback.print_exc()
+                return {"ok": False, "error": error_msg}
+
+        return await asyncio.to_thread(_export_reviewed_zip_sync)
 
     def _determine_label_path(self, item: dict, images_dir: Path, labels_dir: Path, image_id: str) -> Path:
         """确定标签文件路径"""
@@ -988,6 +1470,7 @@ class AnnotationService:
                 by_stem.setdefault(Path(item["image_path"]).stem, item)
 
             imported = 0
+            imported_ids = []
             skipped = []
             for tf in label_files:
                 stem = tf.stem
@@ -1018,8 +1501,16 @@ class AnnotationService:
                     "ai_annotated": False,
                 })
                 imported += 1
+                imported_ids.append(item["image_id"])
 
             shutil.rmtree(tmp_dir, ignore_errors=True)
-            return {"ok": True, "imported": imported, "skipped": skipped}
+            return {"ok": True, "imported": imported, "skipped": skipped,
+                    "imported_ids": imported_ids}
 
-        return await asyncio.to_thread(_import_sync)
+        result = await asyncio.to_thread(_import_sync)
+        # 影子库收口：导入即产生标签，批量回填 task_items.has_label（不污染对外响应）
+        ids = result.pop("imported_ids", None) or []
+        if result.get("ok") and ids:
+            from src.db import shadow
+            await shadow.mark_items_labeled(task_id, ids)
+        return result

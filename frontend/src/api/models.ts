@@ -7,19 +7,42 @@ export interface UpdateModelRequest {
   model_code?: string
   display_name?: string
   status?: 'active' | 'inactive' | string
+  model_library_id?: string | null  // 归入算法库；传空/null 表示移出库（降级为独立模型）
 }
 
-/** 模型统一标签字典项（四字段：index / english_code / chinese_name / chinese_desc） */
+/** 模型统一标签字典项（五字段：index / english_code / chinese_name / chinese_desc / ai_prompt_en） */
 export interface LabelItem {
   index: number
   english_code: string
   chinese_name?: string
   chinese_desc?: string
+  /** 英文检测提示词：告诉 GroundingDINO / YOLO-World 这个类别在画面里长什么样（只认英文） */
+  ai_prompt_en?: string
 }
 
 export interface LabelsDict {
   model_code?: string
   labels: LabelItem[]
+}
+
+/** 标签引用统计：判断每个类别"有没有被数据用过"，用过的英文名锁死不可改 */
+export interface LabelUsageItem {
+  index: number
+  english_code: string
+  images: number
+  datasets: number
+  in_use: boolean
+  /** 该行是否被锁死（英文名不可改、不可删）：在用的那一行及其之前的行 */
+  locked: boolean
+}
+
+export interface LabelsUsage {
+  model_id: string
+  library_root_id: string
+  dict_locked: boolean
+  /** 最后一个"在用"类别所在行号；-1 表示本库还没有任何数据用到标签，字典可自由编辑 */
+  frozen_until: number
+  labels: LabelUsageItem[]
 }
 
 /** 模型守门员评估报告（训练结束后自动对比新旧模型生成） */
@@ -62,7 +85,7 @@ export interface ModelDetails {
   created_at?: string
   weights_path?: string
   name?: string
-  display_name?: string         // 模型库显示名（新建时人工指定，可改）
+  display_name?: string         // 算法库显示名（新建时人工指定，可改）
   description?: string
   tags?: string[]
   file_size?: number
@@ -129,7 +152,7 @@ export const listModels = async () => {
   return data
 }
 
-// ===== 模型库（model_libraries：base_algorithm / 标签字典 / 当前生产模型指针） =====
+// ===== 算法库（model_libraries：base_algorithm / 标签字典 / 当前生产模型指针） =====
 export interface ModelLibrary {
   model_library_id: string
   display_name?: string
@@ -160,7 +183,7 @@ export const deleteLibrary = async (libraryId: string) => {
   return data
 }
 
-// 首页「+ 新建模型库」：创建空白模型（空标签字典 + 采集库），code 已存在则返回现有模型
+// 首页「+ 新建算法库」：创建空白模型（空标签字典 + 采集库），code 已存在则返回现有模型
 export const createModel = async (req: {
   display_name: string
   model_code: string
@@ -225,6 +248,12 @@ export const updateLabelsDict = async (modelId: string, labels: LabelItem[]): Pr
   return data
 }
 
+/** 标签引用统计（弹窗打开时拉一次：决定哪些英文名锁死、显示已用/未用） */
+export const getLabelsUsage = async (modelId: string): Promise<LabelsUsage> => {
+  const { data } = await api.get(`/models/${modelId}/labels/usage`)
+  return data
+}
+
 export interface LabelSuggestion {
   english_code: string
   chinese_name: string
@@ -241,6 +270,38 @@ export const suggestModelLabels = async (modelId: string, datasetId: string, lim
 export const adoptSuggestedLabels = async (modelId: string, suggestions: { english_code: string; chinese_name: string; chinese_desc: string }[]) => {
   const { data } = await api.post(`/models/${modelId}/labels/suggest/adopt`, { suggestions })
   return data as { added: string[]; skipped: string[] }
+}
+
+/** 标签文案同步结果：把标签字典的中文名/描述刷进本库已标注数据 */
+export interface LabelSyncResult {
+  model_id: string
+  dry_run: boolean
+  stats: {
+    datasets: number
+    files_scanned: number
+    files_changed: number
+    boxes_changed: number
+  }
+  samples: {
+    dataset_id: string
+    image_id: string
+    english_code: string
+    field: string
+    before: string
+    after: string
+  }[]
+  backup_id: string | null
+  last_backup: { backup_id?: string; at?: string; files?: number; boxes?: number } | null
+}
+
+export const syncLabelsToAnnotations = async (modelId: string, dryRun: boolean): Promise<LabelSyncResult> => {
+  const { data } = await api.post(`/models/${modelId}/labels/sync-annotations`, { dry_run: dryRun })
+  return data
+}
+
+export const rollbackLabelSync = async (modelId: string) => {
+  const { data } = await api.post(`/models/${modelId}/labels/sync-annotations/rollback`)
+  return data as { model_id: string; restored_files: number; backup_id: string }
 }
 
 export const deleteModel = async (modelId: string) => {
@@ -333,9 +394,11 @@ export const promoteToDetector = async (modelId: string) => {
   return data
 }
 
-export const uploadModel = async (file: File) => {
+export const uploadModel = async (file: File, name?: string, libraryId?: string) => {
   const formData = new FormData()
   formData.append('file', file)
+  if (name && name.trim()) formData.append('name', name.trim())
+  if (libraryId && libraryId.trim()) formData.append('library_id', libraryId.trim())
   const { data } = await api.post('/models/upload', formData)
   return data
 }

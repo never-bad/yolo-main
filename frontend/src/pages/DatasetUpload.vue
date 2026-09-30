@@ -17,34 +17,28 @@
         <div class="upload-row">
           <input type="file" accept=".zip,.tar,.tgz,.tar.gz" id="datasetZip" @change="handleFileSelect" :disabled="uploading" class="file-input" />
           <label for="datasetZip" class="file-btn" :disabled="uploading">选择文件</label>
-          <button class="upload-btn" @click="uploadFile" :disabled="!selectedFile || uploading">
+          <button class="upload-btn" @click="uploadFile" :disabled="!selectedFile || uploading || !uploadLibraryId">
             <span v-if="uploading" class="loading-spinner"></span>
             {{ uploading ? '上传中...' : '上传' }}
           </button>
         </div>
       </div>
       <div class="form-group">
-        <label>归属已有模型（可选，#3 多模型上传）</label>
-        <select v-model="uploadModelId" class="model-code-input" @change="uploadModelCode = ''">
-          <option value="">不归属（txt 包自动按类名匹配；其余进入「未归属数据集」，可在模型详情页绑定）</option>
-          <option v-for="m in allModels" :key="m.model_id" :value="m.model_id">
-            {{ m.display_name || m.name || m.model_code || m.model_id }}{{ m.dataset_count ? `（已挂 ${m.dataset_count} 个数据集）` : '' }}
-          </option>
-        </select>
-        <small class="form-hint">与下方 model code 二选一：选这里直接挂入该模型；留空则交给自动匹配 / 手动绑定</small>
-      </div>
-      <div class="form-group">
-        <label>归属模型 code（可选，2.2 动态建模型）</label>
-        <input
-          v-model="uploadModelCode"
-          class="model-code-input"
-          placeholder="如 traffic_scene；留空则不归属。填了后：已有该 code → 挂入对应模型；没有 → 自动创建空白模型"
-          @input="uploadModelId = ''"
-        />
-        <small class="form-hint">将按归一化精确匹配（traffic-scene == trafficscene），不会模糊合并相似模型</small>
+        <label>归属算法库 <i class="required">*</i></label>
+        <div class="library-row">
+          <select v-model="uploadLibraryId" class="model-code-input" :class="{ invalid: libraryTouched && !uploadLibraryId }">
+            <option value="">— 请选择该数据集归属的算法库 —</option>
+            <option v-for="lib in libraryOptions" :key="lib.model_id" :value="lib.model_id">
+              {{ lib.display_name || lib.model_code || lib.model_id }}{{ lib.dataset_count ? `（已挂 ${lib.dataset_count} 个数据集）` : '' }}
+            </option>
+          </select>
+          <button class="secondary" @click="createLibraryOpen = true" title="没有合适的算法库？先新建一个再归属">+ 新建算法库</button>
+        </div>
+        <small v-if="libraryTouched && !uploadLibraryId" class="form-hint error-hint">数据集必须归属一个算法库，请先选择；没有合适的库请点「+ 新建算法库」</small>
+        <small v-else class="form-hint">归属决定训练产出的模型进入哪个算法库；导入后可在数据集列表里改归属</small>
       </div>
       <div v-if="uploadResult" class="result">
-        <p>✓ 上传成功: {{ uploadResult.dataset_id }}<span v-if="uploadResult.model_auto_created" class="auto-create-tag">（已自动创建模型 {{ uploadResult.model_code }}）</span></p>
+        <p>✓ 上传成功: {{ uploadResult.dataset_id }}<span class="auto-create-tag">（已归属算法库 {{ libraryName(uploadLibraryId) }}）</span></p>
         <p v-if="preparingNew" class="auto-prepare-tip">
           <span class="loading-spinner"></span>正在自动准备数据集（解压/重组/统计），请稍候...
         </p>
@@ -101,6 +95,26 @@
                 class="secondary"
                 title="打开该数据集的标注任务（无任务自动创建，直达标注页）"
               >去标注</button>
+              <button
+                v-if="canApprove(dataset)"
+                @click="approveItem(dataset)"
+                class="primary"
+                :disabled="approvingDataset === dataset.dataset_id"
+                title="人工审核确认标注无误后，该包才允许自动灌桶/封板"
+              >
+                <span v-if="approvingDataset === dataset.dataset_id" class="loading-spinner"></span>
+                {{ approvingDataset === dataset.dataset_id ? '确认中...' : '审核通过' }}
+              </button>
+              <button
+                v-if="canUnpour(dataset)"
+                @click="unpourItem(dataset)"
+                class="secondary"
+                :disabled="unpouringDataset === dataset.dataset_id"
+                title="撤回该包：把已灌入接收桶但尚未封板的图片退回，恢复可编辑"
+              >
+                <span v-if="unpouringDataset === dataset.dataset_id" class="loading-spinner"></span>
+                {{ unpouringDataset === dataset.dataset_id ? '撤回中...' : '撤回' }}
+              </button>
               <button 
                 v-if="canSeal(dataset)"
                 @click="sealDatasetItem(dataset)" 
@@ -154,6 +168,14 @@
             </div>
           </div>
           <p>文件名: {{ dataset.filename }}</p>
+          <p class="lib-row">
+            归属算法库:
+            <b v-if="datasetLibraryId(dataset)">{{ libraryName(datasetLibraryId(dataset)) }}</b>
+            <span v-else class="badge badge-unassigned">未归属</span>
+            <button class="link-btn" @click="openBindDialog(dataset)" title="数据集必须归属一个算法库，训练产出才会进入该库">
+              {{ datasetLibraryId(dataset) ? '改归属' : '去归属' }}
+            </button>
+          </p>
           <p>大小: {{ (dataset.size / 1024 / 1024).toFixed(2) }} MB</p>
           <p class="life-row">
             <span class="life-pill" :class="'life-' + lifecycleOf(dataset).key" :title="lifecycleOf(dataset).hint">{{ lifecycleOf(dataset).text }}</span>
@@ -297,22 +319,51 @@
         <pre v-else class="file-preview-text">{{ filePreviewContent || '加载中...' }}</pre>
       </div>
     </div>
+
+    <!-- 归属算法库：导入时必选，老数据可在这里补选，已归属的可改挂到其它库 -->
+    <LibraryCreateModal v-model:open="createLibraryOpen" confirm-text="创建并选中" @created="onLibraryCreated" />
+
+    <div v-if="bindDialog" class="modal-mask" @click.self="bindDialog = null">
+      <div class="modal bind-modal">
+        <h3>{{ datasetLibraryId(bindDialog) ? '修改归属算法库' : '选择归属算法库' }}</h3>
+        <p class="modal-sub">{{ bindDialog.dataset_id }}<br />数据集必须归属一个算法库，训练产出的模型才会进入该库</p>
+        <div class="form-field">
+          <label>归属算法库 <i>*</i></label>
+          <select v-model="bindLibraryId">
+            <option value="">— 请选择算法库 —</option>
+            <option v-for="lib in libraryOptions" :key="lib.model_id" :value="lib.model_id">
+              {{ lib.display_name || lib.model_code || lib.model_id }}
+            </option>
+          </select>
+        </div>
+        <div v-if="bindError" class="form-error">{{ bindError }}</div>
+        <div class="modal-actions">
+          <button class="secondary" @click="createLibraryOpen = true">+ 新建算法库</button>
+          <button class="secondary" @click="bindDialog = null">取消</button>
+          <button class="primary" @click="submitBind" :disabled="!bindLibraryId || binding">
+            {{ binding ? '保存中...' : '保存' }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted } from 'vue'
-import { uploadDataset, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets } from '@/api/datasets'
+import { uploadDataset, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel } from '@/api/datasets'
 import { listModels } from '@/api/models'
 import { addHardSamples, addBackgroundSamples } from '@/api/samplePool'
 import { downloadFile } from '@/utils/download'
 import { showConfirm, showPrompt } from '@/composables/useDialog'
 import FolderTree from '@/components/FolderTree.vue'
+import LibraryCreateModal from '@/components/LibraryCreateModal.vue'
 
 const selectedFile = ref<File | null>(null)
-const uploadModelCode = ref('')  // 2.2 动态建模型：上传时归属的模型 code
-const uploadModelId = ref('')    // #3 多模型上传：勾选已有模型归属（与 model code 二选一）
-const allModels = ref<any[]>([]) // 已有模型列表（归属下拉数据源）
+const uploadLibraryId = ref('')   // 导入时必选的归属算法库（库根记录 id）
+const libraryTouched = ref(false) // 点过上传但没选库 → 显示红字提示
+const createLibraryOpen = ref(false)
+const allModels = ref<any[]>([]) // registry 记录（算法库下拉数据源）
 const uploading = ref(false)
 const uploadResult = ref<any>(null)
 const sealMinImages = ref(0)  // #6 封板数量门槛（来自后端），列表展示待封板进度
@@ -325,6 +376,8 @@ const editingDataset = ref<string | null>(null)  // 正在编辑的数据集ID
 const deletingDataset = ref<string | null>(null)  // 正在删除的数据集ID
 const exportingDataset = ref<string | null>(null)  // 正在导出的数据集ID
 const sealingDataset = ref<string | null>(null)  // 正在封板的数据集ID
+const approvingDataset = ref<string | null>(null)  // 正在审核确认的数据集ID
+const unpouringDataset = ref<string | null>(null)  // 正在撤回（退桶）的数据集ID
 const viewingDataset = ref<any | null>(null)  // 正在预览的数据集
 const viewerImages = ref<string[]>([])  // 预览图片列表
 const viewerLoading = ref(false)  // 预览加载状态
@@ -359,13 +412,73 @@ const loadPoolModels = async () => {
   }
 }
 
-/** 加载已有模型列表，供上传时勾选归属（#3 多模型上传） */
+/** 加载算法库列表，供导入时必选归属（库 = 自身即库根的 registry 记录） */
 const loadUploadModels = async () => {
   try {
     const result = await listModels()
     allModels.value = (result.models || []).filter((m: any) => m.status !== 'deleted')
+    if (uploadLibraryId.value && !libraryOptions.value.some((l: any) => l.model_id === uploadLibraryId.value)) {
+      uploadLibraryId.value = ''
+    }
   } catch (e) {
     allModels.value = []
+  }
+}
+
+// 算法库下拉数据源：library_root_id 指向自身（或老数据未写该字段）的记录的才是库，
+// 训练产出的版本记录 library_root_id 指向所属库，不会出现在这里
+const libraryOptions = computed(() =>
+  allModels.value.filter((m: any) => (m.library_root_id || m.model_id) === m.model_id)
+)
+
+const libraryName = (id: string) => {
+  const m = allModels.value.find(x => x.model_id === id)
+  return m ? (m.display_name || m.model_code || m.model_id) : (id || '未归属')
+}
+
+// 数据集归属展示：新数据写 library_root_id，老数据只有 model_id（可能就是库根本身）；
+// 指向已删除模型记录的悬空 id 不算归属，按「未归属」处理并允许补选
+const datasetLibraryId = (d: any) => {
+  const id = d?.library_root_id || d?.model_id || ''
+  if (!id) return ''
+  return libraryOptions.value.some((l: any) => l.model_id === id) ? id : ''
+}
+
+// 导入页新建算法库：只选中新库，不做页面跳转
+function onLibraryCreated(meta: any) {
+  loadUploadModels()
+  if (meta?.model_id) {
+    uploadLibraryId.value = meta.model_id
+    libraryTouched.value = false
+    if (bindDialog.value) bindLibraryId.value = meta.model_id
+  }
+}
+
+// ===== 补选 / 改挂归属算法库（历史未归属的老数据集用这个）=====
+const bindDialog = ref<any | null>(null)
+const bindLibraryId = ref('')
+const bindError = ref('')
+const binding = ref(false)
+
+function openBindDialog(dataset: any) {
+  bindDialog.value = dataset
+  bindLibraryId.value = datasetLibraryId(dataset)
+  bindError.value = ''
+}
+
+async function submitBind() {
+  if (!bindDialog.value || !bindLibraryId.value) return
+  binding.value = true
+  bindError.value = ''
+  try {
+    await bindDatasetModel(bindDialog.value.dataset_id, bindLibraryId.value)
+    bindDialog.value = null
+    loadDatasets()
+    loadUploadModels()
+  } catch (e: any) {
+    bindError.value = '保存失败: ' + (e.response?.data?.detail || e.message)
+  } finally {
+    binding.value = false
   }
 }
 
@@ -534,7 +647,13 @@ const bucketBadge = (d: any) => {
   if (!d) return { text: '', cls: '' }
   if (d.is_bucket_snapshot) return { text: `成品 B${d.bucket_index ?? ''}`, cls: 'badge-b' }
   if (d.bucket_archived) return { text: `已归档 → B${d.bucket_index ?? ''}`, cls: 'badge-archived' }
-  if (d.model_id && d.stage && ['annotating', 'collecting'].includes(d.stage)) return { text: 'A包', cls: 'badge-a' }
+  if (d.model_id && d.stage && ['annotating', 'collecting'].includes(d.stage)) {
+    const total = Number(d.image_count || 0)
+    const done = Number(d.label_count || 0)
+    if (d.review_approved) return { text: 'A包·已审核', cls: 'badge-a' }
+    if (total > 0 && done >= total) return { text: 'A包·待审核', cls: 'badge-pending-review' }
+    return { text: 'A包', cls: 'badge-a' }
+  }
   return { text: '', cls: '' }
 }
 
@@ -598,7 +717,7 @@ const lifecycleOf = (d: any) => {
     return { key: 'failed', text: '训练失败', idx: 2, hint: '该数据集训练未通过，保持未完成状态，可重新标注/封板参与下一轮训练', skip: true }
   }
   if (!d?.model_id && !d?.bucket_archived) {
-    return { key: 'unassigned', text: '未分配', idx: 0, hint: '尚未挂载到任何模型库，可在模型详情页绑定后使用', skip: false }
+    return { key: 'unassigned', text: '未归属', idx: 0, hint: '尚未归属任何算法库，点数据集上的「去归属」补选后才能用于训练', skip: false }
   }
   if (s === 'collecting') {
     return { key: 'todo', text: '待标注', idx: 0, hint: '数据已导入数据池，尚未开始标注', skip: false }
@@ -609,6 +728,15 @@ const lifecycleOf = (d: any) => {
   return { key: 'annotating', text: '标注中', idx: 1, hint: '标注工作正在进行', skip: false }
 }
 
+// 封板结果提示：把「这次到底导出了多少分割轮廓」说清楚，避免误以为整包都是分割标注
+const sealMsg = (res: any, head: string) => {
+  const s = res?.sealed_split
+  if (!s || typeof s.segment_boxes !== 'number') return head
+  if (!s.has_segment) return `${head}\n本批标注均为普通框（无轮廓），data.yaml 标记 task: detect`
+  const extra = s.rect_boxes ? `\n另有 ${s.rect_boxes} 个普通框（无轮廓），训练分割时不会生成掩码` : ''
+  return `${head}\n导出分割轮廓 ${s.segment_boxes} 个，data.yaml 已标记 task: segment${extra}`
+}
+
 // 封板（标注不完整时后端拒绝，可走强制封板 = 时间窗口兜底）
 const sealDatasetItem = async (d: any) => {
   // 数量门槛提示（#6）：标注中且数量未达门槛 → 明确提示差额，避免封板被后端拒绝
@@ -617,15 +745,15 @@ const sealDatasetItem = async (d: any) => {
   const sealNote = minN > 0 && imgN > 0 && imgN < minN
     ? `\n⚠ 当前 ${imgN} 张 < 封板门槛 ${minN} 张：直接封板会被拒绝，需走「强制封板」兜底`
     : ''
-  const ratio = d.split_ratio || { train: 0.8, val: 0.2 }
+  const ratio = d.split_ratio || { train: 0.7, val: 0.15, test: 0.15 }
   const input = window.prompt(
-    '请输入数据集划分比例（训练,验证,测试，逗号分隔，如 0.8,0.2,0）：' + sealNote,
+    '请输入数据集划分比例（训练,验证,测试，逗号分隔，如 0.7,0.15,0.15）：' + sealNote,
     `${ratio.train},${ratio.val},${ratio.test ?? 0}`
   )
   if (input === null) return
   const parts = input.split(/[,，、\s]+/).map(Number)
   if (parts.length < 2 || parts.some(n => Number.isNaN(n) || n < 0) || parts.reduce((a, b) => a + b, 0) <= 0) {
-    alert('输入无效，请用逗号分隔三个非负数字，如：0.7,0.2,0.1')
+    alert('输入无效，请用逗号分隔三个非负数字，如：0.7,0.15,0.15')
     return
   }
   const t = parts[0], v = parts[1], te = parts[2] ?? 0
@@ -637,21 +765,72 @@ const sealDatasetItem = async (d: any) => {
   if (!ok) return
   sealingDataset.value = d.dataset_id
   try {
-    await sealDst(d.dataset_id, false, { train: t, val: v, test: te })
-    alert('封板成功')
+    const res = await sealDst(d.dataset_id, false, { train: t, val: v, test: te })
+    alert(sealMsg(res, '封板成功'))
   } catch (e: any) {
     const msg = e.response?.data?.detail || e.message
     const force = await showConfirm(`${msg}\n\n是否需要强制封板（时间窗口兜底，跳过标注完成条件）？`)
     if (force) {
       try {
-        await sealDst(d.dataset_id, true, { train: t, val: v, test: te })
-        alert('强制封板成功')
+        const res2 = await sealDst(d.dataset_id, true, { train: t, val: v, test: te })
+        alert(sealMsg(res2, '强制封板成功'))
       } catch (e2: any) {
         alert('封板失败: ' + (e2.response?.data?.detail || e2.message))
       }
     }
   } finally {
     sealingDataset.value = null
+    loadDatasets()
+  }
+}
+
+// ===== 审核门槛 / 撤回（灌桶前人工确认；未封板的已灌桶包可撤回恢复编辑） =====
+// 可审核：已准备、未封板、未归档、尚未审核通过
+const canApprove = (d: any) => {
+  if (!d) return false
+  if (d.review_approved || d.bucket_archived) return false
+  if (['sealed', 'training', 'completed', 'failed'].includes(d.stage)) return false
+  return d.status === 'prepared'
+}
+
+// 可撤回：已灌入接收桶（archived/pending>0）但桶尚未封板（bucket_sealed==0）
+const canUnpour = (d: any) => {
+  if (!d) return false
+  if (['sealed', 'training', 'completed'].includes(d.stage)) return false
+  if ((Number(d.bucket_sealed) || 0) > 0) return false
+  return !!d.bucket_archived || (Number(d.bucket_pending) || 0) > 0
+}
+
+const approveItem = async (d: any) => {
+  const ok = await showConfirm(
+    `确认数据集 ${d.dataset_id} 的标注已人工审核无误？\n` +
+    `审核通过后该包才允许自动灌桶/封板（灌桶后仍可撤回，封板后不可逆）。`
+  )
+  if (!ok) return
+  approvingDataset.value = d.dataset_id
+  try {
+    await approveDatasetReview(d.dataset_id)
+  } catch (e: any) {
+    alert('审核确认失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    approvingDataset.value = null
+    loadDatasets()
+  }
+}
+
+const unpourItem = async (d: any) => {
+  const ok = await showConfirm(
+    `撤回数据集 ${d.dataset_id}？\n` +
+    `将把该包已灌入接收桶但尚未封板的图片退回，恢复为可编辑状态（需重新审核通过后才会再次灌桶）。`
+  )
+  if (!ok) return
+  unpouringDataset.value = d.dataset_id
+  try {
+    await unpourDatasetBucket(d.dataset_id)
+  } catch (e: any) {
+    alert('撤回失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    unpouringDataset.value = null
     loadDatasets()
   }
 }
@@ -666,27 +845,25 @@ const handleFileSelect = (event: Event) => {
 
 const uploadFile = async () => {
   if (!selectedFile.value) return
-  
+  libraryTouched.value = true
+  if (!uploadLibraryId.value) {
+    alert('请先选择该数据集归属的算法库（没有合适的库请点「+ 新建算法库」）')
+    return
+  }
+
   uploading.value = true
   try {
-    const result = await uploadDataset(
-      selectedFile.value,
-      uploadModelId.value || undefined,
-      uploadModelCode.value.trim() || undefined
-    )
+    const result = await uploadDataset(selectedFile.value, uploadLibraryId.value)
     uploadResult.value = result
     loadDatasets()
     // 上传成功后自动准备（无需用户额外操作）
     preparingNew.value = true
     try {
-      const prep = await prepareDst(result.dataset_id)
-      if (prep?.model_auto_match?.model_code) {
-        alert(`上传并准备成功！已按包内类别自动匹配模型「${prep.model_auto_match.display_name || prep.model_auto_match.model_code}」`)
-      } else {
-        alert('上传并准备成功!')
-      }
+      await prepareDst(result.dataset_id)
+      alert(`上传并准备成功！数据集已归属算法库「${libraryName(uploadLibraryId.value)}」`)
       uploadResult.value = null
       loadDatasets()
+      loadUploadModels()
     } catch (error: any) {
       alert('准备失败: ' + (error.response?.data?.detail || error.message))
     } finally {
@@ -711,6 +888,10 @@ const loadDatasets = async () => {
         bucketNotice.value = `自动灌桶完成：${pouredN} 个 A 包已入池，${sealedN} 个桶已封板`
       } else if (pouredN > 0) {
         bucketNotice.value = `已自动灌桶 ${pouredN} 个 A 包`
+      }
+      const reviewN = (adv.pending_review || []).length
+      if (reviewN > 0) {
+        bucketNotice.value = (bucketNotice.value ? bucketNotice.value + '；' : '') + `${reviewN} 个包标注完成，待人工审核通过后才会灌桶`
       }
     } catch (e) {
       // 灌桶失败不阻塞列表展示
@@ -988,6 +1169,11 @@ onMounted(() => {
   background: #e8d9f5;
   color: #6c3483;
   border: 1px solid #c9a8e0;
+}
+.badge-pending-review {
+  background: #fdecea;
+  color: #b23b2e;
+  border: 1px solid #f0b8b1;
 }
 .badge-archived {
   background: #eee5d5;
@@ -1417,7 +1603,7 @@ button {
   font-size: 0.82rem;
 }
 
-/* ===== 生命周期状态胶囊（3.3 六色：灰/蓝/橙/绿/白/红，与模型库详情页一致） ===== */
+/* ===== 生命周期状态胶囊（3.3 六色：灰/蓝/橙/绿/白/红，与算法库详情页一致） ===== */
 .life-row {
   display: flex;
   align-items: center;
@@ -1514,5 +1700,146 @@ button {
 }
 .life-track.sk .life-seg.cur .life-seg-label {
   color: #c0392b;
+}
+
+/* ===== 归属算法库：导入必选 + 列表展示 + 补选弹窗 ===== */
+.library-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.library-row .model-code-input {
+  flex: 1;
+}
+
+.model-code-input.invalid {
+  border-color: #c62828;
+}
+
+.required {
+  color: #c62828;
+  font-style: normal;
+}
+
+.error-hint {
+  color: #c62828;
+}
+
+.lib-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: #2c6ec5;
+  font-size: 0.78rem;
+  cursor: pointer;
+  padding: 0 0.2rem;
+  text-decoration: underline;
+}
+
+.badge-unassigned {
+  background: #fdecea;
+  color: #b23b2e;
+  border: 1px solid #f0b8b1;
+}
+
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 30, 45, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: #fff;
+  border-radius: 14px;
+  padding: 22px;
+  width: 480px;
+  max-width: 90vw;
+  box-shadow: 0 18px 48px rgba(20, 40, 70, 0.28);
+}
+
+.modal h3 {
+  color: #1f2d3d;
+  margin: 0 0 4px;
+}
+
+.modal-sub {
+  color: #7a8aa0;
+  font-size: 0.82rem;
+  margin: 0 0 14px;
+  word-break: break-all;
+}
+
+.form-field {
+  margin-bottom: 12px;
+  text-align: left;
+}
+
+.form-field label {
+  display: block;
+  font-size: 0.85rem;
+  color: #445;
+  margin-bottom: 5px;
+}
+
+.form-field label i {
+  color: #c62828;
+  font-style: normal;
+}
+
+.form-field select {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #d5dee8;
+  border-radius: 8px;
+  font-size: 0.88rem;
+  box-sizing: border-box;
+  outline: none;
+  font-family: inherit;
+}
+
+.form-field select:focus {
+  border-color: #2c6ec5;
+}
+
+.form-error {
+  color: #c62828;
+  font-size: 0.82rem;
+  margin-bottom: 10px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.primary {
+  background: #2c6ec5;
+  color: #fff;
+  border: 1px solid #2c6ec5;
+  border-radius: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.primary:hover {
+  background: #2459a5;
+}
+
+.primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 </style>

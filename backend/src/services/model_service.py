@@ -12,10 +12,10 @@ from pathlib import Path
 from datetime import datetime
 from fastapi import UploadFile
 from src.core.settings import settings
+from src.db import shadow
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
 import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,21 @@ class ModelService:
         def _list_models_sync():
             models = []
 
-            # 1.7：先扫描数据集，汇总各模型关联的数据集数量与阶段状态分布
+            # 先读全部模型记录：数据集归属换算要用（库内版本记录 → 它所属的库根）
+            metas = {}
+            if self.registry_dir.exists():
+                for model_dir in self.registry_dir.iterdir():
+                    if not model_dir.is_dir():
+                        continue
+                    mf = model_dir / "model.json"
+                    if not mf.exists():
+                        continue
+                    try:
+                        metas[model_dir.name] = _load_json(mf)
+                    except Exception:
+                        continue
+
+            # 1.7：先扫描数据集，按「归属算法库根记录」汇总数量与阶段分布
             ds_stats = {}
             datasets_dir = settings.DATASETS_DIR
             if datasets_dir.exists():
@@ -77,37 +91,35 @@ class ModelService:
                         ds_meta = _load_json(mf)
                     except Exception:
                         continue
-                    mid = ds_meta.get("model_id")
+                    mid = ds_meta.get("library_root_id") or ds_meta.get("model_id")
                     if not mid:
                         continue
+                    # 老数据只写了版本模型 id：换算到该版本所属库根，统计口径与库详情一致
+                    mid = metas.get(mid, {}).get("library_root_id") or mid
                     stat = ds_stats.setdefault(mid, {"count": 0})
                     stat["count"] += 1
                     stage = ds_meta.get("stage") or "collecting"
                     stat[stage] = stat.get(stage, 0) + 1
 
-            if not self.registry_dir.exists():
+            if not metas:
                 return models
 
-            for model_dir in self.registry_dir.iterdir():
-                if model_dir.is_dir():
-                    model_file = model_dir / "model.json"
-                    if model_file.exists():
-                        try:
-                            model_meta = _load_json(model_file)
-                            # 添加模型文件大小
-                            weights_path = model_meta.get("weights_path")
-                            if weights_path and Path(weights_path).exists():
-                                model_meta["file_size"] = os.path.getsize(weights_path)
-                                model_meta["file_size_mb"] = round(model_meta["file_size"] / (1024 * 1024), 2)
-                            # 1.7 模型仓库统计：关联数据集数量 + 阶段分布
-                            stat = ds_stats.get(model_meta.get("model_id"), {})
-                            model_meta["dataset_count"] = stat.get("count", 0)
-                            model_meta["dataset_stats"] = {
-                                k: v for k, v in stat.items() if k != "count"
-                            }
-                            models.append(model_meta)
-                        except Exception:
-                            continue
+            for model_meta in metas.values():
+                try:
+                    # 添加模型文件大小
+                    weights_path = model_meta.get("weights_path")
+                    if weights_path and Path(weights_path).exists():
+                        model_meta["file_size"] = os.path.getsize(weights_path)
+                        model_meta["file_size_mb"] = round(model_meta["file_size"] / (1024 * 1024), 2)
+                    # 1.7 模型仓库统计：关联数据集数量 + 阶段分布
+                    stat = ds_stats.get(model_meta.get("model_id"), {})
+                    model_meta["dataset_count"] = stat.get("count", 0)
+                    model_meta["dataset_stats"] = {
+                        k: v for k, v in stat.items() if k != "count"
+                    }
+                    models.append(model_meta)
+                except Exception:
+                    continue
 
             return models
 
@@ -310,6 +322,13 @@ class ModelService:
                     info["trainable_params"] = trainable_params
                     info["total_params_m"] = round(total_params / 1e6, 2)  # 百万参数
                 
+                # 类别名（供上传单个 .pt 时自动回填 classes）
+                if getattr(model, "names", None):
+                    try:
+                        info["classes"] = [str(model.names[k]) for k in sorted(model.names.keys())]
+                    except Exception:
+                        pass
+                
                 return info
                 
             except Exception as e:
@@ -353,11 +372,31 @@ class ModelService:
                     except Exception:
                         pass
             if request.display_name is not None:
-                model_meta["display_name"] = (request.display_name or "").strip()
+                new_name = (request.display_name or "").strip()
+                if new_name:
+                    owner = self._display_name_owner(model_id, new_name)
+                    if owner:
+                        kind = "算法库" if self._is_library_record(owner) else "模型"
+                        raise ValueError(
+                            f"名称「{new_name}」已被{kind}占用（ID: {owner}），请换一个名字"
+                        )
+                model_meta["display_name"] = new_name
             if request.status is not None:
                 if request.status not in ("active", "inactive"):
                     raise ValueError("status 仅支持 active / inactive")
                 model_meta["status"] = request.status
+            if request.model_library_id is not None:
+                # 归入算法库：写库标识；传空串则移出库（降级为独立模型）
+                lib_id = (request.model_library_id or "").strip()
+                if lib_id:
+                    model_meta["model_library_id"] = lib_id
+                    # 目标是 registry 库根记录（首页建的库）时同步写 library_root_id，
+                    # 让库内聚合/生产轮换/标注页"本库已训模型"等主流程立即认账
+                    if (self.registry_dir / lib_id / "model.json").exists():
+                        model_meta["library_root_id"] = lib_id
+                else:
+                    model_meta.pop("model_library_id", None)
+                    model_meta.pop("library_root_id", None)
             
             model_meta["updated_at"] = datetime.now().isoformat()
             
@@ -365,7 +404,10 @@ class ModelService:
             
             return model_meta
         
-        return await asyncio.to_thread(_update_model_sync)
+        result = await asyncio.to_thread(_update_model_sync)
+        # 影子库收口：落盘后回读 model.json 真值再写库
+        await shadow.sync_model(model_id)
+        return result
     
     def _model_code_exists(self, ignore_model_id: str, code: str) -> bool:
         """检查除自身外是否已有模型占用该 code（大小写不敏感）"""
@@ -384,6 +426,38 @@ class ModelService:
             except Exception:
                 continue
         return False
+
+    def _is_library_record(self, model_id: str) -> bool:
+        """registry 中的库根占位记录（首页「新建算法库」产生的 empty 模型）。"""
+        try:
+            m = _load_json(self.registry_dir / model_id / "model.json")
+        except Exception:
+            return False
+        return bool(m.get("empty"))
+
+    def _display_name_owner(self, ignore_model_id: str, name: str) -> str:
+        """返回占用了该显示名的其他记录 id（忽略首尾空格与大小写）；无人占用返回 ""。
+
+        算法库根记录也一并纳入检查：库名和模型名会出现在同一个下拉/列表里
+        （如预标注的「本库已训模型」、模型管理页的名称列），
+        模型与库重名同样会让人分不清选的是哪一个。
+        """
+        target = (name or "").strip().lower()
+        if not target or not self.registry_dir.exists():
+            return ""
+        for d in self.registry_dir.iterdir():
+            if not d.is_dir() or d.name == ignore_model_id:
+                continue
+            mf = d / "model.json"
+            if not mf.exists():
+                continue
+            try:
+                meta = _load_json(mf)
+            except Exception:
+                continue
+            if (str(meta.get("display_name", "") or "")).strip().lower() == target:
+                return d.name
+        return ""
 
     # ---------------- 2.2 动态建模型（采集/上传时按 code 精确匹配，无则创建） ----------------
 
@@ -405,6 +479,20 @@ class ModelService:
             except Exception:
                 continue
         return None
+
+    def resolve_library_root_id(self, model_id: str):
+        """把任意模型 id 换算成它所属「算法库」的根记录 id。
+
+        算法库 = 一条 empty 模型记录；数据集归属、训练产出版本都统一记这个根 id。
+        历史记录没写该字段时认为它自身就是库根；模型不存在返回 None。
+        """
+        if not model_id:
+            return None
+        try:
+            meta = _load_json(self.registry_dir / model_id / "model.json")
+        except Exception:
+            return None
+        return meta.get("library_root_id") or model_id
 
     async def create_empty_model(self, code: str, display_name: str = "", business: str = "", description: str = ""):
         """动态创建空白模型（空标签字典 + 采集库）。code 已存在则直接返回现有模型。
@@ -435,6 +523,9 @@ class ModelService:
                 "status": "active",
                 "source": "created",
                 "empty": True,               # 空模型：待采集 / 未有训练产出
+                # 算法库根标识：本记录即"库"本身，其下训练产出的版本都会带上同一个 id，
+                # 库详情据此聚合全部模型版本（与 PG 的 model_libraries 表无关）
+                "library_root_id": model_id,
                 "classes": [],               # 冗余英文码列表（与 labels_dict.json 一一对应，data.yaml names 来源）
                 "labels_file": "labels_dict.json",
                 "description": description or "",
@@ -450,7 +541,10 @@ class ModelService:
             _save_json(model_dir / "labels_dict.json", {"model_code": norm, "labels": []})
             return meta
 
-        return await asyncio.to_thread(_create_sync)
+        result = await asyncio.to_thread(_create_sync)
+        if result.get("model_id"):
+            await shadow.sync_model(result["model_id"])
+        return result
 
     # ---------------- 2.7 相似模型排查与合并（人工工具） ----------------
 
@@ -602,6 +696,7 @@ class ModelService:
                         "english_code": code,
                         "chinese_name": (l.get("chinese_name") or "").strip(),
                         "chinese_desc": (l.get("chinese_desc") or "").strip(),
+                        "ai_prompt_en": (l.get("ai_prompt_en") or "").strip(),
                     })
                     main_codes.add(self._norm_class_name(code))
                     added.append(code)
@@ -671,7 +766,14 @@ class ModelService:
                 "log_path": str(log_file),
             }
 
-        return await asyncio.to_thread(_sync)
+        result = await asyncio.to_thread(_sync)
+        # 影子库收口：合并会改主模型、被合并模型（merged_into）与重归属数据集的 model_id
+        if result.get("ok"):
+            for mid in [result.get("main_model_id"), *(result.get("merged_model_ids") or [])]:
+                if mid:
+                    await shadow.sync_model(mid)
+            await shadow.refresh_all_datasets()
+        return result
 
     async def merge_log(self, limit: int = 20) -> dict:
         """读取合并日志（2.7 回滚依据）"""
@@ -743,14 +845,21 @@ class ModelService:
                 "removed_log_index": log_index,
             }
 
-        return await asyncio.to_thread(_sync)
+        result = await asyncio.to_thread(_sync)
+        # 影子库收口：回滚撤销了被合并模型的 merged_into 标记，数据集归属同步还原
+        if result.get("ok"):
+            for mid in result.get("unmarked_models") or []:
+                await shadow.sync_model(mid)
+            await shadow.refresh_all_datasets()
+        return result
 
     # ---------------- 统一标签字典（四字段） ----------------
 
     async def get_labels_dict(self, model_id: str):
         """获取模型标签字典；不存在时从 model.json 的 classes 自动初始化（懒生成）。
 
-        字典四字段：index（YOLO 训练序号）/ english_code（检测/DINO 用）/ chinese_name（UI 用）/ chinese_desc（Qwen 精标用）。
+        字典五字段：index（YOLO 训练序号）/ english_code（检测/DINO 用）/ chinese_name（UI 用）/
+        chinese_desc（Qwen 精标用）/ ai_prompt_en（GroundingDINO、YOLO-World 的英文检测提示词）。
         """
         model_dir = self.registry_dir / model_id
         if not await asyncio.to_thread(lambda: model_dir.exists()):
@@ -760,9 +869,9 @@ class ModelService:
     async def update_labels_dict(self, model_id: str, labels: list | None):
         """保存标签字典（全量覆写）。自动重排连续 index、去重校验 english_code。
 
-        追加禁删保护：已被任何图片标注使用的标签，禁止删除/重命名/调整顺序
-        （class_id 按 index 存储，重排会导致已标注数据类别错乱）。
-        新增标签请追加到末尾，index 递增。
+        在用锁死保护：本库只要有数据用过标签（画过框，或数据集类名清单里出现过），
+        现有类别的英文名与顺序就整体锁死，只能改中文名/中文描述/英文检测提示词，新类别只能追加到末尾
+        （class_id 按 index 存储，重排会导致已标注数据类别错乱；改名会让重新导入整批丢框）。
         """
         model_dir = self.registry_dir / model_id
         if not await asyncio.to_thread(lambda: model_dir.exists()):
@@ -771,30 +880,38 @@ class ModelService:
             raise ValueError("标签字典不能为空")
 
         def _sync():
-            # ---- 禁删/禁重命名/禁重排保护（仅在用标签生效）----
+            # ---- 在用标签锁死：现有类别整体锁死，只允许末尾追加 ----
+            # 判据（任一命中即锁定）：本库有数据画过该类的框 / 类名清单里出现过该类名。
+            # 三条理由：① class_id 按 index 存，插队或删行会让已标注类别错位；
+            #          ② 导入靠"类名 ↔ 英文名"逐字对齐，改名会让整批框丢掉；
+            #          ③ 封板/训练过的数据集要能复现，字典不能事后变脸。
+            # 老字典可能有空 english_code 的行，必须按下标逐位比对（不能过滤，否则错位）。
             old = self._load_labels_dict_sync(model_dir).get("labels") or []
-            old_codes = [str(l.get("english_code") or "").strip().lower() for l in old if l.get("english_code")]
-            new_codes = [str(l.get("english_code") or "").strip().lower() for l in labels if l.get("english_code")]
-            old_set, new_set = set(old_codes), set(new_codes)
-            removed = old_set - new_set
-            if removed:
-                usage = self._labels_usage_sync(model_id)
-                used_removed = {code: usage[code] for code in removed if code in usage}
-                if used_removed:
-                    detail = "、".join(f"{code}（{n} 张图已标注）" for code, n in sorted(used_removed.items()))
-                    raise ValueError(
-                        f"以下标签已被图片标注使用，禁止删除或重命名：{detail}。"
-                        "如需更换，请先修改对应图片的标注"
-                    )
-            # 已有标签顺序被调整 → index 变化 → 已标注 class_id 错乱，禁止
-            # （首次填充或旧字典为空时跳过校验；kept_new 只取"旧标签在新列表中的顺序"）
-            kept_old = [c for c in old_codes if c in new_set]
-            kept_new = [c for c in new_codes if c in old_set]
-            if old_codes and kept_old != kept_new:
-                raise ValueError(
-                    "已有标签的排列顺序不能调整（会改变类别 index，导致已标注图片错乱）。"
-                    "新增标签请追加到末尾"
-                )
+            old_pos = [str(l.get("english_code") or "").strip().lower() for l in old]
+            new_pos = [str(l.get("english_code") or "").strip().lower() for l in labels]
+            usage = self._labels_usage_sync(model_id)
+            if usage and any(old_pos):
+                # 死线 = 最后一个"被用过"的类别所在行；它之前的行名字和顺序全锁死，
+                # 它之后的（还没人用上的）随便改、随便删，新类别一律追加到末尾。
+                frozen = max((i for i, c in enumerate(old_pos) if usage.get(c)), default=-1)
+                if frozen >= 0 and new_pos[:frozen + 1] != old_pos[:frozen + 1]:
+                    for i in range(frozen + 1):
+                        want = old_pos[i]
+                        got = new_pos[i] if i < len(new_pos) else ""
+                        if got != want:
+                            u = usage.get(want) or {"images": 0, "datasets": 0}
+                            used = "、".join(filter(None, [
+                                f"{u['images']} 张图已标注" if u["images"] else "",
+                                f"{u['datasets']} 个数据集引用了它" if u["datasets"] else "",
+                            ])) or "已被数据使用"
+                            extra = "" if u["images"] or u["datasets"] else "（排在已用类别前面，位置不能挪）"
+                            raise ValueError(
+                                f"第 {i + 1} 个类别「{want or '（未填英文名）'}」{used}{extra}，"
+                                f"不能改名、删除或调整顺序（本次改成了"
+                                f"{'「' + got + '」' if got else '「已删除」'}）。"
+                                "新增类别请追加到列表末尾；中文名和中文描述随时可改"
+                            )
+                    raise ValueError("已有类别的顺序不能调整，新增类别请追加到列表末尾")
 
             seen = set()
             new_labels = []
@@ -811,6 +928,7 @@ class ModelService:
                     "english_code": ec,
                     "chinese_name": (item.get("chinese_name") or "").strip(),
                     "chinese_desc": (item.get("chinese_desc") or "").strip(),
+                    "ai_prompt_en": (item.get("ai_prompt_en") or "").strip(),
                 })
             model_meta = _load_json(model_dir / "model.json")
             dic = {
@@ -819,7 +937,10 @@ class ModelService:
             }
             _save_json(model_dir / "labels_dict.json", dic)
             return dic
-        return await asyncio.to_thread(_sync)
+        result = await asyncio.to_thread(_sync)
+        # 影子库收口：labels_dict.json 是 models.labels / labels_file 列的来源，改字典即改库中真值
+        await shadow.sync_model(model_id)
+        return result
 
     def init_labels_from_classes(self, model_id: str, classes: list) -> bool:
         """标签字典自动生成（prepare 后懒回填）：归属模型的标签字典为空时，
@@ -847,12 +968,16 @@ class ModelService:
         if not uniq:
             return False
         labels = [
-            {"index": i, "english_code": c, "chinese_name": "", "chinese_desc": ""}
+            {"index": i, "english_code": c, "chinese_name": "", "chinese_desc": "", "ai_prompt_en": ""}
             for i, c in enumerate(uniq)
         ]
         meta = _load_json(model_dir / "model.json")
         meta["classes"] = uniq
-        meta["empty"] = False
+        # 注意：绝不能用 empty 表达"标签字典已初始化"。empty 的唯一语义是
+        # 「算法库占位记录（非训练产出）」——模型管理页靠 !empty 把它过滤出模型列表，
+        # 「算法库」下拉靠 empty 收录库名（见 routes/models.py list_libraries）。
+        # 这里改写 empty 会让新建的库同时出现两个相反的症状：
+        # 模型列表里冒出来 + 下拉里消失。标签是否已初始化请用 labels_auto_init 判定。
         meta["labels_auto_init"] = True
         meta["labels_auto_init_at"] = datetime.now().isoformat()
         meta["updated_at"] = meta["labels_auto_init_at"]
@@ -865,27 +990,47 @@ class ModelService:
         return True
 
     def _labels_usage_sync(self, model_id: str) -> dict:
-        """统计该模型所有数据集标注中，每个 english_code 被标注的图片数（禁删保护用）。
+        """统计本算法库每个标签"有没有被数据用上"（禁改保护的判据）。两条判据取并集：
 
-        扫描 datasets/{dataset_id}/meta.json（model_id 匹配）→ annotations/*.json 的
-        boxes[].english_code，每图每个类别只计一次。
+        ① 画过框：本库任一数据集的图片上有该类的框。老数据的框里只有类别号
+           class_id、没有 english_code，必须按序号回查标签字典认类，否则永远统计不到。
+        ② 导入过：数据集准备时解析出的类名清单（meta.classes）里出现过该类名。
+           一张还没画也算 —— 导入/重新准备都靠"类名 ↔ 英文名"逐字对齐，改名会整批丢框。
+
+        数据集范围与库详情「数据集管理」「文案同步」同口径（按算法库根换算，
+        老数据只写了版本模型 id 的也算进来）。
+        返回 {english_code 小写: {"images": 有该类框的图片数, "datasets": 引用它的数据集数}}
         """
         usage: dict = {}
-        datasets_dir = settings.DATASETS_DIR
-        if not datasets_dir.exists():
-            return usage
-        for ds_dir in datasets_dir.iterdir():
-            if not ds_dir.is_dir():
-                continue
-            meta_file = ds_dir / "meta.json"
-            if not meta_file.exists():
-                continue
+
+        def _touch(code: str, kind: str):
+            code = (code or "").strip().lower()
+            if not code:
+                return
+            item = usage.setdefault(code, {"images": 0, "datasets": 0})
+            item[kind] += 1
+
+        # 类别号 → 英文名（老标注只有序号，靠它回查）
+        labels = sorted(
+            self._load_labels_dict_sync(self.registry_dir / model_id).get("labels") or [],
+            key=lambda x: int(x.get("index") or 0),
+        )
+        code_by_index = {i: str(l.get("english_code") or "").strip() for i, l in enumerate(labels)}
+
+        root_id = self.resolve_library_root_id(model_id) or model_id
+        for ds_dir in self._library_dataset_dirs_sync(root_id):
             try:
-                ds_meta = _load_json(meta_file)
+                ds_meta = _load_json(ds_dir / "meta.json") or {}
             except Exception:
                 continue
-            if ds_meta.get("model_id") != model_id:
-                continue
+            # 判据②：数据集自带的类名清单
+            referenced = False
+            for name in ds_meta.get("classes") or []:
+                key = str(name or "").strip().lower()
+                if key in usage or any(key == (l.get("english_code") or "").strip().lower() for l in labels):
+                    referenced = True
+                    _touch(key, "datasets")
+            # 判据①：图片标注框（每图每类只计一次）
             ann_dir = ds_dir / "annotations"
             if not ann_dir.exists():
                 continue
@@ -896,11 +1041,62 @@ class ModelService:
                     continue
                 seen = set()
                 for b in boxes:
+                    if not isinstance(b, dict):
+                        continue
                     code = (b.get("english_code") or "").strip()
-                    if code and code not in seen:
-                        seen.add(code)
-                        usage[code] = usage.get(code, 0) + 1
+                    if not code:
+                        try:
+                            cid = int(b.get("class_id"))
+                        except (TypeError, ValueError):
+                            cid = -1
+                        code = code_by_index.get(cid, "")
+                    key = code.lower()
+                    if key and key not in seen:
+                        seen.add(key)
+                        _touch(key, "images")
+                        if not referenced:
+                            referenced = True
+                            _touch(key, "datasets")
         return usage
+
+    async def get_labels_usage(self, model_id: str):
+        """标签引用统计（供前端把"在用"的格子锁住、并显示已标多少张图）。
+
+        模型不存在返回 None；dict_locked 为真表示本库已有数据引用标签，
+        此时现有类别的名字与顺序整体锁死，只能在末尾追加。
+        """
+        def _sync():
+            model_dir = self.registry_dir / model_id
+            if not (model_dir / "model.json").exists():
+                return None
+            labels = sorted(
+                self._load_labels_dict_sync(model_dir).get("labels") or [],
+                key=lambda x: int(x.get("index") or 0),
+            )
+            usage = self._labels_usage_sync(model_id)
+            rows = []
+            for i, l in enumerate(labels):
+                code = str(l.get("english_code") or "").strip()
+                u = usage.get(code.lower(), {"images": 0, "datasets": 0})
+                rows.append({
+                    "index": i,
+                    "english_code": code,
+                    "images": u["images"],
+                    "datasets": u["datasets"],
+                    "in_use": bool(u["images"] or u["datasets"]),
+                })
+            # 死线：最后一个在用的类别所在行；与 update_labels_dict 的校验口径保持一致
+            frozen = max((r["index"] for r in rows if usage.get(r["english_code"].lower())), default=-1)
+            for r in rows:
+                r["locked"] = r["index"] <= frozen
+            return {
+                "model_id": model_id,
+                "library_root_id": self.resolve_library_root_id(model_id) or model_id,
+                "dict_locked": bool(usage),
+                "frozen_until": frozen,
+                "labels": rows,
+            }
+        return await asyncio.to_thread(_sync)
 
     async def suggest_labels_from_dataset(self, model_id: str, dataset_id: str, limit: int = 3) -> dict:
         """AI 识别数据集图片中的新标签（辅助不懂补充什么类别的用户）。
@@ -917,9 +1113,9 @@ class ModelService:
 
         def _collect_sync():
             try:
-                ds_meta = _load_json(meta_file)
+                _load_json(meta_file)
             except Exception:
-                ds_meta = {}
+                pass
             ann_dir = ds_dir / "annotations"
             picks = []
             if ann_dir.exists():
@@ -995,12 +1191,222 @@ class ModelService:
                     "english_code": code,
                     "chinese_name": (s.get("chinese_name") or "").strip(),
                     "chinese_desc": (s.get("chinese_desc") or "").strip(),
+                    "ai_prompt_en": (s.get("ai_prompt_en") or "").strip(),
                 })
                 added.append(code)
             if added:
                 _save_json(model_dir / "labels_dict.json", {"model_code": dic.get("model_code"), "labels": labels})
             return {"added": added, "skipped": skipped}
-        return await asyncio.to_thread(_sync)
+        result = await asyncio.to_thread(_sync)
+        # 影子库收口：采纳建议等于扩写标签字典，同步 models.labels
+        if result.get("added"):
+            await shadow.sync_model(model_id)
+        return result
+
+    # ------------------------------------------------------------------
+    # 标签文案同步：把标签字典的中文名/描述刷进本库已标注数据（每图 JSON 的框冗余字段）
+    # ------------------------------------------------------------------
+    def _library_dataset_dirs_sync(self, root_id: str) -> list:
+        """归属该算法库（库根 = root_id）的数据集目录列表。
+
+        口径与库详情「数据集管理」完全一致：数据集归属先换算成库根再比对
+        （老数据只写了版本模型 id），未归属与悬空引用一律不算。
+        """
+        metas = {}
+        if self.registry_dir.exists():
+            for mdir in self.registry_dir.iterdir():
+                mf = mdir / "model.json"
+                if not mf.exists():
+                    continue
+                try:
+                    metas[mdir.name] = _load_json(mf)
+                except Exception:
+                    continue
+        out = []
+        datasets_dir = settings.DATASETS_DIR
+        if not datasets_dir.exists():
+            return out
+        for ds_dir in datasets_dir.iterdir():
+            mf = ds_dir / "meta.json"
+            if not mf.exists():
+                continue
+            try:
+                ds_meta = _load_json(mf)
+            except Exception:
+                continue
+            owner = ds_meta.get("library_root_id") or ds_meta.get("model_id")
+            if not owner:
+                continue
+            owner = metas.get(owner, {}).get("library_root_id") or owner
+            if owner == root_id:
+                out.append(ds_dir)
+        return out
+
+    def _labels_sync_backup_root(self, model_id: str) -> Path:
+        return settings.DATA_DIR / "label_sync_backup" / model_id
+
+    async def sync_labels_to_annotations(self, model_id: str, dry_run: bool = True) -> dict:
+        """把标签字典的中文名/描述同步到本库已标注数据（默认只预览不改写）。
+
+        只刷「展示/提示词」字段（chinese_name、chinese_desc）；class_id 与
+        english_code 一律不动，因此不影响训练产物与已封板数据。
+        正式同步前把被改的原始 JSON 备份到 data/label_sync_backup/<模型>/<时间戳>/，
+        可用 rollback_labels_sync 整体回退。
+        """
+        def _sync():
+            model_dir = self.registry_dir / model_id
+            if not (model_dir / "model.json").exists():
+                return None
+            dic = self._load_labels_dict_sync(model_dir)
+            labels = sorted(dic.get("labels") or [], key=lambda x: int(x.get("index", 0)))
+            by_code = {}
+            for l in labels:
+                code = str(l.get("english_code") or "").strip().lower()
+                if code:
+                    by_code[code] = l
+            if not by_code:
+                raise ValueError("标签字典为空，没有可同步的文案")
+
+            ds_dirs = self._library_dataset_dirs_sync(
+                self.resolve_library_root_id(model_id) or model_id
+            )
+            stats = {"datasets": len(ds_dirs), "files_scanned": 0,
+                     "files_changed": 0, "boxes_changed": 0}
+            samples = []
+            touched = []  # [(原文件路径, 改写后的标注数据, 备份文件路径)]
+            backup_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_root = self._labels_sync_backup_root(model_id) / backup_id
+
+            for ds_dir in ds_dirs:
+                ann_dir = ds_dir / "annotations"
+                if not ann_dir.is_dir():
+                    continue
+                for fp in sorted(ann_dir.glob("*.json")):
+                    try:
+                        data = _load_json(fp)
+                    except Exception:
+                        continue
+                    stats["files_scanned"] += 1
+                    boxes = data.get("boxes") or []
+                    file_changed = 0
+                    for b in boxes:
+                        if not isinstance(b, dict):
+                            continue
+                        code = str(b.get("english_code") or "").strip().lower()
+                        if not code:
+                            # 老标注可能没写英文码：按 class_id 回查字典序号
+                            cid = b.get("class_id")
+                            if isinstance(cid, int) and 0 <= cid < len(labels):
+                                code = str(labels[cid].get("english_code") or "").strip().lower()
+                        lab = by_code.get(code)
+                        if not lab:
+                            continue
+                        want_name = (lab.get("chinese_name") or "").strip()
+                        want_desc = (lab.get("chinese_desc") or "").strip()
+                        for field, want in (("chinese_name", want_name), ("chinese_desc", want_desc)):
+                            # 字典该列为空时不覆盖已有文案（避免把描述清空）
+                            if not want or b.get(field) == want:
+                                continue
+                            if len(samples) < 10:
+                                samples.append({
+                                    "dataset_id": ds_dir.name,
+                                    "image_id": data.get("image_id") or fp.stem,
+                                    "english_code": code,
+                                    "field": "中文名" if field == "chinese_name" else "描述",
+                                    "before": b.get(field) or "",
+                                    "after": want,
+                                })
+                            b[field] = want
+                            file_changed += 1
+                    if file_changed:
+                        stats["files_changed"] += 1
+                        stats["boxes_changed"] += file_changed
+                        touched.append((fp, data, backup_root / ds_dir.name / fp.name))
+
+            if not dry_run and touched:
+                # 先整体备份原件，再回写改写结果（备份失败则不动原数据）
+                for fp, _data, bk in touched:
+                    bk.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(fp, bk)
+                for fp, data, _bk in touched:
+                    _save_json(fp, data)
+
+            result = {
+                "model_id": model_id,
+                "dry_run": dry_run,
+                "stats": stats,
+                "samples": samples,
+                "backup_id": None if dry_run or not touched else backup_id,
+                "last_backup": None,
+            }
+            meta_path = model_dir / "model.json"
+            try:
+                meta = _load_json(meta_path)
+                lb = meta.get("labels_sync_backup")
+                if lb:
+                    result["last_backup"] = {
+                        "backup_id": lb.get("backup_id"),
+                        "at": lb.get("at"),
+                        "files": lb.get("files"),
+                        "boxes": lb.get("boxes"),
+                    }
+            except Exception:
+                meta = {}
+
+            if not dry_run and touched:
+                meta["labels_sync_backup"] = {
+                    "backup_id": backup_id,
+                    "at": datetime.now().isoformat(),
+                    "files": stats["files_changed"],
+                    "boxes": stats["boxes_changed"],
+                }
+                meta["updated_at"] = meta["labels_sync_backup"]["at"]
+                _save_json(meta_path, meta)
+                result["last_backup"] = meta["labels_sync_backup"]
+            return result
+
+        result = await asyncio.to_thread(_sync)
+        # 影子库收口：非试运行且确有改写时，model.json 会写入 labels_sync_backup
+        if result.get("backup_id"):
+            await shadow.sync_model(model_id)
+        return result
+
+    async def rollback_labels_sync(self, model_id: str) -> dict:
+        """回退最近一次标签文案同步：用备份原件覆盖回写受影响标注文件。"""
+        def _sync():
+            model_dir = self.registry_dir / model_id
+            meta_path = model_dir / "model.json"
+            if not meta_path.exists():
+                return None
+            meta = _load_json(meta_path)
+            lb = meta.get("labels_sync_backup") or {}
+            backup_id = str(lb.get("backup_id") or "")
+            if not backup_id or "/" in backup_id or "\\" in backup_id or ".." in backup_id:
+                raise ValueError("没有可回退的标签文案同步记录")
+            backup_root = self._labels_sync_backup_root(model_id) / backup_id
+            if not backup_root.is_dir():
+                raise ValueError(f"备份目录不存在：{backup_root}")
+            restored = 0
+            for bk in sorted(backup_root.rglob("*.json")):
+                rel = bk.relative_to(backup_root)
+                parts = rel.parts  # (dataset_id, image.json)
+                if len(parts) != 2:
+                    continue
+                target = settings.DATASETS_DIR / parts[0] / "annotations" / parts[1]
+                if not target.parent.is_dir():
+                    continue
+                shutil.copy2(bk, target)
+                restored += 1
+            meta.pop("labels_sync_backup", None)
+            meta["updated_at"] = datetime.now().isoformat()
+            _save_json(meta_path, meta)
+            return {"model_id": model_id, "restored_files": restored, "backup_id": backup_id}
+
+        result = await asyncio.to_thread(_sync)
+        # 影子库收口：回退后 model.json 的 labels_sync_backup 已被移除
+        if result and result.get("restored_files") is not None:
+            await shadow.sync_model(model_id)
+        return result
 
     def _load_labels_dict_sync(self, model_dir: Path) -> dict:
         """读取标签字典；不存在则从 model.json 的 classes 懒初始化并写回"""
@@ -1016,7 +1422,7 @@ class ModelService:
         except Exception:
             pass
         labels = [
-            {"index": i, "english_code": c, "chinese_name": "", "chinese_desc": ""}
+            {"index": i, "english_code": c, "chinese_name": "", "chinese_desc": "", "ai_prompt_en": ""}
             for i, c in enumerate(classes)
         ]
         dic = {
@@ -1035,20 +1441,72 @@ class ModelService:
         
         # 删除模型目录
         await asyncio.to_thread(_delete_directory, model_dir)
+        # 影子库收口：真值目录已消失，PG 行必须一并删除（否则列表残留死记录）
+        await shadow.drop_model(model_id)
         
         return {"ok": True, "message": f"Model {model_id} deleted"}
     
-    async def upload_model(self, file: UploadFile):
-        """上传已有模型（ZIP格式）"""
+    def _attach_to_library(self, model_meta: dict, library_id: str) -> dict:
+        """把模型记录挂到指定算法库下（与 update_model 的归库口径完全一致）。
+
+        不挂库的记录没有 library_root_id，resolve_library_root_id 会把它当成"自成库根"，
+        于是首页凭空多出一张算法库卡片——上传时必须显式归库或明确留在"独立模型"档。
+        """
+        lib_id = (library_id or "").strip()
+        if not lib_id:
+            return model_meta
+        lib_file = self.registry_dir / lib_id / "model.json"
+        if not lib_file.exists():
+            raise ValueError(f"算法库不存在：{lib_id}")
+        try:
+            lib_meta = _load_json(lib_file)
+        except Exception:
+            raise ValueError(f"算法库记录读取失败：{lib_id}")
+
+        mid = model_meta.get("model_id") or ""
+        model_meta["model_library_id"] = lib_id
+        model_meta["library_root_id"] = lib_id
+        # model_code 全局唯一（update_model 会校验占用），版本记录必须保留自己的 code，
+        # 绝不能抄库的：抄了就和库根重名，之后改任一条的 code 都会报「已被其他模型占用」。
+        lib_biz = (lib_meta.get("business") or "").strip()
+        if lib_biz and not (model_meta.get("business") or "").strip():
+            model_meta["business"] = lib_biz
+        model_meta["updated_at"] = datetime.now().isoformat()
+
+        model_dir = self.registry_dir / mid
+        _save_json(model_dir / "model.json", model_meta)
+        # 标签字典跟着对齐 model_code（条目按 index/english_code 组织，内容不受影响）
+        dict_file = model_dir / "labels_dict.json"
+        if dict_file.exists() and model_meta.get("model_code"):
+            try:
+                dic = _load_json(dict_file)
+                if (dic.get("model_code") or "") != model_meta["model_code"]:
+                    dic["model_code"] = model_meta["model_code"]
+                    _save_json(dict_file, dic)
+            except Exception:
+                pass
+        return model_meta
+
+    async def upload_model(self, file: UploadFile, display_name: str = "", library_id: str = ""):
+        """上传已有模型（ZIP 包或单个 .pt 权重文件）
+
+        display_name: 用户指定的模型名称；留空则回退为上传文件名去扩展名
+        library_id: 归入的算法库根记录 id；留空则作为「独立模型」入库
+        """
         # 验证文件格式
-        if not file.filename.endswith('.zip'):
-            raise ValueError("Only .zip files are allowed")
+        if not (file.filename.endswith('.zip') or file.filename.endswith('.pt')):
+            raise ValueError("Only .zip or .pt files are allowed")
+
+        # 目标库先校验：权重落盘后再失败会留下半截记录
+        lib_id = (library_id or "").strip()
+        if lib_id and not (self.registry_dir / lib_id / "model.json").exists():
+            raise ValueError(f"算法库不存在：{lib_id}")
         
-        # 读取ZIP内容
+        # 读取文件内容
         content = await file.read()
         filename = file.filename or "model.zip"
         
-        # 验证ZIP文件大小（防止解压炸弹，限制10GB）
+        # 验证文件大小（防止解压炸弹，限制10GB）
         if len(content) > 10 * 1024 * 1024 * 1024:
             raise ValueError("ZIP file too large (max 100MB)")
         
@@ -1073,15 +1531,10 @@ class ModelService:
                 # 查找model.json和weights目录
                 model_json_path = None
                 weights_dir_path = None
-                zip_model_id = None
                 
                 # 查找model.json（可能在根目录或子目录中）
                 for json_file in temp_path.rglob("model.json"):
                     model_json_path = json_file
-                    # 如果model.json在子目录中，提取model_id
-                    relative_path = json_file.relative_to(temp_path)
-                    if len(relative_path.parts) > 1:
-                        zip_model_id = relative_path.parts[0]
                     break
                 
                 # 查找weights目录
@@ -1192,19 +1645,97 @@ class ModelService:
                 
                 return model_meta
         
-        model_meta = await asyncio.to_thread(_process_zip, filename)
+        def _process_pt(pt_filename: str):
+            """处理单个 .pt 权重上传：统一落为 registry/{model_id}/weights/best.pt"""
+            stem = Path(pt_filename).stem
+            model_id = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            model_dir = self.registry_dir / model_id
+            target_weights_dir = model_dir / "weights"
+            target_weights_dir.mkdir(parents=True, exist_ok=True)
+            # 预标注引擎按约定路径找 weights/best.pt，因此无论原名一律改名
+            target_pt = target_weights_dir / "best.pt"
+            target_pt.write_bytes(content)
+            total_size = target_pt.stat().st_size
+            
+            model_meta = {
+                "model_id": model_id,
+                "name": stem,
+                "display_name": stem,
+                "model_code": model_id,
+                "business": "",
+                "status": "active",
+                "source": "uploaded",
+                "empty": False,
+                "classes": [],
+                "labels_file": "labels_dict.json",
+                "description": f"用户上传的权重文件 {pt_filename}",
+                "tags": ["uploaded"],
+                "weights_path": str(target_pt.resolve()),
+                "file_size": total_size,
+                "file_size_mb": round(total_size / (1024 * 1024), 2),
+                "architecture_family": "",
+                "architecture_name": "",
+                "model_scale": "",
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+            }
+            _save_json(model_dir / "model.json", model_meta)
+            return model_meta
+        
+        if filename.endswith('.pt'):
+            model_meta = await asyncio.to_thread(_process_pt, filename)
+        else:
+            model_meta = await asyncio.to_thread(_process_zip, filename)
+        
+        # 用户显式命名时覆盖默认名（ZIP 自带 model.json 的 name 也以用户输入为准）
+        custom_name = (display_name or "").strip()
+        if custom_name:
+            model_meta["name"] = custom_name
+            model_meta["display_name"] = custom_name
+            model_meta["updated_at"] = datetime.now().isoformat()
+            # 下方 model_info 回填仅在解析成功时才回写 model.json，故此处必须自行落盘
+            await asyncio.to_thread(
+                _save_json,
+                self.registry_dir / model_meta["model_id"] / "model.json",
+                model_meta,
+            )
         
         # 尝试获取模型信息
         weights_path = model_meta.get("weights_path")
         if weights_path:
             model_info = await self._get_model_info(weights_path)
+            model_changed = False
             if model_info:
                 model_meta["model_info"] = model_info
+                model_changed = True
+                # 用权重解析出的任务/类别回填缺失字段（单个 .pt 上传时尤其需要）
+                if not model_meta.get("task") and model_info.get("task"):
+                    model_meta["task"] = model_info["task"]
+                if not model_meta.get("classes") and model_info.get("classes"):
+                    model_meta["classes"] = model_info["classes"]
+            
+            model_dir = self.registry_dir / model_meta["model_id"]
+            if model_changed:
                 # 更新model.json
-                model_dir = self.registry_dir / model_meta["model_id"]
-                model_file = model_dir / "model.json"
-                await asyncio.to_thread(_save_json, model_file, model_meta)
+                await asyncio.to_thread(_save_json, model_dir / "model.json", model_meta)
+            # 标签字典缺失时懒初始化（按最终 classes 生成）
+            labels_file = model_dir / "labels_dict.json"
+            if not labels_file.exists():
+                await asyncio.to_thread(_save_json, labels_file, {
+                    "model_code": model_meta.get("model_code", model_meta["model_id"]),
+                    "labels": [
+                        {"index": i, "english_code": c, "chinese_name": "", "chinese_desc": ""}
+                        for i, c in enumerate(model_meta.get("classes") or [])
+                    ],
+                })
         
+        # 归入指定算法库：放在最后，让 model_code / business 继承与标签字典对齐都基于最终字段
+        if lib_id:
+            model_meta = await asyncio.to_thread(self._attach_to_library, model_meta, lib_id)
+        
+        # 影子库收口：上传链路有多处 model.json / labels_dict.json 落盘，统一在最后回读真值写库
+        if model_meta.get("model_id"):
+            await shadow.sync_model(model_meta["model_id"])
         return model_meta
     
     async def export_model(self, model_id: str):
@@ -1679,6 +2210,12 @@ class ModelService:
             return {"meta": meta, "superseded": superseded_records}
 
         result = await asyncio.to_thread(_override_sync)
+        # 影子库收口：新老模型的 status 同时变化，两个都要重灌
+        meta = result.get("meta") or {}
+        if meta.get("model_id"):
+            await shadow.sync_model(meta["model_id"])
+        for mid in result.get("superseded") or []:
+            await shadow.sync_model(mid)
         return result
 
     # ------------------------------------------------------------------
@@ -1730,8 +2267,11 @@ class ModelService:
             meta["published_at"] = datetime.now().isoformat()
 
             business = meta.get("business") or ""
+            # 生产版本是"库内"概念：模型若归属某算法库，只在本库的版本之间轮换，
+            # 否则同业务线的另一个库发布时会把本库的生产模型误标为已被取代。
+            root_id = meta.get("library_root_id")
             superseded = []
-            if business:
+            if root_id or business:
                 for other in self.registry_dir.iterdir():
                     if not other.is_dir():
                         continue
@@ -1744,7 +2284,10 @@ class ModelService:
                         continue
                     if om.get("model_id") == model_id or om.get("status") != "production_ready":
                         continue
-                    if om.get("business") != business:
+                    if root_id:
+                        if (om.get("library_root_id") or om.get("model_id")) != root_id:
+                            continue
+                    elif om.get("business") != business:
                         continue
                     if (om.get("publish_status") or "pending") != "published":
                         continue
@@ -1755,6 +2298,12 @@ class ModelService:
             return {"meta": meta, "superseded": superseded}
 
         result = await asyncio.to_thread(_confirm_sync)
+        # 影子库收口：确认发布改了目标模型与同库被顶替模型的 status
+        _rid = (result.get("meta") or {}).get("model_id")
+        if _rid:
+            await shadow.sync_model(_rid)
+        for mid in result.get("superseded") or []:
+            await shadow.sync_model(mid)
 
         # 更新 model_libraries.current_production_model_id 指向唯一生产模型
         try:
@@ -1762,7 +2311,13 @@ class ModelService:
                 from src.db import meta_store
                 libs = await meta_store.list_model_libraries()
                 biz = result["meta"].get("business") or ""
-                target_lib = next((l for l in libs if l["model_library_id"] == f"{biz}_lib"), None)
+                # 优先命中模型自己已归入的库（管理页手动归库写入的 model_library_id），
+                # 再退回按业务线约定的 {business}_lib 兜底
+                own_lib = result["meta"].get("model_library_id") or ""
+                target_lib = next(
+                    (l for l in libs if own_lib and l["model_library_id"] == own_lib),
+                    next((l for l in libs if biz and l["model_library_id"] == f"{biz}_lib"), None),
+                )
                 if target_lib is not None:
                     await meta_store.upsert_model_library({
                         **target_lib,

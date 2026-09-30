@@ -121,7 +121,7 @@ class BucketRecord(Base):
 
 
 class ModelLibraryRecord(Base):
-    """模型库：模型的逻辑容器（base_algorithm / 标签字典 / 当前生产模型指针）。"""
+    """算法库：模型的逻辑容器（base_algorithm / 标签字典 / 当前生产模型指针）。"""
     __tablename__ = "model_libraries"
 
     model_library_id: Mapped[str] = mapped_column(String, primary_key=True)

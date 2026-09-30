@@ -1,7 +1,7 @@
 import asyncio
 import json
-import re
 from pathlib import Path
+
 from src.core.settings import settings
 
 
@@ -83,7 +83,7 @@ def _get_file_tail_offset(log_file: Path, n_lines: int = 50):
                 f.seek(0)
                 offset = 0
                 for i in range(total_lines - n_lines):
-                    line = f.readline()
+                    f.readline()
                     offset = f.tell()
                 
                 return offset
@@ -114,7 +114,7 @@ class LogService:
             await asyncio.sleep(0.5)
         
         if not log_file.exists():
-            yield f"data: Log file not found\n\n"
+            yield "data: Log file not found\n\n"
             return
         
         # 获取最后50行的起始位置作为初始offset，只推送增量日志

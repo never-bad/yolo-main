@@ -31,6 +31,9 @@ class TrainJobRequest(BaseModel):
     # 与 base_model_id（源模型）架构不同时自动执行迁移训练（strict=False + lr0 降 10 倍）
     migration_target_model: Optional[str] = None
     recall_enabled: bool = True          # 增量训练时是否混入已完成旧数据（回忆集）
+    # 算法库归属：从算法库详情页「发起训练」时带入该库的根记录 id，
+    # 使训练产出（新版本）自动落在这个库下；缺省则由后端继承基座模型的库归属
+    library_root_id: Optional[str] = None
 
 @router.get("/gpus")
 async def list_gpus():
@@ -80,7 +83,8 @@ async def create_train_job(request: TrainJobRequest):
             hard_sample_ratio=request.hard_sample_ratio,
             background_sample_ratio=request.background_sample_ratio,
             migration_target_model=request.migration_target_model,
-            recall_enabled=request.recall_enabled
+            recall_enabled=request.recall_enabled,
+            library_root_id=request.library_root_id
         )
         return result
     except ValueError as e:

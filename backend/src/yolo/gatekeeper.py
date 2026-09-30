@@ -131,6 +131,8 @@ def evaluate_model(weights: str, data_yaml: str, classes: list) -> dict:
             "mAP50": float|None, "mAP50_95": float|None,
             "precision": float|None, "recall": float|None,
             "speed_ms": float|None,           # 平均推理耗时（推理阶段，不含预处理/NMS）
+            "mask_mAP50": float|None,         # 分割轮廓指标（仅 segment 模型有值，检测模型为 None）
+            "mask_mAP50_95": float|None,
             "class_ap": {class_name: ap},     # 逐类 AP@50:95
             "eval_split": "val"|"test",       # 实际使用的评估集
             "error": str|None
@@ -150,6 +152,20 @@ def evaluate_model(weights: str, data_yaml: str, classes: list) -> dict:
             pass
         res = model.val(data=str(data_yaml), split=split, verbose=False, plots=False)
         m = res.box
+
+        def _num(v):
+            """指标安全取数：None / 非数字一律返回 None，不抛异常"""
+            try:
+                return None if v is None else round(float(v), 4)
+            except (TypeError, ValueError):
+                return None
+
+        # 分割模型才有 res.mask（轮廓质量指标）；检测模型为 None。
+        # 只作为附加信息展示与留档，不参与晋升判定（判定仍以方框 mAP50-95 为准）。
+        mk = getattr(res, "mask", None)
+        mask_map50 = _num(getattr(mk, "map50", None)) if mk is not None else None
+        mask_map50_95 = _num(getattr(mk, "map", None)) if mk is not None else None
+
         speed = getattr(res, "speed", None) or {}
         speed_ms = None
         if isinstance(speed, dict) and speed.get("inference") is not None:
@@ -183,6 +199,8 @@ def evaluate_model(weights: str, data_yaml: str, classes: list) -> dict:
             "mAP50_95": None if m.map is None else round(float(m.map), 4),
             "precision": None if m.mp is None else round(float(m.mp), 4),
             "recall": None if m.mr is None else round(float(m.mr), 4),
+            "mask_mAP50": mask_map50,
+            "mask_mAP50_95": mask_map50_95,
             "speed_ms": speed_ms,
             "class_ap": class_ap,
             "eval_split": split,
@@ -191,6 +209,7 @@ def evaluate_model(weights: str, data_yaml: str, classes: list) -> dict:
     except Exception as e:
         return {
             "mAP50": None, "mAP50_95": None, "precision": None, "recall": None,
+            "mask_mAP50": None, "mask_mAP50_95": None,
             "speed_ms": None, "class_ap": {}, "eval_split": split, "error": str(e),
         }
 
@@ -224,7 +243,6 @@ def check_loss_stability(train_dir) -> dict:
     if not rows:
         return {"stable": True, "check": "no_data", "detail": "results.csv 为空", "window": 0, "last_values": []}
 
-    series = None
     col = None
     for cand in ("box_loss", "val/box_loss", "loss"):
         if cand in rows[0]:
@@ -487,17 +505,3 @@ def select_best_weights(train_dir, data_yaml, classes) -> dict:
         "reason": f"训练 Loss 不稳定且无法完整对比 last.pt 指标（best={best_map}, last={last_map}），保持 best.pt。",
         "loss_stability": ls,
     }
-
-
-def suggest_early_stop_patience(train_dir, defaults: int) -> int:
-    """早停建议：根据已跑 Loss 窗口的稳定性，给出更保守/更宽松的 patience 建议。
-
-    - 训练稳定且仍在收敛（末尾 Loss 走低）→ 建议维持默认（不打断收敛）
-    - Loss 震荡（CV 超标）→ 建议调小 patience（更早止损，避免震荡拖尾浪费算力）
-    - 无法判断 → 返回默认值
-    """
-    ls = check_loss_stability(train_dir)
-    if not ls.get("stable") and ls.get("check") in ("loss_volatile", "loss_unstable"):
-        smaller = max(3, int(defaults * 0.6))
-        return smaller
-    return defaults

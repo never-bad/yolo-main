@@ -25,6 +25,8 @@ export interface TrainJobRequest {
   // 与 base_model_id（源模型）架构不同时自动执行迁移（strict=False + lr0 自动降 10 倍）
   migration_target_model?: string
   recall_enabled?: boolean        // 回忆集混训：增量训练时混入同业务旧数据防遗忘（默认 true）
+  // 算法库归属：从算法库详情页发起训练时带上该库 id，训练产出（新版本）会归到这个库下
+  library_root_id?: string
 }
 
 export interface GpuInfo {

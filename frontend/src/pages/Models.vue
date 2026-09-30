@@ -1,36 +1,5 @@
 <template>
   <div class="models">
-    <!-- 模型库（Phase 0.3：业务逻辑容器） -->
-    <div class="card lib-card">
-      <div class="lib-head">
-        <h2>模型库</h2>
-        <button class="upload-btn" @click="createLibraryDlg">＋ 新建模型库</button>
-      </div>
-      <p class="form-hint">模型库 = 业务逻辑容器（基座算法 / 标签字典 / 当前生产模型指针）。新建模型后可在模型详情中归入对应库。</p>
-      <div v-if="loadingLibraries" class="loading-state">
-        <span class="loading-spinner large"></span>
-        <span>加载模型库...</span>
-      </div>
-      <div v-else-if="libraries.length === 0" class="lib-empty">暂无模型库，点击「＋ 新建模型库」创建。</div>
-      <div v-else class="lib-grid">
-        <div v-for="lib in libraries" :key="lib.model_library_id" class="lib-item">
-          <div class="lib-item-head">
-            <span class="lib-name">{{ lib.display_name || lib.model_library_id }}</span>
-            <button class="mini-btn danger" @click="removeLibrary(lib)" title="仅删除库记录，挂接模型不受影响">删除</button>
-          </div>
-          <div class="lib-item-meta">
-            <div>ID：<code>{{ lib.model_library_id }}</code></div>
-            <div>业务场景：{{ lib.business_scenario || '—' }}</div>
-            <div>基座算法：{{ lib.base_algorithm || '—' }}</div>
-            <div>架构家族：{{ lib.architecture_family || '—' }}</div>
-            <div>标签字典：{{ lib.label_dict_id || '—' }}</div>
-            <div>库内模型：<b>{{ lib.model_count ?? 0 }}</b> 个</div>
-            <div>当前生产模型：<b>{{ lib.production_model_name || '—' }}</b></div>
-          </div>
-        </div>
-      </div>
-    </div>
-
     <!-- 模型管理 -->
     <div class="card">
       <h2>模型管理</h2>
@@ -39,7 +8,7 @@
       <div class="upload-section">
         <h3>上传模型</h3>
         <div class="form-group">
-          <label>选择 .zip 文件（格式与导出格式相同）</label>
+          <label>选择 .zip 或 .pt 文件</label>
           <div v-if="selectedModelFile" class="selected-file">
             <span class="selected-file-icon">📦</span>
             <span class="selected-file-name">{{ selectedModelFile.name }}</span>
@@ -47,16 +16,49 @@
           </div>
           <div v-else class="selected-file empty">尚未选择文件</div>
           <div class="upload-row">
-            <input type="file" accept=".zip" id="modelZip" @change="handleModelFileSelect" :disabled="uploadingModel" class="file-input" />
+            <input type="file" accept=".zip,.pt" id="modelZip" @change="handleModelFileSelect" :disabled="uploadingModel" class="file-input" />
             <label for="modelZip" class="file-btn" :disabled="uploadingModel">选择文件</label>
-            <button class="upload-btn" @click="uploadModelFile" :disabled="!selectedModelFile || uploadingModel">
-              <span v-if="uploadingModel" class="loading-spinner"></span>
-              {{ uploadingModel ? '上传中...' : '上传' }}
-            </button>
           </div>
-          <p class="form-hint">ZIP文件应包含 model.json 和 weights 目录</p>
         </div>
+        <div class="form-group">
+          <label for="modelUploadName">模型名称</label>
+          <input
+            id="modelUploadName"
+            v-model="modelUploadName"
+            type="text"
+            class="name-input"
+            maxlength="64"
+            :disabled="uploadingModel"
+            placeholder="如：积水分割 v2（dfs 机位）；留空则用文件名"
+          />
+          <p class="form-hint">权重入库后统一存为 best.pt，不填名称时列表里会都显示「best」，建议填写</p>
+        </div>
+        <div class="form-group">
+          <label for="modelUploadLib">归入算法库</label>
+          <select
+            id="modelUploadLib"
+            v-model="modelUploadLib"
+            class="lib-select"
+            :disabled="uploadingModel"
+            @focus="ensureLibraries"
+          >
+            <option value="">不归库（独立模型）</option>
+            <option v-for="lib in libraries" :key="lib.model_library_id" :value="lib.model_library_id">
+              {{ lib.display_name || lib.model_library_id }}
+            </option>
+          </select>
+          <p class="form-hint">
+            归库后模型只在算法库详情里出现；不归库会作为「独立模型」单独占一张卡片。
+            <button type="button" class="link-btn" @click="newLibOpen = true">＋新建算法库</button>
+          </p>
+        </div>
+        <button class="upload-btn" @click="uploadModelFile" :disabled="!selectedModelFile || uploadingModel">
+          <span v-if="uploadingModel" class="loading-spinner"></span>
+          {{ uploadingModel ? '上传中...' : '上传' }}
+        </button>
+        <p class="form-hint">直接传 .pt 权重即可（自动入库并可作预标注）；ZIP 文件应包含 model.json 和 weights 目录</p>
       </div>
+      <LibraryCreateModal v-model:open="newLibOpen" confirm-text="创建并选中" @created="onNewLibrary" />
 
       <div v-if="loadingModels" class="loading-state">
         <span class="loading-spinner large"></span>
@@ -73,6 +75,7 @@
               <th>核心指标</th>
               <th>超参摘要</th>
               <th>创建时间</th>
+              <th>算法库</th>
               <th class="th-ops">操作</th>
             </tr>
           </thead>
@@ -104,16 +107,38 @@
               </td>
               <td class="cell-hps">{{ modelHpsText(model) }}</td>
               <td class="cell-time">{{ fmtDateTime(model.created_at) }}</td>
+              <td class="cell-lib">
+                <select
+                  class="lib-select"
+                  :value="modelLibId(model)"
+                  :disabled="assigningLibId === model.model_id"
+                  @focus="ensureLibraries"
+                  @change="assignLibrary(model, ($event.target as HTMLSelectElement).value)"
+                >
+                  <option value="">未归库（独立模型）</option>
+                  <option v-for="lib in libraries" :key="lib.model_library_id" :value="lib.model_library_id">
+                    {{ lib.display_name || lib.model_library_id }}
+                  </option>
+                </select>
+              </td>
               <td class="cell-ops">
                 <button @click="viewModelDetails(model)" class="primary small">详情</button>
-                <div class="more-menu-wrap" @mouseleave="moreOpenId = null">
-                  <button class="secondary small" @click.stop="moreOpenId = moreOpenId === model.model_id ? null : model.model_id" title="更多操作">⋯</button>
+                <div
+                  class="more-menu-wrap"
+                  :class="{ 'menu-open': moreOpenId === model.model_id }"
+                  @mouseenter="cancelMenuClose"
+                  @mouseleave="scheduleMenuClose"
+                >
+                  <button class="secondary small" @click.stop="toggleMenu(model.model_id)" title="更多操作">⋯</button>
                   <div v-if="moreOpenId === model.model_id" class="more-menu">
-                    <button class="menu-item" @click="exportModelFile(model.model_id); moreOpenId = null" :disabled="exportingModel === model.model_id">
+                    <button class="menu-item" @click="renameModelItem(model); closeMenu()" :disabled="renamingModel === model.model_id">
+                      {{ renamingModel === model.model_id ? '保存中...' : '重命名' }}
+                    </button>
+                    <button class="menu-item" @click="exportModelFile(model.model_id); closeMenu()" :disabled="exportingModel === model.model_id">
                       <span v-if="exportingModel === model.model_id" class="loading-spinner"></span>
                       {{ exportingModel === model.model_id ? '导出中...' : '导出 PT' }}
                     </button>
-                    <button class="menu-item menu-danger" @click="deleteModelItem(model.model_id); moreOpenId = null" :disabled="deletingModel === model.model_id">
+                    <button class="menu-item menu-danger" @click="deleteModelItem(model.model_id); closeMenu()" :disabled="deletingModel === model.model_id">
                       {{ deletingModel === model.model_id ? '删除中...' : '删除' }}
                     </button>
                   </div>
@@ -514,9 +539,10 @@
 
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
-import { listModels, deleteModel, getModel, uploadModel, exportModel, generateTrainingCharts, findSimilarModels, mergeModels, getMergeLogs, rollbackMerge, listPendingPublish, confirmPublish, listLibraries, createLibrary, deleteLibrary, type ModelDetails } from '@/api/models'
+import { listModels, deleteModel, getModel, updateModel, uploadModel, exportModel, generateTrainingCharts, findSimilarModels, mergeModels, getMergeLogs, rollbackMerge, listPendingPublish, confirmPublish, listLibraries, type ModelDetails } from '@/api/models'
 import { downloadFile } from '@/utils/download'
 import { showAlert, showConfirm, showPrompt } from '@/composables/useDialog'
+import LibraryCreateModal from '@/components/LibraryCreateModal.vue'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -553,6 +579,34 @@ const models = ref<any[]>([])
 
 // ===== 规范 §2.1 模型列表展示辅助 =====
 const moreOpenId = ref<string | null>(null)
+// 「⋯」悬停菜单的关闭缓冲：指针从按钮移向选项时，哪怕只穿过几个像素的空隙
+// 都会触发一次 mouseleave，立即置空会让菜单在人还没点到选项前就消失。
+// 这里延后关闭，并在指针回到按钮/菜单范围内时取消（见 wrapper 上的 mouseenter）。
+let menuCloseTimer: ReturnType<typeof setTimeout> | null = null
+const cancelMenuClose = () => {
+  if (menuCloseTimer) {
+    clearTimeout(menuCloseTimer)
+    menuCloseTimer = null
+  }
+}
+const scheduleMenuClose = () => {
+  const id = moreOpenId.value
+  if (!id) return
+  cancelMenuClose()
+  menuCloseTimer = setTimeout(() => {
+    menuCloseTimer = null
+    // 只对当时那一项生效：期间若用户已切到别的行的菜单，不能把新开的关掉
+    if (moreOpenId.value === id) moreOpenId.value = null
+  }, 160)
+}
+const closeMenu = () => {
+  cancelMenuClose()
+  moreOpenId.value = null
+}
+const toggleMenu = (modelId: string) => {
+  cancelMenuClose()
+  moreOpenId.value = moreOpenId.value === modelId ? null : modelId
+}
 // 算法架构：优先使用 M11 解析出的架构字段；存量模型按血缘/基座文件名兜底（如 yolov8n.pt → yolov8n）
 const modelArch = (m: any) => {
   if (m?.architecture_name) return m.model_scale ? `${m.architecture_name}${m.model_scale}` : m.architecture_name
@@ -627,13 +681,20 @@ const downloadingChart = ref<string | null>(null)
 
 // 模型上传
 const selectedModelFile = ref<File | null>(null)
+const modelUploadName = ref('')
 const uploadingModel = ref(false)
+// 上传时直接归入的算法库（留空 = 独立模型）；新建库弹窗开关
+const modelUploadLib = ref('')
+const newLibOpen = ref(false)
 
 const loadModels = async () => {
   loadingModels.value = true
   try {
     const data = await listModels()
-    models.value = data.models
+    // 过滤首页「新建算法库」产生的空白占位记录（empty），它们属于算法库层，不与训练产物并排展示
+    models.value = (data.models || []).filter((m: any) => !m.empty)
+    // 仅当列表里确有已归库模型时，才取库名回显下拉选中项（否则不发这次请求）
+    if (models.value.some((m: any) => modelLibId(m))) ensureLibraries()
   } catch (error: any) {
     alert('加载模型失败: ' + (error.response?.data?.detail || error.message))
   } finally {
@@ -641,37 +702,57 @@ const loadModels = async () => {
   }
 }
 
-// ===== 模型库（Phase 0.3：业务逻辑容器） =====
+// ===== 算法库（仅作模型表「算法库」列下拉数据源；创建/管理在首页） =====
 const libraries = ref<any[]>([])
-const loadingLibraries = ref(false)
-const loadLibraries = async () => {
-  loadingLibraries.value = true
+const librariesLoaded = ref(false)
+let librariesLoading: Promise<void> | null = null
+const assigningLibId = ref<string | null>(null)
+
+// 按需加载：只有点开「算法库」下拉时才请求一次（本页主流程是模型列表，
+// 算法库取不到不应打断浏览，故失败时静默记录、不弹窗）
+const ensureLibraries = () => {
+  if (librariesLoaded.value || librariesLoading) return
+  librariesLoading = listLibraries()
+    .then((res) => {
+      libraries.value = res.libraries || []
+      librariesLoaded.value = true
+    })
+    .catch((e: any) => {
+      console.warn('加载算法库失败:', e.response?.data?.detail || e.message)
+    })
+    .finally(() => {
+      librariesLoading = null
+    })
+}
+
+// 当前归库标识：手动归库写的 model_library_id 优先，其次平台训练自带的库根
+const modelLibId = (model: any) => {
+  if (model.model_library_id) return model.model_library_id
+  const root = model.library_root_id
+  return root && root !== model.model_id ? root : ''
+}
+
+// 模型归入/移出算法库（仅写归库标记，不触发其他连锁操作）
+const assignLibrary = async (model: any, libId: string) => {
+  const target = libId || ''
+  const libName = target ? (libraries.value.find(l => l.model_library_id === target)?.display_name || target) : '独立模型'
+  if (!(await showConfirm(`将模型「${model.display_name || model.model_id}」归入算法库「${libName}」？\n仅影响算法库统计展示，可随时改回。`))) return
+  assigningLibId.value = model.model_id
   try {
-    const res = await listLibraries()
-    libraries.value = res.libraries || []
+    await updateModel(model.model_id, { model_library_id: target })
+    // 同步更新本地行，避免整表重载（模型列表数据量大）
+    if (target) {
+      model.model_library_id = target
+      model.library_root_id = target
+    } else {
+      delete model.model_library_id
+      delete model.library_root_id
+    }
   } catch (e: any) {
-    alert('加载模型库失败: ' + (e.response?.data?.detail || e.message))
+    alert('归库失败: ' + (e.response?.data?.detail || e.message))
+    await loadModels()
   } finally {
-    loadingLibraries.value = false
-  }
-}
-const createLibraryDlg = async () => {
-  const name = await showPrompt('模型库名称（将自动生成小写标识 id）:', '')
-  if (!name) return
-  try {
-    await createLibrary({ display_name: name })
-    await loadLibraries()
-  } catch (e: any) {
-    alert('创建模型库失败: ' + (e.response?.data?.detail || e.message))
-  }
-}
-const removeLibrary = async (lib: any) => {
-  if (!(await showConfirm(`确定删除模型库「${lib.display_name || lib.model_library_id}」吗？\n仅删除库记录，挂接模型不受影响。`))) return
-  try {
-    await deleteLibrary(lib.model_library_id)
-    await loadLibraries()
-  } catch (e: any) {
-    alert('删除模型库失败: ' + (e.response?.data?.detail || e.message))
+    assigningLibId.value = null
   }
 }
 
@@ -1562,6 +1643,33 @@ const heatmapChartOption = computed(() => {
   }
 })
 
+// 重命名模型显示名：名称全平台唯一，判重统一交给后端（见 update_model 的 _display_name_owner）
+const renamingModel = ref<string | null>(null)
+const renameModelItem = async (model: any) => {
+  const old = String(model.display_name || '')
+  const input = await showPrompt(
+    `给模型起个新名字（留空则显示模型 ID）\n名字不能与已有模型或算法库重名：`,
+    old,
+    '重命名模型',
+  )
+  if (input === null) return
+  const name = input.trim()
+  if (name === old) return
+  // 重名（含与算法库同名）由后端权威校验并返回 400 提示：本地 models 列表已过滤掉
+  // 库占位记录，在前端判会漏，且列表可能是旧的。
+  renamingModel.value = model.model_id
+  try {
+    await updateModel(model.model_id, { display_name: name })
+    // 与「归库」一致：成功就静默更新本地行（名称列会立刻变），失败才弹窗并重载
+    model.display_name = name
+  } catch (e: any) {
+    alert('重命名失败: ' + (e.response?.data?.detail || e.message))
+    await loadModels()
+  } finally {
+    renamingModel.value = null
+  }
+}
+
 const deleteModelItem = async (modelId: string) => {
   if (!(await showConfirm(`确定要删除模型 ${modelId} 吗？此操作不可恢复！`))) return
   
@@ -1578,10 +1686,20 @@ const deleteModelItem = async (modelId: string) => {
 }
 
 // 模型上传功能
+// 记录上一次由文件名自动预填的名称，用户手改过就不再覆盖
+let autoFilledName = ''
+
 const handleModelFileSelect = (event: Event) => {
   const target = event.target as HTMLInputElement
   if (target.files && target.files[0]) {
-    selectedModelFile.value = target.files[0]
+    const file = target.files[0]
+    selectedModelFile.value = file
+    const stem = file.name.replace(/\.(zip|pt)$/i, '')
+    const cur = modelUploadName.value.trim()
+    if (!cur || cur === autoFilledName) {
+      modelUploadName.value = stem
+      autoFilledName = stem
+    }
   }
 }
 
@@ -1589,11 +1707,25 @@ const uploadModelFile = async () => {
   if (!selectedModelFile.value) return
   
   uploadingModel.value = true
+  const libId = modelUploadLib.value
   try {
-    await uploadModel(selectedModelFile.value)
-    alert('模型上传成功!')
+    const res: any = await uploadModel(selectedModelFile.value, modelUploadName.value.trim(), libId)
+    const libName = libId
+      ? (libraries.value.find(l => l.model_library_id === libId)?.display_name || libId)
+      : ''
+    // 以服务端返回为准：旧后端会静默丢掉 library_id 字段，只看本地选项会误报"已归库"
+    const bound = !libId || (res && (res.library_root_id || res.model_library_id) === libId)
+    if (!libId) {
+      showAlert('模型上传成功（独立模型，未归库）')
+    } else if (bound) {
+      showAlert(`模型上传成功，已归入算法库「${libName}」`)
+    } else {
+      showAlert(`模型上传成功，但归入「${libName}」未生效，请在下方「算法库」列手动补归（后端需重启以启用上传即归库）`)
+    }
     // 清空表单
     selectedModelFile.value = null
+    modelUploadName.value = ''
+    autoFilledName = ''
     // 重新加载模型列表
     loadModels()
   } catch (error: any) {
@@ -1601,6 +1733,19 @@ const uploadModelFile = async () => {
   } finally {
     uploadingModel.value = false
   }
+}
+
+// 上传框里顺手新建算法库：建好即选中，避免出现"建了库却还要回去归库"
+const onNewLibrary = (meta: any) => {
+  const id = meta?.model_id
+  if (!id) return
+  if (!libraries.value.some(l => l.model_library_id === id)) {
+    libraries.value.push({
+      model_library_id: id,
+      display_name: meta.display_name || meta.name || id,
+    })
+  }
+  modelUploadLib.value = id
 }
 
 // 模型导出功能
@@ -1618,7 +1763,6 @@ const exportModelFile = async (modelId: string) => {
 
 onMounted(() => {
   loadModels()
-  loadLibraries()
   loadPendingPublish()
 })
 
@@ -2076,6 +2220,22 @@ button {
   margin-top: 0.25rem;
 }
 
+/* 提示行里的「＋新建算法库」：文字链样式，避免和主上传按钮抢视觉 */
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: #2c6ec5;
+  font-size: inherit;
+  font-family: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.link-btn:hover {
+  color: #2459a5;
+}
+
 /* 上传行（选择文件 + 上传按钮 齐平） */
 .upload-row {
   display: flex;
@@ -2086,6 +2246,10 @@ button {
 
 .file-input {
   display: none;
+}
+
+.name-input {
+  max-width: 420px;
 }
 
 .file-btn {
@@ -2352,6 +2516,17 @@ button {
   vertical-align: middle;
 }
 
+/* 菜单打开时，在按钮正下方铺一条透明的“桥”，把按钮与菜单之间那 4px 视觉缝隙填上。
+   没有它，指针一离开按钮就落在 wrapper 之外，mouseleave 立即触发、菜单来不及点。 */
+.more-menu-wrap.menu-open::before {
+  content: '';
+  position: absolute;
+  left: -8px;
+  right: -8px;
+  top: 100%;
+  height: 12px;
+}
+
 .more-menu {
   position: absolute;
   right: 0;
@@ -2590,71 +2765,6 @@ button {
   border: 1px solid #f5b7b1;
   border-radius: 8px;
   font-weight: bold;
-}
-
-/* ===== 模型库（Phase 0.3） ===== */
-.lib-card {
-  margin-bottom: 1rem;
-}
-.lib-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-}
-.lib-empty {
-  padding: 1rem 0;
-  color: #8a94a6;
-  font-size: 0.85rem;
-}
-.lib-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 0.75rem;
-  margin-top: 0.6rem;
-}
-.lib-item {
-  border: 1px solid #d7dde4;
-  border-radius: 8px;
-  padding: 0.6rem 0.75rem;
-  background: #fafbfc;
-}
-.lib-item-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 0.4rem;
-}
-.lib-name {
-  font-weight: 600;
-  font-size: 0.9rem;
-}
-.mini-btn {
-  border: 1px solid #d7dde4;
-  border-radius: 5px;
-  background: #fff;
-  padding: 2px 8px;
-  font-size: 0.72rem;
-  cursor: pointer;
-}
-.mini-btn.danger {
-  color: #e74c3c;
-  border-color: #f5b7b1;
-}
-.mini-btn.danger:hover {
-  background: #fdecea;
-}
-.lib-item-meta {
-  font-size: 0.78rem;
-  color: #4a5568;
-  display: flex;
-  flex-direction: column;
-  gap: 0.15rem;
-}
-.lib-item-meta code {
-  background: #eef1f5;
-  border-radius: 3px;
-  padding: 0 4px;
 }
 
 /* 详情弹窗守门员面板 */

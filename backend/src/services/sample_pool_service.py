@@ -72,7 +72,6 @@ class SamplePoolService:
             version_dir = self.datasets_dir / dataset_id
             if not version_dir.exists():
                 raise ValueError(f"数据集 {dataset_id} 不存在")
-            base = Path(settings.BASE_DIR)
             yaml_path = version_dir / "data.yaml"
             pool_names = []
             if yaml_path.exists():

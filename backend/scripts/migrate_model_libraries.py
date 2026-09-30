@@ -30,7 +30,7 @@ async def main():
     args = parser.parse_args()
 
     if not await ping():
-        print(f"[错误] 无法连接 PostgreSQL，请先启动 PG 服务")
+        print("[错误] 无法连接 PostgreSQL，请先启动 PG 服务")
         sys.exit(1)
     if not args.dry:
         await init_db()
@@ -72,7 +72,7 @@ async def main():
         print(f"  [{lib_id}] {biz}: {len(models_in)} 个模型 → {models_in}")
         created += 1
 
-    print(f"\n迁移完成：创建/更新 {created} 个模型库"
+    print(f"\n迁移完成：创建/更新 {created} 个算法库"
           + ("（dry）" if args.dry else "")
           + f"，未归库模型 {len(models) - sum(len(v) for v in groups.values())} 个（business 为空）")
 

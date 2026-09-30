@@ -169,9 +169,6 @@ def main():
     xmls = collect_voc_xmls(work)
     has_labels = bool(txt_groups) or bool(xmls)
 
-    # 3. 图片按所属 train/val/test 分组
-    predict_tags = None
-
     def split_of(rel: Path):
         first = rel.parts[-2] if len(rel.parts) > 1 else ""
         if first in ("train", "val", "valid", "test"):

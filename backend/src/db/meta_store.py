@@ -8,8 +8,7 @@
 import logging
 from typing import Optional
 
-from sqlalchemy import delete, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import delete, func, select, update
 
 from src.db.engine import get_session
 from src.db.models import (
@@ -195,6 +194,25 @@ async def update_task_item_has_label(task_id: str, image_id: str, has_label: boo
             if has_label:
                 row.annotated = True
         await s.commit()
+
+
+async def mark_task_items_labeled(task_id: str, image_ids: list) -> int:
+    """批量回填 has_label（YOLO 标签导入一次可能几百张，逐行 update 太慢）。
+
+    只更新已存在的行；task_items 与 task.json 的 items 同源，正常不会缺失。
+    """
+    ids = list({i for i in (image_ids or []) if i})
+    if not ids:
+        return 0
+    async with get_session() as s:
+        res = await s.execute(
+            update(TaskItemRecord)
+            .where(TaskItemRecord.task_id == task_id,
+                   TaskItemRecord.image_id.in_(ids))
+            .values(has_label=True, annotated=True)
+        )
+        await s.commit()
+        return res.rowcount or 0
 
 
 async def delete_task_record(task_id: str) -> None:

@@ -10,7 +10,7 @@ dataset_service = DatasetService()
 model_service = ModelService()
 
 class PrepareRequest(BaseModel):
-    split_ratio: Optional[Dict[str, float]] = {"train": 0.7, "val": 0.2, "test": 0.1}
+    split_ratio: Optional[Dict[str, float]] = {"train": 0.7, "val": 0.15, "test": 0.15}
     classes: Optional[list[str]] = None
 
 class UpdateDatasetRequest(BaseModel):
@@ -23,43 +23,60 @@ class SealRequest(BaseModel):
 
 class BindModelRequest(BaseModel):
     model_id: Optional[str] = None  # 归属模型；None 表示解除归属
+    force: bool = False             # 类别序号对不上时仍强制挂载（前端确认弹窗后才传 True）
+
+@router.get("/{dataset_id}/bind-check")
+async def check_dataset_bind(dataset_id: str, model_id: str = Query(...)):
+    """挂载前校验：该数据集换绑到 model_id 后，已标注类别的序号会不会错位
+
+    返回 {conflict, blocking[], warnings[], summary}；summary 是可直接展示的大白话。
+    """
+    root_id = model_service.resolve_library_root_id(model_id)
+    if not root_id:
+        raise HTTPException(400, f"归属的算法库不存在：{model_id}")
+    try:
+        return await dataset_service.check_bind_target(dataset_id, root_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@router.put("/{dataset_id}/model")
+async def bind_dataset_model(dataset_id: str, request: BindModelRequest):
+    """绑定/解绑数据集到算法库（1.7 模型仓库归属管理）
+
+    传入库内任一版本的模型 id 也会换算成该库的根记录 id 后写入。
+    换库时若已标注类别的序号与目标库字典对不上，默认拒绝（400），需 force=True 放行。
+    """
+    root_id = model_service.resolve_library_root_id(request.model_id) if request.model_id else None
+    if request.model_id and not root_id:
+        raise HTTPException(400, f"归属的算法库不存在：{request.model_id}")
+    try:
+        result = await dataset_service.bind_model(dataset_id, root_id, root_id, request.force)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"dataset_id": dataset_id, "model_id": result.get("model_id")}
 
 @router.post("/upload")
 async def upload_dataset(
     file: UploadFile = File(...),
     model_id: Optional[str] = None,
-    model_code: Optional[str] = None,
 ):
     """上传数据集压缩包（zip / tar / tar.gz / tgz）
 
-    model_id:  1.7 模型仓库归属（可选），数据直接挂到对应模型下
-    model_code: 2.2 动态建模型（可选）：按归一化 code 精确匹配模型；
-               命中 → 挂到该模型；未命中 → 自动创建空白模型再挂载（优先于 model_id）
+    数据集必须有归属的算法库（导入页强制选择，没有库就先在弹窗里新建）：
+    model_id: 归属的算法库/库内任一版本记录 id —— 一律换算成它所属「库根记录」后写入，
+              使库详情的挂载数据集列表、准备阶段的类别过滤、训练产出的库归属都按库生效
     """
     allowed = (".zip", ".tar", ".tar.gz", ".tgz")
     if not (file.filename or "").lower().endswith(allowed):
         raise HTTPException(400, "Only zip / tar / tar.gz / tgz files are allowed")
-    
-    target_model_id = model_id
-    auto_created = False
-    if model_code:
-        try:
-            target = await model_service.create_empty_model(model_code)
-        except ValueError as e:
-            raise HTTPException(400, str(e))
-        target_model_id = target.get("model_id")
-        auto_created = bool(target.get("empty"))
-    
-    result = await dataset_service.upload_dataset(file, target_model_id)
-    result["model_code"] = model_code
-    result["model_auto_created"] = auto_created if model_code else False
-    return result
 
-@router.put("/{dataset_id}/model")
-async def bind_dataset_model(dataset_id: str, request: BindModelRequest):
-    """绑定/解绑数据集到模型（1.7 模型仓库归属管理）"""
-    result = await dataset_service.bind_model(dataset_id, request.model_id)
-    return {"dataset_id": dataset_id, "model_id": result.get("model_id")}
+    if not model_id:
+        raise HTTPException(400, "请先选择该数据集归属的算法库（没有合适的库请先新建算法库）")
+    library_root_id = model_service.resolve_library_root_id(model_id)
+    if not library_root_id:
+        raise HTTPException(400, f"归属的算法库不存在：{model_id}")
+
+    return await dataset_service.upload_dataset(file, library_root_id, library_root_id)
 
 @router.post("/{dataset_id}/prepare")
 async def prepare_dataset(dataset_id: str, request: PrepareRequest):
@@ -105,6 +122,22 @@ async def seal_dataset(dataset_id: str, request: SealRequest):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return result
+
+@router.post("/{dataset_id}/approve")
+async def approve_review(dataset_id: str):
+    """审核通过：人工确认标注无误后标记，之后才允许自动灌桶/封板"""
+    try:
+        return await dataset_service.approve_review(dataset_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@router.post("/{dataset_id}/unpour")
+async def unpour_bucket(dataset_id: str):
+    """撤回：把已灌入接收桶但未封板的图片退回，恢复可编辑"""
+    try:
+        return await dataset_service.unpour_bucket(dataset_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 @router.post("/{dataset_id}/validate")
 async def validate_dataset(dataset_id: str):

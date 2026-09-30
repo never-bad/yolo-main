@@ -10,10 +10,12 @@ sam_service = SAMService()
 
 class ConfigRequest(BaseModel):
     detector: Optional[str] = None            # yolo_world | grounding_dino | qwen_vl | none
-    detectors: Optional[List[str]] = None     # 多引擎同时使用：["grounding_dino","yolo_world","qwen_vl"]，空=沿用单引擎
+    detectors: Optional[List[str]] = None     # 多引擎同时使用：["grounding_dino","yolo_world","qwen_vl","trained_model"]，空=沿用单引擎
+    trained_model_id: Optional[str] = None    # 「本库已训模型」引擎使用的模型版本 id（registry 目录名）
     detector_weights: Optional[str] = None
     grounding_dino_model: Optional[str] = None  # Transformers 集成的 GD 模型名（如 IDEA-Research/grounding-dino-tiny）
-    sam_enabled: Optional[bool] = None
+    sam_enabled: Optional[bool] = None        # 单图 AI 预标注 / 交互式标注是否用 SAM 描分割轮廓
+    batch_sam_enabled: Optional[bool] = None  # 批量预标注是否也描轮廓（默认关：只出方框，速度快一倍以上）
     sam_weights: Optional[str] = None
     imgsz: Optional[int] = None
     sam_imgsz: Optional[int] = None
@@ -55,6 +57,21 @@ class InteractiveLabelRequest(BaseModel):
     conf: Optional[float] = None
     prompts: Optional[List[str]] = None  # 与 classes 一一对应的英文提示词
     region: Optional[dict] = None        # 用户框选的局部区域（图像坐标）{"x1","y1","x2","y2"}，缺省全图
+
+
+class PointLabelRequest(BaseModel):
+    task_id: str
+    image_id: str
+    class_id: int = 0                  # 抠出来的轮廓归到哪个类别（前端"绘制类别"）
+    points: List[dict]                 # [{"x":..,"y":..,"label":1|0}] 1=点中了 0=点错了
+
+
+class ErasePolygonRequest(BaseModel):
+    polygon: List[list]                # 待擦除的分割轮廓 [[x,y],...]（原图像素）
+    erase_rects: List[dict]            # 要挖掉的矩形 [{"x1","y1","x2","y2"}]
+    width: float
+    height: float
+    class_id: int = 0
 
 
 class AuditRequest(BaseModel):
@@ -105,6 +122,16 @@ async def upload_model(file: UploadFile = File(...)):
         raise HTTPException(500, str(e))
 
 
+@router.get("/trained-versions")
+async def trained_versions(task_id: Optional[str] = None):
+    """列出可用来预标注的「已训模型版本」（优先当前算法库自己的，权重必须已落盘）"""
+    try:
+        return sam_service.list_trained_versions(task_id or "")
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
 @router.post("/validate")
 async def validate():
     """验证模型有效性"""
@@ -135,6 +162,38 @@ async def interactive_label(request: InteractiveLabelRequest):
         )
     except ValueError as e:
         raise HTTPException(404, str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+@router.post("/point-label")
+async def point_label(request: PointLabelRequest):
+    """点选抠图：在图上点一下（或几点微调）→ SAM 沿边缘描出轮廓 → 返回分割标注框"""
+    try:
+        return await sam_service.point_label(
+            request.task_id, request.image_id, request.class_id, request.points
+        )
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+@router.post("/erase-polygon")
+async def erase_polygon(request: ErasePolygonRequest):
+    """区域擦除：把分割轮廓按矩形挖掉多余部分（纯几何、零推理、毫秒级）。
+
+    用于"抠大了，拖框切掉文字水印/相邻水面"，替代一下一下点右键负点。
+    """
+    try:
+        cfg = sam_service._read_config()
+        boxes = sam_service.erase_polygon(
+            request.polygon, request.erase_rects,
+            request.width, request.height, request.class_id, cfg
+        )
+        return {"boxes": boxes}
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(500, str(e))

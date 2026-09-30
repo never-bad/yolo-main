@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Query
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -7,7 +7,6 @@ from src.services.dataset_service import DatasetService
 from src.services.queue_service import ModelQueueService
 from src.db import meta_store
 from src.core.settings import settings
-import os
 import shutil
 
 router = APIRouter(prefix="/models", tags=["models"])
@@ -27,19 +26,19 @@ class UpdateModelRequest(BaseModel):
     model_code: Optional[str] = None      # 模型唯一标识（小写+下划线，自动规范化并全局校验唯一）
     display_name: Optional[str] = None    # 业务中文名
     status: Optional[str] = None          # active / inactive
+    model_library_id: Optional[str] = None  # 归入算法库（库标识；传空串/None 表示移出库降级为独立模型）
 
 class LabelItem(BaseModel):
     index: int = 0
     english_code: str
     chinese_name: Optional[str] = ""
     chinese_desc: Optional[str] = ""
+    # 英文检测提示词：告诉 GroundingDINO / YOLO-World「这个类别在画面里长什么样」
+    # （这两个引擎只认英文，填中文或拼音等于无效输入）。留空则回退到英文名。
+    ai_prompt_en: Optional[str] = ""
 
 class UpdateLabelsRequest(BaseModel):
     labels: list[LabelItem]
-
-class UploadModelRequest(BaseModel):
-    name: Optional[str] = None
-    classes: Optional[list[str]] = None
 
 class OverrideModelRequest(BaseModel):
     business: Optional[str] = None      # 业务/算法类型（可选，用于隔离与版本对齐）
@@ -52,7 +51,7 @@ async def list_models():
 
 @router.post("")
 async def create_model(req: CreateModelRequest):
-    """首页「+ 新建模型库」：创建空白模型（空标签字典 + 采集库），code 已存在则返回现有模型"""
+    """首页「+ 新建算法库」：创建空白模型（空标签字典 + 采集库），code 已存在则返回现有模型"""
     try:
         meta = await model_service.create_empty_model(
             req.model_code,
@@ -94,20 +93,39 @@ class LibraryRequest(BaseModel):
 
 @router.get("/libraries")
 async def list_libraries():
-    """模型库列表（逻辑容器：base_algorithm / 标签字典 / 当前生产模型指针）。
+    """算法库列表（供模型管理页「算法库」下拉与库统计）。
 
-    附加每个库挂接的模型数与生产模型名，供管理页展示归库情况。
+    库来源有两处，统一输出：
+    1. registry 中的库根记录（首页「+ 新建算法库」产生的 empty 模型，平台主流程用的就是它）；
+    2. PG model_libraries 表的行（保留兼容）。
+    附加每个库挂接的模型数与生产模型名。
     """
     libs = await meta_store.list_model_libraries()
-    models_list = await model_service.list_models()
+    seen = {l.get("model_library_id") for l in libs}
+    res = await model_service.list_models()
+    models_list = res.get("models", []) if isinstance(res, dict) else (res or [])
+    # registry 库根记录也是一等公民库（否则首页建的库在下拉里看不到）
+    for m in models_list:
+        rid = m.get("model_id")
+        if m.get("empty") and rid and rid not in seen:
+            libs.append({
+                "model_library_id": rid,
+                "display_name": m.get("display_name") or m.get("name") or rid,
+                "description": m.get("description") or "",
+            })
+            seen.add(rid)
     by_lib: dict[str, list] = {}
     prod: dict[str, str] = {}
-    for m in models_list if isinstance(models_list, list) else []:
-        lib_id = m.get("model_library_id")
-        if lib_id:
-            by_lib.setdefault(lib_id, []).append(m)
-            if m.get("status") == "production_ready":
-                prod[lib_id] = m.get("display_name") or m.get("model_id", "")
+    for m in models_list:
+        if m.get("empty"):
+            continue
+        # 归属优先取实际库根（平台训练/手动归库写的 library_root_id），兼容老字段
+        lib_id = m.get("library_root_id") or m.get("model_library_id")
+        if not lib_id or lib_id == m.get("model_id"):
+            continue  # 独立模型自视为根，不算挂库
+        by_lib.setdefault(lib_id, []).append(m)
+        if m.get("status") == "production_ready":
+            prod[lib_id] = m.get("display_name") or m.get("model_id", "")
     for lib in libs:
         lib["model_count"] = len(by_lib.get(lib["model_library_id"], []))
         lib["production_model_name"] = prod.get(lib["model_library_id"], "")
@@ -115,7 +133,7 @@ async def list_libraries():
 
 @router.post("/libraries")
 async def create_library(req: LibraryRequest):
-    """新建/覆盖模型库（upsert 语义：同 id 覆盖）"""
+    """新建/覆盖算法库（upsert 语义：同 id 覆盖）"""
     try:
         import re
         from datetime import datetime
@@ -142,7 +160,7 @@ async def create_library(req: LibraryRequest):
 
 @router.delete("/libraries/{library_id}")
 async def delete_library(library_id: str):
-    """删除模型库（仅解绑记录，不删除挂接模型；模型 model_library_id 留空降级为独立模型）"""
+    """删除算法库（仅解绑记录，不删除挂接模型；模型 model_library_id 留空降级为独立模型）"""
     existed = await meta_store.get_model_library(library_id)
     if not existed:
         raise HTTPException(404, "Model library not found")
@@ -249,12 +267,23 @@ async def update_model(model_id: str, request: UpdateModelRequest):
 
 @router.get("/{model_id}/labels")
 async def get_model_labels(model_id: str):
-    """获取模型统一标签字典（四字段：index/english_code/chinese_name/chinese_desc）。
+    """获取模型统一标签字典（五字段：index/english_code/chinese_name/chinese_desc/ai_prompt_en）。
 
     不存在时自动从 model.json 的 classes 初始化。
     """
     result = await model_service.get_labels_dict(model_id)
     if not result:
+        raise HTTPException(404, "Model not found")
+    return result
+
+@router.get("/{model_id}/labels/usage")
+async def get_model_labels_usage(model_id: str):
+    """标签引用统计：每个类别被多少张图标注、被多少个数据集引用，以及整本字典是否已锁死。
+
+    前端用它把"在用"的英文名格子锁住并显示 已用/未用 标识。
+    """
+    result = await model_service.get_labels_usage(model_id)
+    if result is None:
         raise HTTPException(404, "Model not found")
     return result
 
@@ -291,6 +320,35 @@ async def adopt_model_labels(model_id: str, request: AdoptSuggestRequest):
         raise HTTPException(404, "Model not found")
     return result
 
+class SyncLabelsRequest(BaseModel):
+    dry_run: bool = True
+
+@router.post("/{model_id}/labels/sync-annotations")
+async def sync_model_labels_to_annotations(model_id: str, request: SyncLabelsRequest):
+    """把标签字典的中文名/描述刷进本库已标注数据（dry_run=true 只预览条数与样例，不改写）。
+
+    只改展示文案，不动 class_id / english_code，因此训练产物与已封板数据不受影响；
+    正式同步会先备份被改的原始标注 JSON，可用 /labels/sync-annotations/rollback 回退。
+    """
+    try:
+        result = await model_service.sync_labels_to_annotations(model_id, request.dry_run)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if result is None:
+        raise HTTPException(404, "Model not found")
+    return result
+
+@router.post("/{model_id}/labels/sync-annotations/rollback")
+async def rollback_model_labels_sync(model_id: str):
+    """回退最近一次标签文案同步（用备份原件覆盖回写）"""
+    try:
+        result = await model_service.rollback_labels_sync(model_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if result is None:
+        raise HTTPException(404, "Model not found")
+    return result
+
 @router.delete("/{model_id}")
 async def delete_model(model_id: str):
     """删除模型"""
@@ -301,9 +359,25 @@ async def delete_model(model_id: str):
 
 @router.get("/{model_id}/datasets")
 async def get_model_datasets(model_id: str):
-    """1.7 模型仓库：返回归属于该模型的所有数据集（含状态机字段）"""
+    """1.7 模型仓库：返回归属于该算法库的所有数据集（含状态机字段）
+
+    按库聚合：先把传入的 id 换算成库根记录（打开某个版本详情时也返回整库数据集），
+    再逐个把数据集的归属（新数据写 library_root_id，老数据只有 model_id）换算成库根后比对
+    —— 未归属、归属其它库、以及指向已删除模型的悬空引用一律不出现。
+    """
+    root_id = model_service.resolve_library_root_id(model_id) or model_id
     res = await DatasetService().list_datasets()
-    return {"model_id": model_id, "datasets": [d for d in res["datasets"] if d.get("model_id") == model_id]}
+    owned = []
+    for d in res["datasets"]:
+        owner = d.get("library_root_id") or d.get("model_id")
+        if not owner:
+            continue
+        # 老数据集可能直接挂在库内某个版本模型上：换算成该版本所属库根再比对
+        if owner != root_id:
+            owner = model_service.resolve_library_root_id(owner)
+        if owner == root_id:
+            owned.append(d)
+    return {"model_id": model_id, "datasets": owned}
 
 @router.get("/{model_id}/queue")
 async def get_model_queue(model_id: str):
@@ -349,18 +423,24 @@ async def upload_pretrained_model(file: UploadFile = File(...)):
 
 @router.post("/upload")
 async def upload_model(
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    name: Optional[str] = Form(None),
+    library_id: Optional[str] = Form(None),
 ):
-    """上传已有模型（ZIP格式，与导出格式相同）
+    """上传已有模型（ZIP 包或单个 .pt 权重文件）
     
     Args:
-        file: ZIP格式的模型压缩包，包含model.json和weights目录
+        file: ZIP格式的模型压缩包（包含model.json和weights目录），
+              或单个 .pt 权重文件（自动命名为 best.pt 并解析任务/类别）
+        name: 可选，模型显示名。留空则用上传文件名去扩展名
+              （权重一律落盘为 best.pt，故不传时列表里会都显示 "best"）
+        library_id: 可选，归入的算法库根记录 id。留空则入库为「独立模型」
     """
-    if not file.filename.endswith('.zip'):
-        raise HTTPException(400, "Only .zip files are allowed")
+    if not (file.filename.endswith('.zip') or file.filename.endswith('.pt')):
+        raise HTTPException(400, "Only .zip or .pt files are allowed")
     
     try:
-        result = await model_service.upload_model(file)
+        result = await model_service.upload_model(file, display_name=name or "", library_id=library_id or "")
         return result
     except Exception as e:
         raise HTTPException(400, str(e))

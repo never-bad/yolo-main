@@ -12,13 +12,14 @@ from pathlib import Path
 from datetime import datetime
 import psutil
 from src.core.settings import settings
+from src.db import shadow
 from src.utils.fs_tree import build_tree
 from src.yolo.gatekeeper import infer_business, _normalize_classes
 from src.yolo.train_script import ensure_local_base_weights, parse_architecture
 from src.services.device_manager import get_gpu_utilization, get_available_gpus
 from src.services.dataset_service import (
-    STAGE_TRAINING, STAGE_COMPLETED, STAGE_FAILED,
-    TRAIN_STATUS_INCOMPLETE, TRAIN_STATUS_COMPLETED,
+    STAGE_TRAINING, STAGE_COMPLETED,
+    TRAIN_STATUS_COMPLETED,
     TRAINABLE_STAGES, _ensure_stage_fields,
 )
 
@@ -387,21 +388,9 @@ class TrainService:
 
     def _resolve_dataset_yaml(self, dataset_id: str, version: str = "v1") -> Path:
         """定位数据集训练用 data.yaml：
-        封板快照 sealed/v{N} > 根目录 data.yaml（数据集一律为 datasets/{dataset_id}，无 version 子目录）"""
+        封板后直接输出到 dataset_dir/data.yaml（标准 YOLO 格式）"""
         ds_dir = self.datasets_dir / dataset_id
-        try:
-            meta = _load_json(ds_dir / "meta.json") or {}
-            sv = str(meta.get("sealed_version") or "")
-            if sv:
-                cand = ds_dir / "sealed" / sv / "data.yaml"
-                if cand.exists():
-                    return cand
-        except Exception:
-            pass
-        root = ds_dir / "data.yaml"
-        if root.exists():
-            return root
-        return root
+        return ds_dir / "data.yaml"
 
     def _load_yaml(self, path: Path) -> dict:
         with open(path, "r", encoding="utf-8") as f:
@@ -635,7 +624,9 @@ class TrainService:
                             filter_log["dropped_rows"] += 1
                             continue  # 模型字典外类别 → 丢弃该标注
                         parts[0] = new_id
-                        new_lines.append(" ".join(parts[:5]) + "\n")
+                        # 整行原样保留（只换类别号）：截断到前 5 列会把分割顶点丢掉，
+                        # 分割数据集被静默降级成检测框
+                        new_lines.append(" ".join(parts) + "\n")
                 with open(dst, "w", encoding="utf-8") as f:
                     f.writelines(new_lines)
                 filter_log["converted_txt"] += 1
@@ -767,7 +758,8 @@ class TrainService:
                                 dropped_rows += 1
                                 continue
                             parts[0] = new_id
-                            new_lines.append(" ".join(parts[:5]) + "\n")
+                            # 整行保留，截断到前 5 列 = 丢掉分割轮廓
+                            new_lines.append(" ".join(parts) + "\n")
                     with open(dst, "w", encoding="utf-8") as f:
                         f.writelines(new_lines)
                     converted += 1
@@ -980,7 +972,7 @@ class TrainService:
                             if new_id is None:
                                 continue
                             parts[0] = str(new_id)
-                            lines.append(" ".join(parts[:5]))
+                            lines.append(" ".join(parts))  # 整行保留，别截断丢分割轮廓
                     if _emit("recall", im, lines):
                         merged["recall"] += 1
 
@@ -993,7 +985,6 @@ class TrainService:
                 except Exception:
                     pool_meta = {}
                 pool_names = pool_meta.get("names") or []
-                pool_index = {_norm_class_name(n): i for i, n in enumerate(pool_names)}
                 pool_imgs = self._pool_image_files(hard_dir / "images")
                 rng.shuffle(pool_imgs)
                 limit = max(1, int(len(pool_imgs) * float(hard_ratio)))
@@ -1014,7 +1005,7 @@ class TrainService:
                             if new_id is None:
                                 continue
                             parts[0] = str(new_id)
-                            lines.append(" ".join(parts[:5]))
+                            lines.append(" ".join(parts))  # 整行保留，别截断丢分割轮廓
                     if _emit("hard", im, lines):
                         merged["hard"] += 1
 
@@ -1074,7 +1065,8 @@ class TrainService:
                          gpu_index: int = None, business: str = None,
                          dataset_ids: list = None, aggregate_incomplete: bool = False,
                          hard_sample_ratio: float = 0.1, background_sample_ratio: float = 0.05,
-                         migration_target_model: str = None, recall_enabled: bool = True):
+                         migration_target_model: str = None, recall_enabled: bool = True,
+                         library_root_id: str = None):
         """创建训练任务（支持高级训练参数与训练节点选择、业务/算法类型隔离）
 
         阶段1.3（训练任务聚合）：支持多数据集聚合训练。
@@ -1098,7 +1090,6 @@ class TrainService:
             if ds_id in seen_ids:
                 return
             use_ver = ds_version or version
-            d_dir = self.datasets_dir / ds_id / use_ver
             d_yaml = self._resolve_dataset_yaml(ds_id, use_ver)
             if not d_yaml.exists():
                 raise ValueError(f"Dataset {ds_id}/{use_ver} not prepared")
@@ -1145,6 +1136,26 @@ class TrainService:
 
         # 处理模型路径：如果提供了 base_model_id，使用已有模型的权重
         actual_model_path = model_name
+        # 算法库归属：优先用调用方显式指定的库（从算法库详情页「发起训练」带入），
+        # 其次取主数据集导入时选定的归属库（数据集页强制归属，故从训练页发起也认得库），
+        # 再次继承基座模型所在的库；三者都没有则为不归属任何库的独立模型
+        library_root_id = library_root_id or None
+        if not library_root_id:
+            try:
+                ds_meta = await asyncio.to_thread(
+                    _load_json, self.datasets_dir / primary_id / "meta.json"
+                )
+                cand = ds_meta.get("library_root_id") or ds_meta.get("model_id") or None
+                # 老数据集的 model_id 可能指向已删除的模型记录：记录不存在就不认，
+                # 否则会凭空多出一个"库"（产出版本挂到不存在的库根上）
+                if cand and await asyncio.to_thread(
+                    lambda: (self.registry_dir / cand / "model.json").exists()
+                ):
+                    library_root_id = cand
+            except Exception:
+                library_root_id = None
+        if library_root_id:
+            print(f"[create_job] 产出模型归属算法库: {library_root_id}（主数据集 {primary_id}）")
         migration = None          # 2.4 跨代迁移训练信息（None = 常规微调/全新训练）
         if base_model_id:
             base_model_dir = self.registry_dir / base_model_id
@@ -1153,6 +1164,8 @@ class TrainService:
                 raise ValueError(f"Base model {base_model_id} not found")
             
             base_model_meta = await asyncio.to_thread(_load_json, base_model_file)
+            # 继承基座模型的库归属；基座自身就是库根（无 library_root_id 的旧记录）时归到基座
+            library_root_id = library_root_id or base_model_meta.get("library_root_id") or base_model_id
             
             weights_path = resolve_registry_weights(base_model_meta, self.registry_dir)
             if not weights_path or not await asyncio.to_thread(lambda: weights_path.exists()):
@@ -1287,6 +1300,7 @@ class TrainService:
             "sample_pool": sample_pool_info,       # 阶段1.5/1.6 采样并入信息（未混入为 None）
             "model_name": model_name,
             "base_model_id": base_model_id,
+            "library_root_id": library_root_id,   # 产出模型归属的算法库（继承基座；None=独立模型）
             "original_model_path": actual_model_path,  # 保存原始模型路径，用于恢复
             "epochs": epochs,
             "imgsz": imgsz,
@@ -1320,7 +1334,8 @@ class TrainService:
                 # 2.4 迁移训练：目标架构 + 迁移来源 + lr0 是否自动降级
                 migration.get("target_model") if migration else None,
                 f"{migration['source_model_id']} [{migration['source_architecture']}]" if migration else None,
-                bool(migration and migration.get("lr0_degraded"))
+                bool(migration and migration.get("lr0_degraded")),
+                library_root_id
             )
         except Exception as e:
             try:
@@ -1511,7 +1526,8 @@ class TrainService:
                        gpu_index: int = None, business: str = "general",
                        baseline_path: str = None, baseline_model_id: str = None,
                        migration_target: str = None, migration_source: str = None,
-                       migration_lr0_degraded: bool = False):
+                       migration_lr0_degraded: bool = False,
+                       library_root_id: str = None):
         """启动训练进程（同步方法，在线程中调用）
 
         2.4 迁移训练参数（训练模块规范 §3.2.2）：
@@ -1559,6 +1575,10 @@ class TrainService:
             cmd += ["--migration-source", str(migration_source)]
         if migration_lr0_degraded:
             cmd.append("--migration-lr0-degraded")
+        
+        # 算法库归属：产出模型注册时带上该字段，使同一库的多个版本聚合在一起
+        if library_root_id:
+            cmd += ["--library-root-id", str(library_root_id)]
         
         if resume:
             cmd.append("--resume")
@@ -1700,6 +1720,13 @@ class TrainService:
             return jobs
         
         jobs = await asyncio.to_thread(_list_jobs_sync)
+        # 影子库收口：训练子进程 train_script.py 会绕过本进程直接改数据集 meta.json
+        # （stage / training_status / trained_at / last_trained_round），写侧钩不到，
+        # 因此在读侧按 mtime 水位自愈——未变动的数据集只付一次 stat。
+        touched = [j.get("dataset_id") for j in jobs]
+        for j in jobs:
+            touched.extend(j.get("dataset_ids") or [])
+        await shadow.refresh_datasets(touched)
         return {"jobs": sorted(jobs, key=lambda x: x.get("created_at", ""), reverse=True)}
 
     # g5 GPU 熔断：扫描任务日志尾部识别 OOM（进程被强杀时唯一取证来源）
@@ -1790,6 +1817,8 @@ class TrainService:
             meta["unified_status"] = task_unified(meta)
         except Exception:
             meta["unified_status"] = meta.get("status", "")
+        # 影子库收口：详情页同样是训练子进程改完 meta.json 后的第一个读点
+        await shadow.refresh_datasets([meta.get("dataset_id")] + list(meta.get("dataset_ids") or []))
         return meta
     
     async def stop_job(self, job_id: str):
@@ -1920,8 +1949,8 @@ class TrainService:
                         print(f"Warning: No checkpoint found, restarting from base model {base_model_id}")
                     else:
                         raise ValueError(
-                            f"No checkpoint found and base model weights not found. "
-                            f"Cannot resume training. Please start a new training job."
+                            "No checkpoint found and base model weights not found. "
+                            "Cannot resume training. Please start a new training job."
                         )
                 else:
                     raise ValueError(
@@ -2020,7 +2049,8 @@ class TrainService:
             resume_mig.get("target_model") if need_mig else None,
             f"{resume_mig.get('source_model_id')} [{resume_mig.get('source_architecture')}]"
             if need_mig else None,
-            bool(resume_mig.get("lr0_degraded"))
+            bool(resume_mig.get("lr0_degraded")),
+            job_meta.get("library_root_id")
         )
         
         return {"job_id": job_id, "status": "running", "message": "Training resumed from checkpoint"}
