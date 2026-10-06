@@ -20,6 +20,7 @@ from src.core.settings import settings
 from src.utils.fs_tree import build_tree
 from src.utils.class_labels import model_class_names, merge_classes_with_model
 from src.utils.class_labels import is_placeholder_classes as _is_placeholder_names
+from src.utils import zip_guard
 from src.services.annotation_importers import import_external_annotations
 from src.services.annotation_service import (
     decode_yolo_line, yolo_label_line, clean_polygon, polygon_to_bbox, strip_ann_bbox, boxes_with_bbox,
@@ -137,10 +138,9 @@ def _extract_zip(zip_path: Path, extract_to: Path):
         
         for member in file_list:
             try:
-                # 安全地处理路径（防止路径遍历攻击）
+                # 安全地处理路径（防止路径遍历攻击）——收口到 utils.zip_guard（S-01/S-02）
                 member_path = Path(member)
-                # 跳过绝对路径或包含 .. 的路径
-                if member_path.is_absolute() or '..' in str(member_path):
+                if not zip_guard.is_safe_member(member):
                     logger.warning(f"Skipping unsafe path: {member}")
                     continue
                 

@@ -13,6 +13,7 @@ from datetime import datetime
 from fastapi import UploadFile
 from src.core.settings import settings
 from src.db import shadow
+from src.utils import zip_guard
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
 import matplotlib.pyplot as plt
@@ -1524,8 +1525,15 @@ class ModelService:
                 except zipfile.BadZipFile:
                     raise ValueError("Invalid or corrupted ZIP file")
                 
-                # 解压ZIP文件
-                zip_file.extractall(temp_path)
+                # 解压ZIP文件（S-01：路径遍历 + 解压炸弹校验，收口 utils.zip_guard）
+                try:
+                    zip_guard.guarded_extractall(zip_file, temp_path, strict=True)
+                except zip_guard.ZipBombRisk as e:
+                    zip_file.close()
+                    raise ValueError(str(e))
+                except zip_guard.UnsafeZipMember as e:
+                    zip_file.close()
+                    raise ValueError(str(e))
                 zip_file.close()
                 
                 # 查找model.json和weights目录
