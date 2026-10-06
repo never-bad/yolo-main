@@ -116,3 +116,14 @@ export const advanceBuckets = async () => {
   const { data } = await api.post('/datasets/advance-buckets')
   return data
 }
+
+// 封板/桶灌数量门槛：查询与在线修改（持久化到 data/seal_threshold.json）
+export const getSealThreshold = async (): Promise<{ seal_min_images: number; default: number; seal_max_days: number }> => {
+  const { data } = await api.get('/datasets/config/seal-threshold')
+  return data
+}
+
+export const setSealThreshold = async (sealMinImages: number) => {
+  const { data } = await api.put('/datasets/config/seal-threshold', { seal_min_images: sealMinImages })
+  return data
+}

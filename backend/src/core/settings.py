@@ -52,8 +52,11 @@ class Settings(BaseSettings):
     PUBLISH_CONFIRM_COOLDOWN_HOURS: int = 24
 
     # 封板数量门槛：图片数未达该值默认拒绝封板（force 强制封板可放行；0 关闭）
-    # 用户要求暂定 5000，可按业务批量调整
+    # 用户要求暂定 5000，可按业务批量调整；
+    # 运行期可在「数据集列表-桶进度」处在线修改，持久化到 data/seal_threshold.json，
+    # 启动时由 load_runtime_overrides() 覆盖此默认值。
     SEAL_MIN_IMAGES: int = 5000  # 桶灌阈值：满 5000 张自动封板
+    SEAL_THRESHOLD_FILE: Path = DATA_DIR / "seal_threshold.json"
 
     # P1 封板时间窗口兜底：数据集准备完成进入标注阶段后，超过该天数（未达数量门槛）自动封板；
     # 数量门槛与时间窗口"先达者"生效。0 关闭时间窗口
@@ -111,3 +114,17 @@ class Settings(BaseSettings):
 
 settings = Settings()
 settings.init_directories()
+
+
+def load_runtime_overrides():
+    """启动时加载运行期在线修改的配置覆盖（data/seal_threshold.json）。
+    文件不存在/损坏时静默跳过，保持 .env/默认值。"""
+    import json
+    try:
+        if settings.SEAL_THRESHOLD_FILE.exists():
+            data = json.loads(settings.SEAL_THRESHOLD_FILE.read_text(encoding="utf-8"))
+            v = data.get("SEAL_MIN_IMAGES")
+            if isinstance(v, int) and v >= 0:
+                settings.SEAL_MIN_IMAGES = v
+    except Exception:
+        pass

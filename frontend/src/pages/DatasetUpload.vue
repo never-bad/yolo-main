@@ -52,9 +52,20 @@
         {{ loading ? '加载中...' : '刷新' }}
       </button>
       <div v-if="bucketNotice" class="bucket-notice" @click="bucketNotice = ''" title="点击关闭">{{ bucketNotice }}<span class="bucket-notice-close">✕</span></div>
-      <div v-if="bucketBars.length" class="bucket-progress">
-        <div class="bucket-progress-title">桶进度（每桶满 {{ sealMinImages }} 张自动封板，标完的 A 包自动灌入）</div>
-        <div v-for="bar in bucketBars" :key="bar.model_id" class="bucket-model">
+      <div class="bucket-progress">
+        <div class="bucket-progress-title">
+          桶进度（每桶满
+          <span v-if="!editingThreshold" class="threshold-chip" @click="startEditThreshold" title="点击修改封板/灌桶数量门槛">{{ sealMinImages }} 张 ✎</span>
+          <template v-else>
+            <input v-model.number="thresholdDraft" type="number" min="0" step="100" class="threshold-input" @keyup.enter="saveThreshold" @keyup.esc="editingThreshold = false" />
+            <span>张</span>
+            <button class="link-btn" :disabled="savingThreshold" @click="saveThreshold">{{ savingThreshold ? '保存中…' : '保存' }}</button>
+            <button class="link-btn" @click="editingThreshold = false">取消</button>
+          </template>
+          自动封板，标完的 A 包自动灌入）
+        </div>
+        <template v-if="bucketBars.length">
+          <div v-for="bar in bucketBars" :key="bar.model_id" class="bucket-model">
           <span class="bucket-model-tag">{{ modelName(bar.model_id) }}</span>
           <span v-for="s in bar.sealed" :key="s.version" class="bucket-sealed" :title="'已封板 ' + s.images + ' 张（' + formatTime(s.sealed_at) + '）'">B{{ String(s.version).replace('v', '') }} 已封板</span>
           <span class="bucket-recv">
@@ -62,7 +73,8 @@
             <span class="bar"><span class="bar-fill" :style="{ width: bar.pct + '%' }"></span></span>
             <span class="bar-num">{{ bar.poured }} / {{ bar.cap || '--' }}</span>
           </span>
-        </div>
+          </div>
+        </template>
       </div>
       <div v-if="loading" class="loading-state">
         <span class="loading-spinner large"></span>
@@ -352,7 +364,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onActivated, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { uploadDataset, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel } from '@/api/datasets'
+import { uploadDataset, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel, getSealThreshold, setSealThreshold } from '@/api/datasets'
 import { listModels } from '@/api/models'
 import { addHardSamples, addBackgroundSamples } from '@/api/samplePool'
 import { downloadFile } from '@/utils/download'
@@ -370,6 +382,36 @@ const allModels = ref<any[]>([]) // registry 记录（算法库下拉数据源�
 const uploading = ref(false)
 const uploadResult = ref<any>(null)
 const sealMinImages = ref(0)  // #6 封板数量门槛（来自后端），列表展示待封板进度
+// 门槛在线编辑（持久化到后端 data/seal_threshold.json）
+const editingThreshold = ref(false)
+const thresholdDraft = ref(0)
+const savingThreshold = ref(false)
+const startEditThreshold = async () => {
+  try {
+    const t = await getSealThreshold()
+    thresholdDraft.value = t.seal_min_images
+  } catch {
+    thresholdDraft.value = sealMinImages.value
+  }
+  editingThreshold.value = true
+}
+const saveThreshold = async () => {
+  const v = Number(thresholdDraft.value)
+  if (!Number.isInteger(v) || v < 0 || v > 1000000) {
+    alert('门槛需为 0 ~ 1000000 的整数（0 表示关闭数量门槛）')
+    return
+  }
+  savingThreshold.value = true
+  try {
+    await setSealThreshold(v)
+    editingThreshold.value = false
+    await loadDatasets(true)  // 刷新列表，桶进度条按新门槛重算
+  } catch (e: any) {
+    alert('保存失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    savingThreshold.value = false
+  }
+}
 const datasets = ref<any[]>([])
 const buckets = ref<any[]>([])      // B 系列：按模型桶进度（receiving + sealed）
 const bucketNotice = ref('')        // 灌桶/封板结果提示（点击关闭）
@@ -1272,6 +1314,20 @@ onActivated(() => {
   color: #5a6a7a;
   margin-bottom: 0.5rem;
   font-weight: 600;
+}
+.threshold-chip {
+  color: #1a73e8;
+  cursor: pointer;
+  border-bottom: 1px dashed #1a73e8;
+  white-space: nowrap;
+}
+.threshold-chip:hover { background: rgba(26, 115, 232, 0.08); }
+.threshold-input {
+  width: 90px;
+  padding: 0.1rem 0.35rem;
+  font-size: 0.8rem;
+  border: 1px solid #1a73e8;
+  border-radius: 4px;
 }
 .bucket-model {
   display: flex;

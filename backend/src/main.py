@@ -4,8 +4,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from src.core.settings import settings
+from src.core.settings import settings, load_runtime_overrides
 from src.api.routes import datasets, annotations, train, logs, models, sam, sample_pool
+
+load_runtime_overrides()  # 应用 data/seal_threshold.json 等运行期在线配置
 
 logger = logging.getLogger(__name__)
 

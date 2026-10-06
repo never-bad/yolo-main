@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import Optional, Dict
 from src.services.dataset_service import DatasetService
 from src.services.model_service import ModelService
+from src.core.settings import settings
 
 router = APIRouter(prefix="/datasets", tags=["datasets"])
 dataset_service = DatasetService()
@@ -97,6 +98,45 @@ async def list_datasets():
 async def advance_buckets():
     """按模型滚动灌桶（幂等）：A 包标注完成自动灌桶，桶满 SEAL_MIN_IMAGES 自动封板出成品数据集"""
     return await dataset_service.advance_buckets()
+
+
+class SealThresholdRequest(BaseModel):
+    seal_min_images: int
+
+
+@router.get("/config/seal-threshold")
+async def get_seal_threshold():
+    """封板/桶灌数量门槛（当前生效值 + 默认值），供前端桶进度条展示与编辑"""
+    from src.core.settings import Settings
+    return {
+        "seal_min_images": settings.SEAL_MIN_IMAGES,
+        "default": Settings.model_fields["SEAL_MIN_IMAGES"].default,
+        "seal_max_days": settings.SEAL_MAX_DAYS,
+    }
+
+
+@router.put("/config/seal-threshold")
+async def set_seal_threshold(request: SealThresholdRequest):
+    """在线修改封板/桶灌数量门槛（持久化到 data/seal_threshold.json，重启后仍生效）。
+    0 = 关闭数量门槛（标注完审核通过即可封板/灌桶即满即封）。"""
+    import json
+    v = request.seal_min_images
+    if not isinstance(v, int) or v < 0 or v > 1_000_000:
+        raise HTTPException(400, "门槛需为 0 ~ 1000000 的整数（0 表示关闭数量门槛）")
+    settings.SEAL_MIN_IMAGES = v
+    # 列表接口结果含 seal_min_images，门槛变了要作废签名缓存
+    import src.services.dataset_service as _ds
+    with _ds._LIST_CACHE_LOCK:
+        _ds._LIST_CACHE["sig"] = None
+        _ds._LIST_CACHE["result"] = None
+    try:
+        settings.SEAL_THRESHOLD_FILE.parent.mkdir(parents=True, exist_ok=True)
+        settings.SEAL_THRESHOLD_FILE.write_text(
+            json.dumps({"SEAL_MIN_IMAGES": v}, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception as e:
+        raise HTTPException(500, f"门槛已生效（本次运行），但持久化失败：{e}")
+    return {"seal_min_images": v, "persisted": True}
 
 @router.get("/{dataset_id}")
 async def get_dataset(dataset_id: str):
