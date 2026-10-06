@@ -1126,13 +1126,33 @@ async function handleImportModel(e: any) {
 }
 
 // 版本下载：按该版本自己的 model_id 取权重（库下每个版本各有独立权重）
+// 外层 zip 名与包内权重名对齐：优先业务名（display_name，如 shuaidao_v1），
+// 其次 model_code，兜底 model_id；磁盘存储名保持 best.pt 不变（预标注引擎按约定路径找它）
 const downloadingVer = ref<string | null>(null)
+function exportZipName(v: any): string {
+  const asciiSafe = /^[A-Za-z0-9._-]+$/
+  const dn = String(v.display_name || '').trim()
+  const code = String(v.model_code || '').trim()
+  let base = ''
+  if (dn && dn !== v.model_id && asciiSafe.test(dn)) base = dn
+  else if (code && code !== v.model_id && asciiSafe.test(code)) base = code
+  else if (dn) base = dn  // 中文名浏览器下载也能正常显示
+  else base = code || v.model_id
+  const ver = String(v.version || '').trim()
+  if (ver) {
+    const vp = ver.toLowerCase().startsWith('v') ? ver : 'v' + ver
+    if (!base.toLowerCase().includes(vp.toLowerCase()) && !base.toLowerCase().includes(vp.slice(1).toLowerCase())) {
+      base = base + '_' + vp
+    }
+  }
+  return `${base}.zip`
+}
 async function downloadVersionWeights(v: any) {
   if (!v?.model_id) return
   downloadingVer.value = v.model_id
   try {
     const blob = await exportModel(v.model_id)
-    saveBlob(blob, `${v.model_code || v.model_id}_v${String(v.version || '').replace(/^v/i, '')}.zip`)
+    saveBlob(blob, exportZipName(v))
   } catch (e: any) {
     alert('下载失败：' + (e?.response?.data?.detail || e?.message))
   } finally {

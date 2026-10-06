@@ -1749,6 +1749,28 @@ class ModelService:
             await shadow.sync_model(model_meta["model_id"])
         return model_meta
     
+    @staticmethod
+    def _export_weight_filename(meta: dict, model_id: str) -> str:
+        """导出包内权重的可读文件名：优先 ASCII 安全的 display_name，其次 model_code，兜底 model_id，
+        再拼版本号（display_name 已含版本后缀时不重复拼）。磁盘存储名保持 best.pt 不变。"""
+        import re as _re
+        dn = str(meta.get("display_name") or "").strip()
+        code = str(meta.get("model_code") or "").strip()
+        safe = _re.compile(r"^[A-Za-z0-9._-]+$")
+        base = ""
+        for cand in (dn, code):
+            if cand and cand != model_id and safe.match(cand):
+                base = cand
+                break
+        if not base:
+            base = code if (code and safe.match(code)) else model_id
+        ver = str(meta.get("version") or "").strip()
+        if ver:
+            ver_part = ver if ver.lower().startswith("v") else f"v{ver}"
+            if ver_part.lower() not in base.lower() and ver_part.lstrip("vV").lower() not in base.lower():
+                base = f"{base}_{ver_part}"
+        return f"{base}.pt"
+
     async def export_model(self, model_id: str):
         """导出模型为ZIP文件"""
         model_dir = self.registry_dir / model_id
@@ -1764,16 +1786,21 @@ class ModelService:
             temp_zip_path = temp_zip.name
             temp_zip.close()
             
+            meta = _load_json(model_file) if model_file.exists() else {}
+            weight_name = self._export_weight_filename(meta or {}, model_id)
+            
             with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 # 添加model.json
                 if model_file.exists():
                     zipf.write(model_file, f"{model_id}/model.json")
                 
-                # 添加weights目录
+                # 添加weights目录（best.pt 等统一重命名为可读名；导入端 glob("*.pt") 认任意名）
                 weights_dir = model_dir / "weights"
                 if weights_dir.exists():
                     for weight_file in weights_dir.iterdir():
-                        if weight_file.is_file():
+                        if weight_file.is_file() and weight_file.suffix == ".pt":
+                            zipf.write(weight_file, f"{model_id}/weights/{weight_name}")
+                        elif weight_file.is_file():
                             zipf.write(weight_file, f"{model_id}/weights/{weight_file.name}")
                 
                 # 添加其他可能的文件
