@@ -54,12 +54,13 @@
       <div v-if="bucketNotice" class="bucket-notice" @click="bucketNotice = ''" title="点击关闭">{{ bucketNotice }}<span class="bucket-notice-close">✕</span></div>
       <div class="bucket-progress">
         <div class="bucket-progress-title">
-          <span>桶进度（每桶满 <b>{{ sealMinImages }}</b> 张自动封板，标完的 A 包自动灌入）</span>
+          <span>桶进度（每桶满 <b>{{ sealMinImages }}</b> 张自动封板{{ perModelOverrideCount ? `，${perModelOverrideCount} 个库单独设置` : '' }}，标完的 A 包自动灌入）</span>
           <button class="threshold-gear" @click="openThresholdModal" title="修改封板/灌桶数量门槛">⚙ 门槛设置</button>
         </div>
         <template v-if="bucketBars.length">
           <div v-for="bar in bucketBars" :key="bar.model_id" class="bucket-model">
           <span class="bucket-model-tag">{{ modelName(bar.model_id) }}</span>
+          <span v-if="bar.cap && bar.cap !== sealMinImages" class="bucket-own-th" :title="'该库单独门槛 ' + bar.cap + ' 张（全局默认 ' + sealMinImages + '）'">单独{{ bar.cap }}</span>
           <span v-for="s in bar.sealed" :key="s.version" class="bucket-sealed" :title="'已封板 ' + s.images + ' 张（' + formatTime(s.sealed_at) + '）'">B{{ String(s.version).replace('v', '') }} 已封板</span>
           <span class="bucket-recv">
             接收 B{{ bar.curIndex }}：
@@ -195,7 +196,7 @@
             </div>
           </div>
           <p v-if="dataset.sealed_at">封板时间: {{ formatTime(dataset.sealed_at) }}</p>
-          <p v-if="dataset.image_count">图片数: {{ dataset.image_count }}<span v-if="dataset.stage === 'annotating' && sealMinImages > 0" style="color:#b26a00;font-size:0.8rem">（待封板 {{ dataset.image_count }} / {{ sealMinImages }} 张{{ dataset.image_count < sealMinImages ? `，还差 ${sealMinImages - dataset.image_count} 张` : '' }}）</span></p>
+          <p v-if="dataset.image_count">图片数: {{ dataset.image_count }}<span v-if="dataset.stage === 'annotating' && thresholdForModel(datasetLibraryId(dataset)) > 0" style="color:#b26a00;font-size:0.8rem">（待封板 {{ dataset.image_count }} / {{ thresholdForModel(datasetLibraryId(dataset)) }} 张{{ dataset.image_count < thresholdForModel(datasetLibraryId(dataset)) ? `，还差 ${thresholdForModel(datasetLibraryId(dataset)) - dataset.image_count} 张` : '' }}）</span></p>
           <p v-if="dataset.label_count">标签数: {{ dataset.label_count }}</p>
           <p v-if="dataset.classes">类别: {{ dataset.classes.join(', ') }}</p>
           <p v-if="dataset.annotation_task_id" class="auto-task-hint">
@@ -358,9 +359,21 @@
         <h3>封板 / 灌桶数量门槛</h3>
         <p class="modal-sub">图片数达到该值才允许封板；自动灌桶每满该值封一个 B 桶。<br />未达门槛时仍可在封板确认里走「强制封板」，或等 {{ sealMaxDays }} 天时间窗口兜底。</p>
         <div class="form-field">
+          <label>作用范围</label>
+          <select v-model="thresholdScope" class="threshold-scope">
+            <option value="__global__">全局默认（未单独设置的算法库都用它）</option>
+            <option v-for="lib in libraryOptions" :key="lib.model_id" :value="lib.model_id">
+              仅 {{ lib.display_name || lib.model_code || lib.model_id }}（单独覆盖）
+            </option>
+          </select>
+          <small v-if="thresholdScope !== '__global__' && perModelOverrides[thresholdScope] === undefined" class="form-hint">该库当前跟随全局默认（{{ sealMinImages }} 张），保存后改为单独值</small>
+          <small v-else-if="thresholdScope !== '__global__'" class="form-hint">该库已单独设置：{{ perModelOverrides[thresholdScope] }} 张</small>
+        </div>
+        <div class="form-field">
           <label>门槛值（张）</label>
           <input v-model.number="thresholdDraft" type="number" min="0" step="100" class="threshold-input" @keyup.enter="saveThreshold" />
           <small class="form-hint">0 = 关闭数量门槛（审核通过即可封板）；范围 0 ~ 1,000,000</small>
+          <button v-if="thresholdScope !== '__global__'" class="link-btn" @click="resetScopeToGlobal">恢复跟随全局默认</button>
         </div>
         <div class="threshold-presets">
           <button v-for="p in [0, 1000, 2000, 5000, 10000]" :key="p" class="preset-btn" :class="{ active: thresholdDraft === p }" @click="thresholdDraft = p">
@@ -368,7 +381,7 @@
           </button>
         </div>
         <div v-if="thresholdError" class="form-error">{{ thresholdError }}</div>
-        <!-- 手滑防护：新门槛会让现存接收桶立即达到封板线，需勾选确认才能保存 -->
+        <!-- 手滑防护：新门槛会让该范围现存接收桶立即达到封板线，需勾选确认才能保存 -->
         <div v-if="pendingSealPreview.length" class="threshold-warn" :class="{ armed: thresholdAck }">
           <div class="threshold-warn-title">⚠ 保存后这些库的当前接收桶将<b>立即封板（不可逆）</b>：</div>
           <ul>
@@ -417,27 +430,56 @@ const thresholdError = ref('')
 const sealMaxDays = ref(7)
 const savingThreshold = ref(false)
 const thresholdAck = ref(false)
-// 手滑防护：预览"若按 thresholdDraft 保存，哪些现存接收桶会立即封板"
+// 作用范围：'__global__' = 全局默认；其他值 = 按库单独覆盖的 model_id
+const thresholdScope = ref('__global__')
+const perModelOverrides = ref<Record<string, number>>({})
+const perModelOverrideCount = computed(() => buckets.value.filter((b: any) => Number(b.threshold) > 0 && Number(b.threshold) !== sealMinImages.value).length)
+// 手滑防护：预览"若按 thresholdDraft 保存，哪些现存接收桶会立即封板"（只看作用范围内会封的桶）
 const pendingSealPreview = computed(() => {
   const cap = Number(thresholdDraft.value)
   if (!Number.isInteger(cap) || cap <= 0) return []  // 0/非法值 = 关闭自动灌桶，不触发封板
   return bucketBars.value
-    .filter(b => b.poured >= cap)
+    .filter(b => {
+      if (thresholdScope.value !== '__global__' && b.model_id !== thresholdScope.value) return false
+      return b.poured >= cap
+    })
     .map(b => ({ model_id: b.model_id, name: modelName(b.model_id), poured: b.poured, curIndex: b.curIndex }))
 })
 // 门槛草稿值一变，确认勾选作废（防止先看清 2000 的后果、又改成 100 却没重新评估）
 watch(thresholdDraft, () => { thresholdAck.value = false })
+// 切换作用范围时，输入框回显该范围当前生效值
+watch(thresholdScope, (scope) => {
+  thresholdAck.value = false
+  thresholdError.value = ''
+  if (scope === '__global__') thresholdDraft.value = sealMinImages.value
+  else thresholdDraft.value = perModelOverrides.value[scope] ?? sealMinImages.value
+})
 const openThresholdModal = async () => {
   thresholdError.value = ''
   thresholdAck.value = false
   try {
     const t = await getSealThreshold()
-    thresholdDraft.value = t.seal_min_images
+    sealMinImages.value = t.seal_min_images
+    perModelOverrides.value = t.per_model || {}
     sealMaxDays.value = t.seal_max_days || 7
-  } catch {
-    thresholdDraft.value = sealMinImages.value
-  }
+  } catch { /* 用列表接口已带回的值兜底 */ }
+  thresholdScope.value = '__global__'
+  thresholdDraft.value = sealMinImages.value
   thresholdOpen.value = true
+}
+// 当前库恢复跟随全局（删除按库覆盖）
+const resetScopeToGlobal = async () => {
+  if (thresholdScope.value === '__global__') return
+  savingThreshold.value = true
+  try {
+    await setSealThreshold(-1, thresholdScope.value)
+    thresholdOpen.value = false
+    await loadDatasets(true)
+  } catch (e: any) {
+    thresholdError.value = '操作失败: ' + (e.response?.data?.detail || e.message)
+  } finally {
+    savingThreshold.value = false
+  }
 }
 const saveThreshold = async () => {
   const v = Number(thresholdDraft.value)
@@ -451,7 +493,8 @@ const saveThreshold = async () => {
   }
   savingThreshold.value = true
   try {
-    await setSealThreshold(v)
+    const scope = thresholdScope.value === '__global__' ? null : thresholdScope.value
+    await setSealThreshold(v, scope)
     thresholdOpen.value = false
     await loadDatasets(true)  // 刷新列表，桶进度条按新门槛重算
   } catch (e: any) {
@@ -751,10 +794,10 @@ const bucketBadge = (d: any) => {
   return { text: '', cls: '' }
 }
 
-// 桶进度条（每个模型一行：已封板版本 + 接收桶已灌/容量）
+// 桶进度条（每个模型一行：已封板版本 + 接收桶已灌/该库生效门槛）
 const bucketBars = computed(() => buckets.value.map(b => {
   const recv = b.receiving || { index: 1, poured: 0 }
-  const cap = sealMinImages.value || 0
+  const cap = Number(b.threshold ?? sealMinImages.value) || 0
   const poured = Number(recv.poured) || 0
   return {
     model_id: b.model_id,
@@ -765,6 +808,13 @@ const bucketBars = computed(() => buckets.value.map(b => {
     pct: cap > 0 ? Math.min(100, Math.round((poured / cap) * 100)) : 0,
   }
 }))
+
+// 某算法库生效的封板门槛（按库覆盖优先，否则全局默认）
+const thresholdForModel = (mid: string | undefined) => {
+  if (!mid) return sealMinImages.value
+  const b = buckets.value.find((x: any) => x.model_id === mid)
+  return Number(b?.threshold ?? sealMinImages.value) || 0
+}
 
 // 是否可封板：已准备 且 未进入 sealed/training/completed/failed 阶段 且 未归档（已归档的包已灌入桶）
 const canSeal = (d: any) => {
@@ -835,7 +885,7 @@ const sealMsg = (res: any, head: string) => {
 const sealDatasetItem = async (d: any) => {
   // 数量门槛提示（#6）：标注中且数量未达门槛 → 明确提示差额，避免封板被后端拒绝
   const imgN = Number(d.image_count || 0)
-  const minN = sealMinImages.value
+  const minN = thresholdForModel(datasetLibraryId(d))
   const sealNote = minN > 0 && imgN > 0 && imgN < minN
     ? `\n⚠ 当前 ${imgN} 张 < 封板门槛 ${minN} 张：直接封板会被拒绝，需走「强制封板」兜底`
     : ''
@@ -1417,6 +1467,22 @@ onActivated(() => {
 .threshold-warn ul { margin: 0.2rem 0 0.4rem 1.2rem; padding: 0; }
 .threshold-ack { display: flex; align-items: center; gap: 0.4rem; cursor: pointer; font-weight: 600; }
 .threshold-ack input { cursor: pointer; }
+.threshold-scope {
+  width: 100%;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.85rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 4px;
+}
+.bucket-own-th {
+  background: #eef4ff;
+  color: #1a56b8;
+  border: 1px solid #c4d7f5;
+  border-radius: 10px;
+  padding: 0 0.5rem;
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
 .bucket-model {
   display: flex;
   align-items: center;

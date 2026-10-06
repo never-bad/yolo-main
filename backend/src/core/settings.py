@@ -53,9 +53,10 @@ class Settings(BaseSettings):
 
     # 封板数量门槛：图片数未达该值默认拒绝封板（force 强制封板可放行；0 关闭）
     # 用户要求暂定 5000，可按业务批量调整；
-    # 运行期可在「数据集列表-桶进度」处在线修改，持久化到 data/seal_threshold.json，
-    # 启动时由 load_runtime_overrides() 覆盖此默认值。
-    SEAL_MIN_IMAGES: int = 5000  # 桶灌阈值：满 5000 张自动封板
+    # 运行期可在「数据集列表-桶进度」处在线修改（支持全局默认 + 按算法库单独覆盖），
+    # 持久化到 data/seal_threshold.json，启动时由 load_runtime_overrides() 覆盖此默认值。
+    SEAL_MIN_IMAGES: int = 5000  # 桶灌阈值（全局默认）：满 N 张自动封板
+    SEAL_THRESHOLDS_PER_MODEL: dict = {}  # 按算法库单独门槛 {model_id: N}；未设置的库用全局默认
     SEAL_THRESHOLD_FILE: Path = DATA_DIR / "seal_threshold.json"
 
     # P1 封板时间窗口兜底：数据集准备完成进入标注阶段后，超过该天数（未达数量门槛）自动封板；
@@ -126,5 +127,19 @@ def load_runtime_overrides():
             v = data.get("SEAL_MIN_IMAGES")
             if isinstance(v, int) and v >= 0:
                 settings.SEAL_MIN_IMAGES = v
+            per = data.get("per_model")
+            if isinstance(per, dict):
+                settings.SEAL_THRESHOLDS_PER_MODEL = {
+                    str(k): int(x) for k, x in per.items() if isinstance(x, int) and int(x) >= 0
+                }
     except Exception:
         pass
+
+
+def seal_threshold_for(model_id: str | None = None) -> int:
+    """某算法库生效的封板/灌桶门槛：有按库覆盖用覆盖值，否则用全局默认。"""
+    if model_id:
+        v = settings.SEAL_THRESHOLDS_PER_MODEL.get(str(model_id))
+        if v is not None:
+            return v
+    return settings.SEAL_MIN_IMAGES

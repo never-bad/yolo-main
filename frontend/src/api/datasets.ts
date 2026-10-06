@@ -118,12 +118,13 @@ export const advanceBuckets = async () => {
 }
 
 // 封板/桶灌数量门槛：查询与在线修改（持久化到 data/seal_threshold.json）
-export const getSealThreshold = async (): Promise<{ seal_min_images: number; default: number; seal_max_days: number }> => {
+// modelId 传入 = 单独覆盖该库；不传 = 改全局默认；value 传 -1 = 该库恢复跟随全局
+export const getSealThreshold = async (): Promise<{ seal_min_images: number; default: number; seal_max_days: number; per_model: Record<string, number> }> => {
   const { data } = await api.get('/datasets/config/seal-threshold')
   return data
 }
 
-export const setSealThreshold = async (sealMinImages: number) => {
-  const { data } = await api.put('/datasets/config/seal-threshold', { seal_min_images: sealMinImages })
+export const setSealThreshold = async (sealMinImages: number, modelId?: string | null) => {
+  const { data } = await api.put('/datasets/config/seal-threshold', { seal_min_images: sealMinImages, model_id: modelId ?? null })
   return data
 }

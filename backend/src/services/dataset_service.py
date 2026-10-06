@@ -16,7 +16,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 from fastapi import UploadFile
-from src.core.settings import settings
+from src.core.settings import settings, seal_threshold_for
 from src.utils.fs_tree import build_tree
 from src.utils.class_labels import model_class_names, merge_classes_with_model
 from src.utils.class_labels import is_placeholder_classes as _is_placeholder_names
@@ -1865,6 +1865,8 @@ class DatasetService:
                     "model_id": mid,
                     "receiving": mst.get("receiving"),
                     "sealed": mst.get("sealed") or [],
+                    # 该库生效门槛（按库覆盖优先，否则全局默认）
+                    "threshold": seal_threshold_for(mid),
                 })
             out.sort(key=lambda x: x["model_id"])
             return out
@@ -2135,8 +2137,8 @@ class DatasetService:
                 "请修复标注或使用强制封板兜底"
             )
 
-        # 数量✓：封板最低图片数门槛（settings.SEAL_MIN_IMAGES，force 放行；旧数据无 image_count 不拦截）
-        min_imgs = settings.SEAL_MIN_IMAGES
+        # 数量✓：封板最低图片数门槛（按库覆盖优先，force 放行；旧数据无 image_count 不拦截）
+        min_imgs = seal_threshold_for(meta.get("model_id"))
         img_n = int(meta.get("image_count") or 0)
         # P1 时间窗口兜底：prepared_at 起超过 SEAL_MAX_DAYS 天即视为达标（数量与时间先达者生效）
         prepared_at = meta.get("prepared_at") or ""
@@ -2860,7 +2862,7 @@ class DatasetService:
         未取完的剩余量滚入下一接收桶。返回封板快照信息；无图可封时重置桶返回 None。
         """
         recv = mst["receiving"]
-        need = settings.SEAL_MIN_IMAGES
+        need = seal_threshold_for(model_id)
         if need <= 0 or recv["poured"] < need:
             return None
         picks = []          # [(dataset_id, [records])]
@@ -2917,7 +2919,8 @@ class DatasetService:
         """灌桶同步核心：扫描标完未归档源包 → FIFO 灌桶 → 满 settings.SEAL_MIN_IMAGES 连环自动封板。
         幂等：重复调用不重复灌/封。返回本次变更摘要。
         """
-        if settings.SEAL_MIN_IMAGES <= 0:
+        if settings.SEAL_MIN_IMAGES <= 0 and not any(
+                v > 0 for v in settings.SEAL_THRESHOLDS_PER_MODEL.values()):
             return {"poured": [], "sealed": [], "skipped": 0, "note": "SEAL_MIN_IMAGES=0 关闭"}
         state = self._load_bucket_state()
         self._bucket_state = state
@@ -2999,10 +3002,10 @@ class DatasetService:
                     })
                     logger.info(
                         f"bucket: pour {dataset_id} +{pour_n} -> B{recv['index']} "
-                        f"(total {recv['poured']}/{settings.SEAL_MIN_IMAGES})"
+                        f"(total {recv['poured']}/{seal_threshold_for(model_id)})"
                     )
-                    # 3) 满则连环封板（剩余超过 settings.SEAL_MIN_IMAGES 时可能连续产出多个版本）
-                    while mst["receiving"]["poured"] >= settings.SEAL_MIN_IMAGES:
+                    # 3) 满则连环封板（剩余超过该库门槛时可能连续产出多个版本）
+                    while mst["receiving"]["poured"] >= seal_threshold_for(model_id):
                         snap = self._seal_receiving_bucket(model_id, mst)
                         if not snap:
                             break

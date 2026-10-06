@@ -102,41 +102,68 @@ async def advance_buckets():
 
 class SealThresholdRequest(BaseModel):
     seal_min_images: int
+    model_id: str | None = None   # 传库 id = 单独覆盖该库；不传 = 改全局默认
 
 
 @router.get("/config/seal-threshold")
 async def get_seal_threshold():
-    """封板/桶灌数量门槛（当前生效值 + 默认值），供前端桶进度条展示与编辑"""
+    """封板/桶灌数量门槛（全局默认 + 按库覆盖表），供前端桶进度条展示与编辑"""
     from src.core.settings import Settings
     return {
         "seal_min_images": settings.SEAL_MIN_IMAGES,
         "default": Settings.model_fields["SEAL_MIN_IMAGES"].default,
         "seal_max_days": settings.SEAL_MAX_DAYS,
+        "per_model": dict(settings.SEAL_THRESHOLDS_PER_MODEL),
     }
 
 
 @router.put("/config/seal-threshold")
 async def set_seal_threshold(request: SealThresholdRequest):
     """在线修改封板/桶灌数量门槛（持久化到 data/seal_threshold.json，重启后仍生效）。
+    model_id 为空 = 改全局默认；非空 = 单独覆盖该库（seal_min_images 传 null 语义用 -1 表示恢复跟随全局）。
     0 = 关闭数量门槛（标注完审核通过即可封板/灌桶即满即封）。"""
     import json
     v = request.seal_min_images
-    if not isinstance(v, int) or v < 0 or v > 1_000_000:
-        raise HTTPException(400, "门槛需为 0 ~ 1000000 的整数（0 表示关闭数量门槛）")
-    settings.SEAL_MIN_IMAGES = v
-    # 列表接口结果含 seal_min_images，门槛变了要作废签名缓存
+    if not isinstance(v, int) or v < -1 or v > 1_000_000:
+        raise HTTPException(400, "门槛需为 0 ~ 1000000 的整数（0 关闭数量门槛，-1 恢复跟随全局默认）")
+    mid = (request.model_id or "").strip()
+    if mid:
+        # 按库覆盖：-1 = 删除覆盖，恢复跟随全局
+        if v == -1:
+            settings.SEAL_THRESHOLDS_PER_MODEL.pop(mid, None)
+        else:
+            settings.SEAL_THRESHOLDS_PER_MODEL[mid] = v
+    else:
+        if v == -1:
+            raise HTTPException(400, "全局默认不支持 -1")
+        settings.SEAL_MIN_IMAGES = v
+    # 列表接口结果含门槛/桶进度，变了要作废签名缓存
     import src.services.dataset_service as _ds
     with _ds._LIST_CACHE_LOCK:
         _ds._LIST_CACHE["sig"] = None
         _ds._LIST_CACHE["result"] = None
     try:
         settings.SEAL_THRESHOLD_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # 读旧文件合并写回，避免覆盖丢失另一份配置
+        data = {}
+        if settings.SEAL_THRESHOLD_FILE.exists():
+            try:
+                data = json.loads(settings.SEAL_THRESHOLD_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        data["SEAL_MIN_IMAGES"] = settings.SEAL_MIN_IMAGES
+        data["per_model"] = dict(settings.SEAL_THRESHOLDS_PER_MODEL)
         settings.SEAL_THRESHOLD_FILE.write_text(
-            json.dumps({"SEAL_MIN_IMAGES": v}, ensure_ascii=False), encoding="utf-8"
+            json.dumps(data, ensure_ascii=False), encoding="utf-8"
         )
     except Exception as e:
         raise HTTPException(500, f"门槛已生效（本次运行），但持久化失败：{e}")
-    return {"seal_min_images": v, "persisted": True}
+    return {
+        "seal_min_images": settings.SEAL_MIN_IMAGES,
+        "model_id": mid or None,
+        "per_model": dict(settings.SEAL_THRESHOLDS_PER_MODEL),
+        "persisted": True,
+    }
 
 @router.get("/{dataset_id}")
 async def get_dataset(dataset_id: str):
