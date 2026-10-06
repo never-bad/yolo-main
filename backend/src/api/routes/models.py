@@ -51,7 +51,7 @@ async def list_models():
 
 @router.post("")
 async def create_model(req: CreateModelRequest):
-    """首页「+ 新建算法库」：创建空白模型（空标签字典 + 采集库），code 已存在则返回现有模型"""
+    """首页「+ 新建算法库」：创建空白模型（空标签字典 + 采集库），code 已存在返回 400"""
     try:
         meta = await model_service.create_empty_model(
             req.model_code,

@@ -496,9 +496,10 @@ class ModelService:
         return meta.get("library_root_id") or model_id
 
     async def create_empty_model(self, code: str, display_name: str = "", business: str = "", description: str = ""):
-        """动态创建空白模型（空标签字典 + 采集库）。code 已存在则直接返回现有模型。
+        """动态创建空白模型（空标签字典 + 采集库）。code 已存在则报错（唯一标识冲突）。
 
-        用于采集/上传时：「平台没有该模型 → 自动创建」的落地实现（2.2 / 1.7①）。
+        用于首页「+ 新建算法库」：唯一标识是全局键，撞号必须提示而非静默复用，
+        否则用户以为建了新库，实际跳进了别人的库。
         """
         norm = _normalize_model_code(code)
         if not norm or not MODEL_CODE_RE.match(norm):
@@ -506,7 +507,9 @@ class ModelService:
 
         existing = self.find_model_by_code(norm)
         if existing:
-            return existing
+            raise ValueError(
+                f"唯一标识「{norm}」已存在（{existing.get('display_name') or existing.get('name') or existing.get('model_id')}），请换一个"
+            )
 
         def _create_sync():
             model_id = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
