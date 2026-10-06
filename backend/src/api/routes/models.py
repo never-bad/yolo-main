@@ -246,6 +246,9 @@ async def confirm_publish(model_id: str, request: Optional[ConfirmPublishRequest
     except ValueError as e:
         raise HTTPException(400, str(e))
 
+# ⚠️ B-07 路由顺序陷阱：自本行起为通配路由 `/{model_id}`。
+# FastAPI 按注册顺序匹配，新增任何 GET 固定路径（如 /xxx）必须写在本注释**之前**，
+# 否则会被 `/{model_id}` 吞掉（model_id="xxx"），表现为诡异的 404/错数据。
 @router.get("/{model_id}")
 async def get_model(model_id: str):
     """获取模型详情"""

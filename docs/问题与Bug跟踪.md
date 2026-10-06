@@ -67,7 +67,7 @@
 
 ### B-05　CI 与构建脚本引用不存在的 Dockerfile —— 功能缺陷
 
-- **现象**：`.cnb.yml` L11/L17 引用 `docker/backend/Dockerfile`、`docker/frontend/Dockerfile`；`build-unified.bat` 同样引用。这两个目录实际为**空**。
+- **现象**：`.cnb.yml` L11/L19 引用 `docker/backend/Dockerfile`、`docker/frontend/Dockerfile`；`build-unified.bat` 同样引用。这两个目录实际为**空**。
 - **影响**：CNB 流水线一旦触发必失败。现行有效路径是 `docker/Dockerfile` + `docker/Dockerfile.env`（见 `docker/build_push.sh` 头部注释）。
 - **处置**：`.cnb.yml` 改指向新路径，或整份停用；`build-unified.bat` 删除、统一用 `build_push.sh`（《项目文件功能说明》§5.3）。
 - **进展（09-30 核对）**：`build-unified.bat` 与 `docker/{backend,frontend}` 空目录已删除；**`.cnb.yml` 仍引用旧路径，待改**。

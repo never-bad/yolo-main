@@ -15,7 +15,8 @@ async def lifespan(app: FastAPI):
     """启动时挂载后台任务：
     1) PG 影子库初始化（幂等建表，容错：连不上不影响启动，JSON 仍为主存储）
     2) 模型消息队列轮询（定时打包 → 自动进入标注页）
-    3) 桶灌自动轮询（B 系列：A 包标完自动灌桶 → 满 1500 自动封板）
+    3) 桶灌/封板自动轮询（B 系列：A 包标完自动灌桶 → 满 settings.SEAL_MIN_IMAGES 自动封板）
+    4) GPU 熔断轮询（利用率持续过低自动停训；配置关停时空转直接返回）
     """
     try:
         from src.db.engine import init_db

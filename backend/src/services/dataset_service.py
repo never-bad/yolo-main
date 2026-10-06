@@ -2598,7 +2598,7 @@ class DatasetService:
     #   - A 包（标注前原料）与 B 桶（成品数据集）分离：A 包在 datasets/ds_xxx 标注，
     #     封板产物生成**独立成品数据集** datasets/ds_auto_{ts}（stage=sealed，命名 {模型code}_v{N}）
     #   - 一个 A 包全部标注完成（每图 JSON 有框）后，数据按 FIFO 灌入所属模型最小编号未满桶
-    #   - 桶累计 >= SEAL_MIN_IMAGES(默认1500) 自动封板并产出 v{N} 快照；
+    #   - 桶累计 >= settings.SEAL_MIN_IMAGES 自动封板并产出 v{N} 快照；
     #     超出部分（最后一个包的剩余图）自动滚入下一桶 B{N+1}——即「A2 拆开补 B1，剩的进下一桶」
     #   - 只增不减：已灌入桶的数据不重排、不调出
 
@@ -2825,7 +2825,7 @@ class DatasetService:
         return snap
 
     def _advance_buckets_sync(self) -> dict:
-        """灌桶同步核心：扫描标完未归档源包 → FIFO 灌桶 → 满 1500 连环自动封板。
+        """灌桶同步核心：扫描标完未归档源包 → FIFO 灌桶 → 满 settings.SEAL_MIN_IMAGES 连环自动封板。
         幂等：重复调用不重复灌/封。返回本次变更摘要。
         """
         if settings.SEAL_MIN_IMAGES <= 0:
@@ -2912,7 +2912,7 @@ class DatasetService:
                         f"bucket: pour {dataset_id} +{pour_n} -> B{recv['index']} "
                         f"(total {recv['poured']}/{settings.SEAL_MIN_IMAGES})"
                     )
-                    # 3) 满则连环封板（剩余超过 1500 时可能连续产出多个版本）
+                    # 3) 满则连环封板（剩余超过 settings.SEAL_MIN_IMAGES 时可能连续产出多个版本）
                     while mst["receiving"]["poured"] >= settings.SEAL_MIN_IMAGES:
                         snap = self._seal_receiving_bucket(model_id, mst)
                         if not snap:
@@ -2925,7 +2925,7 @@ class DatasetService:
                 "pending_review": pending_review}
 
     async def advance_buckets(self) -> dict:
-        """按模型滚动灌桶（幂等）：A 包「标完 + 审核通过」后灌桶，满 1500 自动封板出成品数据集。
+        """按模型滚动灌桶（幂等）：A 包「标完 + 审核通过」后灌桶，满 settings.SEAL_MIN_IMAGES 自动封板出成品数据集。
         供前端在数据集页加载 / 标注完成返回时调用。
         """
         def _locked():
