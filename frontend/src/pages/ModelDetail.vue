@@ -1214,24 +1214,25 @@ async function removeModel() {
 async function refresh() {
   loading.value = true
   try {
-    const m = await getModel(modelId)
+    // 6 个接口各自独立，串行 await 会把 65~170ms 逐个累加成 1~2s；改并行后总耗时≈最慢的一个
+    const [m, dsRes, allRes, ld, lm] = await Promise.all([
+      getModel(modelId),
+      getModelDatasets(modelId),
+      listDatasets(),
+      getLabelsDict(modelId).catch(() => null),      // 标签字典可能尚未初始化
+      listModels().catch(() => null),                 // 忽略
+    ])
     model.value = m?.model_id ? m : null
     if (!model.value) return
-    const dsRes = await getModelDatasets(modelId)
     mountedDatasets.value = dsRes.datasets || []
-    const allRes = await listDatasets()
     const all: any[] = allRes.datasets || []
     allDatasets.value = all
     sealMinImages.value = allRes.seal_min_images || 0
-    try {
-      const ld = await getLabelsDict(modelId)
+    if (ld) {
       labelsDict.value = { labels: ld?.labels || [], model_code: ld?.model_code }
       syncLabelRows()
-    } catch { /* 标签字典尚未初始化 */ }
-    try {
-      const lm = await listModels()
-      allModels.value = lm.models || []
-    } catch { /* 忽略 */ }
+    }
+    if (lm) allModels.value = lm.models || []
     descDraft.value = m?.description || ''
     nameDraft.value = m?.name || m?.display_name || ''
   } finally {
