@@ -1639,8 +1639,11 @@ class DatasetService:
                     scs["boxes"][nm] = scs["boxes"].get(nm, 0) + 1
 
         # 4) 生成 data.yaml（names 用模型标签字典英文码，缺省回退 meta.classes；已在导出前确定）
+        # B-09 治本：不写 path 键。ultralytics 缺 path 时自动回退到 yaml 所在目录
+        # （check_det_dataset: Path(data["yaml_file"]).parent），train/val 保持相对路径，
+        # 数据集改名/迁移/换机器后训练不再因 stale 绝对路径报 images not found。
+        # （写 "." 不行——相对路径按训练进程 cwd 解析，不是按 yaml 所在目录）
         yaml_data = {
-            "path": str(dataset_dir),
             "train": "images/train",
             "val": "images/val",
             "nc": len(names),
@@ -2258,17 +2261,18 @@ class DatasetService:
         except Exception as e:  # noqa: BLE001
             logger.warning(f"rename {old_id}: bucket ledger update failed: {e}")
 
-        # 5) 路径引用跟随（治本）：更名后新目录内所有 data.yaml 的 path 前缀、
-        #    及 meta 中记录的旧绝对路径字段（sealed_out 等）一并替换，
-        #    否则封板产物 data.yaml 仍指向旧目录，训练/导出会报 images not found
+        # 5) 路径引用跟随：更名后新目录内 data.yaml 若仍带指向旧目录的 path 键，删除之
+        #    （B-09：新封板产物已不写 path，ultralytics 自动按 yaml 所在目录解析；
+        #     此处兜底处理更名前生成的旧 yaml，train/val 是相对路径，删掉 path 即可自愈）。
+        #    meta 中记录的旧绝对路径字段（sealed_out 等）一并替换。
         old_prefix = str(old_dir.relative_to(settings.DATA_DIR))
         new_prefix = str(new_dir.relative_to(settings.DATA_DIR))
         try:
             for yf in new_dir.rglob("data.yaml"):
                 try:
                     yd = _load_yaml(yf)
-                    if yd and str(yd.get("path", "")).startswith(old_prefix):
-                        yd["path"] = new_prefix + str(yd["path"])[len(old_prefix):]
+                    if yd and "path" in yd and old_prefix in str(yd.get("path", "")):
+                        yd.pop("path")
                         _save_yaml(yf, yd)
                 except Exception:  # noqa: BLE001
                     continue

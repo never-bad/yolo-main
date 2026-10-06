@@ -392,6 +392,29 @@ class TrainService:
         ds_dir = self.datasets_dir / dataset_id
         return ds_dir / "data.yaml"
 
+    @staticmethod
+    def _heal_dataset_yaml(yaml_path: Path) -> None:
+        """B-09 存量自愈：旧封板 yaml 的 path 键可能指向已改名/删除/迁移的源目录，
+        导致 ultralytics 按 stale path 解析 train/val 报 images not found。
+        若 path 不存在且 yaml 同级的 images/train 存在，删除 path 键
+        （ultralytics 缺 path 时自动回退到 yaml 所在目录），并回写文件。"""
+        try:
+            with open(yaml_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f)
+            if not isinstance(cfg, dict) or "path" not in cfg:
+                return
+            p = Path(str(cfg.get("path")))
+            if p.exists():
+                return
+            if not (yaml_path.parent / "images" / "train").is_dir():
+                return  # 删了 path 也救不活，保留原样让报错可见
+            cfg.pop("path")
+            with open(yaml_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
+            print(f"[heal_dataset_yaml] {yaml_path} 的 stale path 已移除: {p}")
+        except Exception as e:
+            print(f"[heal_dataset_yaml] {yaml_path} 自愈失败（跳过）: {e}")
+
     def _load_yaml(self, path: Path) -> dict:
         with open(path, "r", encoding="utf-8") as f:
             return yaml.safe_load(f)
@@ -1025,6 +1048,9 @@ class TrainService:
         # ---------- 4. 生成独立 data.yaml（train/val 绝对路径列表） ----------
         def _resolve_entries(entries) -> list:
             root = Path(cfg.get("path") or yaml_p.parent)
+            # B-09：旧封板 yaml 的 path 可能指向已改名/删除的源目录，回退到 yaml 所在目录
+            if not root.exists():
+                root = yaml_p.parent
             if isinstance(entries, str):
                 entries = [entries]
             resolved = []
@@ -1093,6 +1119,7 @@ class TrainService:
             d_yaml = self._resolve_dataset_yaml(ds_id, use_ver)
             if not d_yaml.exists():
                 raise ValueError(f"Dataset {ds_id}/{use_ver} not prepared")
+            self._heal_dataset_yaml(d_yaml)  # B-09：训练前自动修 stale path
             seen_ids.add(ds_id)
             specs.append((ds_id, use_ver, d_yaml))
 
