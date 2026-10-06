@@ -38,6 +38,13 @@ ARCHIVE_SUFFIXES = (".zip", ".tar", ".tar.gz", ".tgz")
 # 排除可视化预览图（如 *_result.jpg）
 EXCLUDE_KEYWORDS = ("_result", "_predict", "_detect")
 
+# list_datasets 签名缓存：磁盘（数据集 meta/类别文件、标签字典、桶账本）无变化时
+# 直接复用上次结果，把列表页从 ~200-1800ms（冷）降到 ~1ms（热）。
+# 签名 = 各关键文件 (路径, mtime_ns, size) 的聚合哈希，任一文件变化即失效，
+# 保证 #6「库改标签实时可见」等语义不被缓存破坏。
+_LIST_CACHE_LOCK = threading.Lock()
+_LIST_CACHE = {"sig": None, "result": None, "ts": 0.0}
+
 # ===== 数据集生命周期状态机（MLOps 改造 1.1）=====
 # stage：主状态（对齐设计文档 1.2 状态机）
 STAGE_COLLECTING = "collecting"    # 采集/接收中（数据持续写入）
@@ -1007,8 +1014,11 @@ class DatasetService:
         if not all(re.fullmatch(r"class_\d+", str(c)) for c in classes):
             return classes
         version_dir = dataset_dir
+        # 类别文件通常就在数据集根目录；rglob 会把 images/labels 下上千文件全 stat 一遍
+        # （冷缓存实测单数据集 1.2s，是列表页卡顿主因）。改为限定深度扫描：
+        # 根目录 + 2 层子目录内查找，命中候选即止，绝不深入 images/labels/test 等大目录。
         for name in ["classes.txt", "coco.names", "names.txt"]:
-            for path in version_dir.rglob(name):
+            for path in self._iter_named_files_shallow(version_dir, name):
                 try:
                     with open(path, "r", encoding="utf-8") as f:
                         names = [line.strip() for line in f if line.strip()]
@@ -1017,6 +1027,30 @@ class DatasetService:
                 except Exception:
                     continue
         return classes
+
+    @staticmethod
+    def _iter_named_files_shallow(root: Path, filename: str, max_depth: int = 3):
+        """在 root 下限定深度查找名为 filename 的文件，跳过图片/标签等大目录。
+
+        替代 rglob(filename)：后者会 stat 目录树里每个文件（数千级），
+        而类别文件几乎总在根目录或浅层标注子目录，命中即返回。
+        """
+        _SKIP_DIRS = {"images", "labels", "train", "val", "test", "previews", "thumbnails", "__pycache__"}
+        stack = [(root, 0)]
+        while stack:
+            d, depth = stack.pop()
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        try:
+                            if e.is_file(follow_symlinks=False) and e.name == filename:
+                                yield Path(e.path)
+                            elif e.is_dir(follow_symlinks=False) and depth < max_depth and e.name not in _SKIP_DIRS:
+                                stack.append((Path(e.path), depth + 1))
+                        except OSError:
+                            continue
+            except OSError:
+                continue
 
     def _is_annotated_exported(self, dataset_dir: Path, version: str) -> bool:
         """标注导出会生成 labels/{train,val,test} 划分结构（含 .txt 标签），
@@ -1687,8 +1721,54 @@ class DatasetService:
             "mixed": seg_lines > 0 and rect_lines > 0,
         }
 
+    def _list_cache_signature(self) -> tuple:
+        """聚合磁盘关键文件的 (路径, mtime_ns, size) 作为缓存签名。
+
+        覆盖：各数据集 meta.json / 根目录 data.yaml、各模型 labels_dict.json、
+        桶账本。任一文件增删改 → 签名变化 → 缓存失效。
+        不覆盖：训练子进程绕过 meta 的极端情况——由下方 TTL 兜底（最多陈旧 2s）。
+        """
+        import hashlib
+
+        def _fp(p: Path):
+            try:
+                st = p.stat()
+                return f"{p.name}|{st.st_mtime_ns}|{st.st_size}"
+            except OSError:
+                return "-"
+
+        parts = []
+        try:
+            for d in sorted(self.datasets_dir.iterdir()):
+                if not d.is_dir() or d.name.startswith("_") or "__deleting" in d.name:
+                    continue
+                parts.append(d.name)
+                parts.append(_fp(d / "meta.json"))
+                parts.append(_fp(d / "data.yaml"))
+        except OSError:
+            pass
+        try:
+            if settings.REGISTRY_DIR.exists():
+                for m in sorted(settings.REGISTRY_DIR.iterdir()):
+                    if m.is_dir():
+                        parts.append(_fp(m / "labels_dict.json"))
+        except OSError:
+            pass
+        parts.append(_fp(Path(settings.DATA_DIR) / "buckets.json"))
+        return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
+
     async def list_datasets(self):
-        """列出所有数据集"""
+        """列出所有数据集（带签名缓存：磁盘无变化时直接返回上次结果，秒出）"""
+        # 缓存命中：签名（关键文件 mtime/size 聚合）未变且未过 TTL → 直接返回，
+        # 跳过全量扫描/rglob/shadow 自愈（这些合计 100~1800ms）。
+        _TTL = 2.0
+        sig = await asyncio.to_thread(self._list_cache_signature)
+        now = time.time()
+        with _LIST_CACHE_LOCK:
+            if (_LIST_CACHE["sig"] == sig and _LIST_CACHE["result"] is not None
+                    and now - _LIST_CACHE["ts"] < _TTL):
+                return _LIST_CACHE["result"]
+
         def _list_datasets_sync():
             datasets = []
             if not self.datasets_dir.exists():
@@ -1788,13 +1868,18 @@ class DatasetService:
                 })
             out.sort(key=lambda x: x["model_id"])
             return out
-        return {
+        result = {
             "datasets": sorted(datasets, key=lambda x: x.get("uploaded_at", ""), reverse=True),
             # 封板数量门槛（#6）：前端列表展示「待封板 X / 门槛 N 张」进度
             "seal_min_images": settings.SEAL_MIN_IMAGES,
             # B 系列：按模型滚动灌桶进度（接收桶累计量 / 已封板版本列表）
             "buckets": _bucket_summary(),
         }
+        with _LIST_CACHE_LOCK:
+            _LIST_CACHE["sig"] = sig
+            _LIST_CACHE["result"] = result
+            _LIST_CACHE["ts"] = time.time()
+        return result
 
     async def bind_model(self, dataset_id: str, model_id: str, library_root_id: str = None,
                          force: bool = False):
