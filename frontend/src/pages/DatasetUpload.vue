@@ -77,7 +77,7 @@
             <span class="ds-section-count">{{ section.items.length }} 个</span>
           </div>
           <div v-if="!section.items.length" class="empty-state mini">{{ section.emptyText }}</div>
-          <div v-for="dataset in section.items" :key="dataset.dataset_id" class="dataset-item" :data-ds="dataset.dataset_id" :class="{ 'ds-focus': focusId === dataset.dataset_id }">
+          <div v-for="dataset in section.items" :key="dataset.dataset_id" class="dataset-item" :data-ds="dataset.dataset_id">
           <div class="dataset-header">
             <h3 class="dataset-name" @click="viewDataset(dataset)" title="点击查看数据集文件夹结构">
               {{ dataset.display_name || dataset.dataset_id }}
@@ -363,7 +363,6 @@ import LibraryCreateModal from '@/components/LibraryCreateModal.vue'
 const selectedFile = ref<File | null>(null)
 const router = useRouter()
 const route = useRoute()
-const focusId = ref('')  // D-02：从 ModelDetail 跳转带来的 ?focus= 数据集 id，滚动+高亮
 const uploadLibraryId = ref('')   // 导入时必选的归属算法库（库根记录 id）
 const libraryTouched = ref(false) // 点过上传但没选库 → 显示红字提示
 const createLibraryOpen = ref(false)
@@ -978,15 +977,26 @@ const exportOriginal = async (datasetId: string) => {
 }
 
 // D-02：滚动 + 高亮指定数据集卡片（列表渲染完成后再定位）
+// 用内联 style 而非 classList：Vue patch 元素时会把 class 重置回模板值，外部加的 class 会被抹掉，
+// 但未绑定的内联 style 不受 class patch 影响，故高亮更稳。
 const applyFocus = (id: string) => {
-  focusId.value = id
-  nextTick(() => {
+  const tryLocate = (attempt: number) => {
     const el = document.querySelector(`[data-ds="${CSS.escape(id)}"]`) as HTMLElement | null
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' })
-      setTimeout(() => { focusId.value = '' }, 4000)  // 高亮 4s 后淡出
+    if (!el) {
+      if (attempt < 10) setTimeout(() => tryLocate(attempt + 1), 100)  // 列表尚未渲染，重试
+      return
     }
-  })
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    el.style.setProperty('outline', '3px solid #f59e0b')
+    el.style.setProperty('outline-offset', '1px')
+    el.style.setProperty('box-shadow', '0 0 0 6px rgba(245, 158, 11, 0.35)')
+    setTimeout(() => {
+      el.style.removeProperty('outline')
+      el.style.removeProperty('outline-offset')
+      el.style.removeProperty('box-shadow')
+    }, 4000)  // 高亮 4s 后淡出
+  }
+  nextTick(() => tryLocate(0))
 }
 
 onMounted(async () => {
