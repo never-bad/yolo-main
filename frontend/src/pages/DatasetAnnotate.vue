@@ -370,6 +370,19 @@
                 <span v-if="exporting" class="loading-spinner"></span>
                 {{ exporting ? '导出中...' : '导出' }}
               </button>
+              <button
+                v-if="approveEligible"
+                class="primary"
+                @click="approveCurrentDataset(); moreOpen = false"
+                :disabled="approvingReview"
+                title="本批标注已人工复核完毕，确认审核通过：数据集即可自动灌入训练桶（也可到数据集页点同一按钮，效果一样）"
+              >
+                <span v-if="approvingReview" class="loading-spinner"></span>
+                {{ approvingReview ? '确认中...' : `✓ 审核通过本数据集（${counts.annotated}/${counts.total}）` }}
+              </button>
+              <div v-else-if="taskDatasetId && counts.total > 0" class="menu-hint" :title="approveHintTitle">
+                {{ approveHintText }}
+              </div>
               <button @click="exportReviewedPackage(); moreOpen = false" :disabled="exportingReviewed || counts.reviewed === 0" title="只把人工修过（筛子里“轮廓·已修过”）的图片+YOLO标签打包成 zip 下载，labels 为分割格式，解压即可用">
                 <span v-if="exportingReviewed" class="loading-spinner"></span>
                 {{ exportingReviewed ? '打包中...' : `导出已修过 zip（${counts.reviewed}）` }}
@@ -662,7 +675,7 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import type { BBox } from '@/api/annotations'
 import { createAnnotationTask, findAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotations, exportReviewedZip, autoLabelImage, interactiveLabelImage, pointLabelImage, erasePolygonRegion, startBatchLabel, getBatchProgress, stopBatchLabel, getSamConfig, updateSamConfig, getSamModels, getSamTrainedVersions, clearAiAnnotations, clearAllAnnotations, cleanTaskOverlaps, importYoloLabels, deleteTaskImage, auditImage, listAuditIssues } from '@/api/annotations'
-import { listDatasets } from '@/api/datasets'
+import { listDatasets, approveDatasetReview } from '@/api/datasets'
 import { showConfirm, showPrompt, showAlert } from '@/composables/useDialog'
 import { downloadFile } from '@/utils/download'
 import { suggestModelLabels, adoptSuggestedLabels } from '@/api/models'
@@ -730,6 +743,46 @@ const exporting = ref(false)
 const exportingReviewed = ref(false)
 // 清除全部标注（AI + 人工）进行中，防止重复触发
 const clearingAll = ref(false)
+// 审核通过（标注页顺手点）：与数据集页同一接口，成功后该包进入灌桶资格
+const approvingReview = ref(false)
+const taskDatasetMeta = computed(() =>
+  (datasets.value || []).find((d: any) => d.dataset_id === taskDatasetId.value) || null)
+const approveEligible = computed(() => {
+  const d = taskDatasetMeta.value
+  if (!d || !taskDatasetId.value) return false
+  if (d.review_approved || d.bucket_archived) return false
+  if (['sealed', 'training', 'completed', 'failed'].includes(d.stage)) return false
+  // 标注页现场判定：每张图都有标注 JSON 才允许审核（与后端校验同口径）
+  return counts.value.total > 0 && counts.value.annotated === counts.value.total
+})
+const approveHintText = computed(() => {
+  const d = taskDatasetMeta.value
+  if (d?.review_approved) return '✓ 本数据集已审核通过'
+  if (counts.value.total > 0 && counts.value.annotated < counts.value.total) {
+    return `还有 ${counts.value.total - counts.value.annotated} 张未标注，全部标完才能审核通过`
+  }
+  return ''
+})
+const approveHintTitle = computed(() => '审核通过条件：数据集已归属算法库、全部图片完成标注、尚未审核')
+const approveCurrentDataset = async () => {
+  const dsId = taskDatasetId.value
+  if (!dsId || approvingReview.value) return
+  const ok = await showConfirm(
+    `确认审核通过本数据集（${counts.value.annotated} 张已全部标注）？\n\n` +
+    `通过后该包将自动灌入所属算法库的训练桶，桶满即封板（封板后只读）。\n` +
+    `封板前如需继续修改，可到数据集页点「撤回」。`)
+  if (!ok) return
+  approvingReview.value = true
+  try {
+    await approveDatasetReview(dsId)
+    await loadDatasets()  // 刷新徽标状态（按钮变为"已审核通过"）
+    alert('已审核通过 ✓ 该数据集进入灌桶队列，下次刷新数据集页自动灌入训练桶')
+  } catch (e: any) {
+    alert('审核确认失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    approvingReview.value = false
+  }
+}
 // 标注任务持久化 key，用于中途离开页面后返回时恢复
 const ANNOTATE_STORE_KEY = 'annotate_task_resume'
 
@@ -4071,6 +4124,23 @@ onUnmounted(() => {
   width: 100%;
   margin-bottom: 0.25rem;
   font-size: 0.85rem;
+}
+
+.more-menu button.primary {
+  background: #1c64f2;
+  color: #fff;
+  border: none;
+}
+.more-menu button.primary:hover { background: #1a56d8; }
+.more-menu .menu-hint {
+  padding: 0.35rem 0.5rem;
+  margin-bottom: 0.25rem;
+  font-size: 0.78rem;
+  color: #92400e;
+  background: #fffbeb;
+  border: 1px dashed #f5c26b;
+  border-radius: 4px;
+  text-align: center;
 }
 
 .more-menu .import-label {
