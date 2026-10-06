@@ -54,15 +54,8 @@
       <div v-if="bucketNotice" class="bucket-notice" @click="bucketNotice = ''" title="点击关闭">{{ bucketNotice }}<span class="bucket-notice-close">✕</span></div>
       <div class="bucket-progress">
         <div class="bucket-progress-title">
-          桶进度（每桶满
-          <span v-if="!editingThreshold" class="threshold-chip" @click="startEditThreshold" title="点击修改封板/灌桶数量门槛">{{ sealMinImages }} 张 ✎</span>
-          <template v-else>
-            <input v-model.number="thresholdDraft" type="number" min="0" step="100" class="threshold-input" @keyup.enter="saveThreshold" @keyup.esc="editingThreshold = false" />
-            <span>张</span>
-            <button class="link-btn" :disabled="savingThreshold" @click="saveThreshold">{{ savingThreshold ? '保存中…' : '保存' }}</button>
-            <button class="link-btn" @click="editingThreshold = false">取消</button>
-          </template>
-          自动封板，标完的 A 包自动灌入）
+          <span>桶进度（每桶满 <b>{{ sealMinImages }}</b> 张自动封板，标完的 A 包自动灌入）</span>
+          <button class="threshold-gear" @click="openThresholdModal" title="修改封板/灌桶数量门槛">⚙ 门槛设置</button>
         </div>
         <template v-if="bucketBars.length">
           <div v-for="bar in bucketBars" :key="bar.model_id" class="bucket-model">
@@ -358,6 +351,31 @@
         </div>
       </div>
     </div>
+
+    <!-- 封板/灌桶数量门槛设置弹窗 -->
+    <div v-if="thresholdOpen" class="modal-mask" @click.self="thresholdOpen = false">
+      <div class="modal threshold-modal">
+        <h3>封板 / 灌桶数量门槛</h3>
+        <p class="modal-sub">图片数达到该值才允许封板；自动灌桶每满该值封一个 B 桶。<br />未达门槛时仍可在封板确认里走「强制封板」，或等 {{ sealMaxDays }} 天时间窗口兜底。</p>
+        <div class="form-field">
+          <label>门槛值（张）</label>
+          <input v-model.number="thresholdDraft" type="number" min="0" step="100" class="threshold-input" @keyup.enter="saveThreshold" />
+          <small class="form-hint">0 = 关闭数量门槛（审核通过即可封板）；范围 0 ~ 1,000,000</small>
+        </div>
+        <div class="threshold-presets">
+          <button v-for="p in [0, 1000, 2000, 5000, 10000]" :key="p" class="preset-btn" :class="{ active: thresholdDraft === p }" @click="thresholdDraft = p">
+            {{ p === 0 ? '关闭门槛' : p + ' 张' }}
+          </button>
+        </div>
+        <div v-if="thresholdError" class="form-error">{{ thresholdError }}</div>
+        <div class="modal-actions">
+          <button class="secondary" @click="thresholdOpen = false">取消</button>
+          <button class="primary" :disabled="savingThreshold" @click="saveThreshold">
+            {{ savingThreshold ? '保存中...' : '保存' }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -382,32 +400,36 @@ const allModels = ref<any[]>([]) // registry 记录（算法库下拉数据源�
 const uploading = ref(false)
 const uploadResult = ref<any>(null)
 const sealMinImages = ref(0)  // #6 封板数量门槛（来自后端），列表展示待封板进度
-// 门槛在线编辑（持久化到后端 data/seal_threshold.json）
-const editingThreshold = ref(false)
+// 门槛在线设置（独立弹窗，持久化到后端 data/seal_threshold.json）
+const thresholdOpen = ref(false)
 const thresholdDraft = ref(0)
+const thresholdError = ref('')
+const sealMaxDays = ref(7)
 const savingThreshold = ref(false)
-const startEditThreshold = async () => {
+const openThresholdModal = async () => {
+  thresholdError.value = ''
   try {
     const t = await getSealThreshold()
     thresholdDraft.value = t.seal_min_images
+    sealMaxDays.value = t.seal_max_days || 7
   } catch {
     thresholdDraft.value = sealMinImages.value
   }
-  editingThreshold.value = true
+  thresholdOpen.value = true
 }
 const saveThreshold = async () => {
   const v = Number(thresholdDraft.value)
   if (!Number.isInteger(v) || v < 0 || v > 1000000) {
-    alert('门槛需为 0 ~ 1000000 的整数（0 表示关闭数量门槛）')
+    thresholdError.value = '门槛需为 0 ~ 1,000,000 的整数（0 表示关闭数量门槛）'
     return
   }
   savingThreshold.value = true
   try {
     await setSealThreshold(v)
-    editingThreshold.value = false
+    thresholdOpen.value = false
     await loadDatasets(true)  // 刷新列表，桶进度条按新门槛重算
   } catch (e: any) {
-    alert('保存失败: ' + (e.response?.data?.detail || e.message))
+    thresholdError.value = '保存失败: ' + (e.response?.data?.detail || e.message)
   } finally {
     savingThreshold.value = false
   }
@@ -1314,21 +1336,47 @@ onActivated(() => {
   color: #5a6a7a;
   margin-bottom: 0.5rem;
   font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  flex-wrap: wrap;
 }
-.threshold-chip {
+.threshold-gear {
+  border: 1px solid #cbd5e1;
+  background: #fff;
   color: #1a73e8;
+  border-radius: 5px;
+  padding: 0.1rem 0.55rem;
+  font-size: 0.75rem;
   cursor: pointer;
-  border-bottom: 1px dashed #1a73e8;
-  white-space: nowrap;
+  font-weight: 500;
 }
-.threshold-chip:hover { background: rgba(26, 115, 232, 0.08); }
+.threshold-gear:hover { background: rgba(26, 115, 232, 0.08); border-color: #1a73e8; }
 .threshold-input {
-  width: 90px;
-  padding: 0.1rem 0.35rem;
-  font-size: 0.8rem;
-  border: 1px solid #1a73e8;
+  width: 140px;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.9rem;
+  border: 1px solid #cbd5e1;
   border-radius: 4px;
 }
+.threshold-presets {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin: 0.5rem 0 0.2rem;
+}
+.preset-btn {
+  border: 1px solid #cbd5e1;
+  background: #f7f9fb;
+  border-radius: 14px;
+  padding: 0.15rem 0.7rem;
+  font-size: 0.78rem;
+  cursor: pointer;
+  color: #445;
+}
+.preset-btn:hover { border-color: #1a73e8; color: #1a73e8; }
+.preset-btn.active { background: #1a73e8; border-color: #1a73e8; color: #fff; }
 .bucket-model {
   display: flex;
   align-items: center;
