@@ -368,10 +368,20 @@
           </button>
         </div>
         <div v-if="thresholdError" class="form-error">{{ thresholdError }}</div>
+        <!-- 手滑防护：新门槛会让现存接收桶立即达到封板线，需勾选确认才能保存 -->
+        <div v-if="pendingSealPreview.length" class="threshold-warn" :class="{ armed: thresholdAck }">
+          <div class="threshold-warn-title">⚠ 保存后这些库的当前接收桶将<b>立即封板（不可逆）</b>：</div>
+          <ul>
+            <li v-for="p in pendingSealPreview" :key="p.model_id">{{ p.name }}：已灌 {{ p.poured }} 张 ≥ {{ thresholdDraft }}，封板为 B{{ p.curIndex }}</li>
+          </ul>
+          <label class="threshold-ack">
+            <input type="checkbox" v-model="thresholdAck" /> 我已确认，接受以上封板结果
+          </label>
+        </div>
         <div class="modal-actions">
           <button class="secondary" @click="thresholdOpen = false">取消</button>
-          <button class="primary" :disabled="savingThreshold" @click="saveThreshold">
-            {{ savingThreshold ? '保存中...' : '保存' }}
+          <button class="primary" :class="{ danger: pendingSealPreview.length && !thresholdAck }" :disabled="savingThreshold || (pendingSealPreview.length > 0 && !thresholdAck)" @click="saveThreshold">
+            {{ savingThreshold ? '保存中...' : (pendingSealPreview.length && !thresholdAck ? '请先勾选确认' : '保存') }}
           </button>
         </div>
       </div>
@@ -380,7 +390,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onActivated, nextTick } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onActivated, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { uploadDataset, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel, getSealThreshold, setSealThreshold } from '@/api/datasets'
 import { listModels } from '@/api/models'
@@ -406,8 +416,20 @@ const thresholdDraft = ref(0)
 const thresholdError = ref('')
 const sealMaxDays = ref(7)
 const savingThreshold = ref(false)
+const thresholdAck = ref(false)
+// 手滑防护：预览"若按 thresholdDraft 保存，哪些现存接收桶会立即封板"
+const pendingSealPreview = computed(() => {
+  const cap = Number(thresholdDraft.value)
+  if (!Number.isInteger(cap) || cap <= 0) return []  // 0/非法值 = 关闭自动灌桶，不触发封板
+  return bucketBars.value
+    .filter(b => b.poured >= cap)
+    .map(b => ({ model_id: b.model_id, name: modelName(b.model_id), poured: b.poured, curIndex: b.curIndex }))
+})
+// 门槛草稿值一变，确认勾选作废（防止先看清 2000 的后果、又改成 100 却没重新评估）
+watch(thresholdDraft, () => { thresholdAck.value = false })
 const openThresholdModal = async () => {
   thresholdError.value = ''
+  thresholdAck.value = false
   try {
     const t = await getSealThreshold()
     thresholdDraft.value = t.seal_min_images
@@ -421,6 +443,10 @@ const saveThreshold = async () => {
   const v = Number(thresholdDraft.value)
   if (!Number.isInteger(v) || v < 0 || v > 1000000) {
     thresholdError.value = '门槛需为 0 ~ 1,000,000 的整数（0 表示关闭数量门槛）'
+    return
+  }
+  if (pendingSealPreview.value.length && !thresholdAck.value) {
+    thresholdError.value = '存在保存后会立即封板的接收桶，请先勾选确认'
     return
   }
   savingThreshold.value = true
@@ -1377,6 +1403,20 @@ onActivated(() => {
 }
 .preset-btn:hover { border-color: #1a73e8; color: #1a73e8; }
 .preset-btn.active { background: #1a73e8; border-color: #1a73e8; color: #fff; }
+.threshold-warn {
+  margin-top: 0.6rem;
+  border: 1px solid #f59e0b;
+  background: #fffbeb;
+  border-radius: 6px;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.8rem;
+  color: #92400e;
+}
+.threshold-warn.armed { border-color: #16a34a; background: #f0fdf4; color: #166534; }
+.threshold-warn-title { font-weight: 600; margin-bottom: 0.25rem; }
+.threshold-warn ul { margin: 0.2rem 0 0.4rem 1.2rem; padding: 0; }
+.threshold-ack { display: flex; align-items: center; gap: 0.4rem; cursor: pointer; font-weight: 600; }
+.threshold-ack input { cursor: pointer; }
 .bucket-model {
   display: flex;
   align-items: center;
