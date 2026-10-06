@@ -11,6 +11,7 @@ from datetime import datetime
 from PIL import Image
 from src.core.settings import settings
 from src.utils.class_labels import model_class_names, merge_classes_with_model
+from src.utils import zip_guard
 
 logger = logging.getLogger(__name__)
 
@@ -1451,13 +1452,17 @@ class AnnotationService:
             classes = task_meta.get("classes", [])
             dataset_id, version = self._task_to_ds(task_meta)
 
-            # 解压 zip 到临时目录
+            # 解压 zip 到临时目录（S-02：路径遍历 + 解压炸弹校验，收口 utils.zip_guard）
             tmp_dir = task_dir / "import_tmp"
             if tmp_dir.exists():
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             tmp_dir.mkdir(parents=True, exist_ok=True)
-            with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(tmp_dir)
+            try:
+                with zipfile.ZipFile(zip_path) as zf:
+                    zip_guard.guarded_extractall(zf, tmp_dir, strict=True)
+            except (zip_guard.UnsafeZipMember, zip_guard.ZipBombRisk) as e:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return {"ok": False, "error": str(e)}
 
             # 优先取 labels 目录下的 txt，其次临时目录内所有 txt
             labels_dir = tmp_dir / "labels"
