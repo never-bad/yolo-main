@@ -151,7 +151,7 @@
       <div v-else class="empty-state">
         暂无模型，请先训练模型
       </div>
-      <button @click="loadModels" class="secondary" :disabled="loadingModels">
+      <button @click="loadModels()" class="secondary" :disabled="loadingModels">
         <span v-if="loadingModels" class="loading-spinner"></span>
         {{ loadingModels ? '加载中...' : '刷新模型列表' }}
       </button>
@@ -538,7 +538,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onActivated, computed } from 'vue'
 import { listModels, deleteModel, getModel, updateModel, uploadModel, exportModel, generateTrainingCharts, findSimilarModels, mergeModels, getMergeLogs, rollbackMerge, listPendingPublish, confirmPublish, listLibraries, type ModelDetails } from '@/api/models'
 import { downloadFile } from '@/utils/download'
 import { showAlert, showConfirm, showPrompt } from '@/composables/useDialog'
@@ -687,8 +687,8 @@ const uploadingModel = ref(false)
 const modelUploadLib = ref('')
 const newLibOpen = ref(false)
 
-const loadModels = async () => {
-  loadingModels.value = true
+const loadModels = async (silent = false) => {
+  if (!silent) loadingModels.value = true
   try {
     const data = await listModels()
     // 过滤首页「新建算法库」产生的空白占位记录（empty），它们属于算法库层，不与训练产物并排展示
@@ -1763,6 +1763,14 @@ const exportModelFile = async (modelId: string) => {
 
 onMounted(() => {
   loadModels()
+  loadPendingPublish()
+})
+
+// B-10：keep-alive 缓存后切回本页时静默刷新（首次挂载跳过，避免重复请求）
+let _modelsFirstActivate = true
+onActivated(() => {
+  if (_modelsFirstActivate) { _modelsFirstActivate = false; return }
+  loadModels(true)
   loadPendingPublish()
 })
 

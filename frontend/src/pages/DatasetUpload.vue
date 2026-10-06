@@ -47,7 +47,7 @@
 
     <div class="card">
       <h2>数据集列表</h2>
-      <button @click="loadDatasets" :disabled="loading" class="secondary">
+      <button @click="loadDatasets()" :disabled="loading" class="secondary">
         <span v-if="loading" class="loading-spinner"></span>
         {{ loading ? '加载中...' : '刷新' }}
       </button>
@@ -350,7 +350,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, nextTick } from 'vue'
+import { ref, reactive, computed, onMounted, onActivated, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { uploadDataset, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel } from '@/api/datasets'
 import { listModels } from '@/api/models'
@@ -880,8 +880,8 @@ const uploadFile = async () => {
   }
 }
 
-const loadDatasets = async () => {
-  loading.value = true
+const loadDatasets = async (silent = false) => {
+  if (!silent) loading.value = true
   try {
     // B 系列：先触发按模型滚动灌桶（幂等，标注完成返回列表时自动执行），再拉取最新列表
     try {
@@ -999,13 +999,31 @@ const applyFocus = (id: string) => {
   nextTick(() => tryLocate(0))
 }
 
+const consumeFocus = () => {
+  const f = (route.query.focus as string) || ''
+  if (f) applyFocus(f)
+}
+
 onMounted(async () => {
   // D-02：消费 ?focus= —— 列表加载后滚动到目标数据集并高亮
-  const f = (route.query.focus as string) || ''
   await loadDatasets()
   loadPoolModels()
   loadUploadModels()
-  if (f) applyFocus(f)
+  consumeFocus()
+})
+
+// B-10：keep-alive 缓存后，切回本页静默刷新（不闪骨架屏）；
+// 且从模型详情页带 ?focus= 跳转进来时组件不会重新 onMounted，
+// 需在 activated 里消费 focus，否则高亮定位失效。首次挂载跳过避免重复请求。
+// 注：不做滚动位置恢复——导航栏非 sticky，点导航前必然已滚回顶部，恢复无意义。
+let _dsFirstActivate = true
+onActivated(() => {
+  const skipRefresh = _dsFirstActivate
+  _dsFirstActivate = false
+  if (!skipRefresh) {
+    loadDatasets(true)
+    consumeFocus()
+  }
 })
 </script>
 

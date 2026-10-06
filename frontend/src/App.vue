@@ -11,7 +11,13 @@
       </div>
     </nav>
     <main class="main-content">
-      <router-view />
+      <!-- B-10：列表类页面缓存实例，切回不再整页重新加载；
+           训练页（SSE/定时器）与标注页（草稿状态）不缓存 -->
+      <router-view v-slot="{ Component }">
+        <keep-alive :include="['Dashboard', 'DatasetUpload', 'Models']">
+          <component :is="Component" />
+        </keep-alive>
+      </router-view>
     </main>
     <GlobalDialog />
   </div>

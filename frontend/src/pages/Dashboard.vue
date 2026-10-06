@@ -215,7 +215,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onActivated } from 'vue'
 import { useRouter } from 'vue-router'
 import { listModels, updateModel, deleteModel, exportModel } from '@/api/models'
 import { listDatasets } from '@/api/datasets'
@@ -475,6 +475,13 @@ async function load() {
   }
 }
 onMounted(load)
+// B-10：keep-alive 缓存后，切回本页时静默刷新（不清空已有数据，不闪骨架屏）。
+// 首次挂载 activated 也会触发，用 flag 跳过，避免与 onMounted 重复请求。
+let _dashFirstActivate = true
+onActivated(() => {
+  if (_dashFirstActivate) { _dashFirstActivate = false; return }
+  load()
+})
 </script>
 
 <style scoped>
