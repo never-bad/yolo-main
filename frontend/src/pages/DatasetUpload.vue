@@ -77,7 +77,7 @@
             <span class="ds-section-count">{{ section.items.length }} 个</span>
           </div>
           <div v-if="!section.items.length" class="empty-state mini">{{ section.emptyText }}</div>
-          <div v-for="dataset in section.items" :key="dataset.dataset_id" class="dataset-item">
+          <div v-for="dataset in section.items" :key="dataset.dataset_id" class="dataset-item" :data-ds="dataset.dataset_id" :class="{ 'ds-focus': focusId === dataset.dataset_id }">
           <div class="dataset-header">
             <h3 class="dataset-name" @click="viewDataset(dataset)" title="点击查看数据集文件夹结构">
               {{ dataset.display_name || dataset.dataset_id }}
@@ -350,7 +350,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, nextTick } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
 import { uploadDataset, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel } from '@/api/datasets'
 import { listModels } from '@/api/models'
 import { addHardSamples, addBackgroundSamples } from '@/api/samplePool'
@@ -360,6 +361,9 @@ import FolderTree from '@/components/FolderTree.vue'
 import LibraryCreateModal from '@/components/LibraryCreateModal.vue'
 
 const selectedFile = ref<File | null>(null)
+const router = useRouter()
+const route = useRoute()
+const focusId = ref('')  // D-02：从 ModelDetail 跳转带来的 ?focus= 数据集 id，滚动+高亮
 const uploadLibraryId = ref('')   // 导入时必选的归属算法库（库根记录 id）
 const libraryTouched = ref(false) // 点过上传但没选库 → 显示红字提示
 const createLibraryOpen = ref(false)
@@ -557,8 +561,9 @@ const viewDataset = async (dataset: any) => {
 }
 
 // 雪球闭环（1.8）：直达标注页 —— ?dataset_id=xxx，标注页优先复用已有任务/自动创建
+// P-01：改用 router.push 走 SPA 跳转，避免整页刷新丢失前端状态
 const goAnnotate = (dataset: any) => {
-  window.location.href = '/annotate?dataset_id=' + dataset.dataset_id
+  router.push('/annotate?dataset_id=' + dataset.dataset_id)
 }
 
 // 关闭预览
@@ -972,10 +977,25 @@ const exportOriginal = async (datasetId: string) => {
   }
 }
 
-onMounted(() => {
-  loadDatasets()
+// D-02：滚动 + 高亮指定数据集卡片（列表渲染完成后再定位）
+const applyFocus = (id: string) => {
+  focusId.value = id
+  nextTick(() => {
+    const el = document.querySelector(`[data-ds="${CSS.escape(id)}"]`) as HTMLElement | null
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      setTimeout(() => { focusId.value = '' }, 4000)  // 高亮 4s 后淡出
+    }
+  })
+}
+
+onMounted(async () => {
+  // D-02：消费 ?focus= —— 列表加载后滚动到目标数据集并高亮
+  const f = (route.query.focus as string) || ''
+  await loadDatasets()
   loadPoolModels()
   loadUploadModels()
+  if (f) applyFocus(f)
 })
 </script>
 
@@ -1113,6 +1133,13 @@ onMounted(() => {
   padding: 1rem;
   border: 1px solid #ddd;
   border-radius: 4px;
+}
+
+/* D-02：从模型详情跳转聚焦时的临时高亮 */
+.dataset-item.ds-focus {
+  border-color: #f59e0b;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.35);
+  transition: box-shadow 0.6s ease, border-color 0.6s ease;
 }
 
 .dataset-header {
