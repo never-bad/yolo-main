@@ -205,12 +205,18 @@
 
         <div v-if="versions.length === 0" class="empty-state">该算法库还没有训练产出的模型版本</div>
 
-        <div v-for="(v, i) in versions" :key="v.model_id || i" class="ver-card">
+        <!-- 主视图：使用中 / 待发布 / 训练中 / 已入库；退役版本折叠到底部「历史版本」 -->
+        <div v-for="v in mainVersions" :key="v.model_id || ''" class="ver-card">
           <div class="ver-head">
-            <span class="ver-name">{{ verTitle(v) }}<span v-if="i === 0 && v.version" class="ver-latest">最新</span></span>
-            <span v-if="!v.version" class="ver-latest">上传导入</span>
-            <span class="status-tag" :class="v.status">{{ statusLabel(v.status) }}</span>
-            <span v-if="v.status === 'production_ready' && v.publish_status === 'published'" class="ver-latest prod">生产中</span>
+            <span class="ver-name">{{ verTitle(v) }}<span v-if="v.model_id === versions[0]?.model_id && v.version" class="ver-latest">最新</span><span v-if="!v.version" class="ver-latest">上传导入</span></span>
+            <span class="status-tag" :class="verBadge(v).cls">{{ verBadge(v).text }}</span>
+            <button
+              v-if="v.status === 'production_ready' && v.publish_status !== 'published'"
+              class="primary small"
+              :disabled="publishingId === v.model_id"
+              title="发布后本版本成为唯一使用中版本，旧使用中版本自动变为已换代"
+              @click="doPublish(v)"
+            >{{ publishingId === v.model_id ? '发布中...' : '✓ 确认发布' }}</button>
             <button
               class="secondary small ver-dl"
               :disabled="downloadingVer === v.model_id"
@@ -254,6 +260,30 @@
               </div>
               <div v-if="deltaOf(v)" class="gk-delta">
                 对比上一代：mAP50-95 {{ deltaOf(v)?.deltaText }}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 退役版本（已换代 / 守门员拦截）默认折叠 -->
+        <div v-if="histVersions.length" class="ver-hist-wrap">
+          <button class="link-btn ver-hist-toggle" @click="showHistVersions = !showHistVersions">
+            {{ showHistVersions ? '▾' : '▸' }} 历史版本（{{ histVersions.length }}）· 已换代 / 守门员拦截
+          </button>
+          <div v-if="showHistVersions" class="ver-hist-list">
+            <div v-for="v in histVersions" :key="v.model_id" class="ver-card ver-card-hist">
+              <div class="ver-head">
+                <span class="ver-name">{{ verTitle(v) }}</span>
+                <span class="status-tag" :class="verBadge(v).cls">{{ verBadge(v).text }}</span>
+                <button
+                  class="secondary small ver-dl"
+                  :disabled="downloadingVer === v.model_id"
+                  @click="downloadVersionWeights(v)"
+                >{{ downloadingVer === v.model_id ? '下载中...' : '⬇ 下载 .pt' }}</button>
+              </div>
+              <div class="ver-meta">
+                <span>产出时间：{{ fmtTime(v.created_at) }}</span>
+                <span v-if="v.lineage?.base_model">基座 {{ v.lineage.base_model }}</span>
               </div>
             </div>
           </div>
@@ -532,7 +562,7 @@ import {
   getModel, getModelDatasets, updateModel, deleteModel, exportModel,
   getLabelsDict, updateLabelsDict, generateTrainingCharts, listModels,
   uploadModel,
-  syncLabelsToAnnotations, rollbackLabelSync, getLabelsUsage,
+  syncLabelsToAnnotations, rollbackLabelSync, getLabelsUsage, confirmPublish,
   type ModelDataset, type LabelsDict, type LabelSyncResult, type LabelsUsage
 } from '@/api/models'
 import {
@@ -624,7 +654,7 @@ function statusLabel(status?: string): string {
   if (!status) return '未知'
   const map: Record<string, string> = {
     production_ready: '生产就绪', rejected: '守门员拦截', superseded: '已换代',
-    training: '训练中', evaluating: '评估中', active: '启用中', inactive: '停用'
+    training: '训练中', evaluating: '评估中', active: '已入库', inactive: '停用'
   }
   return map[status] || status
 }
@@ -908,6 +938,52 @@ const versions = computed(() => {
   })
 })
 const newestVersion = computed(() => versions.value[0] || null)
+
+// ===== 版本状态简化展示：每卡只挂 1 个徽标，退役版本折叠 =====
+// 状态机不变（active/production_ready/superseded/rejected/training/evaluating + publish_status），
+// 只把「生产中」改叫「使用中」（用户只关心哪个正在用），待确认发布叫「待发布」并给一键发布。
+function verBadge(v: any): { text: string; cls: string } {
+  if (v.status === 'production_ready') {
+    return v.publish_status === 'published'
+      ? { text: '✓ 使用中', cls: 'using' }
+      : { text: '待发布', cls: 'pending' }
+  }
+  if (v.status === 'superseded') return { text: '已换代', cls: 'superseded' }
+  if (v.status === 'rejected') return { text: '守门员拦截', cls: 'rejected' }
+  if (v.status === 'training') return { text: '训练中', cls: 'training' }
+  if (v.status === 'evaluating') return { text: '评估中', cls: 'evaluating' }
+  return { text: '已入库', cls: 'active' }  // active：手工上传权重，可下载/预标注，未进生产流程
+}
+function isHistVer(v: any): boolean {
+  return v.status === 'superseded' || v.status === 'rejected'
+}
+const showHistVersions = ref(false)
+const histVersions = computed(() => versions.value.filter(isHistVer))
+// 主视图排序：使用中置顶 → 其余按版本号新到旧
+const mainVersions = computed(() => {
+  const main = versions.value.filter((v: any) => !isHistVer(v))
+  return main.sort((a: any, b: any) => {
+    const au = a.status === 'production_ready' && a.publish_status === 'published' ? 0 : 1
+    const bu = b.status === 'production_ready' && b.publish_status === 'published' ? 0 : 1
+    if (au !== bu) return au - bu
+    return 0
+  })
+})
+const publishingId = ref<string | null>(null)
+async function doPublish(v: any) {
+  const cur = versions.value.find((x: any) => x.status === 'production_ready' && x.publish_status === 'published')
+  const extra = cur ? `当前使用中版本为 ${verTitle(cur)}，发布后它将变为「已换代」。` : ''
+  if (!confirm(`确认将 ${verTitle(v)} 发布为使用中版本？${extra}`)) return
+  publishingId.value = v.model_id
+  try {
+    await confirmPublish(v.model_id)
+    await refresh()
+  } catch (e: any) {
+    alert('发布失败：' + (e?.response?.data?.detail || e?.message))
+  } finally {
+    publishingId.value = null
+  }
+}
 
 // ===== Tab（依赖引用于此处定义之后） =====
 const wkTabs = computed(() => [
@@ -1289,11 +1365,17 @@ onMounted(async () => {
 .wk-title h1 { margin: 0; color: #1f2d3d; font-size: 1.5rem; }
 .model-code { font-size: 0.75rem; color: #7a8aa0; background: #f3f6fa; padding: 2px 8px; border-radius: 6px; }
 .status-tag { font-size: 0.75rem; padding: 2px 10px; border-radius: 10px; background: #f1f3f5; color: #6b7c93; }
+.status-tag.using { background: #e8f5e9; color: #1e8449; font-weight: 600; }
+.status-tag.pending { background: #e3f2fd; color: #1565c0; }
 .status-tag.production_ready, .status-tag.active { background: #e8f5e9; color: #2e7d32; }
 .status-tag.rejected { background: #ffebee; color: #c62828; }
 .status-tag.evaluating { background: #e3f2fd; color: #1565c0; }
 .status-tag.superseded { background: #fff8e1; color: #b26a00; }
 .status-tag.training { background: #e8eaf6; color: #3949ab; }
+.ver-hist-wrap { margin-top: 10px; }
+.ver-hist-toggle { font-size: 0.85rem; color: #6b7c93; }
+.ver-hist-list { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+.ver-card-hist { opacity: 0.75; }
 
 .wk-desc { margin-top: 10px; color: #7f8c8d; font-size: 0.9rem; line-height: 1.6; }
 .wk-meta { margin-top: 8px; font-size: 0.85rem; color: #34495e; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
