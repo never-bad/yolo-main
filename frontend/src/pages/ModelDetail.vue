@@ -210,7 +210,7 @@
             <span class="ver-name">{{ verTitle(v) }}<span v-if="i === 0 && v.version" class="ver-latest">最新</span></span>
             <span v-if="!v.version" class="ver-latest">上传导入</span>
             <span class="status-tag" :class="v.status">{{ statusLabel(v.status) }}</span>
-            <span v-if="v.publish_status === 'published'" class="ver-latest prod">生产中</span>
+            <span v-if="v.status === 'production_ready' && v.publish_status === 'published'" class="ver-latest prod">生产中</span>
             <button
               class="secondary small ver-dl"
               :disabled="downloadingVer === v.model_id"
