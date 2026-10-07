@@ -43,11 +43,15 @@ class SaveAnnotationRequest(BaseModel):
 @router.post("/tasks")
 async def create_annotation_task(request: CreateTaskRequest):
     """创建标注任务"""
-    result = await annotation_service.create_task(
-        request.dataset_id,
-        request.version,
-        request.classes
-    )
+    try:
+        result = await annotation_service.create_task(
+            request.dataset_id,
+            request.version,
+            request.classes
+        )
+    except ValueError as e:
+        # P1-2：数据集不存在/未 prepare 等业务前置错误 → 400（服务层已抛语义化 ValueError）
+        raise HTTPException(400, str(e))
     return result
 
 @router.get("/tasks/by-dataset/{dataset_id}")
