@@ -115,6 +115,10 @@ async def get_train_job_tree(job_id: str):
 async def stop_train_job(job_id: str):
     """停止训练任务"""
     result = await train_service.stop_job(job_id)
+    if not result.get("ok"):
+        # P1-3：停止失败不再返回 200；区分"任务不存在"与"存在但未运行"两种 404 文案
+        job_meta = await train_service.get_job(job_id)
+        raise HTTPException(404, "Job not found" if job_meta is None else "Job not running")
     return result
 
 @router.post("/jobs/{job_id}/resume")
