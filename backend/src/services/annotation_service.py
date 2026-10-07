@@ -957,6 +957,21 @@ class AnnotationService:
             classes = task_meta.get("classes", []) or []
             class_meta = self._class_meta_map(task_meta.get("model_id", ""))
             norm_boxes = self._normalize_boxes(boxes, classes, class_meta)
+
+            # P1-1：矩形坐标越界直接拒绝落盘（脏坐标会污染 YOLO 导出）。
+            # 只带轮廓点的分割框跳过（矩形由读取口现算）；图尺寸未知（0）时跳过避免误杀。
+            vw = int(info.get("width") or existing.get("width") or 0)
+            vh = int(info.get("height") or existing.get("height") or 0)
+            if vw > 0 and vh > 0:
+                for nb in norm_boxes:
+                    x1, y1, x2, y2 = nb.get("x1"), nb.get("y1"), nb.get("x2"), nb.get("y2")
+                    if None in (x1, y1, x2, y2):
+                        continue
+                    if not (0 <= x1 < x2 <= vw and 0 <= y1 < y2 <= vh):
+                        raise ValueError(
+                            f"标注框越界（图片 {vw}×{vh}）: x1={x1}, y1={y1}, x2={x2}, y2={y2}"
+                        )
+
             ai = ai_annotated or prev_ai
             s_type, s_reasons = self._resolve_sample_type(norm_boxes, ai, sample_type, sample_reason)
 

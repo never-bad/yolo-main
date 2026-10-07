@@ -73,15 +73,19 @@ async def get_task_items(task_id: str):
 @router.post("/tasks/{task_id}/items/{image_id}")
 async def save_annotation(task_id: str, image_id: str, request: SaveAnnotationRequest):
     """保存图片标注（自动补全标签四字段 + 判定样本类型，人工可覆盖）"""
-    result = await annotation_service.save_annotation(
-        task_id,
-        image_id,
-        request.boxes,
-        request.ai_annotated,
-        request.sample_type,
-        request.sample_reason,
-        request.reviewed,
-    )
+    try:
+        result = await annotation_service.save_annotation(
+            task_id,
+            image_id,
+            request.boxes,
+            request.ai_annotated,
+            request.sample_type,
+            request.sample_reason,
+            request.reviewed,
+        )
+    except ValueError as e:
+        # P1-1：标注框越界等坐标非法 → 400 拒绝落盘
+        raise HTTPException(400, str(e))
     return result
 
 @router.get("/tasks/{task_id}/items/{image_id}")
