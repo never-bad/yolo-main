@@ -197,6 +197,7 @@
           <p class="lib-row">
             归属算法库:
             <b v-if="datasetLibraryId(dataset)">{{ libraryName(datasetLibraryId(dataset)) }}</b>
+            <span v-else-if="libraryOrphaned(dataset)" class="badge badge-orphan" title="原归属算法库已被删除；数据集与标注数据均保留，点右侧「去归属」可重新归属">库已删除</span>
             <span v-else class="badge badge-unassigned">未归属</span>
             <button class="link-btn" @click="openBindDialog(dataset)" title="数据集必须归属一个算法库，训练产出才会进入该库">
               {{ datasetLibraryId(dataset) ? '改归属' : '去归属' }}
@@ -598,6 +599,14 @@ const datasetLibraryId = (d: any) => {
   const id = d?.library_root_id || d?.model_id || ''
   if (!id) return ''
   return libraryOptions.value.some((l: any) => l.model_id === id) ? id : ''
+}
+
+// P2-5：孤儿提示——归属字段有值但指向的算法库已被删除（datasetLibraryId 已做悬空归一）；
+// allModels 未加载完成时不判，避免首帧把正常归属误闪为孤儿
+const libraryOrphaned = (d: any) => {
+  if (!allModels.value.length) return false
+  const raw = d?.library_root_id || d?.model_id || ''
+  return !!raw && !datasetLibraryId(d)
 }
 
 // 导入页新建算法库：只选中新库，不做页面跳转
@@ -2110,6 +2119,14 @@ button {
   background: #fdecea;
   color: #b23b2e;
   border: 1px solid #f0b8b1;
+}
+
+/* P2-5：库已删除（孤儿数据集）警示徽标，悬停原生 title 说明数据已保留 */
+.badge-orphan {
+  background: #fff3cd;
+  color: #664d03;
+  border: 1px solid #ffecb5;
+  cursor: help;
 }
 
 .modal-mask {
