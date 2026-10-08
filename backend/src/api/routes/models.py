@@ -382,6 +382,9 @@ async def delete_model(model_id: str, action: str = "", target_model_id: str = "
     - action=unbind：挂接数据集逐个置为「未归属」后再删（标注 JSON 原样保留，可重新归属）；
     - action=transfer：逐个转移挂接到 target_model_id 所在库后再删
       （类别序号冲突时报 400，force=true 表示仍坚持转移）。
+
+    删库同时清掉该库的桶账本记录（N-1）：否则 GET /datasets 的 buckets 里
+    会留着已删除库的灌桶进度，前端桶进度条挂着一个点不进去的 ghost 库。
     """
     attached = await _attached_datasets(model_id)
     if attached and not action:
@@ -415,12 +418,18 @@ async def delete_model(model_id: str, action: str = "", target_model_id: str = "
                     raise HTTPException(400, str(e))
         else:
             raise HTTPException(400, f"不支持的 action：{action}（仅支持 unbind / transfer）")
+    # 桶账本清理必须赶在删模型目录之前：删后库内版本 id 再也反查不回库根，死键清不掉
+    purged_buckets = 0
+    if (settings.REGISTRY_DIR / model_id).exists():
+        purged_buckets = await DatasetService().purge_library_buckets(
+            model_service.resolve_library_root_id(model_id) or model_id)
     result = await model_service.delete_model(model_id)
     if not result:
         raise HTTPException(404, "Model not found")
     result.update({
         "empty": not attached, "deleted": True,
         "action": action or None, "handled_datasets": len(attached),
+        "purged_buckets": purged_buckets,
     })
     return result
 

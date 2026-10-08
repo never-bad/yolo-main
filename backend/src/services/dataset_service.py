@@ -1874,6 +1874,10 @@ class DatasetService:
             except Exception:
                 return out
             for mid, mst in (state.get("models") or {}).items():
+                # N-1 ghost bucket：算法库已删除但账本残留 → 不再对外展示，
+                # 否则前端桶进度条会挂着一个点不进去的库（历史残留由删库时的 purge 兜住）
+                if not (settings.REGISTRY_DIR / mid).exists():
+                    continue
                 out.append({
                     "model_id": mid,
                     "receiving": mst.get("receiving"),
@@ -3043,6 +3047,41 @@ class DatasetService:
         await shadow.sync_buckets()
         await shadow.refresh_all_datasets()
         return events
+
+    def _purge_library_buckets_sync(self, root_id: str) -> int:
+        """删库时清理桶账本（N-1 ghost bucket）：库根 + 库内版本模型的桶记录一并移除。
+
+        必须在模型目录删除**之前**调用：删后 registry 里已查不到版本记录，
+        就无法把库内版本模型的 id 反查回库根，账本会留下永远清不掉的死键。
+        返回实际清掉的桶记录条数。
+        """
+        state = self._load_bucket_state()
+        models = state.get("models") or {}
+        doomed = set()
+        for mid in models:
+            if mid == root_id or self._library_root_id_of(mid) == root_id:
+                doomed.add(mid)
+        for mid in doomed:
+            models.pop(mid, None)
+        if doomed:
+            self._save_bucket_state(state)
+            logger.info(f"purge buckets: library={root_id} removed={sorted(doomed)}")
+        return len(doomed)
+
+    async def purge_library_buckets(self, root_id: str) -> int:
+        """删库联动：清掉该库在桶账本（buckets.json）里的灌桶/封板记录。
+
+        数据集本身不动（去向由删库守卫的 unbind / transfer 决定），只清库级桶进度，
+        避免 GET /datasets 的 buckets 里出现已删除库的 ghost 进度条。
+        """
+        def _locked():
+            with _BUCKET_LOCK:
+                return self._purge_library_buckets_sync(root_id)
+        removed = await asyncio.to_thread(_locked)
+        if removed:
+            from src.db import shadow
+            await shadow.sync_buckets()
+        return removed
 
     async def approve_review(self, dataset_id: str) -> dict:
         """审核通过：人工确认标注无误后标记，之后才允许自动灌桶/封板。
