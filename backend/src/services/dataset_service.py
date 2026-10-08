@@ -339,9 +339,18 @@ class DatasetService:
         library_root_id: 归属算法库的根记录 id；训练产出未显式指定库时以此为准。
                          为空时由调用方按 model_id 反查（模型自身即库根时取自身）
         """
-        dataset_id = f"ds_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        dataset_id = f"ds_{ts}"
         dataset_dir = self.datasets_dir / dataset_id
-        
+        # P1-4：同秒二次上传会碰撞同一目录（原 exist_ok 静默复用 → 后传覆盖先传的 meta）。
+        # 目录已存在时 ID 自增后缀 _2、_3…（与封板快照路径的 while-exists 自愈同思路，
+        # 保持 ds_YYYYMMDD_HHMMSS 前缀格式，meta/PG 按目录名自动同步）
+        n = 1
+        while dataset_dir.exists():
+            n += 1
+            dataset_id = f"ds_{ts}_{n}"
+            dataset_dir = self.datasets_dir / dataset_id
+
         # 异步创建目录
         await asyncio.to_thread(lambda: dataset_dir.mkdir(parents=True, exist_ok=True))
         
