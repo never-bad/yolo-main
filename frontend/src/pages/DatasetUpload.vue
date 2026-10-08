@@ -888,7 +888,8 @@ const matchLibrary = (d: any) => {
 }
 // P2-1（含 P2-4）：状态筛选，选项与匹配依据均取自 lifecycleOf 的状态文案，与卡片进度条展示同源
 const filterStatus = ref('')
-const statusOptions = ['待标注', '标注中', '待审核', '待封板', '已封板', '训练中', '已完成训练', '训练失败', '未归属']
+// N-2-tidy：补「已归档」——lifecycleOf 在 bucket_archived=True 时返回该文案，缺此项会导致归档包在状态筛选里选不出来
+const statusOptions = ['待标注', '标注中', '待审核', '待封板', '已封板', '已归档', '训练中', '已完成训练', '训练失败', '未归属']
 const matchStatus = (d: any) => !filterStatus.value || lifecycleOf(d).text === filterStatus.value
 const visibleDatasets = computed(() => datasets.value.filter((d: any) => matchLibrary(d) && matchStatus(d)))
 
@@ -911,7 +912,7 @@ const datasetSections = computed(() => [
   },
   {
     key: 'frozen',
-    title: '🧊 训练数据集（已封板快照 · 只读）',
+    title: '🧊 训练数据集（已封板·可撤回）',
     desc: '封板后为不可变数据集版本，可被多个训练任务同时复用（硬链接零额外存储）',
     emptyText: '暂无已封板数据集：完成标注后在数据池中点击「封板」',
     items: frozenDatasets.value
