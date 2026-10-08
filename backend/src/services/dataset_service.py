@@ -1806,6 +1806,10 @@ class DatasetService:
                                     dataset_dir, meta.get("version", "v1")
                                 )
                             )
+                            # P2-2：暴露实际标注文件数（与 approve_review 判据同源），供前端审核按钮校验
+                            meta["annotated_count"] = self._count_annotated_files(
+                                dataset_dir
+                            )
                             datasets.append(meta)
                         except Exception:
                             continue

@@ -877,6 +877,10 @@ const lifecycleOf = (d: any) => {
     return { key: 'todo', text: '待标注', idx: 0, hint: '数据已导入数据池，尚未开始标注', skip: false }
   }
   if (canSeal(d)) {
+    // P2-2：已 prepared 但未审核通过的，状态应为「待审核」而非「待封板」（复用 pending 样式）
+    if (!d?.review_approved) {
+      return { key: 'pending', text: '待审核', idx: 2, hint: '标注已准备就绪，等待人工审核通过后才能封板', skip: false }
+    }
     return { key: 'pending', text: '待封板', idx: 2, hint: '标注完成且达到封板门槛（或准备就绪），等待封板确认', skip: false }
   }
   return { key: 'annotating', text: '标注中', idx: 1, hint: '标注工作正在进行', skip: false }
@@ -939,12 +943,14 @@ const sealDatasetItem = async (d: any) => {
 }
 
 // ===== 审核门槛 / 撤回（灌桶前人工确认；未封板的已灌桶包可撤回恢复编辑） =====
-// 可审核：已准备、未封板、未归档、尚未审核通过
+// 可审核：已准备、未封板、未归档、尚未审核通过，且标注完成度达标
+// P2-2：annotated_count 与后端 approve_review 判据同源（annotations/*.json 数 >= image_count），
+// 避免前端出按钮但后端 400（image_count=0 时 0>=0 为真，与后端跳过校验一致）
 const canApprove = (d: any) => {
   if (!d) return false
   if (d.review_approved || d.bucket_archived) return false
   if (['sealed', 'training', 'completed', 'failed'].includes(d.stage)) return false
-  return d.status === 'prepared'
+  return d.status === 'prepared' && Number(d.annotated_count || 0) >= Number(d.image_count || 0)
 }
 
 // 可撤回：已灌入接收桶（archived/pending>0）但桶尚未封板（bucket_sealed==0）
