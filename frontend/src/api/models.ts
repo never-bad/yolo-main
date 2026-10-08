@@ -210,6 +210,7 @@ export interface ModelDataset {
   model_id?: string | null
   classes?: string[]
   label_count?: number
+  annotated_count?: number       // 实际标注文件数（annotations/*.json，与后端 approve 判据同源，P2-2）
   label_validation?: {
     status?: 'ok' | 'failed'
     checked_files?: number
