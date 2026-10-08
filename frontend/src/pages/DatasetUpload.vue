@@ -11,7 +11,7 @@
         <div v-if="selectedFile" class="selected-file">
           <span class="selected-file-icon">📦</span>
           <span class="selected-file-name">{{ selectedFile.name }}</span>
-          <span class="selected-file-size">({{ (selectedFile.size / 1024 / 1024).toFixed(2) }} MB)</span>
+          <span class="selected-file-size">({{ formatSize(selectedFile.size) }})</span>
         </div>
         <div v-else class="selected-file empty">尚未选择文件</div>
         <div class="upload-row">
@@ -182,7 +182,7 @@
               {{ datasetLibraryId(dataset) ? '改归属' : '去归属' }}
             </button>
           </p>
-          <p>大小: {{ (dataset.size / 1024 / 1024).toFixed(2) }} MB</p>
+          <p>大小: {{ formatSize(dataset.size) }}</p>
           <p class="life-row">
             <span class="life-pill" :class="'life-' + lifecycleOf(dataset).key" :title="lifecycleOf(dataset).hint">{{ lifecycleOf(dataset).text }}</span>
             <span v-if="['training', 'completed'].includes(dataset.stage) && dataset.training_status" class="life-sub" :title="'training_status'">{{ trainingLabel(dataset.training_status) }}</span>
@@ -764,6 +764,16 @@ const formatTime = (t: any) => {
   const d = new Date(t)
   if (isNaN(d.getTime())) return String(t).slice(0, 19).replace('T', ' ')
   return d.toLocaleString('zh-CN')
+}
+
+// P2-6：文件大小按量级切换 B/KB/MB/GB，避免 <1MB 文件显示「0.00 MB」
+const formatSize = (bytes: any) => {
+  const n = Number(bytes || 0)
+  if (!Number.isFinite(n) || n <= 0) return '0 B'
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(2)} KB`
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(2)} MB`
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
 // ===== 数据集生命周期状态（MLOps 1.1）：文字由 lifecycleOf 胶囊提供；训练子状态单独展示 =====
