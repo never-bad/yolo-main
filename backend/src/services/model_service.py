@@ -56,6 +56,30 @@ def _delete_directory(path: Path):
     shutil.rmtree(path)
 
 
+def _reserve_model_dir(registry_dir: Path, wanted_id: str = "") -> tuple:
+    """N-5：原子占位一个 registry/{model_id} 目录，返回 (model_id, model_dir)
+
+    建库 / ZIP 导入 / .pt 上传原先都用裸时间戳算 id，再配 mkdir(exist_ok=True)：
+    同一秒内的第二次操作会拿到同一个 id 并**静默覆盖**前一条记录
+    （model.json 被改写，前一个库直接从列表里消失）。
+
+    这里 mkdir 不带 exist_ok —— 目录已存在即判定碰撞，依次退让到 _2、_3… 后缀
+    （与 dataset_service.upload_dataset 的 P1-4 修复同格式同思路），
+    靠 mkdir 的文件系统原子性挡住真并发的同秒请求。
+    """
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    base = wanted_id or f"model_{ts}"
+    n = 1
+    while True:
+        model_id = base if n == 1 else f"{base}_{n}"
+        model_dir = registry_dir / model_id
+        try:
+            model_dir.mkdir(parents=True)
+            return model_id, model_dir
+        except FileExistsError:
+            n += 1
+
+
 class ModelService:
     def __init__(self):
         self.registry_dir = settings.REGISTRY_DIR
@@ -512,9 +536,8 @@ class ModelService:
             )
 
         def _create_sync():
-            model_id = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            model_dir = self.registry_dir / model_id
-            model_dir.mkdir(parents=True, exist_ok=True)
+            # N-5：同秒二次建库会碰撞同一 model_id 并静默覆盖前一个库 → 原子占位目录取号
+            model_id, model_dir = _reserve_model_dir(self.registry_dir)
             now = datetime.now().isoformat()
             # 统一 model.json 字段规范（与上传/训练路径保持一致）：
             # 基础标识 + 状态 + 关联标签字典(labels_file) + 类别列表 + 审计时间
@@ -1564,23 +1587,20 @@ class ModelService:
                     raise ValueError("weights directory must contain at least one .pt file")
                 
                 # 读取或创建model.json
+                # N-5：id 一律由 _reserve_model_dir 原子占位，同秒导入两个 ZIP 不再互相覆盖
                 if model_json_path and model_json_path.exists():
                     model_meta = _load_json(model_json_path)
                     # 如果ZIP中有model_id，检查是否已存在
                     original_model_id = model_meta.get("model_id")
-                    if original_model_id:
-                        # 检查model_id是否已存在
-                        existing_model_dir = self.registry_dir / original_model_id
-                        if existing_model_dir.exists():
-                            # 生成新的model_id
-                            model_id = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                        else:
-                            model_id = original_model_id
+                    if original_model_id and not (self.registry_dir / original_model_id).exists():
+                        # 沿用 ZIP 自带 id；万一恰好被别人抢占，占位会自动退让到 _2、_3…
+                        model_id, model_dir = _reserve_model_dir(self.registry_dir, original_model_id)
                     else:
-                        model_id = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                        # ZIP 未带 id，或原 id 已存在 → 生成新的model_id
+                        model_id, model_dir = _reserve_model_dir(self.registry_dir)
                 else:
                     # 创建新的model.json（字段规范与 create_empty_model 一致）
-                    model_id = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    model_id, model_dir = _reserve_model_dir(self.registry_dir)
                     model_meta = {
                         "model_id": model_id,
                         "name": zip_filename.replace('.zip', ''),
@@ -1592,10 +1612,8 @@ class ModelService:
                         "tags": ["uploaded"],
                     }
                 
-                # 创建目标目录
-                model_dir = self.registry_dir / model_id
+                # 目标目录已由 _reserve_model_dir 原子占位（N-5），这里只补建 weights 子目录
                 target_weights_dir = model_dir / "weights"
-                model_dir.mkdir(parents=True, exist_ok=True)
                 target_weights_dir.mkdir(parents=True, exist_ok=True)
                 
                 # 复制权重文件
@@ -1659,8 +1677,8 @@ class ModelService:
         def _process_pt(pt_filename: str):
             """处理单个 .pt 权重上传：统一落为 registry/{model_id}/weights/best.pt"""
             stem = Path(pt_filename).stem
-            model_id = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            model_dir = self.registry_dir / model_id
+            # N-5：同秒上传两个 .pt 会碰撞同一 model_id 并互相覆盖权重 → 原子占位目录取号
+            model_id, model_dir = _reserve_model_dir(self.registry_dir)
             target_weights_dir = model_dir / "weights"
             target_weights_dir.mkdir(parents=True, exist_ok=True)
             # 预标注引擎按约定路径找 weights/best.pt，因此无论原名一律改名
