@@ -305,8 +305,29 @@ export const rollbackLabelSync = async (modelId: string) => {
   return data as { model_id: string; restored_files: number; backup_id: string }
 }
 
-export const deleteModel = async (modelId: string) => {
-  const { data } = await api.delete(`/models/${modelId}`)
+// P2-5：删库守卫——挂接非空时后端不删，返回 empty:false + datasets 清单交前端弹确认；
+// 用户选择后带 action=unbind（置未归属）或 action=transfer + target_model_id 重发
+export interface DeleteModelAttachedDataset {
+  dataset_id: string
+  name: string
+  image_count: number
+}
+
+export interface DeleteModelResult {
+  ok: boolean
+  deleted: boolean
+  empty: boolean
+  message?: string
+  datasets?: DeleteModelAttachedDataset[]
+  action?: 'unbind' | 'transfer' | null
+  handled_datasets?: number
+}
+
+export const deleteModel = async (
+  modelId: string,
+  params?: { action?: 'unbind' | 'transfer'; target_model_id?: string; force?: boolean },
+): Promise<DeleteModelResult> => {
+  const { data } = await api.delete(`/models/${modelId}`, { params })
   return data
 }
 

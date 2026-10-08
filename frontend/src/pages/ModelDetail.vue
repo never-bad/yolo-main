@@ -559,7 +559,7 @@
 import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import {
-  getModel, getModelDatasets, updateModel, deleteModel, exportModel,
+  getModel, getModelDatasets, updateModel, exportModel,
   getLabelsDict, updateLabelsDict, generateTrainingCharts, listModels,
   uploadModel,
   syncLabelsToAnnotations, rollbackLabelSync, getLabelsUsage, confirmPublish,
@@ -570,6 +570,7 @@ import {
   uploadDataset, prepareDataset
 } from '@/api/datasets'
 import { listTrainJobs } from '@/api/train'
+import { deleteModelWithGuard } from '@/composables/useDialog'
 
 const route = useRoute()
 const modelId = String(route.params.modelId)
@@ -1296,7 +1297,9 @@ async function removeModel() {
   if (!confirm('确定删除该算法库及其全部模型版本与权重文件？此操作不可恢复！')) return
   deleting.value = true
   try {
-    await deleteModel(modelId)
+    // P2-5：挂接非空时后端不删，守卫流程弹清单让用户选「转移归属 / 保留未归属」
+    const name = model.value?.display_name || model.value?.name || modelId
+    if (await deleteModelWithGuard(modelId, name) !== 'deleted') return
     alert('算法库已删除')
     window.location.href = '/'
   } catch (e: any) {

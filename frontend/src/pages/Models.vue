@@ -539,9 +539,9 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onActivated, computed } from 'vue'
-import { listModels, deleteModel, getModel, updateModel, uploadModel, exportModel, generateTrainingCharts, findSimilarModels, mergeModels, getMergeLogs, rollbackMerge, listPendingPublish, confirmPublish, listLibraries, type ModelDetails } from '@/api/models'
+import { listModels, getModel, updateModel, uploadModel, exportModel, generateTrainingCharts, findSimilarModels, mergeModels, getMergeLogs, rollbackMerge, listPendingPublish, confirmPublish, listLibraries, type ModelDetails } from '@/api/models'
 import { downloadFile } from '@/utils/download'
-import { showAlert, showConfirm, showPrompt } from '@/composables/useDialog'
+import { showAlert, showConfirm, showPrompt, deleteModelWithGuard } from '@/composables/useDialog'
 import LibraryCreateModal from '@/components/LibraryCreateModal.vue'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
@@ -1675,7 +1675,9 @@ const deleteModelItem = async (modelId: string) => {
   
   deletingModel.value = modelId
   try {
-    await deleteModel(modelId)
+    // P2-5：挂接非空时后端不删，守卫流程弹清单让用户选「转移归属 / 保留未归属」
+    const m = models.value.find((x: any) => x.model_id === modelId)
+    if (await deleteModelWithGuard(modelId, m?.display_name || m?.name || modelId) !== 'deleted') return
     alert('删除成功!')
     loadModels()
   } catch (error: any) {

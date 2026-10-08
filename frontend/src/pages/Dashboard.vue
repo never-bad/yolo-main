@@ -217,7 +217,8 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onActivated } from 'vue'
 import { useRouter } from 'vue-router'
-import { listModels, updateModel, deleteModel, exportModel } from '@/api/models'
+import { listModels, updateModel, exportModel } from '@/api/models'
+import { deleteModelWithGuard } from '@/composables/useDialog'
 import { listDatasets } from '@/api/datasets'
 import LibraryCreateModal from '@/components/LibraryCreateModal.vue'
 
@@ -403,10 +404,12 @@ async function exportModelItem(m: any) {
   }
 }
 async function deleteModelItem(m: any) {
-  if (!confirm(`确认删除算法库「${m.display_name || m.name || m.model_id}」？该操作不可恢复。`)) return
+  const name = m.display_name || m.name || m.model_id
+  if (!confirm(`确认删除算法库「${name}」？该操作不可恢复。`)) return
   deleting.value = true
   try {
-    await deleteModel(m.model_id)
+    // P2-5：挂接非空时后端不删，守卫流程弹清单让用户选「转移归属 / 保留未归属」
+    if (await deleteModelWithGuard(m.model_id, name) !== 'deleted') return
     menuId.value = null
     await load()
   } catch (e: any) {
