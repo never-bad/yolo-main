@@ -217,7 +217,7 @@
             </div>
           </div>
           <p v-if="dataset.sealed_at">封板时间: {{ formatTime(dataset.sealed_at) }}</p>
-          <p v-if="dataset.image_count">图片数: {{ dataset.image_count }}<span v-if="dataset.stage === 'annotating' && thresholdForModel(datasetLibraryId(dataset)) > 0" style="color:#b26a00;font-size:0.8rem">（待封板 {{ dataset.image_count }} / {{ thresholdForModel(datasetLibraryId(dataset)) }} 张{{ dataset.image_count < thresholdForModel(datasetLibraryId(dataset)) ? `，还差 ${thresholdForModel(datasetLibraryId(dataset)) - dataset.image_count} 张` : '' }}）</span></p>
+          <p v-if="dataset.image_count">图片数: {{ dataset.image_count }}<span v-if="dataset.stage === 'annotating' && !dataset.bucket_archived && thresholdForModel(datasetLibraryId(dataset)) > 0" style="color:#b26a00;font-size:0.8rem">（待封板 {{ dataset.image_count }} / {{ thresholdForModel(datasetLibraryId(dataset)) }} 张{{ dataset.image_count < thresholdForModel(datasetLibraryId(dataset)) ? `，还差 ${thresholdForModel(datasetLibraryId(dataset)) - dataset.image_count} 张` : '' }}）</span></p>
           <p v-if="dataset.label_count">标签数: {{ dataset.label_count }}</p>
           <p v-if="dataset.classes">类别: {{ dataset.classes.join(', ') }}</p>
           <p v-if="dataset.annotation_task_id" class="auto-task-hint">
@@ -893,11 +893,13 @@ const matchStatus = (d: any) => !filterStatus.value || lifecycleOf(d).text === f
 const visibleDatasets = computed(() => datasets.value.filter((d: any) => matchLibrary(d) && matchStatus(d)))
 
 // ===== 数据池 ↔ 训练仓库双分区（数据模块 §3/§4：未封板=池，封板=不可变快照） =====
+// N-2：bucket_archived=True 的包已灌入接收桶（不再可编辑），强制归入训练仓库分区，
+// 避免「已归档」的包仍留在「🌊 数据池（未封板 · 可编辑）」里与徽标语义打架
 const poolDatasets = computed(() =>
-  visibleDatasets.value.filter((d: any) => !['sealed', 'training', 'completed'].includes(d.stage))
+  visibleDatasets.value.filter((d: any) => !d.bucket_archived && !['sealed', 'training', 'completed'].includes(d.stage))
 )
 const frozenDatasets = computed(() =>
-  visibleDatasets.value.filter((d: any) => ['sealed', 'training', 'completed'].includes(d.stage))
+  visibleDatasets.value.filter((d: any) => !!d.bucket_archived || ['sealed', 'training', 'completed'].includes(d.stage))
 )
 const datasetSections = computed(() => [
   {
@@ -926,6 +928,11 @@ const lifecycleOf = (d: any) => {
   }
   if (s === 'failed') {
     return { key: 'failed', text: '训练失败', idx: 2, hint: '该数据集训练未通过，保持未完成状态，可重新标注/封板参与下一轮训练', skip: true }
+  }
+  // N-2：bucket_archived=True = 该包已灌入接收桶（已归档），生命周期不再走「待封板/标注中」语义，
+  // 否则会与卡片上的「已归档 → B{N}」徽标自相矛盾（徽标说已归档，胶囊说标注中/待封板）
+  if (d?.bucket_archived) {
+    return { key: 'archived', text: '已归档', idx: 3, hint: '该包已归档并灌入接收桶，不再参与待封板流程；如需恢复编辑可点「撤回」', skip: false }
   }
   if (!d?.model_id && !d?.bucket_archived) {
     return { key: 'unassigned', text: '未归属', idx: 0, hint: '尚未归属任何算法库，点数据集上的「去归属」补选后才能用于训练', skip: false }
@@ -1998,6 +2005,8 @@ button {
 .life-sealed { background: #e8f5e9; color: #2e7d32; border-color: #c8e6c9; }
 .life-unassigned { background: #fff; color: #9aa7b6; border-color: #eaedf1; }
 .life-failed { background: #ffebee; color: #c62828; border-color: #ffcdd2; }
+/* N-2：已归档胶囊（与 .badge-archived 同色系，土黄），区别于「已封板」绿 */
+.life-archived { background: #eee5d5; color: #8a6d1b; border-color: #d8c490; }
 .life-sub {
   font-size: 0.72rem;
   color: #7f8c8d;
