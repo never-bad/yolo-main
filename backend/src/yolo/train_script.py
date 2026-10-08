@@ -453,9 +453,21 @@ def main():
         print(f"[{datetime.now().isoformat()}] Training completed!")
         
         # 训练完成，注册模型
-        model_id = f"model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        model_dir = Path(args.registry_dir) / model_id
-        model_dir.mkdir(parents=True, exist_ok=True)
+        # N-5：同一秒内两个训练任务先后完成会算出同一个 model_id，再配 mkdir(exist_ok=True)
+        # 就会静默覆盖前一个模型的记录（权重与 model.json 被改写）。目录已存在即退让到
+        # _2、_3… 后缀，靠 mkdir 的原子性挡住并发（与 model_service._reserve_model_dir、
+        # 数据集上传 P1-4 同一套格式）。本脚本是独立子进程，不引 src.* 依赖，故就地实现。
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        n = 1
+        while True:
+            model_id = f"model_{ts}" if n == 1 else f"model_{ts}_{n}"
+            model_dir = Path(args.registry_dir) / model_id
+            try:
+                model_dir.mkdir(parents=True)
+                break
+            except FileExistsError:
+                n += 1
+        print(f"[{datetime.now().isoformat()}] Registered model_id: {model_id}")
         
         # 复制权重文件
         weights_dir = model_dir / "weights"
