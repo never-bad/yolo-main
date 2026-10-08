@@ -107,6 +107,7 @@
             <h3 class="dataset-name" @click="viewDataset(dataset)" title="点击查看数据集文件夹结构">
               {{ dataset.display_name || dataset.dataset_id }}
               <span v-if="bucketBadge(dataset).text" :class="'badge ' + bucketBadge(dataset).cls">{{ bucketBadge(dataset).text }}</span>
+              <span v-if="validationBadge(dataset).text" :class="'badge ' + validationBadge(dataset).cls" :title="validationBadge(dataset).tip">{{ validationBadge(dataset).text }}</span>
             </h3>
             <div class="dataset-actions">
               <button 
@@ -823,6 +824,21 @@ const bucketBadge = (d: any) => {
   return { text: '', cls: '' }
 }
 
+// P2-3：标注校验徽标——后端 label_validation 为 failed 时卡片显示红色徽标，
+// 悬浮（原生 title）展示明细：无效文件/行数 + 前 5 条错误，零新增组件
+const validationBadge = (d: any) => {
+  const v = d?.label_validation
+  if (!v || v.status !== 'failed') return { text: '', cls: '', tip: '' }
+  const errs: string[] = v.errors || []
+  const tip = [
+    `标注校验未通过：${v.invalid_files ?? 0} 个文件 / ${v.invalid_lines ?? 0} 行无效（已检查 ${v.checked_files ?? 0} 文件 ${v.lines_checked ?? 0} 行）`,
+    v.checked_at ? `校验时间：${formatTime(v.checked_at)}` : '',
+    ...errs.slice(0, 5),
+    errs.length > 5 ? `…另有 ${errs.length - 5} 条错误` : ''
+  ].filter(Boolean).join('\n')
+  return { text: `校验✗ ${v.invalid_lines ?? 0} 行`, cls: 'badge-invalid', tip }
+}
+
 // 桶进度条（每个模型一行：已封板版本 + 接收桶已灌/该库生效门槛）
 const bucketBars = computed(() => buckets.value.map(b => {
   const recv = b.receiving || { index: 1, poured: 0 }
@@ -1427,6 +1443,13 @@ onActivated(() => {
   background: #d4efdf;
   color: #1e7e4a;
   border: 1px solid #9ed4b4;
+}
+/* P2-3：标注校验失败徽标（悬浮看明细） */
+.badge-invalid {
+  background: #f8d7da;
+  color: #842029;
+  border: 1px solid #f1aeb5;
+  cursor: help;
 }
 
 /* ===== P1-5/P2-1：数据集列表筛选栏 ===== */
