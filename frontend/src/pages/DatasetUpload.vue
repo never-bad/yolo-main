@@ -70,7 +70,7 @@
           </div>
         </template>
       </div>
-      <!-- P1-5：数据集列表筛选栏（按归属算法库筛选） -->
+      <!-- P1-5/P2-1：数据集列表筛选栏（按归属算法库 + 生命周期状态筛选） -->
       <div class="ds-filter-bar">
         <label class="ds-filter-item">
           <span>归属库</span>
@@ -80,6 +80,14 @@
             <option v-for="lib in libraryOptions" :key="lib.model_id" :value="lib.model_id">{{ lib.display_name || lib.model_code || lib.model_id }}</option>
           </select>
         </label>
+        <label class="ds-filter-item">
+          <span>状态</span>
+          <select v-model="filterStatus">
+            <option value="">全部状态</option>
+            <option v-for="s in statusOptions" :key="s" :value="s">{{ s }}</option>
+          </select>
+        </label>
+        <span v-if="filterLibraryId || filterStatus" class="ds-filter-count">筛出 {{ visibleDatasets.length }} / {{ datasets.length }} 个</span>
       </div>
       <div v-if="loading" class="loading-state">
         <span class="loading-spinner large"></span>
@@ -853,7 +861,11 @@ const matchLibrary = (d: any) => {
   const id = datasetLibraryId(d)
   return filterLibraryId.value === '__none__' ? !id : id === filterLibraryId.value
 }
-const visibleDatasets = computed(() => datasets.value.filter(matchLibrary))
+// P2-1（含 P2-4）：状态筛选，选项与匹配依据均取自 lifecycleOf 的状态文案，与卡片进度条展示同源
+const filterStatus = ref('')
+const statusOptions = ['待标注', '标注中', '待审核', '待封板', '已封板', '训练中', '已完成训练', '训练失败', '未归属']
+const matchStatus = (d: any) => !filterStatus.value || lifecycleOf(d).text === filterStatus.value
+const visibleDatasets = computed(() => datasets.value.filter((d: any) => matchLibrary(d) && matchStatus(d)))
 
 // ===== 数据池 ↔ 训练仓库双分区（数据模块 §3/§4：未封板=池，封板=不可变快照） =====
 const poolDatasets = computed(() =>
@@ -1439,6 +1451,10 @@ onActivated(() => {
   background: #fff;
   font-size: 0.85rem;
   color: #2d3748;
+}
+.ds-filter-count {
+  font-size: 0.8rem;
+  color: #718096;
 }
 
 .bucket-notice {
