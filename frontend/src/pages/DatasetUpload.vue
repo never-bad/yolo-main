@@ -70,6 +70,17 @@
           </div>
         </template>
       </div>
+      <!-- P1-5：数据集列表筛选栏（按归属算法库筛选） -->
+      <div class="ds-filter-bar">
+        <label class="ds-filter-item">
+          <span>归属库</span>
+          <select v-model="filterLibraryId">
+            <option value="">全部库</option>
+            <option value="__none__">未归属</option>
+            <option v-for="lib in libraryOptions" :key="lib.model_id" :value="lib.model_id">{{ lib.display_name || lib.model_code || lib.model_id }}</option>
+          </select>
+        </label>
+      </div>
       <div v-if="loading" class="loading-state">
         <span class="loading-spinner large"></span>
         <span>加载数据集列表...</span>
@@ -835,12 +846,21 @@ const canSeal = (d: any) => {
   return d.status === 'prepared'
 }
 
+// P1-5：库筛选（「未归属」用特殊值 __none__，悬空 library_root_id 经 datasetLibraryId 归一为未归属）
+const filterLibraryId = ref('')
+const matchLibrary = (d: any) => {
+  if (!filterLibraryId.value) return true
+  const id = datasetLibraryId(d)
+  return filterLibraryId.value === '__none__' ? !id : id === filterLibraryId.value
+}
+const visibleDatasets = computed(() => datasets.value.filter(matchLibrary))
+
 // ===== 数据池 ↔ 训练仓库双分区（数据模块 §3/§4：未封板=池，封板=不可变快照） =====
 const poolDatasets = computed(() =>
-  datasets.value.filter((d: any) => !['sealed', 'training', 'completed'].includes(d.stage))
+  visibleDatasets.value.filter((d: any) => !['sealed', 'training', 'completed'].includes(d.stage))
 )
 const frozenDatasets = computed(() =>
-  datasets.value.filter((d: any) => ['sealed', 'training', 'completed'].includes(d.stage))
+  visibleDatasets.value.filter((d: any) => ['sealed', 'training', 'completed'].includes(d.stage))
 )
 const datasetSections = computed(() => [
   {
@@ -1395,6 +1415,30 @@ onActivated(() => {
   background: #d4efdf;
   color: #1e7e4a;
   border: 1px solid #9ed4b4;
+}
+
+/* ===== P1-5/P2-1：数据集列表筛选栏 ===== */
+.ds-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin: 0.75rem 0;
+}
+.ds-filter-item {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: #4a5568;
+}
+.ds-filter-item select {
+  padding: 0.25rem 0.5rem;
+  border: 1px solid #cbd5e0;
+  border-radius: 6px;
+  background: #fff;
+  font-size: 0.85rem;
+  color: #2d3748;
 }
 
 .bucket-notice {
