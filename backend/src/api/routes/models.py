@@ -352,19 +352,10 @@ async def rollback_model_labels_sync(model_id: str):
         raise HTTPException(404, "Model not found")
     return result
 
-@router.delete("/{model_id}")
-async def delete_model(model_id: str):
-    """删除模型"""
-    result = await model_service.delete_model(model_id)
-    if not result:
-        raise HTTPException(404, "Model not found")
-    return result
+async def _attached_datasets(model_id: str) -> list[dict]:
+    """挂接到该算法库的数据集清单（P2-5 删库守卫与「库详情—挂载数据集」共用同一口径）
 
-@router.get("/{model_id}/datasets")
-async def get_model_datasets(model_id: str):
-    """1.7 模型仓库：返回归属于该算法库的所有数据集（含状态机字段）
-
-    按库聚合：先把传入的 id 换算成库根记录（打开某个版本详情时也返回整库数据集），
+    按库聚合：先把传入的 id 换算成库根记录（版本 id 也归到整库），
     再逐个把数据集的归属（新数据写 library_root_id，老数据只有 model_id）换算成库根后比对
     —— 未归属、归属其它库、以及指向已删除模型的悬空引用一律不出现。
     """
@@ -380,6 +371,63 @@ async def get_model_datasets(model_id: str):
             owner = model_service.resolve_library_root_id(owner)
         if owner == root_id:
             owned.append(d)
+    return owned
+
+@router.delete("/{model_id}")
+async def delete_model(model_id: str, action: str = "", target_model_id: str = "", force: bool = False):
+    """删除模型（P2-5：先查挂接数据集清单，禁止硬删制造孤儿数据集）
+
+    - 挂接为空：直接删除（与原行为一致）；
+    - 挂接非空且未传 action：不删，返回 {empty: false, datasets: [...]} 交前端弹确认；
+    - action=unbind：挂接数据集逐个置为「未归属」后再删（标注 JSON 原样保留，可重新归属）；
+    - action=transfer：逐个转移挂接到 target_model_id 所在库后再删
+      （类别序号冲突时报 400，force=true 表示仍坚持转移）。
+    """
+    attached = await _attached_datasets(model_id)
+    if attached and not action:
+        return {
+            "ok": False, "deleted": False, "empty": False,
+            "message": f"该算法库仍挂接 {len(attached)} 个数据集，请选择转移归属或保留为未归属",
+            "datasets": [
+                {
+                    "dataset_id": d.get("dataset_id"),
+                    "name": d.get("filename") or d.get("dataset_id"),
+                    "image_count": d.get("image_count", 0),
+                }
+                for d in attached
+            ],
+        }
+    if attached:
+        ds_service = DatasetService()
+        if action == "unbind":
+            for d in attached:
+                await ds_service.bind_model(d["dataset_id"], None, None)
+        elif action == "transfer":
+            target_root = model_service.resolve_library_root_id(target_model_id) or target_model_id
+            if not target_model_id or not (settings.REGISTRY_DIR / target_root).exists():
+                raise HTTPException(400, f"转移目标库不存在：{target_model_id or '(未指定)'}")
+            if target_root == (model_service.resolve_library_root_id(model_id) or model_id):
+                raise HTTPException(400, "转移目标不能是被删除的库自身")
+            for d in attached:
+                try:
+                    await ds_service.bind_model(d["dataset_id"], target_root, target_root, force=force)
+                except ValueError as e:
+                    raise HTTPException(400, str(e))
+        else:
+            raise HTTPException(400, f"不支持的 action：{action}（仅支持 unbind / transfer）")
+    result = await model_service.delete_model(model_id)
+    if not result:
+        raise HTTPException(404, "Model not found")
+    result.update({
+        "empty": not attached, "deleted": True,
+        "action": action or None, "handled_datasets": len(attached),
+    })
+    return result
+
+@router.get("/{model_id}/datasets")
+async def get_model_datasets(model_id: str):
+    """1.7 模型仓库：返回归属于该算法库的所有数据集（含状态机字段）"""
+    owned = await _attached_datasets(model_id)
     return {"model_id": model_id, "datasets": owned}
 
 @router.get("/{model_id}/queue")
