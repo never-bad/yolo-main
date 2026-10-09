@@ -1223,6 +1223,7 @@ const applyFocus = (id: string) => {
 const consumeFocus = () => {
   const f = (route.query.focus as string) || ''
   if (f) applyFocus(f)
+  if (route.query.stage) filterStatus.value = route.query.stage === 'sealed' ? '已封板' : '训练失败'
 }
 
 onMounted(async () => {

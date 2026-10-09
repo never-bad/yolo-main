@@ -26,7 +26,7 @@
         <span class="stat-label">待办事项</span>
         <b>{{ todoPills.length }}</b>
         <div class="todo-pills">
-          <span v-for="p in todoPills" :key="p">{{ p }}</span>
+          <router-link v-for="p in todoPills" :key="p" :to="{ path: '/datasets', query: { stage: todoQuery(p) } }" class="todo-pill">{{ p }}</router-link>
         </div>
       </div>
     </div>
@@ -304,6 +304,7 @@ const todoPills = computed(() => {
   if (failed) pills.push(`${failed} 个数据集训练失败`)
   return pills
 })
+const todoQuery = (p: string) => (p.includes('待封板') ? 'sealed' : 'failed')
 
 // ---- 卡片信息 ----
 function fullScene(m: any): string {
@@ -580,13 +581,16 @@ onActivated(() => {
   margin-top: 4px;
 }
 
-.todo-pills span {
+.todo-pills .todo-pill {
+  text-decoration: none;
   background: #ffedd5;
   color: #b26a00;
   font-size: 0.75rem;
   padding: 2px 8px;
   border-radius: 8px;
 }
+
+.todo-pills .todo-pill:hover { background: #fde3c0; text-decoration: underline; }
 
 .filter-row {
   display: flex;
