@@ -1866,6 +1866,24 @@ class DatasetService:
         # （trained_at / last_trained_round / stage），列表页按 mtime 水位补齐差集。
         from src.db import shadow
         await shadow.refresh_datasets(d.get("dataset_id") for d in datasets)
+        # N-3：display_name 撞名消歧。封板兜底命名 `ds_v{n}` 跨数据集不唯一，会让标注/训练页
+        # 下拉出现多条完全同名的条目而无法区分（dataset_id 本身唯一，不是重复数据，不能去重删条目）。
+        # 这里只在列表返回值上给撞名项追加 dataset_id 时间尾缀，如 `ds_v1 (20260817-163421)`：
+        # 不落盘、不删数据、不按名字去重，条目总数保持不变。
+        _by_name: dict = {}
+        for _m in datasets:
+            _n = (_m.get("display_name") or "").strip()
+            if _n:
+                _by_name.setdefault(_n, []).append(_m)
+        for _group in _by_name.values():
+            if len(_group) < 2:
+                continue
+            for _m in _group:
+                _did = str(_m.get("dataset_id") or "")
+                _p = _did.split("_")
+                _tail = f"{_p[1]}-{_p[2]}" if len(_p) >= 3 and _p[1].isdigit() and _p[2].isdigit() else _did
+                if _tail and _did != _m.get("display_name"):
+                    _m["display_name"] = f"{_m['display_name']} ({_tail})"
         # 桶灌进度（B 系列）：每个模型当前接收桶累计量 + 已封板版本，供前端展示
         def _bucket_summary():
             out = []
