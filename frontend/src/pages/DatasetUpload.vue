@@ -106,7 +106,7 @@
           <div v-for="dataset in section.items" :key="dataset.dataset_id" class="dataset-item" :data-ds="dataset.dataset_id">
           <div class="dataset-header">
             <h3 class="dataset-name" @click="viewDataset(dataset)" title="点击查看数据集文件夹结构">
-              {{ dataset.display_name || dataset.dataset_id }}
+              {{ dsTitle(dataset) }}<small v-if="dsSub(dataset)" class="ds-id-sub">{{ dsSub(dataset) }}</small>
               <span v-if="bucketBadge(dataset).text" :class="'badge ' + bucketBadge(dataset).cls">{{ bucketBadge(dataset).text }}</span>
               <span v-if="validationBadge(dataset).text" :class="'badge ' + validationBadge(dataset).cls" :title="validationBadge(dataset).tip">{{ validationBadge(dataset).text }}</span>
             </h3>
@@ -431,6 +431,7 @@ import { uploadDataset, prepareDataset as prepareDst, listDatasets, getDataset, 
 import { listModels } from '@/api/models'
 import { addHardSamples, addBackgroundSamples } from '@/api/samplePool'
 import { downloadFile } from '@/utils/download'
+import { dsTitle, dsSub } from '@/utils/dsDisplay'
 import { showConfirm, showPrompt } from '@/composables/useDialog'
 import FolderTree from '@/components/FolderTree.vue'
 import LibraryCreateModal from '@/components/LibraryCreateModal.vue'

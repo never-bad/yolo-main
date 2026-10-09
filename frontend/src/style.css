@@ -201,3 +201,6 @@ button.secondary .loading-spinner {
   background: #f8f9fa;
   border-radius: 4px;
 }
+
+/* 数据集副标题灰小字：display_name · dataset_id（UX-5/6/7 三页共用） */
+.ds-id-sub { font-size: 12px; color: #94a3b8; font-weight: normal; margin-left: 6px; }
