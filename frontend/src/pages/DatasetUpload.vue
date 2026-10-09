@@ -913,7 +913,7 @@ const datasetSections = computed(() => [
   {
     key: 'frozen',
     title: '🧊 训练数据集（已封板·可撤回）',
-    desc: '封板后为不可变数据集版本，可被多个训练任务同时复用（硬链接零额外存储）',
+    desc: '已归档或封板后形成的不可变数据集版本，可被多个训练任务同时复用（硬链接零额外存储）',
     emptyText: '暂无已封板数据集：完成标注后在数据池中点击「封板」',
     items: frozenDatasets.value
   }
