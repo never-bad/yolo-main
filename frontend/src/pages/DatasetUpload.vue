@@ -51,7 +51,8 @@
         <span v-if="loading" class="loading-spinner"></span>
         {{ loading ? '加载中...' : '刷新' }}
       </button>
-      <div v-if="bucketNotice" class="bucket-notice" @click="bucketNotice = ''" title="点击关闭">{{ bucketNotice }}<span class="bucket-notice-close">✕</span></div>
+      <div v-if="bucketNotice" class="bucket-notice" @click="dismissBucketNotice" title="点击关闭">{{ bucketNotice }}<span class="bucket-notice-close">✕</span></div>
+      <button v-else-if="bucketNoticeDismissed && bucketNoticeLast" class="bucket-notice-restore" @click="restoreBucketNotice" title="恢复最近一次灌桶/封板提示">↻ 恢复上次提示</button>
       <div class="bucket-progress">
         <div class="bucket-progress-title">
           <span>桶进度（每桶满 <b>{{ sealMinImages }}</b> 张自动封板{{ perModelOverrideCount ? `，${perModelOverrideCount} 个库单独设置` : '' }}，标完的 A 包自动灌入）</span>
@@ -527,6 +528,17 @@ const saveThreshold = async () => {
 const datasets = ref<any[]>([])
 const buckets = ref<any[]>([])      // B 系列：按模型桶进度（receiving + sealed）
 const bucketNotice = ref('')        // 灌桶/封板结果提示（点击关闭）
+// UX-4：提示持久化——✕ 关闭后留 ↻ 恢复入口；页面加载会自动重算提示，故同内容不视为新提示，避免关掉又弹回
+const BN_LAST = 'bucket_notice_last', BN_KEY = 'bucket_notice_dismissed'
+const bucketNoticeLast = ref(localStorage.getItem(BN_LAST) || '')
+const bucketNoticeDismissed = ref(localStorage.getItem(BN_KEY) === '1')
+watch(bucketNotice, (v) => {
+  if (!v) return
+  const isNew = v !== bucketNoticeLast.value
+  bucketNoticeLast.value = v; localStorage.setItem(BN_LAST, v); if (isNew) { bucketNoticeDismissed.value = false; localStorage.removeItem(BN_KEY) } else if (bucketNoticeDismissed.value) bucketNotice.value = ''
+})
+const dismissBucketNotice = () => { bucketNotice.value = ''; bucketNoticeDismissed.value = true; localStorage.setItem(BN_KEY, '1') }
+const restoreBucketNotice = () => { bucketNotice.value = bucketNoticeLast.value; bucketNoticeDismissed.value = false; localStorage.removeItem(BN_KEY) }
 const loading = ref(false)
 const preparingNew = ref(false)  // 正在准备新上传的数据集
 const editingDataset = ref<string | null>(null)  // 正在编辑的数据集ID
@@ -1511,6 +1523,7 @@ onActivated(() => {
   align-items: center;
   justify-content: space-between;
 }
+.bucket-notice-restore { margin: 0.75rem 0 0; padding: 2px 10px; background: none; border: 1px dashed #ead9a8; border-radius: 6px; color: #8a6d1b; font-size: 0.75rem; cursor: pointer; }
 .bucket-notice-close {
   margin-left: 0.75rem;
   font-weight: bold;
