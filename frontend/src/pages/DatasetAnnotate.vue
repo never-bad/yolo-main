@@ -32,11 +32,11 @@
             @click="selectDataset(ds)"
           >
             <div class="ds-card-header">
-              <span class="ds-name">{{ dsTitle(ds) }}<span v-if="dsSub(ds)" class="ds-id-sub">{{ dsSub(ds) }}</span></span>
+              <span class="ds-name">{{ dsTitle(ds) }}</span>
               <span :class="'status-badge status-' + ds.status">{{ getDatasetStatus(ds) }}</span>
             </div>
             <div class="ds-card-info">
-              <span v-if="ds.filename">文件: {{ ds.filename }}</span>
+              <span>数据集id：{{ ds.dataset_id }}</span>
               <span v-if="ds.image_count">{{ ds.image_count }} 张图片</span>
               <span v-if="ds.classes && ds.classes.length" class="ds-classes" :title="ds.classes.join(', ')">
                 {{ ds.classes.length }} 类: {{ ds.classes.slice(0, 3).join(', ') }}<template v-if="ds.classes.length > 3"> 等</template>
@@ -678,7 +678,7 @@ import { createAnnotationTask, findAnnotationTask, getTaskItems, getImageAnnotat
 import { listDatasets, approveDatasetReview } from '@/api/datasets'
 import { showConfirm, showPrompt, showAlert } from '@/composables/useDialog'
 import { downloadFile } from '@/utils/download'
-import { dsTitle, dsSub } from '@/utils/dsDisplay'
+import { dsTitle } from '@/utils/dsDisplay'
 import { suggestModelLabels, adoptSuggestedLabels } from '@/api/models'
 
 const newTask = ref({ datasetId: '', version: 'v1' })

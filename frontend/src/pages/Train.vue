@@ -18,11 +18,11 @@
             @click="selectDataset(ds)"
           >
             <div class="ds-card-header">
-              <span class="ds-name">{{ dsTitle(ds) }}<span v-if="dsSub(ds)" class="ds-id-sub">{{ dsSub(ds) }}</span> <span v-if="trainForm.dataset_id === ds.dataset_id" class="ds-main-tag">主</span></span>
+              <span class="ds-name">{{ dsTitle(ds) }} <span v-if="trainForm.dataset_id === ds.dataset_id" class="ds-main-tag">主</span></span>
               <span :class="'status-badge status-' + ds.status">{{ getDatasetStatus(ds) }}</span>
             </div>
             <div class="ds-card-info">
-              <span v-if="ds.filename">文件: {{ ds.filename }}</span>
+              <span>数据集id：{{ ds.dataset_id }}</span>
               <span v-if="ds.image_count">{{ ds.image_count }} 张图片</span>
               <span v-if="ds.classes && ds.classes.length">{{ ds.classes.length }} 类</span>
             </div>
@@ -511,7 +511,7 @@ import { useRouter, useRoute } from 'vue-router'
 import { createTrainJob, listTrainJobs, deleteTrainJob, resumeTrainJob, getTrainJobTree, suggestTrainParams, inferBusiness, listGpus, prepareWeights, type TrainJobRequest } from '@/api/train'
 import { listModels, uploadPretrainedPt, listCustomModels } from '@/api/models'
 import { listDatasets } from '@/api/datasets'
-import { dsTitle, dsSub } from '@/utils/dsDisplay'
+import { dsTitle } from '@/utils/dsDisplay'
 import { subscribeLogsSSE, pollLogsTail, getLogLines } from '@/api/logs'
 import FolderTree from '@/components/FolderTree.vue'
 import { useLogStore } from '@/store/logs'
