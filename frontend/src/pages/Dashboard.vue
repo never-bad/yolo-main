@@ -32,7 +32,9 @@
     </div>
 
     <!-- D. 快捷筛选器：算法 / 业务线 / 状态 -->
-    <div class="filter-row">
+    <!-- N-4：archOptions/bizOptions 由 libraryModels 动态推导，库少于 3 个时下拉只剩 1-2 项，
+         小白看到的是「筛不出东西」的负价值 → 整栏隐藏，降级为一行说明。filter-row 原样保留。 -->
+    <div v-if="libraryModels.length >= 3" class="filter-row">
       <select v-model="filterArch" class="filter-select">
         <option value="">全部算法</option>
         <option v-for="a in archOptions" :key="a" :value="a">{{ a }}</option>
@@ -53,6 +55,7 @@
       </select>
       <span v-if="filterActive" class="filter-reset" @click="resetFilters">清除筛选</span>
     </div>
+    <div v-if="libraryModels.length < 3" class="filter-row">数据较少，筛选功能在 ≥3 个算法库时启用（当前 {{ libraryModels.length }} 个）</div>
 
     <!-- 模型对比（勾选 2~3 个后出现） -->
     <div v-if="compareIds.length >= 2" class="compare-bar">
