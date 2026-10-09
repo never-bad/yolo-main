@@ -85,7 +85,7 @@
             <div class="ov-label">标签体系（{{ labelsDict.labels?.length || 0 }} 类）</div>
             <div class="ov-tags" v-if="labelsDict.labels?.length">
               <span v-for="l in labelsDict.labels" :key="l.index" class="ov-tag">
-                {{ l.index }}·{{ l.english_code }}{{ l.chinese_name ? ' ' + l.chinese_name : '' }}
+                {{ l.chinese_name || l.english_code }} <small class="ov-tag-sub">({{ l.index }}·{{ l.english_code }})</small>
               </span>
             </div>
             <div class="ov-value" v-else>尚未定义标签体系，可在「设置」中创建</div>
@@ -1421,6 +1421,7 @@ onMounted(async () => {
 .ov-value { font-size: 0.9rem; color: #2c3e50; line-height: 1.5; }
 .ov-tags { display: flex; flex-wrap: wrap; gap: 5px; }
 .ov-tag { font-size: 0.72rem; background: #eef4ff; color: #2c6ec5; padding: 2px 8px; border-radius: 10px; }
+.ov-tag-sub { color: #7f8c8d; font-size: 11px; margin-left: 4px; }
 .mt4 { margin-top: 8px; }
 
 /* ===== 数据集管理 ===== */
