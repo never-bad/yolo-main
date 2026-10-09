@@ -98,9 +98,9 @@
               </div>
               <button
                 class="secondary small mt4"
-                :disabled="downloadingVer === newestVersion.model_id"
+                :disabled="downloadingVer === newestVersion.model_id || !newestVersion.weights_path"
                 @click="downloadVersionWeights(newestVersion)"
-              >{{ downloadingVer === newestVersion.model_id ? '下载中...' : '⬇ 下载 .pt' }}</button>
+              >{{ downloadingVer === newestVersion.model_id ? '下载中...' : newestVersion.weights_path ? '⬇ 下载 .pt' : '暂无权重' }}</button>
             </div>
             <div class="ov-value" v-else>该算法库尚无训练产出，发起训练后即可下载</div>
           </div>
