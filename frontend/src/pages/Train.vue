@@ -1991,6 +1991,7 @@ onUnmounted(() => {
 
 .check-line {
   display: flex;
+  width: fit-content;
   align-items: center;
   gap: 0.4rem;
   cursor: pointer;
@@ -2336,6 +2337,7 @@ onUnmounted(() => {
 
 .aggregate-opt {
   display: flex;
+  width: fit-content;
   align-items: center;
   gap: 0.35rem;
   margin-top: 0.4rem;
