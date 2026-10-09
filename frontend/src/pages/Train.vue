@@ -320,10 +320,10 @@
       <div v-else class="jobs-list">
         <div v-for="job in jobs" :key="job.job_id" class="job-item">
           <div class="job-head">
-            <h3 class="job-name" @click="openJobFiles(job.job_id)" title="点击查看任务文件">{{ job.job_id }}</h3>
+            <h3 class="job-name" @click="openJobFiles(job.job_id)" title="点击查看任务文件">{{ jobTitle(job) }}<span class="ds-id-sub">{{ job.job_id }}</span></h3>
             <span class="job-pill" :class="'jp-' + jobPillKey(job.status)">{{ jobStatusText(job.status) }}</span>
           </div>
-          <p>数据集: {{ job.dataset_id }}&nbsp;|&nbsp;模型: {{ job.model_name }}&nbsp;|&nbsp;{{ job.epochs }} 轮&nbsp;|&nbsp;Img {{ job.imgsz }}&nbsp;|&nbsp;Batch {{ job.batch }}</p>
+          <p>数据集: {{ job.dataset_id }}&nbsp;|&nbsp;模型: {{ (job.model_name || '').split(/[\\/]/).pop() }}&nbsp;|&nbsp;{{ job.epochs }} 轮&nbsp;|&nbsp;Img {{ job.imgsz }}&nbsp;|&nbsp;Batch {{ job.batch }}</p>
           <p>节点: {{ job.gpu_index != null && job.gpu_index !== undefined ? 'GPU ' + job.gpu_index : '自动选择' }}&nbsp;|&nbsp;启动: {{ new Date(job.created_at).toLocaleString() }}</p>
           <p class="job-badges">
             <span v-if="job.gpu_abnormal" class="gpu-abnormal-badge" title="GPU 利用率持续过低，系统自动停止训练">⚠️ GPU 异常熔断</span>
@@ -1155,6 +1155,12 @@ const training = ref(false)
 const preparingWeight = ref(false)
 const currentJobId = ref<string | null>(null)
 const jobs = ref<any[]>([])
+// UX-7 任务卡标题 = 数据集名 · 模型文件名（basename），灰小字 job_id
+const jobTitle = (job: any) => {
+  const ds = datasets.value.find((d: any) => d.dataset_id === job.dataset_id)
+  const model = (job.model_name || '').split(/[\\/]/).pop()
+  return (ds ? dsTitle(ds) : job.dataset_id) + ' · ' + (model || '未知模型')
+}
 let eventSource: EventSource | null = null
 let pollInterval: any = null
 
