@@ -55,7 +55,7 @@
       </select>
       <span v-if="filterActive" class="filter-reset" @click="resetFilters">清除筛选</span>
     </div>
-    <div v-if="libraryModels.length < 3" class="filter-row">数据较少，筛选功能在 ≥3 个算法库时启用（当前 {{ libraryModels.length }} 个）</div>
+    <div v-if="libraryModels.length < 3" class="filter-row filter-hint">数据较少，筛选功能在 ≥3 个算法库时启用（当前 {{ libraryModels.length }} 个）</div>
 
     <!-- 模型对比（勾选 2~3 个后出现） -->
     <div v-if="compareIds.length >= 2" class="compare-bar">
@@ -595,6 +595,8 @@ onActivated(() => {
   margin-bottom: 14px;
   flex-wrap: wrap;
 }
+
+.filter-hint { color: #6b7280; font-size: 0.85rem; padding-top: 0.5rem; }
 
 .filter-select {
   padding: 6px 10px;
