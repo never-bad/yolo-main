@@ -106,7 +106,7 @@
           <div v-for="dataset in section.items" :key="dataset.dataset_id" class="dataset-item" :data-ds="dataset.dataset_id">
           <div class="dataset-header">
             <h3 class="dataset-name" @click="viewDataset(dataset)" title="点击查看数据集文件夹结构">
-              {{ dsTitle(dataset) }}<small v-if="dsSub(dataset)" class="ds-id-sub">{{ dsSub(dataset) }}</small>
+              {{ dsTitle(dataset) }}<span v-if="dsSub(dataset)" class="ds-id-sub">{{ dsSub(dataset) }}</span>
               <span v-if="bucketBadge(dataset).text" :class="'badge ' + bucketBadge(dataset).cls">{{ bucketBadge(dataset).text }}</span>
               <span v-if="validationBadge(dataset).text" :class="'badge ' + validationBadge(dataset).cls" :title="validationBadge(dataset).tip">{{ validationBadge(dataset).text }}</span>
             </h3>

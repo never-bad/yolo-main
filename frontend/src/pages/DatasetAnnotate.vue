@@ -32,7 +32,7 @@
             @click="selectDataset(ds)"
           >
             <div class="ds-card-header">
-              <span class="ds-name">{{ ds.display_name || ds.dataset_id }}</span>
+              <span class="ds-name">{{ dsTitle(ds) }}<span v-if="dsSub(ds)" class="ds-id-sub">{{ dsSub(ds) }}</span></span>
               <span :class="'status-badge status-' + ds.status">{{ getDatasetStatus(ds) }}</span>
             </div>
             <div class="ds-card-info">
@@ -678,6 +678,7 @@ import { createAnnotationTask, findAnnotationTask, getTaskItems, getImageAnnotat
 import { listDatasets, approveDatasetReview } from '@/api/datasets'
 import { showConfirm, showPrompt, showAlert } from '@/composables/useDialog'
 import { downloadFile } from '@/utils/download'
+import { dsTitle, dsSub } from '@/utils/dsDisplay'
 import { suggestModelLabels, adoptSuggestedLabels } from '@/api/models'
 
 const newTask = ref({ datasetId: '', version: 'v1' })
