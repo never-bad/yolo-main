@@ -300,11 +300,11 @@ const todoPills = computed(() => {
   const pills: string[] = []
   const sealable = datasets.value.filter((d: any) => (d.stage || '').toLowerCase() === 'sealed').length
   const failed = datasets.value.filter((d: any) => (d.stage || '').toLowerCase() === 'failed').length
-  if (sealable) pills.push(`${sealable} 个数据集待封板`)
+  if (sealable) pills.push(`${sealable} 个数据集已封板`)
   if (failed) pills.push(`${failed} 个数据集训练失败`)
   return pills
 })
-const todoQuery = (p: string) => (p.includes('待封板') ? 'sealed' : 'failed')
+const todoQuery = (p: string) => (p.includes('已封板') ? 'sealed' : 'failed')
 
 // ---- 卡片信息 ----
 function fullScene(m: any): string {
