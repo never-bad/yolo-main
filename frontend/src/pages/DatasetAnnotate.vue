@@ -1613,7 +1613,11 @@ const windowStart = computed(() => {
   const n = visibleItems.value.length
   if (n <= LIST_WINDOW) return 0
   const anchor = visibleIdx.value >= 0 ? visibleIdx.value - Math.floor(LIST_WINDOW / 2) : 0
-  return clampIdx(anchor + browseOffset.value, 0, n - LIST_WINDOW)
+  // H-2r：先把 anchor 收敛成「以当前图为中心」的合法基础位，再叠加浏览偏移整体收敛。
+  // 原实现 anchor 未先收敛，当前图在列表头部（anchor=-40）时首次触底的 +40 偏移
+  // 被下限 0 吞掉，表现为「滚到底没反应，须第二次滚动才平移」（批次 H 验收实测发现）。
+  const base = clampIdx(anchor, 0, n - LIST_WINDOW)
+  return clampIdx(base + browseOffset.value, 0, n - LIST_WINDOW)
 })
 const windowEnd = computed(() => Math.min(windowStart.value + LIST_WINDOW, visibleItems.value.length))
 const windowedItems = computed(() => visibleItems.value.slice(windowStart.value, windowEnd.value))
