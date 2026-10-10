@@ -1104,7 +1104,7 @@ class TrainService:
             （合格→completed/已完成训练；不合格→failed/保持未完成，参与下一轮雪球）。
         2.4 跨代迁移训练（训练模块规范 §3.2.2）：base_model_id（源模型）+
           migration_target_model（目标架构，如 yolov8s.pt）且源/目标架构不同 →
-          strict=False 加载 + lr0 自动降 10 倍 + [Migration] 日志 + weight_mappings 溯源。
+          strict=False 加载 + lr0 自动降 10 倍 + [Migration] 日志。
         """
         job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 

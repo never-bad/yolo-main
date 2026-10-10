@@ -145,18 +145,3 @@ class StatusMappingRecord(Base):
     old_value: Mapped[str] = mapped_column(String, primary_key=True)
     new_value: Mapped[str] = mapped_column(String, default="")
     rule: Mapped[str] = mapped_column(String, default="")
-
-
-class WeightMappingRecord(Base):
-    """2.4 weight_mappings：跨代迁移的层名映射规则（源算法 → 目标算法）。
-
-    规范：训练模块 §6.3。初始内置 ultralytics 同族映射（strict=False + 按层名/形状匹配），
-    后续可扩展更多算法组合。mapping_rules 格式 {"source_layer_name": "target_layer_name"}。
-    """
-    __tablename__ = "weight_mappings"
-
-    source_architecture: Mapped[str] = mapped_column(String, primary_key=True)
-    target_architecture: Mapped[str] = mapped_column(String, primary_key=True)
-    mapping_rules: Mapped[dict] = mapped_column(JSONB, default=dict)
-    skip_layers: Mapped[list] = mapped_column(JSONB, default=list)
-    created_at: Mapped[str] = mapped_column(String, default="")
