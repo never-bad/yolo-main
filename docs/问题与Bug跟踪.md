@@ -6,7 +6,7 @@
 > 紧急程度：🔴 紧急（近期部署/交付前必须处理）｜🟡 中（本迭代内处理）｜🟢 低（待处理，后期统一修正）
 > 状态：`待拍板` = 需用户决策后才能动工；`待处理` = 已确认但排期靠后；`已缓解` = 有临时对策；`已修复` = 进 §5
 > 交叉引用：改进项 `I-xx` 查《功能实现与改进点跟踪》；文件位置查《项目文件功能说明》；页面/接口行为查《平台功能与页面关联》。
-> 更新时间：2026-09-30（B-05 部分修复登记）
+> 更新时间：2026-10-10（批次 G 落地：B-05/B-04 关闭，S-01/S-02 修复核实，I-01/B-01 核实关闭）
 
 ---
 
@@ -14,14 +14,14 @@
 
 | 编号 | 分类 | 紧急 | 一句话描述 | 状态 | 关联 |
 |---|---|---|---|---|---|
-| I-01* | 功能缺陷 | 🔴 | shadow.py 等 4 个功能必需文件未入 git，clone 后跑不起来 | 待处理 | 文件说明 §5.4 |
+| I-01* | 功能缺陷 | 🔴 | shadow.py 等 4 个功能必需文件未入 git，clone 后跑不起来 | 已解决（10-10 核实：4 文件全部 TRACKED，未跟踪文件归零） | 文件说明 §5.4 |
 | S-01 | 安全 | 🔴 | 模型上传 extractall 无路径遍历防护 | 已修复（d0a81fb，zip_guard 收口） | I-02 |
 | S-02 | 安全 | 🔴 | YOLO 标签导入 extractall 无 member 校验 | 已修复（ffe2c79，zip_guard 收口） | I-02 |
-| B-05 | 功能缺陷 | 🔴 | CI/bat 引用不存在的 docker/{backend,frontend}/Dockerfile | 已拍板（10-10）：删 .cnb.yml，并入批次 G | 文件说明 §4 |
+| B-05 | 功能缺陷 | 🔴 | CI/bat 引用不存在的 docker/{backend,frontend}/Dockerfile | 已解决（10-10，de6850e 批次 G-1 删 .cnb.yml） | 文件说明 §4 |
 | S-03 | 安全 | 🟡 | 全平台无鉴权 + CORS `*` + 20 GB 上传上限 | 已拍板（10-10）：嵌入宿主，网关鉴权 | X-04 |
 | B-02 | 功能缺陷 | 🟡 | 清除标注后 PG `has_label` 虚高（有意不回填） | 已拍板（10-10）：接受虚高，重标覆盖 | I-04 |
 | B-03 | 功能缺陷 | 🟡 | 全量重灌会冲掉 has_label，必须二步入库流程 | 已缓解 | 改进跟踪 §2.3 |
-| B-04 | 功能缺陷 | 🟡 | weight_mappings 有表无 DAO，恒为空 | 已拍板（10-10）：删表，功能移入下版本需求 | I-06 |
+| B-04 | 功能缺陷 | 🟡 | weight_mappings 有表无 DAO，恒为空 | 已解决（10-10，bbd3d6d 批次 G-3 删表） | I-06 |
 | P-01 | 性能/体验 | 🟡 | goAnnotate 用 window.location.href，整页刷新丢 SPA 状态 | 待处理 | — |
 | P-02 | 性能 | 🟡 | 超大 task.json（13k+ items）预标注 O(N²) 重复全量读 | 需验证 | — |
 | D-01 | 文档漂移 | 🟡 | 平台细节说明 §2.4「无多边形」已过期（polygon 已实现） | 待处理 | I-12 |
@@ -44,7 +44,7 @@
 
 ## 2. 🔴 紧急
 
-### I-01 / B-01　功能必需文件未入版本控制 —— 功能缺陷
+### I-01 / B-01　功能必需文件未入版本控制 —— 功能缺陷（已解决 ✅ 2026-10-10 核实）
 
 - **现象**：以下文件在磁盘上被大量 import，但 `git ls-files` 不跟踪（`git clone` 后平台直接起不来）：
   - `backend/src/db/shadow.py` —— 44 处写点 `await shadow.*` 依赖
@@ -53,6 +53,7 @@
   - `frontend/src/components/LibraryCreateModal.vue` —— Dashboard / DatasetUpload / Models 三页 import
 - **根因**：`.gitignore` 未排除它们，纯粹是新增后未 `git add`。
 - **处置**：`git add` 上述 4 文件并提交。**这是四份文档所述一切工作的交付前提**。
+- **结案（2026-10-10 复核）**：4 文件全部 `git ls-files --error-unmatch` 命中（TRACKED）；`git ls-files --others --exclude-standard` = **0**（工作区已无未跟踪文件）。本项关闭。
 - 详见《项目文件功能说明》§5.4。
 
 ### S-01　模型上传解压无路径遍历防护 —— 安全（已修复 ✅）
@@ -65,10 +66,12 @@
 
 - **修复**：`ffe2c79 fix(S-02)`，annotation_service 现调用 `zip_guard.guarded_extractall(zf, tmp_dir, strict=True)`，与 S-01 同一收口模块。
 
-### B-05　CI 与构建脚本引用不存在的 Dockerfile —— 功能缺陷（已拍板 ✅ 2026-10-10）
+### B-05　CI 与构建脚本引用不存在的 Dockerfile —— 功能缺陷（已解决 ✅ 2026-10-10，批次 G-1）
 
 - **现象**：`.cnb.yml` 三阶段流水线属分层镜像改造前旧架构：前两阶段用 `docker/Dockerfile`（统一镜像）重复构建 backend/frontend 两个 tag，第三阶段动态生成已废弃的 `Dockerfile.unified`；`build-unified.bat` 已先行删除。
-- **拍板结论**：**删除 `.cnb.yml` 整份**（实际部署一直是本地 `build_push.sh --app-only` + 服务器 `deploy.sh`，CI 从未启用）。并入批次 G（G-1）执行。
+- **拍板结论**：**删除 `.cnb.yml` 整份**（实际部署一直是本地 `build_push.sh --app-only` + 服务器 `deploy.sh`，CI 从未启用）。
+- **实施**：`de6850e chore(G-1)` 仓库根 `git rm .cnb.yml`（89 行整份删除），`docker/` 其余 7 个 tracked 文件一字未动。
+- **验证（验收方独立复核）**：`git diff bf5454c..HEAD -- .cnb.yml` = 89 deletions；`grep -rn cnb docker/` 零命中；`bash -n docker/build_push.sh` EXIT=0；`.cnb.yml` 已不存在于工作区。**B-05 终结**。
 
 ---
 
@@ -92,10 +95,12 @@
 - **缓解**：`migrate_to_pg.py` 文档头已写警告；部署流程固定第二步跑 `backfill_has_label.py`；回归 T4 用例（合成任务 + `with_items=True` 反向对照）守住收口层不再误用。
 - **残留风险**：人工只跑重灌忘了回填 → 列表页"有标注"筛选失效。处置：把二步并入 `deploy.sh`（I-05）。
 
-### B-04　`weight_mappings` 有表无 DAO —— 功能缺陷（已拍板 ✅ 2026-10-10）
+### B-04　`weight_mappings` 有表无 DAO —— 功能缺陷（已解决 ✅ 2026-10-10，批次 G-3）
 
 - **现状**：`db/models.py` L150 定义了表，`meta_store` 无对应读写函数，`shadow.py` 无接线，`migrate_to_pg.py` 不灌它 → 恒为空。实际跨代迁移由 ultralytics `strict=False` 自动匹配承担（train_service L1107 注释），从未用到过该表。
-- **拍板结论**：**选 C 删表**——跨代映射功能暂缓，已移入下版本需求。全仓引用仅 2 处：`db/models.py` L150-162 的 `WeightMappingRecord` 类定义（删除）+ `train_service.py` L1107 注释中"weight_mappings 溯源"字样（改写）；PG 侧对空表执行 `DROP TABLE IF EXISTS weight_mappings`。并入批次 G 执行。
+- **拍板结论**：**选 C 删表**——跨代映射功能暂缓，已移入下版本需求。
+- **实施**：`bbd3d6d fix(G-3)` 三处——① `db/models.py` 删 `WeightMappingRecord` 类（文件尾块，实测 L148-162，删后 147 行、以 `rule:` 行结尾、恰一个尾 LF、无 BOM）；② `train_service.py` L1107 注释去「 + weight_mappings 溯源」字样；③ 本地 PG 执行 `DROP TABLE IF EXISTS weight_mappings`（服务器存量库待部署时执行同一条）。
+- **验证（验收方独立复核）**：`git grep WeightMappingRecord|weight_mappings -- backend/ docker/` 零命中（exit 1）；`from src.db import models` 无报错、`hasattr(WeightMappingRecord)=False`、`Base.metadata.tables` 恰 7 张且不含 `weight_mappings`；本地 PG 实测 `to_regclass('public.weight_mappings')=None`、`pg_tables` 7 张。
 - 关联改进项 I-06 随之关闭。
 
 ### P-01　`goAnnotate` 整页刷新 —— 性能/体验
@@ -143,7 +148,7 @@
 | B-06 | 死代码 | `components/Logs/LogPanel.vue`、`LogToolbar.vue` 不被任何页面引用（Train 自绘日志区） | 接入或删除（I-07） |
 | B-07 | 风险约定 | `/models` 路由：`/{model_id}` 通配注册在前会吞静态段。现有顺序正确，但**新增静态路径必须插在通配之前** | 已在《平台功能与页面关联》§6 留警示，代码加注释即可 |
 | I-11 | 悬空 | `backend/data/inference_results/` 目录存在但无路由/服务写入方 | 确认历史用途后清理或补文档 |
-| — | 悬空 | `docker/backend/`、`docker/frontend/` 空目录（B-05 的诱因） | 随 B-05 一并删 |
+| — | 悬空 | ~~`docker/backend/`、`docker/frontend/` 空目录（B-05 的诱因）~~ | ✅ 已删除（09-30），B-05 已于 10-10 随批次 G-1 终结 |
 
 ---
 
@@ -158,6 +163,7 @@
 | R-05 | `migrate_to_pg.py` 的 `--prune` 实现被外部回退（文档头留着说明、函数丢失） | 重新补入 `_truth_ids()` + `prune_orphans(dry)` + main 参数接线 | `py_compile` + `--dry --prune-only` EXIT=0；prune 清掉 6 条游离（2 datasets + 2 models + 2 游离 task_items），纠偏后三域与真值等集（23/12/179） |
 | R-06 | 38 个任务 `has_label` 零命中疑似异常 | 归因：其 `dataset_id` 指向的目录已不存在（17 个目录）或无 annotations 子目录 → 真值无标注，PG 为 false 正确 | **非 bug**，结案 |
 | R-07 | 回归 T4 依赖真实数据抽样，prune 后无样本导致 FAIL | T4 重写为确定性用例：tempfile 假真值 + `zz_` 合成任务 + `with_items=True` 反向对照 | FAILS=0 |
+| R-08 | 镜像内缺 `/app/scripts`，部署后 `docker compose exec` 跑 `migrate_to_pg.py` / `backfill_has_label.py` 报 No such file（文档外发现，内部代号 BLOCKER-1） | `b062ba0 fix(G-2)`：`docker/Dockerfile` 在 `COPY backend/models`（L49）后插入 `COPY backend/scripts /app/scripts`（现 L53），`.dockerignore` 已排除 `__pycache__` | 验收方独立复跑：`python backend/scripts/migrate_to_pg.py --help` 与 `backfill_has_label.py --help` 均打印 usage、EXIT=0（证明 `parent.parent` 自定位 + `import src.*` 链通）。真实镜像构建顺延至服务器 `build_push.sh --app-only` 后补验 |
 
 ---
 
@@ -165,11 +171,13 @@
 
 | 分类 | 🔴 | 🟡 | 🟢 | 已归档 |
 |---|---|---|---|---|
-| B 功能缺陷 | 2（B-01/B-05） | 3 | 2 | 3 |
+| B 功能缺陷 | 0 | 1（B-03 已缓解） | 2（B-06/B-07） | 3 + 当日关闭 2（B-04/B-05）+ I-01/B-01 |
 | P 性能/健壮性 | 0 | 2 | 2 | 0 |
-| S 安全 | 2 | 1（待拍板） | 0 | 0 |
+| S 安全 | 0（S-01/S-02 已修复） | 1（S-03 已拍板关闭） | 0 | 0 |
 | D 文档/口径漂移 | 0 | 4 | 2 | 0 |
 | C 兼容性 | 0 | 0 | 0 | 1（C-01，见下） |
+
+> **2026-10-10 更新说明**：上表各列为当日复核后的实际在册数。S-01/S-02 由 `d0a81fb`/`ffe2c79` 修复（zip_guard 收口），B-05 由 `de6850e` 关闭，B-04 由 `bbd3d6d` 关闭，I-01/B-01 核实 4 文件全部 TRACKED、未跟踪文件归零；S-03/B-02 拍板关闭（见 §3 详情节）。
 
 **C-01（归档）**：`data.yaml` 曾用绝对路径导致跨平台（Windows 开发 / Linux 容器）训练失败 → 已定硬约束：**一律相对路径 `.`**。后续任何改 `seal_dataset`/`prepare` 的任务不得回退。
 
@@ -177,4 +185,5 @@
 1. 🔴 全部属于"补防护 / 入 git / 修脚本引用"，**不需要新框架**，当前阶段就该做；
 2. ~~待拍板三项（S-03、B-02、B-04）**未决策前不动代码**~~ → **已于 10-10 全部拍板**：S-03 嵌入宿主/网关鉴权（关闭）；B-02 接受虚高+重标覆盖（关闭）；B-04 删表、功能移入下版本需求（并入批次 G）；
 3. 🟢 项攒批处理，修一个带一个，不单独排期；
-4. 任何修复必须附回归脚本且**保留脚本**（§5 的 test_* 是资产不是垃圾）。
+4. 任何修复必须附回归脚本；§5 的 `test_*` 属资产。
+   - ⚠️ **2026-10-10 更正**：经全盘核实，`_tmp_scripts/` 回归脚本（`test_fix_3_6.py` 34 项、`test_shadow_writethrough.py` 36 项、S1~S9 50 项）**在本地与 git 中均不存在**（`.gitignore` 仅含 `_tmp/`），此前"脚本已保留"的记录不成立。后续任务书中的"跑回归脚本"验证项按"脚本不在则如实报跳过、不许自造替代"处理。
