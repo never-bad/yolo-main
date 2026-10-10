@@ -2637,6 +2637,7 @@ button {
 }
 .migration-toggle {
   display: flex;
+  width: fit-content; /* 批次E：勾选框行收紧为内容宽度，点右侧空白不再误勾选 */
   align-items: center;
   gap: 0.4rem;
   font-size: 0.85rem;
