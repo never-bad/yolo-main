@@ -22,6 +22,11 @@
             {{ uploading ? '上传中...' : '上传' }}
           </button>
         </div>
+        <!-- 大压缩包上传耗时长，给出字节级进度，避免用户以为卡死重复点 -->
+        <div v-if="uploading" class="upload-progress">
+          <div class="upload-progress-bar" :style="{ width: uploadPercent + '%' }"></div>
+          <span class="upload-progress-text">{{ uploadPercent }}%</span>
+        </div>
       </div>
       <div class="form-group">
         <label>归属算法库 <i class="required">*</i></label>
@@ -116,6 +121,26 @@
                 class="secondary"
                 title="查看数据集图片"
               >查看</button>
+              <button
+                v-if="canPrepare(dataset)"
+                @click="prepareItem(dataset)"
+                class="secondary"
+                :disabled="preparingDataset === dataset.dataset_id"
+                title="从原始压缩包解压/重组/统计；用于修复准备中断、卡在未准备状态的数据集"
+              >
+                <span v-if="preparingDataset === dataset.dataset_id" class="loading-spinner"></span>
+                {{ preparingDataset === dataset.dataset_id ? '准备中...' : '准备' }}
+              </button>
+              <button
+                v-if="canReprepare(dataset)"
+                @click="prepareItem(dataset, true)"
+                class="secondary"
+                :disabled="preparingDataset === dataset.dataset_id"
+                title="重新解压/重组/统计（会先清空数据目录；仅对尚无标注的数据集开放）"
+              >
+                <span v-if="preparingDataset === dataset.dataset_id" class="loading-spinner"></span>
+                {{ preparingDataset === dataset.dataset_id ? '准备中...' : '重新准备' }}
+              </button>
               <button 
                 v-if="dataset.status === 'prepared'"
                 @click="goAnnotate(dataset)"
@@ -444,6 +469,7 @@ const libraryTouched = ref(false) // 点过上传但没选库 → 显示红字�
 const createLibraryOpen = ref(false)
 const allModels = ref<any[]>([]) // registry 记录（算法库下拉数据源）
 const uploading = ref(false)
+const uploadPercent = ref(0)   // 上传字节进度（0~100），仅在 uploading 时显示
 const uploadResult = ref<any>(null)
 const sealMinImages = ref(0)  // #6 封板数量门槛（来自后端），列表展示待封板进度
 // 门槛在线设置（独立弹窗，持久化到后端 data/seal_threshold.json）
@@ -1031,6 +1057,35 @@ const canApprove = (d: any) => {
   return d.status === 'prepared' && Number(d.annotated_count || 0) >= Number(d.image_count || 0)
 }
 
+// ===== 准备 / 重新准备（用户反馈 #46：准备中断后页面没有救回入口，只能删了重传） =====
+const preparingDataset = ref<string | null>(null)   // 正在准备的数据集 id
+
+const isFrozen = (d: any) => ['sealed', 'training', 'completed', 'failed'].includes(d?.stage)
+// 可「准备」：尚未准备且未冻结
+const canPrepare = (d: any) => !!d && d.status !== 'prepared' && !isFrozen(d)
+// 可「重新准备」：已准备、无任何标注、未冻结（避免清目录破坏已标注数据）
+const canReprepare = (d: any) =>
+  !!d && d.status === 'prepared' && !isFrozen(d) && Number(d.annotated_count || 0) === 0
+
+const prepareItem = async (d: any, reprepare = false) => {
+  const ok = await showConfirm(
+    reprepare
+      ? `要对数据集 ${d.dataset_id} 重新准备吗？\n「准备」会清空该数据集的数据目录并从原始压缩包重新解压、重新统计。\n（仅对尚无标注的数据集开放此操作）`
+      : `要准备数据集 ${d.dataset_id} 吗？\n将从原始压缩包解压、重组为标准格式并统计（用于修复准备中断的数据集）。`
+  )
+  if (!ok) return
+  preparingDataset.value = d.dataset_id
+  try {
+    await prepareDst(d.dataset_id)
+    alert('准备完成！')
+  } catch (e: any) {
+    alert('准备失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    preparingDataset.value = null
+    loadDatasets()
+  }
+}
+
 // 可撤回：已灌入接收桶（archived/pending>0）但桶尚未封板（bucket_sealed==0）
 const canUnpour = (d: any) => {
   if (!d) return false
@@ -1090,8 +1145,9 @@ const uploadFile = async () => {
   }
 
   uploading.value = true
+  uploadPercent.value = 0
   try {
-    const result = await uploadDataset(selectedFile.value, uploadLibraryId.value)
+    const result = await uploadDataset(selectedFile.value, uploadLibraryId.value, (p) => { uploadPercent.value = p })
     uploadResult.value = result
     loadDatasets()
     // 上传成功后自动准备（无需用户额外操作）
@@ -1279,6 +1335,10 @@ onActivated(() => {
   gap: 0.75rem;
   margin-top: 0.25rem;
 }
+
+.upload-progress { position: relative; height: 18px; margin-top: .4rem; background: #eef1f3; border-radius: 4px; overflow: hidden; }
+.upload-progress-bar { height: 100%; background: #3498db; transition: width .15s ease; }
+.upload-progress-text { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: .72rem; color: #2c3e50; }
 
 .file-input {
   display: none;

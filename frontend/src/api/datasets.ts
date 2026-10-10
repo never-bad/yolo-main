@@ -5,12 +5,21 @@ export interface UpdateDatasetRequest {
   tags?: string[]
 }
 
-/** 上传数据集压缩包；modelId 为归属的算法库（必填，后端会换算成库根记录） */
-export const uploadDataset = async (file: File, modelId: string) => {
+/** 上传数据集压缩包；modelId 为归属的算法库（必填，后端会换算成库根记录）
+ *  onProgress 可选：上传字节进度百分比回调，不传则与旧调用方完全一致 */
+export const uploadDataset = async (
+  file: File, modelId: string,
+  onProgress?: (percent: number) => void
+) => {
   const formData = new FormData()
   formData.append('file', file)
   const { data } = await api.post('/datasets/upload', formData, {
-    params: { model_id: modelId }
+    params: { model_id: modelId },
+    onUploadProgress: (e) => {
+      if (!onProgress) return
+      const total = e.total || e.loaded || 1
+      onProgress(Math.min(100, Math.round((e.loaded / total) * 100)))
+    }
   })
   return data
 }
