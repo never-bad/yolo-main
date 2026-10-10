@@ -71,7 +71,7 @@
     <div v-if="currentTask" class="annotate-workspace">
       <div class="sidebar">
         <!-- 计数跟着真正显示的图片走：筛/搜之后括号里是结果数，后面灰字是全量 -->
-        <h3>
+        <h3 class="list-title" @dblclick="jumpToIndex" title="双击可跳转到指定张数">
           图片列表 ({{ visibleItems.length }}<span v-if="visibleItems.length !== items.length" class="list-count-total"> / {{ items.length }}</span>)
         </h3>
         <div v-if="importedCount > 0" class="import-info">
@@ -150,14 +150,12 @@
           <span class="loading-spinner"></span>
           <span>加载图片列表...</span>
         </div>
-        <div v-else ref="imageListRef" class="image-list">
-          <!-- 列表只渲染当前图附近的一段，窗口外的部分用这两条浏览杆平移 -->
-          <button v-if="hasEarlier" class="list-browse" @click="browseEarlier">
-            ↑ 更早（还有 {{ windowStart }} 张）
-          </button>
+        <div v-else ref="imageListRef" class="image-list" @scroll.passive="onListScroll">
+          <!-- 列表只渲染当前图附近的一段；滚到边缘时自动平移窗口，体感是连续滚动 -->
           <div
             v-for="item in windowedItems"
             :key="item.image_id"
+            :data-img="item.image_id"
             :class="['image-item', { active: currentImage?.image_id === item.image_id, annotated: item.annotated }]"
             @click="selectImageByItem(item)"
           >
@@ -169,9 +167,6 @@
               <span v-if="item.ai_annotated" class="img-badge ai" title="AI 预标注，建议人工审核">AI</span>
             </span>
           </div>
-          <button v-if="hasLater" class="list-browse" @click="browseLater">
-            ↓ 更晚（还有 {{ visibleItems.length - windowEnd }} 张）
-          </button>
           <div v-if="visibleItems.length === 0" class="empty-filter">
             <template v-if="imageQuery.trim() && imageFilter !== 'all'">
               「{{ filterLabels[imageFilter] }}」里没有文件名包含「{{ imageQuery.trim() }}」的图片
@@ -1609,7 +1604,7 @@ const canNext = computed(() => visibleIdx.value >= 0 && visibleIdx.value < visib
 
 // 窗口化渲染：只把当前图附近的一段条目放进 DOM（千张级的任务里
 // 全量渲染会让滚动和切换都变钝），窗口跟着当前图滑动，
-// 列表更长时用「更早/更晚」浏览条平移。
+// 列表更长时由滚动到边缘触发平移。
 const LIST_WINDOW = 80
 const clampIdx = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(v, hi))
 // 手动浏览产生的平移偏移：选图或改筛选/搜索条件后归零，重新回到跟随当前图
@@ -1624,8 +1619,52 @@ const windowEnd = computed(() => Math.min(windowStart.value + LIST_WINDOW, visib
 const windowedItems = computed(() => visibleItems.value.slice(windowStart.value, windowEnd.value))
 const hasEarlier = computed(() => windowStart.value > 0)
 const hasLater = computed(() => windowEnd.value < visibleItems.value.length)
-const browseEarlier = () => { browseOffset.value -= LIST_WINDOW }
-const browseLater = () => { browseOffset.value += LIST_WINDOW }
+// 滚到列表边缘时把窗口平移一段，取代原来的「更早/更晚」按钮
+const LIST_SHIFT = 40          // 每次平移条数
+const isShifting = ref(false)
+const shiftWindow = async (delta: number) => {
+  if (isShifting.value) return
+  const el = imageListRef.value
+  if (!el) return
+  isShifting.value = true
+  // 锚定：取当前视口顶部第一个可见项
+  const listRect = el.getBoundingClientRect()
+  let anchor: HTMLElement | null = null
+  const kids = el.querySelectorAll<HTMLElement>('.image-item[data-img]')
+  for (const k of Array.from(kids)) {
+    if (k.getBoundingClientRect().bottom > listRect.top + 1) { anchor = k; break }
+  }
+  const anchorId = anchor?.dataset.img || ''
+  const beforeTop = anchor ? anchor.getBoundingClientRect().top : 0
+  browseOffset.value += delta
+  await nextTick()
+  if (anchorId) {
+    const again = el.querySelector<HTMLElement>(`.image-item[data-img="${anchorId}"]`)
+    if (again) {
+      const afterTop = again.getBoundingClientRect().top
+      el.scrollTop += (afterTop - beforeTop)   // 视觉位置保持不跳
+    }
+  }
+  isShifting.value = false
+}
+const onListScroll = () => {
+  const el = imageListRef.value
+  if (!el || isShifting.value) return
+  const NEAR = 8
+  if (el.scrollTop <= NEAR && hasEarlier.value) shiftWindow(-LIST_SHIFT)
+  else if (el.scrollHeight - el.scrollTop - el.clientHeight <= NEAR && hasLater.value) shiftWindow(LIST_SHIFT)
+}
+
+// 双击「图片列表 (N)」计数：输入序号直接跳到那一张
+const jumpToIndex = async () => {
+  const n = visibleItems.value.length
+  if (!n) return
+  const input = await showPrompt(`跳转到第几张？（1 ~ ${n}）`, String(visibleIdx.value + 1), '跳转图片')
+  if (input == null) return
+  const p = parseInt(String(input).trim(), 10)
+  if (!Number.isFinite(p) || p < 1 || p > n) { showAlert(`请输入 1 ~ ${n} 之间的整数`); return }
+  selectImageByItem(visibleItems.value[p - 1])   // 复用：会触发 selectImage → watch(currentImage) 重置 browseOffset 并把窗口对准
+}
 
 const imageListRef = ref<HTMLElement | null>(null)
 // block:'nearest' 只在当前项真看不见时才动，避免每次切图列表都跳到顶上
@@ -4242,24 +4281,10 @@ onUnmounted(() => {
   margin: 1rem 0;
 }
 
-/* 列表只渲染窗口内一段，靠这两条浏览杆平移；sticky 让它滚到边界时仍留在视野里 */
-.list-browse {
-  position: sticky;
-  left: 0;
-  width: 100%;
-  padding: 0.35rem 0.5rem;
-  margin-bottom: 0.25rem;
-  font-size: 0.78rem;
-  color: #5b6770;
-  background: #f4f6f7;
-  border: 1px dashed #ccd2d6;
-  border-radius: 4px;
+/* 「图片列表 (N)」可双击跳转到指定张数 */
+.list-title {
   cursor: pointer;
-}
-
-.list-browse:hover {
-  background: #e9edee;
-  color: #2c3e50;
+  user-select: none;
 }
 
 /* 图片名搜索框 */
