@@ -3985,6 +3985,12 @@ onUnmounted(() => {
   font-size: 13px;
   color: #333;
 }
+/* 批次E：仅收紧"勾选框行"。不能改 .modal-box .row 本体 —— 同一弹窗里
+   「接入方式/服务地址/模型名/API Key/超时」等行内是 .w-input{flex:1}，
+   若整条 .row 收成 fit-content，这些输入框会塌成默认窄宽（回归）。 */
+.modal-box .row:has(> input[type="checkbox"]) {
+  width: fit-content;
+}
 .modal-box .hint {
   font-size: 12px;
   color: #7f8c8d;
