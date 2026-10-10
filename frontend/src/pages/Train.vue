@@ -1155,7 +1155,7 @@ const training = ref(false)
 const preparingWeight = ref(false)
 const currentJobId = ref<string | null>(null)
 const jobs = ref<any[]>([])
-// UX-7 任务卡标题 = 数据集名 · 模型文件名（basename），灰小字 job_id
+// UX-7 任务卡标题 = 数据集名 · 模型文件名（basename）；job_id 改由下方元信息行首段「任务id:」展示，灰小字副标题已去掉
 const jobTitle = (job: any) => {
   const ds = datasets.value.find((d: any) => d.dataset_id === job.dataset_id)
   const model = (job.model_name || '').split(/[\\/]/).pop()
