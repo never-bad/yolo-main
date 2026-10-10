@@ -14,6 +14,7 @@
 #   3. 验证 GPU 对容器可见（仅提示，不影响启动）
 #   4. 从镜像仓库拉取统一镜像并启动（零配置，无需上传代码/模型）
 #   5. 健康检查并输出访问地址
+#   6. 影子库 has_label 回填（幂等，防人工漏跑导致“有标注”筛选失效）
 # =============================================================================
 set -euo pipefail
 
@@ -80,7 +81,19 @@ else
     warn "90 秒内未探测到后端端口，请检查日志: docker logs yolo-platform"
 fi
 
-# ---------- 6. 输出访问信息 ----------
+# ---------- 6. 影子库回填（I-05：并入部署防人工漏跑，B-03 缓解措施落地） ----------
+if [ "$backend_ready" -eq 1 ]; then
+    log "回填 task_items.has_label（幂等，仅 false→true）..."
+    if docker compose exec -T yolo-platform python /app/scripts/backfill_has_label.py; then
+        log "has_label 回填完成"
+    else
+        warn "backfill_has_label.py 执行失败（PG 未就绪或首次部署未初始化）——首次部署请先人工执行: docker compose exec -T yolo-platform python /app/scripts/migrate_to_pg.py --prune-only"
+    fi
+else
+    warn "后端未就绪，跳过 has_label 回填（下次部署自动补）"
+fi
+
+# ---------- 7. 输出访问信息 ----------
 SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 echo ""
 echo "=========================================================="
