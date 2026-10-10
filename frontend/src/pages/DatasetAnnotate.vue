@@ -8,7 +8,7 @@
       <div class="form-group">
         <label>选择数据集</label>
         <div class="select-with-refresh">
-          <select v-model="newTask.datasetId" :disabled="loadingDatasets || creatingTask" @change="syncClassesFromDataset(newTask.datasetId)">
+          <select v-model="newTask.datasetId" :disabled="loadingDatasets || creatingTask" @change="onDatasetSelectChange">
             <option value="">-- 请选择数据集 --</option>
             <option 
               v-for="ds in preparedDatasets" 
@@ -24,9 +24,19 @@
             {{ loadingDatasets ? '加载中...' : '刷新' }}
           </button>
         </div>
+        <div v-if="preparedDatasets.length > 0" class="ds-pager">
+          <span class="ds-pager-info">共 {{ preparedDatasets.length }} 个 · 第 {{ dsPage }}/{{ dsPageCount }} 页</span>
+          <span class="ds-pager-nav">
+            <button type="button" class="ds-pager-btn" :disabled="dsPage <= 1" @click="dsPage = dsPage - 1">上一页</button>
+            <button type="button" class="ds-pager-btn" :disabled="dsPage >= dsPageCount" @click="dsPage = dsPage + 1">下一页</button>
+          </span>
+          <select v-model.number="dsPageSize" class="ds-pager-size" :disabled="loadingDatasets">
+            <option v-for="n in DS_PAGE_SIZES" :key="n" :value="n">每页 {{ n }} 个</option>
+          </select>
+        </div>
         <div class="ds-grid">
           <div
-            v-for="ds in preparedDatasets"
+            v-for="ds in pagedDatasets"
             :key="ds.dataset_id"
             :class="['ds-card', { selected: newTask.datasetId === ds.dataset_id }]"
             @click="selectDataset(ds)"
@@ -812,6 +822,25 @@ const preparedDatasets = computed(() => {
   return (datasets.value || []).filter((d: any) => d.status === 'prepared')
 })
 
+// 卡片网格分页：已准备的数据集有几十个，一次性铺满会把「新建任务」卡片拉得很长，
+// 这里只切分渲染范围，下拉框仍然是全量（下拉自身可滚动，不受分页影响）。
+const dsPageSize = ref(10)          // 每页条数，默认 10
+const dsPage = ref(1)               // 当前页（1-based）
+const DS_PAGE_SIZES = [10, 20, 30, 50]
+const dsPageCount = computed(() => Math.max(1, Math.ceil(preparedDatasets.value.length / dsPageSize.value)))
+const pagedDatasets = computed(() => {
+  const start = (dsPage.value - 1) * dsPageSize.value
+  return preparedDatasets.value.slice(start, start + dsPageSize.value)
+})
+// 某个数据集落在第几页；不在已准备列表里返回 0
+const dsPageOf = (id: string) => {
+  const i = preparedDatasets.value.findIndex((d: any) => d.dataset_id === id)
+  return i < 0 ? 0 : Math.floor(i / dsPageSize.value) + 1
+}
+// 换页大小、数据集增删都回到第 1 页，避免停在已不存在的页码上
+watch(dsPageSize, () => { dsPage.value = 1 })
+watch(preparedDatasets, () => { dsPage.value = 1 })
+
 // 切换数据集时自动刷新类别输入框：跟随所选数据集的类别；
 // 数据集无类别则清空，避免把上一个数据集的类别误带到新数据集
 const syncClassesFromDataset = (dsId: string) => {
@@ -825,6 +854,15 @@ const syncClassesFromDataset = (dsId: string) => {
 const selectDataset = (ds: any) => {
   newTask.value.datasetId = ds.dataset_id
   syncClassesFromDataset(ds.dataset_id)
+  const p = dsPageOf(ds.dataset_id)
+  if (p > 0) dsPage.value = p
+}
+// 下拉框选中：下拉是全量的，选中的数据集卡片可能不在当前页，顺带跳到它所在的页
+const onDatasetSelectChange = () => {
+  const id = newTask.value.datasetId
+  syncClassesFromDataset(id)
+  const p = dsPageOf(id)
+  if (p > 0) dsPage.value = p
 }
 const classesInput = ref('')  // 默认为空，从数据集自动读取
 const classes = ref<string[]>([])
@@ -4859,6 +4897,53 @@ canvas {
   display: flex;
   justify-content: flex-end;
   margin-bottom: 0.5rem;
+}
+
+.ds-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+  font-size: 0.78rem;
+  color: #5b6770;
+}
+
+.ds-pager-info {
+  white-space: nowrap;
+}
+
+.ds-pager-nav {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.ds-pager-btn {
+  padding: 0.2rem 0.6rem;
+  font-size: 0.78rem;
+  color: #2c3e50;
+  background: #fff;
+  border: 1px solid #d0d3d8;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ds-pager-btn:hover:not(:disabled) {
+  border-color: #8e44ad;
+  color: #8e44ad;
+}
+
+.ds-pager-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 全局 select 是 width:100%，分页条里要收成内容宽度 */
+.ds-pager-size {
+  width: auto;
+  padding: 0.2rem 0.4rem;
+  font-size: 0.78rem;
 }
 
 .ds-grid {
