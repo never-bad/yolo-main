@@ -168,7 +168,7 @@
               </button>
               <button 
                 v-if="dataset.status === 'prepared'"
-                @click="exportAnnotated(dataset.dataset_id)" 
+                @click="exportAnnotated(dataset)" 
                 class="secondary"
                 :disabled="exportingDataset === dataset.dataset_id + '_annotated'"
               >
@@ -177,7 +177,7 @@
               </button>
               <button 
                 v-if="dataset.status === 'prepared'"
-                @click="exportOriginal(dataset.dataset_id)" 
+                @click="exportOriginal(dataset)" 
                 class="secondary"
                 :disabled="exportingDataset === dataset.dataset_id + '_original'"
               >
@@ -1182,12 +1182,21 @@ const deleteDatasetItem = async (datasetId: string) => {
   }
 }
 
+// 导出文件名：有业务名（dsTitle 且不等于 dataset_id）时前置业务名，否则保持原样
+const exportName = (d: any, kind: string) => {
+  const id = String(d?.dataset_id || '')
+  const title = String(dsTitle(d) || '').trim()
+  const prefix = title && title !== id ? `${title}_` : ''
+  return `${prefix}${id}_${kind}.zip`
+}
+
 // 导出标注后的数据集
-const exportAnnotated = async (datasetId: string) => {
+const exportAnnotated = async (d: any) => {
+  const datasetId = d.dataset_id
   exportingDataset.value = datasetId + '_annotated'
   try {
     const blob = await exportAnnotatedDataset(datasetId)
-    downloadFile(blob, `${datasetId}_annotated.zip`)
+    downloadFile(blob, exportName(d, 'annotated'))
     alert('导出成功!')
   } catch (error: any) {
     alert('导出失败: ' + (error.response?.data?.detail || error.message))
@@ -1197,11 +1206,12 @@ const exportAnnotated = async (datasetId: string) => {
 }
 
 // 导出标注前的数据集
-const exportOriginal = async (datasetId: string) => {
+const exportOriginal = async (d: any) => {
+  const datasetId = d.dataset_id
   exportingDataset.value = datasetId + '_original'
   try {
     const blob = await exportOriginalDataset(datasetId)
-    downloadFile(blob, `${datasetId}_original.zip`)
+    downloadFile(blob, exportName(d, 'original'))
     alert('导出成功!')
   } catch (error: any) {
     alert('导出失败: ' + (error.response?.data?.detail || error.message))

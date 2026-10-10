@@ -3802,7 +3802,11 @@ const exportReviewedPackage = async () => {
   exportingReviewed.value = true
   try {
     const blob = await exportReviewedZip(currentTask.value)
-    downloadFile(blob, `${currentTask.value}_reviewed.zip`)
+    // 文件名前置数据集业务名，方便下载后一眼认出是哪个库；查不到元数据时退化为原名
+    const meta = taskDatasetMeta.value
+    const title = meta ? String(dsTitle(meta) || '').trim() : ''
+    const prefix = title ? `${title}_` : ''
+    downloadFile(blob, `${prefix}${currentTask.value}_reviewed.zip`)
     alert(
       `已开始下载 zip：包含您修过的 ${counts.value.reviewed} 张图片。\n` +
       `解压后：images/ 是图片，labels/ 是 YOLO 标签（含分割轮廓），还有 classes.txt 和 data.yaml，可直接用于训练。`
