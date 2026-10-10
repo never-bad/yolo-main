@@ -1188,7 +1188,7 @@ class AnnotationService:
         return await asyncio.to_thread(_sync)
 
     async def export_to_yolo(self, task_id: str):
-        """导出标注为YOLO格式"""
+        """导出标注为YOLO格式；无框/未标注图片写 0 字节空标签文件（negative sample 约定）"""
         def _export_to_yolo_sync():
             try:
                 task_dir = self.annotations_dir / task_id
@@ -1229,7 +1229,8 @@ class AnnotationService:
                         if (images_dir / subdir).exists():
                             (labels_dir / subdir).mkdir(exist_ok=True)
                 
-                exported_count = 0
+                exported_with_labels = 0
+                exported_empty = 0
                 seg_boxes = 0  # 带分割轮廓的框数，用于回显「本次导出含 N 条分割标注」
                 errors = []
                 # class_id（英文名）→ YOLO 数字索引（与任务类别列表顺序一致）
@@ -1239,50 +1240,56 @@ class AnnotationService:
                 for item in task_meta["items"]:
                     try:
                         image_id = item["image_id"]
-                        if image_id not in annotations:
-                            continue
-                        
+                        ann = annotations.get(image_id) or {}
+
                         width = item["width"]
                         height = item["height"]
-                        boxes = annotations[image_id]["boxes"]
-                        
-                        if not boxes:
-                            continue
-                        
-                        # 逐框写行：有轮廓 → 分割行（只写顶点），无轮廓 → 检测行；
-                        # 同一文件里混有分割行时，无轮廓的框退化成 4 角点分割行
-                        polys = [clean_polygon(box.get("polygon")) for box in boxes]
-                        has_seg = any(polys)
-                        yolo_lines = []
-                        for box, poly in zip(boxes, polys):
-                            class_id = box["class_id"]
-                            if isinstance(class_id, int) or (isinstance(class_id, str) and class_id.isdigit()):
-                                cls_id = int(class_id)  # 旧数据数字索引直接使用
-                            else:
-                                cls_id = _cls_idx.get(str(class_id).lower(), 0)
+                        boxes = ann.get("boxes") or []
 
-                            yolo_lines.append(yolo_label_line(
-                                cls_id, (box["x1"], box["y1"], box["x2"], box["y2"]),
-                                poly, width, height, rect_as_poly=has_seg))
-                            if poly:
-                                seg_boxes += 1
-                        
-                        # 确定标签文件路径
+                        # 确定标签文件路径（有框/无框两条分支都要写文件，故提到分支之前）
                         label_path = self._determine_label_path(item, images_dir, labels_dir, image_id)
-                        
                         label_path.parent.mkdir(parents=True, exist_ok=True)
-                        
-                        # 写入标签文件
-                        _write_text(label_path, "\n".join(yolo_lines))
-                        
-                        exported_count += 1
+
+                        if boxes:
+                            # 逐框写行：有轮廓 → 分割行（只写顶点），无轮廓 → 检测行；
+                            # 同一文件里混有分割行时，无轮廓的框退化成 4 角点分割行
+                            polys = [clean_polygon(box.get("polygon")) for box in boxes]
+                            has_seg = any(polys)
+                            yolo_lines = []
+                            for box, poly in zip(boxes, polys):
+                                class_id = box["class_id"]
+                                if isinstance(class_id, int) or (isinstance(class_id, str) and class_id.isdigit()):
+                                    cls_id = int(class_id)  # 旧数据数字索引直接使用
+                                else:
+                                    cls_id = _cls_idx.get(str(class_id).lower(), 0)
+
+                                yolo_lines.append(yolo_label_line(
+                                    cls_id, (box["x1"], box["y1"], box["x2"], box["y2"]),
+                                    poly, width, height, rect_as_poly=has_seg))
+                                if poly:
+                                    seg_boxes += 1
+
+                            # 写入标签文件
+                            _write_text(label_path, "\n".join(yolo_lines))
+                            exported_with_labels += 1
+                        else:
+                            # 无框 / 未标注：写 0 字节空标签文件（YOLO negative sample 约定）
+                            _write_text(label_path, "")
+                            exported_empty += 1
                     except Exception as e:
                         error_msg = f"Error exporting annotation for image {item.get('image_id', 'unknown')}: {str(e)}"
                         print(error_msg)
                         errors.append(error_msg)
                         continue
                 
-                result = {"ok": True, "exported_count": exported_count, "segment_boxes": seg_boxes}
+                result = {
+                    "ok": True,
+                    # exported_count 保留旧键（= 有标签的图片数），向后兼容前端
+                    "exported_count": exported_with_labels,
+                    "exported_with_labels": exported_with_labels,
+                    "exported_empty": exported_empty,
+                    "segment_boxes": seg_boxes,
+                }
                 if errors:
                     result["errors"] = errors
                 return result
