@@ -111,7 +111,7 @@
               <small v-else>尚未导入自定义模型，可点「添加」上传 .pt 权重文件</small>
               <input ref="ptFile" type="file" accept=".pt" class="pt-file-input" @change="handlePtFile" />
             </div>
-            <small>当前选择: {{ trainForm.model_name }}</small>
+            <small>当前选择: {{ currentModelLabel }}</small>
           </div>
           <!-- 指定业务模型：算法库选择 + 跨代迁移入口二（§3.2.2） -->
           <div v-else class="form-group">
@@ -120,7 +120,7 @@
               <select v-model="trainForm.base_model_id" :disabled="loadingModels || training">
                 <option value="">-- 请选择模型 --</option>
                 <option v-for="model in baseModelOptions" :key="model.model_id" :value="model.model_id">
-                  {{ model.model_id }} ({{ model.classes?.length || 0 }} 类)
+                  {{ modelOptTitle(model) }}（{{ modelOptSuffix(model) }}）
                 </option>
               </select>
               <button type="button" @click="loadModels" class="refresh-btn" :disabled="loadingModels">
@@ -763,6 +763,34 @@ const crossLibraryDatasets = computed(() => {
 })
 // 可作为"继续训练的已有模型"的选项：排除算法库的空白占位记录（它没有权重文件，选了必然报错）
 const baseModelOptions = computed(() => models.value.filter((m: any) => !m.empty))
+// 下拉标题：业务名优先（display_name > name > model_id 原样保底）
+const modelOptTitle = (m: any): string => {
+  const dn = String(m?.display_name || '').trim()
+  const nm = String(m?.name || '').trim()
+  return dn || nm || String(m?.model_id || '')
+}
+// 后缀：[v{N} · ]N 类[ · 状态]；active/其它状态用日期代替状态
+const modelOptSuffix = (m: any): string => {
+  const parts: string[] = []
+  const v = String(m?.version || '').trim()
+  if (v) parts.push(v)
+  parts.push(`${m?.classes?.length || 0} 类`)
+  const st = String(m?.status || '')
+  const stTxt = st === 'production_ready' ? '生产可用'
+    : st === 'superseded' ? '已被替代'
+    : st === 'rejected' ? '未通过' : ''
+  if (stTxt) parts.push(stTxt)
+  else {
+    const d = String(m?.created_at || '').slice(0, 10)
+    if (d) parts.push(d)
+  }
+  return parts.join(' · ')
+}
+// 「当前选择」显示：能在业务模型列表里找到就显业务名，找不到保持 model_name 原样
+const currentModelLabel = computed(() => {
+  const hit = baseModelOptions.value.find((m: any) => m.model_id === trainForm.value.model_name)
+  return hit ? modelOptTitle(hit) : trainForm.value.model_name
+})
 const datasets = ref<any[]>([])
 const loadingDatasets = ref(false)
 const loadingModels = ref(false)
