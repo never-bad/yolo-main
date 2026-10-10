@@ -48,6 +48,10 @@ COPY backend/run.py /app/run.py
 # 新增训练权重：放入 backend/models/custom 后重新构建代码层镜像
 COPY backend/models /app/models
 
+# 维护脚本（migrate_to_pg / backfill_has_label 等部署后 PG 维护步骤在容器内执行）
+# 脚本依赖 Path(__file__).parent.parent 定位 /app 并 import src.*，故必须落在 /app/scripts
+COPY backend/scripts /app/scripts
+
 # 数据目录：dataset 持久化在 /app/data（compose 用命名卷挂载）；训练输出写入 /app/runs
 RUN mkdir -p /app/data /app/runs
 
