@@ -1596,7 +1596,14 @@ onActivated(() => {
 .threshold-warn.armed { border-color: #16a34a; background: #f0fdf4; color: #166534; }
 .threshold-warn-title { font-weight: 600; margin-bottom: 0.25rem; }
 .threshold-warn ul { margin: 0.2rem 0 0.4rem 1.2rem; padding: 0; }
-.threshold-ack { display: flex; align-items: center; gap: 0.4rem; cursor: pointer; font-weight: 600; }
+.threshold-ack {
+  display: flex;
+  width: fit-content; /* 批次E：同上 */
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+  font-weight: 600;
+}
 .threshold-ack input { cursor: pointer; }
 .threshold-scope {
   width: 100%;
