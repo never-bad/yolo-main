@@ -1598,7 +1598,7 @@ onActivated(() => {
 .threshold-warn ul { margin: 0.2rem 0 0.4rem 1.2rem; padding: 0; }
 .threshold-ack {
   display: flex;
-  width: fit-content; /* 批次E：同上 */
+  width: fit-content; /* 批次E：勾选框行收紧为内容宽度，点右侧空白不再误勾选 */
   align-items: center;
   gap: 0.4rem;
   cursor: pointer;
