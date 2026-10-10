@@ -15,13 +15,13 @@
 | 编号 | 分类 | 紧急 | 一句话描述 | 状态 | 关联 |
 |---|---|---|---|---|---|
 | I-01* | 功能缺陷 | 🔴 | shadow.py 等 4 个功能必需文件未入 git，clone 后跑不起来 | 待处理 | 文件说明 §5.4 |
-| S-01 | 安全 | 🔴 | 模型上传 extractall 无路径遍历防护 | 待处理 | I-02 |
-| S-02 | 安全 | 🔴 | YOLO 标签导入 extractall 无 member 校验 | 待处理 | I-02 |
-| B-05 | 功能缺陷 | 🔴 | CI/bat 引用不存在的 docker/{backend,frontend}/Dockerfile | 待处理 | 文件说明 §4 |
-| S-03 | 安全 | 🟡 | 全平台无鉴权 + CORS `*` + 20 GB 上传上限 | **待拍板** | X-04 |
-| B-02 | 功能缺陷 | 🟡 | 清除标注后 PG `has_label` 虚高（有意不回填） | **待拍板** | I-04 |
+| S-01 | 安全 | 🔴 | 模型上传 extractall 无路径遍历防护 | 已修复（d0a81fb，zip_guard 收口） | I-02 |
+| S-02 | 安全 | 🔴 | YOLO 标签导入 extractall 无 member 校验 | 已修复（ffe2c79，zip_guard 收口） | I-02 |
+| B-05 | 功能缺陷 | 🔴 | CI/bat 引用不存在的 docker/{backend,frontend}/Dockerfile | 已拍板（10-10）：删 .cnb.yml，并入批次 G | 文件说明 §4 |
+| S-03 | 安全 | 🟡 | 全平台无鉴权 + CORS `*` + 20 GB 上传上限 | 已拍板（10-10）：嵌入宿主，网关鉴权 | X-04 |
+| B-02 | 功能缺陷 | 🟡 | 清除标注后 PG `has_label` 虚高（有意不回填） | 已拍板（10-10）：接受虚高，重标覆盖 | I-04 |
 | B-03 | 功能缺陷 | 🟡 | 全量重灌会冲掉 has_label，必须二步入库流程 | 已缓解 | 改进跟踪 §2.3 |
-| B-04 | 功能缺陷 | 🟡 | weight_mappings 有表无 DAO，恒为空 | **待拍板** | I-06 |
+| B-04 | 功能缺陷 | 🟡 | weight_mappings 有表无 DAO，恒为空 | 已拍板（10-10）：删表，功能移入下版本需求 | I-06 |
 | P-01 | 性能/体验 | 🟡 | goAnnotate 用 window.location.href，整页刷新丢 SPA 状态 | 待处理 | — |
 | P-02 | 性能 | 🟡 | 超大 task.json（13k+ items）预标注 O(N²) 重复全量读 | 需验证 | — |
 | D-01 | 文档漂移 | 🟡 | 平台细节说明 §2.4「无多边形」已过期（polygon 已实现） | 待处理 | I-12 |
@@ -55,40 +55,36 @@
 - **处置**：`git add` 上述 4 文件并提交。**这是四份文档所述一切工作的交付前提**。
 - 详见《项目文件功能说明》§5.4。
 
-### S-01　模型上传解压无路径遍历防护 —— 安全
+### S-01　模型上传解压无路径遍历防护 —— 安全（已修复 ✅）
 
-- **位置**：[model_service.py](file:///c:/Users/41653/Desktop/yolo-main/yolo-main/backend/src/services/model_service.py) L1516-L1540：`zip_file.testzip()` 后直接 `extractall(temp_path)`。
-- **风险**：恶意 zip 成员名含 `../../` 或绝对路径时可写出目标目录之外。
-- **对照**：`dataset_service._extract_zip`（L119）**有**防护（`member_path.is_absolute() or '..' in str(...)` 跳过 + `_ensure_long_path`），两处标准不一致。
-- **处置**：复用 dataset_service 的 member 校验写法（改进项 I-02）。上传源若全部可信可降为 🟡，但嵌入他人平台后上传方不可控，按 🔴 处理。
+- **原位置**：model_service 上传解压处（原 L1516-1540）。
+- **修复**：`d0a81fb fix(S-01)` 引入 `backend/src/utils/zip_guard.py`（路径遍历 + 解压炸弹双防护，`MAX_UNCOMPRESSED_BYTES` 默认 50 GB / `MAX_RATIO` 100，可用环境变量覆盖），model_service 现调用 `zip_guard.guarded_extractall(zip_file, temp_path, strict=True)`。
+- 2026-10-10 复核确认在当前分支祖先链上，三处解压入口（dataset/model/annotation）统一收口。
 
-### S-02　YOLO 标签导入解压无 member 校验 —— 安全
+### S-02　YOLO 标签导入解压无 member 校验 —— 安全（已修复 ✅）
 
-- **位置**：[annotation_service.py](file:///c:/Users/41653/Desktop/yolo-main/yolo-main/backend/src/services/annotation_service.py) L1461：`zf.extractall(tmp_dir)`，无任何成员名校验。
-- **风险 / 处置**：同 S-01，一并修（I-02）。
+- **修复**：`ffe2c79 fix(S-02)`，annotation_service 现调用 `zip_guard.guarded_extractall(zf, tmp_dir, strict=True)`，与 S-01 同一收口模块。
 
-### B-05　CI 与构建脚本引用不存在的 Dockerfile —— 功能缺陷
+### B-05　CI 与构建脚本引用不存在的 Dockerfile —— 功能缺陷（已拍板 ✅ 2026-10-10）
 
-- **现象**：`.cnb.yml` L11/L19 引用 `docker/backend/Dockerfile`、`docker/frontend/Dockerfile`；`build-unified.bat` 同样引用。这两个目录实际为**空**。
-- **影响**：CNB 流水线一旦触发必失败。现行有效路径是 `docker/Dockerfile` + `docker/Dockerfile.env`（见 `docker/build_push.sh` 头部注释）。
-- **处置**：`.cnb.yml` 改指向新路径，或整份停用；`build-unified.bat` 删除、统一用 `build_push.sh`（《项目文件功能说明》§5.3）。
-- **进展（09-30 核对）**：`build-unified.bat` 与 `docker/{backend,frontend}` 空目录已删除；**`.cnb.yml` 仍引用旧路径，待改**。
+- **现象**：`.cnb.yml` 三阶段流水线属分层镜像改造前旧架构：前两阶段用 `docker/Dockerfile`（统一镜像）重复构建 backend/frontend 两个 tag，第三阶段动态生成已废弃的 `Dockerfile.unified`；`build-unified.bat` 已先行删除。
+- **拍板结论**：**删除 `.cnb.yml` 整份**（实际部署一直是本地 `build_push.sh --app-only` + 服务器 `deploy.sh`，CI 从未启用）。并入批次 G（G-1）执行。
 
 ---
 
 ## 3. 🟡 中
 
-### S-03　无鉴权 + CORS 全开 —— 安全（待拍板）
+### S-03　无鉴权 + CORS 全开 —— 安全（已拍板 ✅ 2026-10-10）
 
 - **现状**：后端所有端点无 token/session 校验；`main.py` CORS `allow_origins=["*"]`；nginx `client_max_body_size 20480m`。
-- **判断**：若平台**嵌入他人平台**（既定方向），鉴权与来源限制应由宿主网关承担，当前实现可接受；若**独立公网部署**则必须补。
-- **待拍板**：确认部署形态后再决定加 API 前缀鉴权中间件还是维持现状（黑名单 X-04 当前禁止自建用户体系）。
+- **拍板结论**：**确认嵌入宿主平台**。鉴权与来源限制由宿主网关承担（黑名单 X-04 禁止自建用户体系），本平台不加鉴权中间件，S-03 关闭。
+- **残留约束**：部署文档须写死前提——`:8000`/`:3000` 不得直接暴露公网，必须经宿主网关（待并入部署评估文档的部署前提节）。
 
-### B-02　清除标注不回填 PG，`has_label` 虚高 —— 功能缺陷（待拍板）
+### B-02　清除标注不回填 PG，`has_label` 虚高 —— 功能缺陷（已拍板 ✅ 2026-10-10）
 
 - **现象**：`clear_ai_annotations`（L1013）与 `clear_all_annotations`（L1054）的 docstring 明写"不回填 PG 影子库（一图一 JSON 才是唯一权威）"。清标后 JSON 真值已空，但 PG `task_items.has_label` 仍为 true，按 PG 查询的计数/筛选会偏大。
-- **两个选项**：A 接受虚高（真值唯一原则，PG 只做加速）；B 在 `shadow.py` 加反向 `mark_items_unlabeled` 并接线（需处理"清标后重标"的顺序覆盖）。
-- 关联改进项 I-04。
+- **拍板结论**：**接受虚高（A 方案）**。清标不动 PG；重新标注保存时由既有写通链路覆盖对齐——`save_annotation`（annotation_service L1018-1023）每次保存按当前框数调 `meta_store.update_task_item_has_label(..., bool(norm_boxes))`，有框写 true、0 框写 false，天然实现"标注完覆盖 PG 原记录"，无需新增反向回填链路。
+- 关联改进项 I-04 随之关闭。
 
 ### B-03　全量重灌冲掉 `has_label` —— 功能缺陷（流程风险，已缓解）
 
@@ -96,10 +92,11 @@
 - **缓解**：`migrate_to_pg.py` 文档头已写警告；部署流程固定第二步跑 `backfill_has_label.py`；回归 T4 用例（合成任务 + `with_items=True` 反向对照）守住收口层不再误用。
 - **残留风险**：人工只跑重灌忘了回填 → 列表页"有标注"筛选失效。处置：把二步并入 `deploy.sh`（I-05）。
 
-### B-04　`weight_mappings` 有表无 DAO —— 功能缺陷（待拍板）
+### B-04　`weight_mappings` 有表无 DAO —— 功能缺陷（已拍板 ✅ 2026-10-10）
 
-- **现状**：`db/models.py` L150 定义了表，`meta_store` 无对应读写函数，`shadow.py` 无接线，`migrate_to_pg.py` 不灌它 → 恒为空。
-- **待拍板**：A 留给外部平台的接口位（补一行注释说明用途）；B 漏实现（补 DAO）；C 删表。关联 I-06。
+- **现状**：`db/models.py` L150 定义了表，`meta_store` 无对应读写函数，`shadow.py` 无接线，`migrate_to_pg.py` 不灌它 → 恒为空。实际跨代迁移由 ultralytics `strict=False` 自动匹配承担（train_service L1107 注释），从未用到过该表。
+- **拍板结论**：**选 C 删表**——跨代映射功能暂缓，已移入下版本需求。全仓引用仅 2 处：`db/models.py` L150-162 的 `WeightMappingRecord` 类定义（删除）+ `train_service.py` L1107 注释中"weight_mappings 溯源"字样（改写）；PG 侧对空表执行 `DROP TABLE IF EXISTS weight_mappings`。并入批次 G 执行。
+- 关联改进项 I-06 随之关闭。
 
 ### P-01　`goAnnotate` 整页刷新 —— 性能/体验
 
@@ -178,6 +175,6 @@
 
 处理原则（与《功能实现与改进点跟踪》§3 黑名单一致）：
 1. 🔴 全部属于"补防护 / 入 git / 修脚本引用"，**不需要新框架**，当前阶段就该做；
-2. 待拍板三项（S-03、B-02、B-04）**未决策前不动代码**；
+2. ~~待拍板三项（S-03、B-02、B-04）**未决策前不动代码**~~ → **已于 10-10 全部拍板**：S-03 嵌入宿主/网关鉴权（关闭）；B-02 接受虚高+重标覆盖（关闭）；B-04 删表、功能移入下版本需求（并入批次 G）；
 3. 🟢 项攒批处理，修一个带一个，不单独排期；
 4. 任何修复必须附回归脚本且**保留脚本**（§5 的 test_* 是资产不是垃圾）。
