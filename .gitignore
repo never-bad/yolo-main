@@ -18,6 +18,8 @@ backend/_repro_out.txt
 backend/*_install_log.txt
 backend/runs/
 _tmp/
+# publish.sh 服务器连接配置（含 IP/用户名，勿提交）
+docker/.deploy.env
 
 # ============ GitHub 发布排除（2026-08-23） ============
 # 本地 Python 虚拟环境
