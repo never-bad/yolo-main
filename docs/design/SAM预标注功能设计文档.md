@@ -356,9 +356,8 @@ GET /sam/download/status
 ### 5.1 API 封装（`frontend/src/api/annotations.ts`）
 
 ```ts
-export interface AIBox extends BBox { score?: number }
-
-export const getSamAvailable = () => api.get('/sam/available')
+// AIBox / getSamAvailable / uploadSamModel：前端未提供封装层（2026-10 批次 K-启动清理：删除 3 个死导出 getSamAvailable / uploadSamModel / AIBox，全仓零引用）
+// 设计语义保留：AIBox = BBox + 可选 score（模型置信度）；GET /sam/available 探测后端 SAM 引擎可用性；POST /sam/models 上传 SAM 权重
 export const downloadSamModel = () => api.post('/sam/download/start')
 export const getDownloadProgress = () => api.get('/sam/download/status')
 export const autoLabelImage = (taskId, imageId, classes, conf, prompts?, useSam?, onlyUnannotated?) =>

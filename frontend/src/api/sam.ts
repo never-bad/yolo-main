@@ -1,16 +1,6 @@
 import api from './axios'
-import type { BBox } from './annotations'
 
 // ===== SAM 大模型预标注 =====
-export interface AIBox extends BBox {
-  score?: number
-}
-
-export const getSamAvailable = async () => {
-  const { data } = await api.get('/sam/available')
-  return data
-}
-
 export const getSamConfig = async () => {
   const { data } = await api.get('/sam/config')
   return data
@@ -29,13 +19,6 @@ export const getSamModels = async () => {
 // 「本库已训模型」预标注引擎可选的版本（优先返回当前标注任务所属算法库训练出的版本）
 export const getSamTrainedVersions = async (taskId?: string) => {
   const { data } = await api.get('/sam/trained-versions', { params: taskId ? { task_id: taskId } : {} })
-  return data
-}
-
-export const uploadSamModel = async (file: File) => {
-  const form = new FormData()
-  form.append('file', file)
-  const { data } = await api.post('/sam/models', form)
   return data
 }
 
