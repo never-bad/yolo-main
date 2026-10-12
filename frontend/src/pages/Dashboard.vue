@@ -221,8 +221,9 @@
 import { ref, computed, onMounted, onActivated } from 'vue'
 import { useRouter } from 'vue-router'
 import { listModels, updateModel, exportModel } from '@/api/models'
-import { deleteModelWithGuard } from '@/composables/useDialog'
+import { deleteModelWithGuard, showConfirm } from '@/composables/useDialog'
 import { listDatasets } from '@/api/datasets'
+import { showToast } from '@/utils/toast'
 import LibraryCreateModal from '@/components/LibraryCreateModal.vue'
 
 const router = useRouter()
@@ -401,7 +402,7 @@ async function exportModelItem(m: any) {
     const blob = await exportModel(m.model_id)
     downloadBlob(blob, `${m.model_code || m.model_id}.zip`)
   } catch (e: any) {
-    alert(e?.response?.data?.detail || '导出失败')
+    if (!e?.__toastShown) showToast(e?.response?.data?.detail || '导出失败', 'error', 4000)
   } finally {
     exporting.value = false
     menuId.value = null
@@ -409,7 +410,7 @@ async function exportModelItem(m: any) {
 }
 async function deleteModelItem(m: any) {
   const name = m.display_name || m.name || m.model_id
-  if (!confirm(`确认删除算法库「${name}」？该操作不可恢复。`)) return
+  if (!(await showConfirm(`确认删除算法库「${name}」？该操作不可恢复。`))) return
   deleting.value = true
   try {
     // P2-5：挂接非空时后端不删，守卫流程弹清单让用户选「转移归属 / 保留未归属」
@@ -417,7 +418,7 @@ async function deleteModelItem(m: any) {
     menuId.value = null
     await load()
   } catch (e: any) {
-    alert(e?.response?.data?.detail || '删除失败')
+    if (!e?.__toastShown) showToast(e?.response?.data?.detail || '删除失败', 'error', 4000)
   } finally {
     deleting.value = false
   }
@@ -443,7 +444,7 @@ function toggleCompare(id: string) {
   } else if (compareIds.value.length < 3) {
     compareIds.value.push(id)
   } else {
-    alert('最多同时对比 3 个算法库')
+    showToast('最多同时对比 3 个算法库', 'info', 4000)
   }
 }
 const compareModels = computed(() => compareIds.value.map((id) => models.value.find((m) => m.model_id === id)).filter(Boolean))

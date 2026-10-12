@@ -570,7 +570,8 @@ import {
   uploadDataset, prepareDataset
 } from '@/api/datasets'
 import { listTrainJobs } from '@/api/train'
-import { deleteModelWithGuard } from '@/composables/useDialog'
+import { deleteModelWithGuard, showConfirm } from '@/composables/useDialog'
+import { showToast } from '@/utils/toast'
 
 const route = useRoute()
 const modelId = String(route.params.modelId)
@@ -793,16 +794,16 @@ async function doImportDataset() {
       dsImportOpen.value = false
       dsImportFile.value = null
       await refresh()
-      alert(`导入成功：数据集已归属算法库「${libName}」并完成准备`)
+      showToast(`导入成功：数据集已归属算法库「${libName}」并完成准备`, 'info', 4000)
     } catch (e: any) {
       // 上传成功但准备失败：数据集已入库，刷新后可在列表里重试准备
       await refresh()
-      alert('上传成功，但自动准备失败：' + (e?.response?.data?.detail || e?.message) + '\n数据集已保留在列表中，可稍后重新准备。')
+      if (!e?.__toastShown) showToast('上传成功，但自动准备失败：' + (e?.response?.data?.detail || e?.message) + '\n数据集已保留在列表中，可稍后重新准备。', 'error', 4000)
     } finally {
       dsPreparing.value = false
     }
   } catch (e: any) {
-    alert('导入失败：' + (e?.response?.data?.detail || e?.message))
+    if (!e?.__toastShown) showToast('导入失败：' + (e?.response?.data?.detail || e?.message), 'error', 4000)
   } finally {
     dsImporting.value = false
   }
@@ -832,13 +833,13 @@ async function sealAction(d: any) {
   const cnt = Number(d.label_count || 0)
   const within = sealMinImages.value > 0 && cnt >= sealMinImages.value
   const msg = `数据集 ${d.dataset_id} 共 ${cnt} 张标注，${within ? '达到封板门槛，确认封板？' : `未达到封板门槛（${sealMinImages.value} 张），确认强制封板？`}`
-  if (!confirm(msg)) return
+  if (!(await showConfirm(msg))) return
   try {
     await sealDataset(d.dataset_id, !within)
-    alert('已封板：数据集将作为该模型的训练数据（只读）。')
+    showToast('已封板：数据集将作为该模型的训练数据（只读）。', 'info', 4000)
     await refresh()
   } catch (e: any) {
-    alert('封板失败：' + (e?.response?.data?.detail || e?.message))
+    if (!e?.__toastShown) showToast('封板失败：' + (e?.response?.data?.detail || e?.message), 'error', 4000)
   }
 }
 
@@ -864,12 +865,12 @@ async function bindCurrent(d: any) {
   } else if (check && (check.warnings || []).length) {
     msg = `${base}\n\n${check.summary}`
   }
-  if (!confirm(msg)) return
+  if (!(await showConfirm(msg))) return
   try {
     await bindDatasetModel(d.dataset_id, modelId, force)
     await refresh()
   } catch (e: any) {
-    alert('挂载失败：' + (e?.response?.data?.detail || e?.message))
+    if (!e?.__toastShown) showToast('挂载失败：' + (e?.response?.data?.detail || e?.message), 'error', 4000)
   }
 }
 
@@ -878,34 +879,34 @@ async function revalidate(d: ModelDataset) {
     const res = await validateDataset(d.dataset_id)
     const ok = res?.status === 'ok'
     if (ok) {
-      alert(`校验通过：${res.checked_files} 个标注文件 / ${res.lines_checked} 行标注均符合 YOLO 格式`)
+      showToast(`校验通过：${res.checked_files} 个标注文件 / ${res.lines_checked} 行标注均符合 YOLO 格式`, 'info', 4000)
     } else {
       const errs = (res?.errors || []).slice(0, 5).join('\n')
-      alert(`校验未通过：${res.invalid_lines} 行异常（${res.invalid_files} 个文件）\n示例：\n${errs || '(无详情)'}`)
+      showToast(`校验未通过：${res.invalid_lines} 行异常（${res.invalid_files} 个文件）\n示例：\n${errs || '(无详情)'}`, 'info', 4000)
     }
     await refresh()
   } catch (e: any) {
-    alert('校验失败：' + (e?.response?.data?.detail || e?.message || '未知错误'))
+    if (!e?.__toastShown) showToast('校验失败：' + (e?.response?.data?.detail || e?.message || '未知错误'), 'error', 4000)
   }
 }
 
 async function unbind(d: ModelDataset) {
-  if (!confirm(`解绑数据集 ${d.dataset_id}？它将不再归属当前算法库。`)) return
+  if (!(await showConfirm(`解绑数据集 ${d.dataset_id}？它将不再归属当前算法库。`))) return
   try {
     await bindDatasetModel(d.dataset_id, null)
     await refresh()
   } catch (e: any) {
-    alert('解绑失败：' + (e?.response?.data?.detail || e?.message))
+    if (!e?.__toastShown) showToast('解绑失败：' + (e?.response?.data?.detail || e?.message), 'error', 4000)
   }
 }
 
 async function removeDs(d: ModelDataset) {
-  if (!confirm(`删除数据集 ${d.dataset_id}？此操作不可恢复！`)) return
+  if (!(await showConfirm(`删除数据集 ${d.dataset_id}？此操作不可恢复！`))) return
   try {
     await deleteDataset(d.dataset_id)
     await refresh()
   } catch (e: any) {
-    alert('删除失败：' + (e?.response?.data?.detail || e?.message))
+    if (!e?.__toastShown) showToast('删除失败：' + (e?.response?.data?.detail || e?.message), 'error', 4000)
   }
 }
 
@@ -974,13 +975,13 @@ const publishingId = ref<string | null>(null)
 async function doPublish(v: any) {
   const cur = versions.value.find((x: any) => x.status === 'production_ready' && x.publish_status === 'published')
   const extra = cur ? `当前使用中版本为 ${verTitle(cur)}，发布后它将变为「已换代」。` : ''
-  if (!confirm(`确认将 ${verTitle(v)} 发布为使用中版本？${extra}`)) return
+  if (!(await showConfirm(`确认将 ${verTitle(v)} 发布为使用中版本？${extra}`))) return
   publishingId.value = v.model_id
   try {
     await confirmPublish(v.model_id)
     await refresh()
   } catch (e: any) {
-    alert('发布失败：' + (e?.response?.data?.detail || e?.message))
+    if (!e?.__toastShown) showToast('发布失败：' + (e?.response?.data?.detail || e?.message), 'error', 4000)
   } finally {
     publishingId.value = null
   }
@@ -1126,7 +1127,7 @@ async function previewLabelSync() {
 async function runLabelSync() {
   if (labelSyncing.value || !hasLabelDiff.value) return
   const n = labelSyncInfo.value?.stats?.boxes_changed || 0
-  if (!confirm(`将改写本库已标注数据中 ${n} 处文案（中文名/描述），类别号不动。\n原文件会自动备份，可一键回退。确认同步？`)) return
+  if (!(await showConfirm(`将改写本库已标注数据中 ${n} 处文案（中文名/描述），类别号不动。\n原文件会自动备份，可一键回退。确认同步？`))) return
   labelSyncing.value = true
   labelsMsg.value = ''
   try {
@@ -1143,7 +1144,7 @@ async function runLabelSync() {
 async function rollbackLabelSyncAction() {
   if (labelSyncing.value) return
   const id = labelSyncInfo.value?.last_backup?.backup_id || ''
-  if (!confirm(`回退到上次同步之前？将用备份覆盖 ${labelSyncInfo.value?.last_backup?.files || 0} 个标注文件（备份号 ${id}）。`)) return
+  if (!(await showConfirm(`回退到上次同步之前？将用备份覆盖 ${labelSyncInfo.value?.last_backup?.files || 0} 个标注文件（备份号 ${id}）。`))) return
   labelSyncing.value = true
   labelsMsg.value = ''
   try {
@@ -1189,14 +1190,16 @@ async function handleImportModel(e: any) {
       }
     }
     // 归库没成就是要如实说，否则用户会在库里找不到模型、以为导入丢了
-    alert(
+    showToast(
       bound
         ? '导入成功：' + name + '（已归入本算法库）'
-        : '导入成功：' + name + '，但归入本算法库未生效，请到模型管理页手动归库（后端需重启以启用上传即归库）'
+        : '导入成功：' + name + '，但归入本算法库未生效，请到模型管理页手动归库（后端需重启以启用上传即归库）',
+      'info',
+      4000
     )
     await refresh()
   } catch (err: any) {
-    alert('导入失败：' + (err?.response?.data?.detail || err?.message))
+    if (!err?.__toastShown) showToast('导入失败：' + (err?.response?.data?.detail || err?.message), 'error', 4000)
   } finally {
     e.target.value = ''
   }
@@ -1231,7 +1234,7 @@ async function downloadVersionWeights(v: any) {
     const blob = await exportModel(v.model_id)
     saveBlob(blob, exportZipName(v))
   } catch (e: any) {
-    alert('下载失败：' + (e?.response?.data?.detail || e?.message))
+    if (!e?.__toastShown) showToast('下载失败：' + (e?.response?.data?.detail || e?.message), 'error', 4000)
   } finally {
     downloadingVer.value = null
   }
@@ -1243,7 +1246,7 @@ async function downloadCharts() {
     const blob = await generateTrainingCharts(modelId, 'all')
     window.open(URL.createObjectURL(blob), '_blank')
   } catch (e: any) {
-    alert('图表生成失败（可能该模型尚无训练结果）：' + (e?.response?.data?.detail || e?.message))
+    if (!e?.__toastShown) showToast('图表生成失败（可能该模型尚无训练结果）：' + (e?.response?.data?.detail || e?.message), 'error', 4000)
   } finally {
     charting.value = false
   }
@@ -1294,16 +1297,16 @@ function saveName() {
 
 const deleting = ref(false)
 async function removeModel() {
-  if (!confirm('确定删除该算法库及其全部模型版本与权重文件？此操作不可恢复！')) return
+  if (!(await showConfirm('确定删除该算法库及其全部模型版本与权重文件？此操作不可恢复！'))) return
   deleting.value = true
   try {
     // P2-5：挂接非空时后端不删，守卫流程弹清单让用户选「转移归属 / 保留未归属」
     const name = model.value?.display_name || model.value?.name || modelId
     if (await deleteModelWithGuard(modelId, name) !== 'deleted') return
-    alert('算法库已删除')
+    showToast('算法库已删除', 'success')
     window.location.href = '/'
   } catch (e: any) {
-    alert('删除失败：' + (e?.response?.data?.detail || e?.message))
+    if (!e?.__toastShown) showToast('删除失败：' + (e?.response?.data?.detail || e?.message), 'error', 4000)
   } finally {
     deleting.value = false
   }

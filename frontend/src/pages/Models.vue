@@ -542,6 +542,7 @@ import { ref, onMounted, onActivated, computed } from 'vue'
 import { listModels, getModel, updateModel, uploadModel, exportModel, generateTrainingCharts, findSimilarModels, mergeModels, getMergeLogs, rollbackMerge, listPendingPublish, confirmPublish, listLibraries, type ModelDetails } from '@/api/models'
 import { downloadFile } from '@/utils/download'
 import { showAlert, showConfirm, showPrompt, deleteModelWithGuard } from '@/composables/useDialog'
+import { showToast } from '@/utils/toast'
 import LibraryCreateModal from '@/components/LibraryCreateModal.vue'
 import VChart from 'vue-echarts'
 import { use } from 'echarts/core'
@@ -696,7 +697,7 @@ const loadModels = async (silent = false) => {
     // 仅当列表里确有已归库模型时，才取库名回显下拉选中项（否则不发这次请求）
     if (models.value.some((m: any) => modelLibId(m))) ensureLibraries()
   } catch (error: any) {
-    alert('加载模型失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('加载模型失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     loadingModels.value = false
   }
@@ -749,7 +750,7 @@ const assignLibrary = async (model: any, libId: string) => {
       delete model.library_root_id
     }
   } catch (e: any) {
-    alert('归库失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('归库失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
     await loadModels()
   } finally {
     assigningLibId.value = null
@@ -809,7 +810,7 @@ const confirmPublishItem = async (m: any) => {
     await loadPendingPublish()
     await loadModels()
   } catch (e: any) {
-    alert('确认发布失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('确认发布失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   } finally {
     publishingModel.value = null
   }
@@ -1663,7 +1664,7 @@ const renameModelItem = async (model: any) => {
     // 与「归库」一致：成功就静默更新本地行（名称列会立刻变），失败才弹窗并重载
     model.display_name = name
   } catch (e: any) {
-    alert('重命名失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('重命名失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
     await loadModels()
   } finally {
     renamingModel.value = null
@@ -1678,10 +1679,10 @@ const deleteModelItem = async (modelId: string) => {
     // P2-5：挂接非空时后端不删，守卫流程弹清单让用户选「转移归属 / 保留未归属」
     const m = models.value.find((x: any) => x.model_id === modelId)
     if (await deleteModelWithGuard(modelId, m?.display_name || m?.name || modelId) !== 'deleted') return
-    alert('删除成功!')
+    showToast('删除成功!', 'success')
     loadModels()
   } catch (error: any) {
-    alert('删除失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('删除失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     deletingModel.value = null
   }
@@ -1731,7 +1732,7 @@ const uploadModelFile = async () => {
     // 重新加载模型列表
     loadModels()
   } catch (error: any) {
-    alert('上传失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('上传失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     uploadingModel.value = false
   }
@@ -1757,7 +1758,7 @@ const exportModelFile = async (modelId: string) => {
     const blob = await exportModel(modelId)
     downloadFile(blob, `${modelId}.zip`)
   } catch (error: any) {
-    alert('导出失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('导出失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     exportingModel.value = null
   }
@@ -1791,10 +1792,10 @@ const runSimilarScan = async () => {
     simPairs.value = (res.pairs || []).map((p: any) => ({ ...p, checked: false }))
     simScanned.value = true
     if (simPairs.value.length) {
-      alert(`发现 ${simPairs.value.length} 组相似模型对，请勾选（默认按推荐主模型吸收）后点击合并。`)
+      showToast(`发现 ${simPairs.value.length} 组相似模型对，请勾选（默认按推荐主模型吸收）后点击合并。`, 'info', 4000)
     }
   } catch (e: any) {
-    alert('扫描失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('扫描失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   } finally {
     simScanning.value = false
   }
@@ -1821,12 +1822,12 @@ const confirmMergeSelected = async () => {
       totalDs += res.datasets_rebound || 0
       totalCls += res.classes_added_count || 0
     }
-    alert(`合并完成：${selected.length} 组，共并入 ${totalCls} 个类别、重归属 ${totalDs} 个数据集。\n可在「合并日志」中查看记录或回滚。`)
+    showToast(`合并完成：${selected.length} 组，共并入 ${totalCls} 个类别、重归属 ${totalDs} 个数据集。\n可在「合并日志」中查看记录或回滚。`, 'info', 4000)
     simPairs.value = []
     simScanned.value = false
     loadModels()
   } catch (e: any) {
-    alert('合并失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('合并失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   } finally {
     mergingSim.value = false
   }
@@ -1844,7 +1845,7 @@ const loadMergeLogs = async () => {
     const res = await getMergeLogs(20)
     mergeLogs.value = res.logs || []
   } catch (e: any) {
-    alert('加载合并日志失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('加载合并日志失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   } finally {
     loadingMergeLogs.value = false
   }
@@ -1862,11 +1863,11 @@ const doRollbackMerge = async (logIndex: number) => {
   rollingBackMerge.value = true
   try {
     const res = await rollbackMerge(logIndex)
-    alert(`回滚完成：还原 ${res.restored_datasets?.length || 0} 个数据集、撤销 ${res.unmarked_models?.length || 0} 个模型标记。`)
+    showToast(`回滚完成：还原 ${res.restored_datasets?.length || 0} 个数据集、撤销 ${res.unmarked_models?.length || 0} 个模型标记。`, 'info', 4000)
     closeMergeLogs()
     loadModels()
   } catch (e: any) {
-    alert('回滚失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('回滚失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   } finally {
     rollingBackMerge.value = false
   }
