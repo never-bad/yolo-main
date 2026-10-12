@@ -32,7 +32,7 @@
 | D-05 | 文档漂移 | 🟢 | 平台细节说明「满 1500 封板」≠ 代码 `SEAL_MIN_IMAGES=5000`；**09-30 复审：代码注释亦有 4 处过期写 1500**（dataset_service L2601/L2828/L2928 + main.py L18 docstring，后者还漏列 GPU 熔断任务） | 已解决（10-06 905a535：后端注释改引用 settings.SEAL_MIN_IMAGES，全后端零 1500） | I-12 |
 | D-06 | 文档漂移 | 🟢 | 文档称状态"一套口径"，实际 `USE_UNIFIED_STATUS=False` | 已解决（10-06 905a535：平台细节说明 L54 声明口径现状；读侧切换仍待 I-03 拍板） | I-03 |
 | P-03 | 健壮性 | 🟢 | 损坏 zip（如 1.15 MB 的 person.zip）可入库，训练时才炸 | 待处理 | — |
-| P-04 | 体验 | 🟢 | axios 无统一错误拦截，各调用点各自 try/catch | 待处理 | I-08 |
+| P-04 | 体验 | 🟢 | axios 无统一错误拦截，各调用点各自 try/catch | 已解决（10-11 批次 J：全局 toast + axios 拦截器 + unhandledrejection 兜底 + 143 alert/11 confirm 全量迁移） | I-08 |
 | B-06 | 死代码 | 🟢 | components/Logs/* 预留未接入任何页面 | 已解决（10-10 批次 I：删除未接入的预留组件） | I-07 |
 | B-07 | 风险约定 | 🟢 | models.py 通配路由 `/{model_id}` 顺序陷阱（新增路由易被吞） | 已解决（10-06 905a535：routes/models.py 通配路由前加顺序警示注释） | 页面关联 §6 |
 | B-09 | 功能缺陷 | 🔴 | 封板 data.yaml 写死源目录绝对 path，改名/删源/换机器后训练报 images not found，需手动改 yaml | 已修复（10-06 b365934） | 安全升级文档 |
@@ -149,7 +149,7 @@
 | D-05 | 文档 | 平台细节说明多处「满 1500 自动封板」，实际 `SEAL_MIN_IMAGES=5000`（README 为 5000；09-30 复审发现代码注释另有 4 处过期写 1500：dataset_service L2601/L2828/L2928 + main.py L18） | 改文档 + 注释改为引用 `settings.SEAL_MIN_IMAGES`，随 I-12 一起做 → ✅ **结案（2026-10-10 复核）**：`905a535` 已修。`git grep -n "1500" -- backend/src/**/*.py` **零命中（exit 1）**；注释已改引用配置项（实测 `main.py` L20 lifespan docstring 写「满 `settings.SEAL_MIN_IMAGES` 自动封板」，`dataset_service.py` L2722/L2727/L2896/L2954 同口径，原行号随代码演进漂移到 2722+/2954+）；`平台细节说明.md` L38/L132/L135/L272/L291 五处均写「默认 5000」。⚠️ 该说明文件未入 git，见下方风险登记行。I-12 关闭 |
 | D-06 | 文档 | 文档称前后端状态"一套口径"，实际 `USE_UNIFIED_STATUS=False`，读侧仍走旧列 | 等 I-03 灰度决策后一并修订 → ✅ **结案（2026-10-10 复核，文档侧）**：`905a535` 已在 `平台细节说明.md` **L54** 声明「状态口径现状（D-06）：影子库已建 `unified_status` 统一列，但 `USE_UNIFIED_STATUS=False`——**读侧仍走旧列**（stage/status/training_status 多套），统一状态机仅影子库写入侧生效，灰度切换待 I-03 决策」。文档不再谎称"一套口径"，本项关闭；**代码侧灰度切换仍开放，归 I-03 需用户拍板** |
 | P-03 | 健壮性 | 损坏/超小 zip（教训：1.15 MB 的 person.zip）上传即入库，训练阶段才暴露无效图片 | 上传/prepare 时加"可解码抽样 + 包体大小下限"校验 |
-| P-04 | 体验 | `axios.ts` 无响应拦截器，错误处理散落在 6 个页面各自 try/catch + alert | 加统一拦截 + toast（I-08） |
+| P-04 | 体验 | `axios.ts` 无响应拦截器，错误处理散落在 6 个页面各自 try/catch + alert | 加统一拦截 + toast（I-08）→ ✅ **已解决（2026-10-11 批次 J）**：① `api/axios.ts` 加响应拦截器（`d8e3dac`）——网络异常/超时（无 `err.response`）与 5xx 统一弹全局 toast 并打 `err.__toastShown = true`，**只标记不吞错**，仍原样 `Promise.reject(err)` 交由各页 catch；`baseURL`/`timeout` 未动。4xx（含 404）不在拦截器分支，仍由各页自行提示，避免与既有 catch 重复弹两次。② 新建 `utils/toast.ts`（纯 DOM 单实例懒挂载、`success/error/info` 三态、可配时长、连续提示复用同一 timer），`style.css` 追加 `.app-toast`（`z-index:10000`、`white-space:pre-line`、配色逐值沿用原 `.delete-toast`），**未引入任何 UI 组件库**（守红线 X-02）。③ `main.ts` 加 `unhandledrejection` 兜底（漏 catch 的 axios 错误弹 5000ms toast，已有 `__toastShown` 则跳过）；原 `window.alert` 全局替换逻辑（L11-13）**未动**。④ 6 个页面 143 处 alert + 11 处原生 confirm 全量迁移（`83ccb89`/`4498e45`/`0a85f09`）：Dashboard 3+1、Models 15+0、ModelDetail 18+8、DatasetUpload 28+0、Train 23+0、DatasetAnnotate 56+2。实测 `git grep -rn "alert(" frontend/src/pages/` **零命中**、原生 `confirm(` **零命中**。→ I-08 关闭。<br>**机制更正说明**：`window.alert` 早已在本批次之前被 `composables/useDialog.ts` 的 `showAlert` 全局替换为**居中模态弹框**（`main.ts` L11-13），P-04 原始描述「各自 try/catch + alert」中的 alert 实为该弹框、**非浏览器原生 alert**——所以本项的真实痛点是「阻塞式弹框 + 错误处理散落」，而非原生弹窗被 iframe 拦截。<br>**三套提示机制收敛结果**：① `window.alert` 全局替换成的 useDialog 弹框 → 保留 `showAlert`/`showConfirm`/`showPrompt` 能力，但替换逻辑**仅保留给历史路径**（本批次后 pages 目录已无 `alert(` 调用点）；② DatasetAnnotate 页内自绘的本地 toast（`toastMsg`/`toastType`/`toastTimer`/`showToast`/`.delete-toast`）→ **删除并收敛到全局 `utils/toast.ts`**，签名一致故 36 处既有调用点零改动；③ 原生 `confirm(` → **全部改 `await showConfirm`，清零**。至此提示机制统一为「轻提示用全局 toast、需确认用 showConfirm」两套 |
 | B-06 | 死代码 | ~~`components/Logs/LogPanel.vue`、`LogToolbar.vue` 不被任何页面引用（Train 自绘日志区）~~ | 接入或删除（I-07）→ ✅ **已解决（2026-10-10 批次 I：删除未接入的预留组件）**：选择「删除」而非「接入」——Train 页自绘日志区已稳定运行且直连 `useLogStore`（实测 `Train.vue` L517 import、L520 取 store、L1285/L1404 `clearLogs`、L1458 `setStreaming`、L1465/L1486 `addLog`、L1911 `setStreaming(false)`），替换成预留件属无收益重构。删除前复核引用面：`git grep -n "LogPanel\|LogToolbar\|components/Logs"` 全仓命中仅 `LogPanel.vue` L3 `<LogToolbar`、L32 `import LogToolbar` 两处**自引用**，无任何页面/路由/测试引用 → 判定死代码无疑，`git rm` 两文件（`Logs/` 目录随之消失）。`useLogStore`（`store/logs.ts`）**保留**，Train 页仍在用，未产生孤儿 store。残留文档引用（本批次按「diff = 2 deleted + 2 docs」约束未动，登记待后续清理）：`docs/平台功能与页面关联.md` L295/L531/L532/L534、`docs/项目文件功能说明.md` L248/L319 仍列这两个组件 |
 | B-07 | 风险约定 | `/models` 路由：`/{model_id}` 通配注册在前会吞静态段。现有顺序正确，但**新增静态路径必须插在通配之前** | 已在《平台功能与页面关联》§6 留警示，代码加注释即可 → ✅ **结案（2026-10-10 复核）**：`905a535` 已把警示写进代码。实测 `backend/src/api/routes/models.py` **L249-251**（紧邻 L252 `@router.get("/{model_id}")`）：「⚠️ B-07 路由顺序陷阱：自本行起为通配路由 `/{model_id}`。FastAPI 按注册顺序匹配，新增任何 GET 固定路径（如 /xxx）必须写在本注释**之前**，否则会被 `/{model_id}` 吞掉（model_id="xxx"），表现为诡异的 404/错数据。」文档 + 代码双侧留痕，本项关闭 |
 | I-11 | 悬空 | `backend/data/inference_results/` 目录存在但无路由/服务写入方 | 确认历史用途后清理或补文档 → ✅ **已结案（2026-10-10 批次 I）**：核实为**空目录**（`Get-ChildItem -Force` 计数 = 0，仅 `.`/`..`），且 `git grep -n "inference_results" -- backend/src/**/*.py` **零命中（exit 1）**——无任何路由/服务读写方，历史遗留无疑。已删除该空目录（git 不跟踪空目录 → **无 diff**，动作记在 commit body）。残留（均为文档层，本批次按「diff 恰 2 docs」约束未动）：`docs/项目文件功能说明.md` L171 仍列该目录为「⚠ 无对应路由，历史遗留」，`API_DOCUMENTATION.md` L1336/L1385/L3392 在**未实现**的推理章节与 CLI 示例内引用同名路径（已由 D-04 警示覆盖） |
@@ -178,7 +178,7 @@
 | 分类 | 🔴 | 🟡 | 🟢 | 已归档 |
 |---|---|---|---|---|
 | B 功能缺陷 | 0 | 1（B-03 已缓解） | 0 | 3 + 当日关闭 2（B-04/B-05）+ I-01/B-01 + 批次 I 前置更正 1（B-07）+ 批次 I 删除 1（B-06） |
-| P 性能/健壮性 | 0 | 1（P-02 需验证） | 2（P-03/P-04） | 1（批次 I 前置更正：P-01） |
+| P 性能/健壮性 | 0 | 1（P-02 需验证） | 1（P-03） | 2（批次 I 前置更正：P-01 + 批次 J：P-04） |
 | S 安全 | 0（S-01/S-02 已修复） | 1（S-03 已拍板关闭） | 0 | 0 |
 | D 文档/口径漂移 | 0 | 1（D-03） | 0 | 5（批次 I 前置更正：D-01/D-02/D-04/D-05/D-06） |
 | C 兼容性 | 0 | 0 | 0 | 1（C-01，见下） |
@@ -186,6 +186,8 @@
 > **2026-10-10 更新说明**：上表各列为当日复核后的实际在册数。S-01/S-02 由 `d0a81fb`/`ffe2c79` 修复（zip_guard 收口），B-05 由 `de6850e` 关闭，B-04 由 `bbd3d6d` 关闭，I-01/B-01 核实 4 文件全部 TRACKED、未跟踪文件归零；S-03/B-02 拍板关闭（见 §3 详情节）。
 >
 > **2026-10-10 批次 I 前置更正说明**：本表按更正后口径重算——此前 7 项（P-01/D-01/D-02/D-04/D-05/D-06/B-07）实际已由 10-06 的 `305756e`（P-01/D-02）与 `905a535`（D-01/D-04/D-05/D-06/B-07）修复，但文档状态漏改仍标「待处理/约定防护」，现全部移入「已归档」列（B 🟢 2→0、P 🟡 2→1 且已归档 0→1、D 🟡 4→1 且 🟢 2→0 已归档 0→5）。另：**I-11**（悬空目录 `backend/data/inference_results/`）本批次结案并删除空目录，该项在 §1 总览单列为「悬空目录」类、原表无对应分类行，故不计入上表五行，仅在此登记；git 不跟踪空目录，删除不产生 diff。**B-06**（死代码 `components/Logs/*`）已于批次 I 随 `git rm` 两文件关闭，B 类 🟢 归 0。当前全表在册**未关闭项仅剩 5 条**：B-03（已缓解，靠 I-05 落地——本批次已并入 `deploy.sh`）、P-02（需实测）、P-03、P-04、D-03（待批次 K）。
+>
+> **2026-10-11 批次 J 更新说明**：**P-04** 于批次 J 结案（详见 §1 总览 L35 与 §4 低优先表），P 类 🟢 由 2 归 1（仅剩 P-03）、已归档由 1 增 2。连带关闭《功能实现与改进点跟踪》的 **I-08**（全局轻提示 + 统一错误拦截）与 **I-09**（SAM 接口从 `api/annotations.ts` 拆出为 `api/sam.ts`）。批次 J 全部为前端 + 文档改动，**零 backend 改动**。当前全表在册**未关闭项仅剩 4 条**：B-03（已缓解）、P-02（需实测）、P-03、D-03（待批次 K）。批次 J 遗留待拍板一项：`api/sam.ts` 内 3 个疑似死导出 `getSamAvailable` / `uploadSamModel` / `AIBox`（全仓仅定义处或仅文档提及、无代码调用方），按「拆分为纯搬迁、零逻辑变更」原则随迁保留未删，已在《功能实现与改进点跟踪》I-09 行登记。
 
 **C-01（归档）**：`data.yaml` 曾用绝对路径导致跨平台（Windows 开发 / Linux 容器）训练失败 → 已定硬约束：**一律相对路径 `.`**。后续任何改 `seal_dataset`/`prepare` 的任务不得回退。
 
