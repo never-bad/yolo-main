@@ -679,7 +679,8 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import type { BBox } from '@/api/annotations'
-import { createAnnotationTask, findAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotations, exportReviewedZip, autoLabelImage, interactiveLabelImage, pointLabelImage, erasePolygonRegion, startBatchLabel, getBatchProgress, stopBatchLabel, getSamConfig, updateSamConfig, getSamModels, getSamTrainedVersions, clearAiAnnotations, clearAllAnnotations, cleanTaskOverlaps, importYoloLabels, deleteTaskImage, auditImage, listAuditIssues } from '@/api/annotations'
+import { createAnnotationTask, findAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotations, exportReviewedZip, clearAiAnnotations, clearAllAnnotations, cleanTaskOverlaps, importYoloLabels, deleteTaskImage } from '@/api/annotations'
+import { autoLabelImage, interactiveLabelImage, pointLabelImage, erasePolygonRegion, startBatchLabel, getBatchProgress, stopBatchLabel, getSamConfig, updateSamConfig, getSamModels, getSamTrainedVersions, auditImage, listAuditIssues } from '@/api/sam'
 import { listDatasets, approveDatasetReview } from '@/api/datasets'
 import { showConfirm, showPrompt, showAlert } from '@/composables/useDialog'
 import { downloadFile } from '@/utils/download'
