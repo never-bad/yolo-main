@@ -458,6 +458,7 @@ import { addHardSamples, addBackgroundSamples } from '@/api/samplePool'
 import { downloadFile } from '@/utils/download'
 import { dsTitle } from '@/utils/dsDisplay'
 import { showConfirm, showPrompt } from '@/composables/useDialog'
+import { showToast } from '@/utils/toast'
 import FolderTree from '@/components/FolderTree.vue'
 import LibraryCreateModal from '@/components/LibraryCreateModal.vue'
 
@@ -697,7 +698,7 @@ const imageStems = (paths: string[]) =>
 const addSelectionToHardPool = async () => {
   if (!viewingDataset.value || poolImagesSelected.value.length === 0) return
   if (!poolModelId.value) {
-    alert('请先选择困难样本归属模型（困难样本库按模型 1:1 隔离，训练该模型时才会抽样并入）')
+    showToast('请先选择困难样本归属模型（困难样本库按模型 1:1 隔离，训练该模型时才会抽样并入）', 'info', 4000)
     return
   }
   const ok = await showConfirm(`将 ${poolImagesSelected.value.length} 张图片（连同标注）加入模型 ${poolModelId.value} 的困难样本库？\n标注缺失的图片会跳过。`)
@@ -710,9 +711,9 @@ const addSelectionToHardPool = async () => {
       image_names: imageStems(poolImagesSelected.value),
       version: 'v1'
     })
-    alert(`入库完成：新增 ${res.added} 张，跳过 ${res.skipped} 张（未找到/已存在）。\n该模型困难样本库现有 ${res.pool_image_count} 张。`)
+    showToast(`入库完成：新增 ${res.added} 张，跳过 ${res.skipped} 张（未找到/已存在）。\n该模型困难样本库现有 ${res.pool_image_count} 张。`, 'info', 4000)
   } catch (e: any) {
-    alert('加入困难样本库失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('加入困难样本库失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   } finally {
     poolBusy.value = ''
   }
@@ -729,9 +730,9 @@ const addSelectionToBackground = async () => {
       image_names: imageStems(poolImagesSelected.value),
       version: 'v1'
     })
-    alert(`入库完成：新增 ${res.added} 张，跳过 ${res.skipped} 张。`)
+    showToast(`入库完成：新增 ${res.added} 张，跳过 ${res.skipped} 张。`, 'info', 4000)
   } catch (e: any) {
-    alert('加入空白样本库失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('加入空白样本库失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   } finally {
     poolBusy.value = ''
   }
@@ -740,7 +741,7 @@ const addSelectionToBackground = async () => {
 // 打开数据集查看（统计信息 + 图片预览）
 const viewDataset = async (dataset: any) => {
   if (dataset.status !== 'prepared') {
-    alert('该数据集尚未"准备"，无法查看。请先执行"准备"操作。')
+    showToast('该数据集尚未"准备"，无法查看。请先执行"准备"操作。', 'info', 4000)
     return
   }
   viewingDataset.value = dataset
@@ -753,7 +754,7 @@ const viewDataset = async (dataset: any) => {
     viewerDetail.value = result
     viewerImages.value = result.images || []
   } catch (e: any) {
-    alert('加载数据集详情失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('加载数据集详情失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   } finally {
     viewerLoading.value = false
   }
@@ -1015,7 +1016,7 @@ const sealDatasetItem = async (d: any) => {
   if (input === null) return
   const parts = input.split(/[,，、\s]+/).map(Number)
   if (parts.length < 2 || parts.some(n => Number.isNaN(n) || n < 0) || parts.reduce((a, b) => a + b, 0) <= 0) {
-    alert('输入无效，请用逗号分隔三个非负数字，如：0.7,0.15,0.15')
+    showToast('输入无效，请用逗号分隔三个非负数字，如：0.7,0.15,0.15', 'info', 4000)
     return
   }
   const t = parts[0], v = parts[1], te = parts[2] ?? 0
@@ -1028,16 +1029,16 @@ const sealDatasetItem = async (d: any) => {
   sealingDataset.value = d.dataset_id
   try {
     const res = await sealDst(d.dataset_id, false, { train: t, val: v, test: te })
-    alert(sealMsg(res, '封板成功'))
+    showToast(sealMsg(res, '封板成功'), 'info', 4000)
   } catch (e: any) {
     const msg = e.response?.data?.detail || e.message
     const force = await showConfirm(`${msg}\n\n是否需要强制封板（时间窗口兜底，跳过标注完成条件）？`)
     if (force) {
       try {
         const res2 = await sealDst(d.dataset_id, true, { train: t, val: v, test: te })
-        alert(sealMsg(res2, '强制封板成功'))
+        showToast(sealMsg(res2, '强制封板成功'), 'info', 4000)
       } catch (e2: any) {
-        alert('封板失败: ' + (e2.response?.data?.detail || e2.message))
+        if (!e2?.__toastShown) showToast('封板失败: ' + (e2.response?.data?.detail || e2.message), 'error', 4000)
       }
     }
   } finally {
@@ -1077,9 +1078,9 @@ const prepareItem = async (d: any, reprepare = false) => {
   preparingDataset.value = d.dataset_id
   try {
     await prepareDst(d.dataset_id)
-    alert('准备完成！')
+    showToast('准备完成！', 'success')
   } catch (e: any) {
-    alert('准备失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('准备失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   } finally {
     preparingDataset.value = null
     loadDatasets()
@@ -1104,7 +1105,7 @@ const approveItem = async (d: any) => {
   try {
     await approveDatasetReview(d.dataset_id)
   } catch (e: any) {
-    alert('审核确认失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('审核确认失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   } finally {
     approvingDataset.value = null
     loadDatasets()
@@ -1121,7 +1122,7 @@ const unpourItem = async (d: any) => {
   try {
     await unpourDatasetBucket(d.dataset_id)
   } catch (e: any) {
-    alert('撤回失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('撤回失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   } finally {
     unpouringDataset.value = null
     loadDatasets()
@@ -1140,7 +1141,7 @@ const uploadFile = async () => {
   if (!selectedFile.value) return
   libraryTouched.value = true
   if (!uploadLibraryId.value) {
-    alert('请先选择该数据集归属的算法库（没有合适的库请点「+ 新建算法库」）')
+    showToast('请先选择该数据集归属的算法库（没有合适的库请点「+ 新建算法库」）', 'info', 4000)
     return
   }
 
@@ -1154,17 +1155,17 @@ const uploadFile = async () => {
     preparingNew.value = true
     try {
       await prepareDst(result.dataset_id)
-      alert(`上传并准备成功！数据集已归属算法库「${libraryName(uploadLibraryId.value)}」`)
+      showToast(`上传并准备成功！数据集已归属算法库「${libraryName(uploadLibraryId.value)}」`, 'info', 4000)
       uploadResult.value = null
       loadDatasets()
       loadUploadModels()
     } catch (error: any) {
-      alert('准备失败: ' + (error.response?.data?.detail || error.message))
+      if (!error?.__toastShown) showToast('准备失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
     } finally {
       preparingNew.value = false
     }
   } catch (error: any) {
-    alert('上传失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('上传失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     uploading.value = false
   }
@@ -1195,7 +1196,7 @@ const loadDatasets = async (silent = false) => {
     sealMinImages.value = result.seal_min_images || 0
     buckets.value = result.buckets || []
   } catch (error: any) {
-    alert('加载失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('加载失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     loading.value = false
   }
@@ -1214,10 +1215,10 @@ const editDataset = async (dataset: any) => {
       description: description || undefined,
       tags: tags
     })
-    alert('更新成功!')
+    showToast('更新成功!', 'success')
     loadDatasets()
   } catch (error: any) {
-    alert('更新失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('更新失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     editingDataset.value = null
   }
@@ -1229,10 +1230,10 @@ const deleteDatasetItem = async (datasetId: string) => {
   deletingDataset.value = datasetId
   try {
     await deleteDataset(datasetId)
-    alert('删除成功!')
+    showToast('删除成功!', 'success')
     loadDatasets()
   } catch (error: any) {
-    alert('删除失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('删除失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     deletingDataset.value = null
   }
@@ -1253,9 +1254,9 @@ const exportAnnotated = async (d: any) => {
   try {
     const blob = await exportAnnotatedDataset(datasetId)
     downloadFile(blob, exportName(d, 'annotated'))
-    alert('导出成功!')
+    showToast('导出成功!', 'success')
   } catch (error: any) {
-    alert('导出失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('导出失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     exportingDataset.value = null
   }
@@ -1268,9 +1269,9 @@ const exportOriginal = async (d: any) => {
   try {
     const blob = await exportOriginalDataset(datasetId)
     downloadFile(blob, exportName(d, 'original'))
-    alert('导出成功!')
+    showToast('导出成功!', 'success')
   } catch (error: any) {
-    alert('导出失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('导出失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     exportingDataset.value = null
   }

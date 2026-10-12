@@ -516,6 +516,7 @@ import { subscribeLogsSSE, pollLogsTail, getLogLines } from '@/api/logs'
 import FolderTree from '@/components/FolderTree.vue'
 import { useLogStore } from '@/store/logs'
 import { showAlert, showConfirm } from '@/composables/useDialog'
+import { showToast } from '@/utils/toast'
 
 const logStore = useLogStore()
 
@@ -677,7 +678,7 @@ const applyTier = (tier: any) => {
   trainForm.value.batch = tier.batch
   trainForm.value.epochs = tier.epochs
   if (trainForm.value.lr0 !== undefined) trainForm.value.lr0 = tier.lr0
-  alert('已应用「' + tier.label + '」档参数（可继续手动微调）')
+  showToast('已应用「' + tier.label + '」档参数（可继续手动微调）', 'info', 4000)
 }
 let suggestTimer: any = null
 
@@ -1081,7 +1082,7 @@ const loadDatasets = async () => {
     datasets.value = (result.datasets || []).filter((d: any) => d.annotated)
   } catch (error: any) {
     console.error('加载数据集失败:', error)
-    alert('加载数据集失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('加载数据集失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     loadingDatasets.value = false
   }
@@ -1102,7 +1103,7 @@ const isDatasetPrepared = (dataset: any) => {
 // 卡片式选择数据集（支持多选聚合：1.3）
 const selectDataset = (ds: any) => {
   if (!isDatasetPrepared(ds)) {
-    alert('该数据集尚未准备，请先在"数据集"页面执行"准备"操作')
+    showToast('该数据集尚未准备，请先在"数据集"页面执行"准备"操作', 'info', 4000)
     return
   }
   const idx = selectedDatasetIds.value.indexOf(ds.dataset_id)
@@ -1148,7 +1149,7 @@ const handlePtFile = async (event: any) => {
   const file = event.target.files?.[0]
   if (!file) return
   if (!file.name.endsWith('.pt')) {
-    alert('仅支持 .pt 格式的模型权重文件')
+    showToast('仅支持 .pt 格式的模型权重文件', 'info', 4000)
     return
   }
   uploadingPt.value = true
@@ -1158,9 +1159,9 @@ const handlePtFile = async (event: any) => {
     // 自动选中刚上传的模型
     customSelectedPath.value = result.path
     trainForm.value.model_name = result.path
-    alert('模型导入成功: ' + result.filename)
+    showToast('模型导入成功: ' + result.filename, 'info', 4000)
   } catch (error: any) {
-    alert('模型导入失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('模型导入失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     uploadingPt.value = false
     event.target.value = ''
@@ -1207,19 +1208,19 @@ const stripAnsi = (text: string): string => text.replace(/\x1B\[[0-9;]*[mK]/g, '
 
 const startTraining = async () => {
   if (!trainForm.value.dataset_id) {
-    alert('请选择数据集')
+    showToast('请选择数据集', 'info', 4000)
     return
   }
   
   // 检查数据集是否已准备
   const selectedDataset = datasets.value.find(ds => ds.dataset_id === trainForm.value.dataset_id)
   if (selectedDataset && selectedDataset.status === 'uploaded') {
-    alert('数据集尚未准备（prepare）。请先在数据集上传页面执行"准备"操作后再开始训练。')
+    showToast('数据集尚未准备（prepare）。请先在数据集上传页面执行"准备"操作后再开始训练。', 'info', 4000)
     return
   }
   
   if (isBusinessPretrain.value && !trainForm.value.base_model_id) {
-    alert('请选择要用作预训练权重的业务模型')
+    showToast('请选择要用作预训练权重的业务模型', 'info', 4000)
     return
   }
   
@@ -1261,23 +1262,27 @@ const startTraining = async () => {
     currentJobId.value = result.job_id
     // 阶段1.3：聚合训练结果提示
     if (result.aggregated && result.aggregation) {
-      alert(
+      showToast(
         `训练任务已启动！聚合 ${result.aggregation.dataset_count} 个数据集、` +
         `${result.aggregation.unified_names.length} 类统一命名空间、` +
-        `${result.aggregation.total_images} 张图片进行训练。`
+        `${result.aggregation.total_images} 张图片进行训练。`,
+        'info',
+        4000
       )
     } else {
       const lf = result.label_filter
       if (lf && lf.dropped && lf.dropped.length > 0) {
-        alert(
+        showToast(
           '训练任务已启动！\n\n' +
           '已按微调模型标签字典过滤数据集类别：\n' +
           `剔除（模型字典外）: ${lf.dropped.join('、')}\n` +
           `保留训练: ${lf.kept.join('、')}` +
-          (lf.model_code ? `\n模型: ${lf.model_code}` : '')
+          (lf.model_code ? `\n模型: ${lf.model_code}` : ''),
+          'info',
+          4000
         )
       } else {
-        alert('训练任务已启动!')
+        showToast('训练任务已启动!', 'success')
       }
     }
     
@@ -1311,7 +1316,7 @@ const startTraining = async () => {
     recallRatio.value = 0.1
     migrationEnabled.value = false
   } catch (error: any) {
-    alert('启动失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('启动失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     training.value = false
   }
@@ -1350,13 +1355,13 @@ const retrainJob = async (job: any) => {
     }
     const result = await createTrainJob(params)
     restoreScroll(prevScrollY)
-    alert('已重新创建训练任务: ' + result.job_id)
+    showToast('已重新创建训练任务: ' + result.job_id, 'info', 4000)
     currentJobId.value = result.job_id
     subscribeToLogs(result.job_id)
     loadJobs()
   } catch (error: any) {
     restoreScroll(prevScrollY)
-    alert('重新训练失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('重新训练失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     retrainingJob.value = null
   }
@@ -1378,11 +1383,11 @@ const stopJob = async (jobId: string) => {
     stopJobPolling(jobId)
     const { stopTrainJob } = await import('@/api/train')
     await stopTrainJob(jobId)
-    alert('任务已停止')
+    showToast('任务已停止', 'success')
     restoreScroll(prevScrollY)
     loadJobs()
   } catch (error: any) {
-    alert('停止失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('停止失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
     restoreScroll(prevScrollY)
   } finally {
     stoppingJob.value = null
@@ -1397,7 +1402,7 @@ const resumeJob = async (jobId: string) => {
   try {
     stopJobPolling(jobId)
     await resumeTrainJob(jobId)
-    alert('训练已恢复!')
+    showToast('训练已恢复!', 'success')
     restoreScroll(prevScrollY)
     
     // 开始订阅日志
@@ -1416,7 +1421,7 @@ const resumeJob = async (jobId: string) => {
     } else {
       errorMsg += '未知错误'
     }
-    alert(errorMsg)
+    if (!error?.__toastShown) showToast(errorMsg, 'error', 4000)
   } finally {
     resumingJob.value = null
   }
@@ -1430,11 +1435,11 @@ const deleteJobItem = async (jobId: string) => {
   try {
     stopJobPolling(jobId)
     await deleteTrainJob(jobId)
-    alert('删除成功!')
+    showToast('删除成功!', 'success')
     restoreScroll(prevScrollY)
     loadJobs()
   } catch (error: any) {
-    alert('删除失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('删除失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
     restoreScroll(prevScrollY)
   } finally {
     deletingJob.value = null
@@ -1448,7 +1453,7 @@ const loadModels = async () => {
     models.value = result.models
   } catch (error: any) {
     console.error('加载模型失败:', error)
-    alert('加载模型失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('加载模型失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     loadingModels.value = false
   }
@@ -1863,7 +1868,7 @@ const loadJobs = async () => {
     // 同步刷新模型列表，保证任务卡的守门员状态徽章/报告最新
     loadModels()
   } catch (error: any) {
-    alert('加载失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('加载失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     loadingJobs.value = false
   }
