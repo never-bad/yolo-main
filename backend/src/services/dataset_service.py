@@ -15,7 +15,8 @@ import random
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
-from fastapi import UploadFile
+from PIL import Image
+from fastapi import UploadFile, HTTPException
 from src.core.settings import settings, seal_threshold_for
 from src.utils.fs_tree import build_tree
 from src.utils.class_labels import model_class_names, merge_classes_with_model
@@ -248,6 +249,121 @@ def _extract_archive(archive_path: Path, extract_to: Path):
         raise ValueError(f"Unsupported archive format: {archive_path.name}")
 
 
+# P-03：抽样试解只认这三类后缀（与 IMG_SUFFIX 的交集，PIL 解码代价最低、覆盖最广）
+_VALIDATE_IMG_SUFFIXES = (".jpg", ".jpeg", ".png")
+
+
+def _validate_archive(archive_path: Path) -> tuple[bool, str]:
+    """压缩包完整性与可解码抽样校验（P-03）。
+
+    返回 (ok, reason)，通过返回 (True, "")。同步函数，调用方用 asyncio.to_thread 包裹。
+
+    步骤：
+      (1) 文件存在、非 0 字节；
+      (2) zipfile / tarfile 可正常打开（打不开即完整性失败）；
+      (3) 成员非空，且全成员路径安全（复用 zip_guard.is_safe_member，与解压入口同一判据）；
+      (4) 包体 >= settings.MIN_ARCHIVE_SIZE_BYTES；
+      (5) 抽 settings.ARCHIVE_SAMPLE_DECODE_COUNT 个 .jpg/.jpeg/.png 成员，
+          用 PIL.Image.open + verify 试解，全失败则拒绝。
+
+    两处调用（双重校验）：
+      - upload_dataset 写盘后、meta 落盘前：拦住坏包入库；
+      - prepare_dataset 解压前、clear_dir 之前：拦住历史遗留坏包在数据子目录
+        已被清空之后才炸掉，把原本可用的数据一并毁掉。
+
+    注：大小门槛 (4) 排在成员数检查 (3) 之后，否则空 zip 只有 22 字节，
+    会先命中「包体过小」而给不出「压缩包为空」这个更准确的 reason。
+
+    settings.ARCHIVE_VALIDATE_TIMEOUT_S 为预留的兜底超时 hook：本函数只做
+    「抽样解码」而非全量解压/全量 CRC，代价与包内文件总数基本无关，
+    故当前不实现真实超时逻辑（与 zip_guard.check_zip_bomb 的体积预检同理）。
+    """
+    if not archive_path.exists():
+        return False, "压缩包不存在"
+
+    size = archive_path.stat().st_size
+    if size <= 0:
+        return False, "压缩包为空（0 字节）"
+
+    name = archive_path.name.lower()
+    if not name.endswith(ARCHIVE_SUFFIXES):
+        return False, f"不支持的压缩包格式：{archive_path.name}"
+
+    min_bytes = settings.MIN_ARCHIVE_SIZE_BYTES
+    sample_n = max(1, settings.ARCHIVE_SAMPLE_DECODE_COUNT)
+    is_zip = name.endswith(".zip")
+
+    if is_zip:
+        try:
+            with zipfile.ZipFile(archive_path) as zf:
+                members = zf.namelist()
+                if not members:
+                    return False, "压缩包为空（无任何成员）"
+                if size < min_bytes:
+                    return False, f"包体过小（{size} 字节 < {min_bytes} 字节下限）"
+                unsafe = [m for m in members if not zip_guard.is_safe_member(m)]
+                if unsafe:
+                    return False, (
+                        f"含 {len(unsafe)} 个不安全路径成员（绝对路径/含 ..），示例：{unsafe[:3]}"
+                    )
+                candidates = [m for m in members if m.lower().endswith(_VALIDATE_IMG_SUFFIXES)]
+                if not candidates:
+                    return False, "无有效图片（未找到 .jpg/.jpeg/.png 成员）"
+                picked = candidates[:sample_n]
+                decoded = 0
+                for m in picked:
+                    try:
+                        with zf.open(m) as fp:
+                            Image.open(fp).verify()
+                        decoded += 1
+                    except zipfile.BadZipFile as e:
+                        return False, f"zip 完整性校验失败（成员 {m} 数据损坏：{e}）"
+                    except Exception:  # noqa: BLE001 - 单张解不开不算包坏，继续抽下一张
+                        continue
+                if decoded == 0:
+                    return False, f"无有效图片（抽样 {len(picked)} 张均无法解码）"
+        except zipfile.BadZipFile as e:
+            return False, f"zip 完整性校验失败（无法打开：{e}）"
+        return True, ""
+
+    mode = "r:gz" if (name.endswith(".tar.gz") or name.endswith(".tgz")) else "r:"
+    try:
+        with tarfile.open(archive_path, mode) as tf:
+            members = tf.getmembers()
+            files = [m for m in members if m.isfile()]
+            if not files:
+                return False, "压缩包为空（无任何文件成员）"
+            if size < min_bytes:
+                return False, f"包体过小（{size} 字节 < {min_bytes} 字节下限）"
+            unsafe = [m.name for m in members if not zip_guard.is_safe_member(m.name)]
+            if unsafe:
+                return False, (
+                    f"含 {len(unsafe)} 个不安全路径成员（绝对路径/含 ..），示例：{unsafe[:3]}"
+                )
+            candidates = [m for m in files if m.name.lower().endswith(_VALIDATE_IMG_SUFFIXES)]
+            if not candidates:
+                return False, "无有效图片（未找到 .jpg/.jpeg/.png 成员）"
+            picked = candidates[:sample_n]
+            decoded = 0
+            for m in picked:
+                try:
+                    src = tf.extractfile(m)
+                    if src is None:
+                        continue
+                    with src:
+                        Image.open(src).verify()
+                    decoded += 1
+                except tarfile.TarError as e:
+                    return False, f"tar 完整性校验失败（成员 {m.name} 数据损坏：{e}）"
+                except Exception:  # noqa: BLE001 - 单张解不开不算包坏，继续抽下一张
+                    continue
+            if decoded == 0:
+                return False, f"无有效图片（抽样 {len(picked)} 张均无法解码）"
+    except tarfile.TarError as e:
+        return False, f"tar 完整性校验失败（无法打开：{e}）"
+    return True, ""
+
+
 # ===== 后台删除队列（MLOps 优化：删除接口秒回，磁盘清理不阻塞请求）=====
 # 专用单线程工作线程：删除任务逐个排队执行，
 # 不占 asyncio.to_thread 的公共线程池，也不阻塞事件循环 / API 请求
@@ -361,6 +477,15 @@ class DatasetService:
         archive_path = self.uploads_dir / archive_name
         content = await file.read()
         await asyncio.to_thread(_write_bytes, archive_path, content)
+
+        # P-03 双重校验之一：写盘后立即校验压缩包完整性与可解码抽样，
+        # 不通过则清掉半成品（目录 + archive），绝不让坏包写进 meta / PG 影子库
+        ok, reason = await asyncio.to_thread(_validate_archive, archive_path)
+        if not ok:
+            shutil.rmtree(dataset_dir, ignore_errors=True)
+            archive_path.unlink(missing_ok=True)
+            logger.warning(f"upload {dataset_id}: archive validation failed: {reason}")
+            raise HTTPException(400, f"压缩包校验失败：{reason}")
         
         # 保存元数据（stage=collecting：上传即进入采集/接收阶段）
         meta = {
@@ -413,7 +538,18 @@ class DatasetService:
         # 读取元数据
         meta_path = dataset_dir / "meta.json"
         meta = await asyncio.to_thread(_load_json, meta_path)
-        
+
+        # 按 meta 记录的文件名找到上传的压缩包（兼容旧版本固定 .zip 命名）
+        # 位置刻意排在 clear_dir 之前：P-03 双重校验之二，坏包在清空数据子目录
+        # 之前就被拦住，避免「先清空、再解压失败」把上一次已准备好的数据一并毁掉
+        archive_name = meta.get("archive") or f"{dataset_id}.zip"
+        archive_path = self.uploads_dir / archive_name
+        ok, reason = await asyncio.to_thread(_validate_archive, archive_path)
+        if not ok:
+            logger.warning(f"prepare {dataset_id}: archive validation failed: {reason}")
+            await self._rollback_model_binding_on_prepare_failure(meta_path)
+            raise HTTPException(400, f"压缩包校验失败：{reason}")
+
         # 解压数据集（准备语义=从 zip 重新构建，先清空数据子目录旧内容，
         # 避免重复准备时与上一次解压内容叠加，例如 zip 顶层目录残留 + 双份图片）
         # 数据集一律为 datasets/{dataset_id}（无 version 子目录）
@@ -437,9 +573,6 @@ class DatasetService:
         else:
             await asyncio.to_thread(lambda: version_dir.mkdir(exist_ok=True))
         
-        # 按 meta 记录的文件名找到上传的压缩包并解压（兼容旧版本固定 .zip 命名）
-        archive_name = meta.get("archive") or f"{dataset_id}.zip"
-        archive_path = self.uploads_dir / archive_name
         try:
             await asyncio.to_thread(_extract_archive, archive_path, version_dir)
         except Exception:

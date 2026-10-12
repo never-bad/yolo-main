@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     # 雪球闭环（1.8）：新数据自动建任务，标注页可直接进入，不再需要手动建任务
     AUTO_TASK_MIN_IMAGES: int = 20
 
+    # P-03：上传/prepare 时压缩包完整性与可解码抽样校验的门槛
+    MIN_ARCHIVE_SIZE_BYTES: int = 1024           # 包体大小下限，1KB，过滤空包/纯垃圾
+    ARCHIVE_SAMPLE_DECODE_COUNT: int = 5         # 抽几张图试解
+    ARCHIVE_VALIDATE_TIMEOUT_S: int = 30         # 兜底超时，防恶意大包阻塞
+
     # 模型消息队列（D）：被分配进模型的数据先入队，达阈值或定时自动打包进入标注页面
     # 阈值：入队图片数达到该值立即打包（0 关闭阈值触发）
     MODEL_QUEUE_MIN_IMAGES: int = 20
