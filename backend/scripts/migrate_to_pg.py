@@ -39,6 +39,8 @@ def _load_json(p: Path) -> dict:
 async def migrate_datasets(dry: bool) -> int:
     count = 0
     for meta_path in sorted((DATA_DIR / "datasets").glob("*/meta.json")):
+        if meta_path.parent.name.startswith("_"):
+            continue  # D-03：归档目录（_ 前缀）不入 PG，与 list_datasets 口径一致
         meta = _load_json(meta_path)
         if not meta.get("dataset_id"):
             meta["dataset_id"] = meta_path.parent.name
@@ -54,6 +56,8 @@ async def migrate_datasets(dry: bool) -> int:
 async def migrate_tasks(dry: bool) -> int:
     count = 0
     for task_file in sorted((DATA_DIR / "annotations").glob("*/task.json")):
+        if task_file.parent.name.startswith("_"):
+            continue  # D-03：归档目录（_ 前缀）不入 PG，与 datasets 侧同一判据
         meta = _load_json(task_file)
         if not meta.get("task_id"):
             meta["task_id"] = task_file.parent.name
@@ -73,6 +77,8 @@ async def migrate_models(dry: bool) -> int:
         print("models 目录不存在，跳过模型迁移")
         return 0
     for model_file in sorted(MODELS_DIR.glob("*/model.json")):
+        if model_file.parent.name.startswith("_"):
+            continue  # D-03：归档目录（_ 前缀）不入 PG，与 datasets 侧同一判据
         meta = _load_json(model_file)
         if not meta.get("model_id"):
             meta["model_id"] = model_file.parent.name

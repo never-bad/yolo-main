@@ -147,7 +147,8 @@ async def refresh_all_datasets() -> int:
     root = Path(settings.DATASETS_DIR)
     if not root.exists():
         return 0
-    ids = [p.parent.name for p in root.glob("*/meta.json")]
+    # D-03：归档目录（_ 前缀）不进影子库，判据与 list_datasets / migrate_to_pg 一致
+    ids = [p.parent.name for p in root.glob("*/meta.json") if not p.parent.name.startswith("_")]
     return await refresh_datasets(ids)
 
 
