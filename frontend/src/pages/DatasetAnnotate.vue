@@ -513,7 +513,6 @@
             </button>
           </div>
         </div>
-        <div class="delete-toast" :class="toastType" v-if="toastMsg">{{ toastMsg }}</div>
       </div>
     </div>
   </div>
@@ -684,6 +683,7 @@ import { autoLabelImage, interactiveLabelImage, pointLabelImage, erasePolygonReg
 import { listDatasets, approveDatasetReview } from '@/api/datasets'
 import { showConfirm, showPrompt, showAlert } from '@/composables/useDialog'
 import { downloadFile } from '@/utils/download'
+import { showToast } from '@/utils/toast'
 import { dsTitle } from '@/utils/dsDisplay'
 import { suggestModelLabels, adoptSuggestedLabels } from '@/api/models'
 
@@ -694,9 +694,6 @@ const creatingTask = ref(false)
 const loadingItems = ref(false)
 const savingAnnotation = ref(false)
 const deletingImage = ref(false)
-// 页面内轻提示（浏览器 iframe 会拦截原生 alert，删除操作必须给出可见反馈）
-const toastMsg = ref('')
-const toastType = ref<'success' | 'error' | 'info'>('info')
 // 右侧面板"⋯ 更多"（全局/批量操作）菜单开关
 const moreOpen = ref(false)
 // AI 标注模型设置弹窗（多引擎可同时检测）
@@ -731,13 +728,6 @@ const modelCfg = ref<any>({
   qwen_keep_alive: '5m',
   qwen_num_parallel: 1,
 })
-let toastTimer: any = null
-const showToast = (msg: string, type: 'success' | 'error' | 'info' = 'info', durationMs = 2500) => {
-  toastMsg.value = msg
-  toastType.value = type
-  if (toastTimer) clearTimeout(toastTimer)
-  toastTimer = setTimeout(() => { toastMsg.value = '' }, durationMs)
-}
 // 自动保存（防抖）
 const autoSaveTimer = ref<any>(null)
 const dirty = ref(false)
@@ -783,9 +773,9 @@ const approveCurrentDataset = async () => {
   try {
     await approveDatasetReview(dsId)
     await loadDatasets()  // 刷新徽标状态（按钮变为"已审核通过"）
-    alert('已审核通过 ✓ 该数据集进入灌桶队列，下次刷新数据集页自动灌入训练桶')
+    showToast('已审核通过 ✓ 该数据集进入灌桶队列，下次刷新数据集页自动灌入训练桶', 'success', 4000)
   } catch (e: any) {
-    alert('审核确认失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('审核确认失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   } finally {
     approvingReview.value = false
   }
@@ -800,7 +790,7 @@ const loadDatasets = async () => {
     datasets.value = result.datasets || []
   } catch (error: any) {
     console.error('加载数据集失败:', error)
-    alert('加载数据集失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('加载数据集失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     loadingDatasets.value = false
   }
@@ -949,10 +939,10 @@ const adoptSuggest = async () => {
       chinese_desc: c.chinese_desc
     })))
     const added = res.added || []
-    alert(`已采纳 ${added.length} 个新标签，追加到模型标签字典末尾：${added.join('、') || '（无新增）'}`)
+    showToast(`已采纳 ${added.length} 个新标签，追加到模型标签字典末尾：${added.join('、') || '（无新增）'}`, 'info', 4000)
     suggestDialogOpen.value = false
   } catch (error: any) {
-    alert('采纳失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('采纳失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     suggestAdopting.value = false
   }
@@ -1693,14 +1683,14 @@ watch(currentImage, () => {
 
 const createTask = async () => {
   if (!newTask.value.datasetId) {
-    alert('请选择数据集')
+    showToast('请选择数据集', 'info', 4000)
     return
   }
   
   // 检查数据集是否已准备
   const selectedDataset = datasets.value.find(ds => ds.dataset_id === newTask.value.datasetId)
   if (selectedDataset && selectedDataset.status === 'uploaded') {
-    alert('数据集尚未准备（prepare）。请先在数据集上传页面执行"准备"操作后再创建标注任务。')
+    showToast('数据集尚未准备（prepare）。请先在数据集上传页面执行"准备"操作后再创建标注任务。', 'info', 4000)
     return
   }
   
@@ -1726,13 +1716,13 @@ const createTask = async () => {
     // 显示导入信息
     if (result.imported_annotations > 0) {
       importedCount.value = result.imported_annotations
-      alert(`任务创建成功！\n共 ${result.total_images} 张图片\n已导入 ${result.imported_annotations} 个已有标注`)
+      showToast(`任务创建成功！\n共 ${result.total_images} 张图片\n已导入 ${result.imported_annotations} 个已有标注`, 'info', 4000)
     }
     
     await loadTaskItems()
     saveAnnotateState()
   } catch (error: any) {
-    alert('创建任务失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('创建任务失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     creatingTask.value = false
   }
@@ -1773,7 +1763,7 @@ const loadTaskItems = async () => {
       selectImage(0)
     }
   } catch (error: any) {
-    alert('加载失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('加载失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     loadingItems.value = false
   }
@@ -1903,7 +1893,7 @@ const restoreAnnotateState = async () => {
     currentTask.value = null
     items.value = []
     clearAnnotateState()
-    alert('恢复标注任务失败，已清空记录，请重新创建任务: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('恢复标注任务失败，已清空记录，请重新创建任务: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   }
 }
 
@@ -2031,7 +2021,7 @@ const loadImageToCanvas = () => {
     })
     // 显示更友好的错误提示
     const errorMsg = `图片加载失败\n路径: ${imageUrl}\n\n请检查：\n1. 后端服务是否运行\n2. 静态文件服务是否正常\n3. 图片文件是否存在`
-    alert(errorMsg)
+    showToast(errorMsg, 'error', 5000)
   }
   
   img.value.src = imageUrl
@@ -2519,7 +2509,7 @@ const onCanvasDblClick = () => {
 const runInteractiveLabel = async () => {
   if (!interactiveRegion.value || !currentTask.value || !currentImage.value) return
   if (!classes.value.length) {
-    alert('当前任务没有类别，无法进行交互式标注')
+    showToast('当前任务没有类别，无法进行交互式标注', 'info', 4000)
     return
   }
   interactiveBusy.value = true
@@ -2548,13 +2538,13 @@ const runInteractiveLabel = async () => {
     if (newBoxes.length) {
       pushUndo()
       currentBoxes.value.push(...newBoxes)
-      alert(`已在所选区域标注 ${newBoxes.length} 个目标`)
+      showToast(`已在所选区域标注 ${newBoxes.length} 个目标`, 'info', 4000)
     } else {
-      alert('该区域未检测到目标，可调整区域范围或类别后重试')
+      showToast('该区域未检测到目标，可调整区域范围或类别后重试', 'info', 4000)
     }
     redrawCanvas()
   } catch (e: any) {
-    alert('交互式标注失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('交互式标注失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   } finally {
     interactiveBusy.value = false
     interactiveRegion.value = null
@@ -3185,7 +3175,7 @@ const openModelCfg = async () => {
     modelCfg.value.qwen_num_parallel = typeof cfg.qwen_num_parallel === 'number' ? cfg.qwen_num_parallel : 1
     showModelCfg.value = true
   } catch (e: any) {
-    alert('读取 AI 标注配置失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('读取 AI 标注配置失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   }
 }
 
@@ -3198,12 +3188,12 @@ const closeModelCfg = async () => {
 const saveModelCfg = async () => {
   try {
     if (!modelCfg.value.detectors.length) {
-      alert('请至少勾选一个检测引擎')
+      showToast('请至少勾选一个检测引擎', 'info', 4000)
       return
     }
     // 勾了「本库已训模型」却没选版本 = 这个引擎永远出不了框，保存前先拦住
     if (modelCfg.value.detectors.includes('trained_model') && !modelCfg.value.trained_model_id) {
-      alert('请为「本库已训模型」选择一个模型版本（列表为空说明这个库还没训练过）')
+      showToast('请为「本库已训模型」选择一个模型版本（列表为空说明这个库还没训练过）', 'info', 4000)
       return
     }
     await updateSamConfig({
@@ -3235,7 +3225,7 @@ const saveModelCfg = async () => {
     showModelCfg.value = false
     showToast('AI 标注模型配置已保存并生效', 'success')
   } catch (e: any) {
-    alert('保存 AI 标注配置失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('保存 AI 标注配置失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   }
 }
 
@@ -3263,7 +3253,7 @@ const runAutoLabel = async () => {
     return
   }
   if (!classes.value.length) {
-    alert('请先设置类别')
+    showToast('请先设置类别', 'info', 4000)
     return
   }
   aiLabeling.value = true
@@ -3278,7 +3268,7 @@ const runAutoLabel = async () => {
       aiAbortCtrl.value.signal
     )
     if (result.error) {
-      alert('AI 预标注失败: ' + result.error)
+      showToast('AI 预标注失败: ' + result.error, 'error', 4000)
       return
     }
     const auditMap = new Map<number, any>()
@@ -3326,15 +3316,15 @@ const runAutoLabel = async () => {
       showToast(`L2 审核：${parts.join(' · ') || '全部通过'}`, parts.length ? 'info' : 'success')
     }
     if (!aiBoxes.length) {
-      alert('未检测到目标，可调低置信度重试')
+      showToast('未检测到目标，可调低置信度重试', 'info', 4000)
     } else if (!newAiBoxes.length) {
-      alert(`检测到 ${aiBoxes.length} 个目标，但均与已有标注重复，未新增`)
+      showToast(`检测到 ${aiBoxes.length} 个目标，但均与已有标注重复，未新增`, 'info', 4000)
     }
   } catch (e: any) {
     if (e?.code === 'ERR_CANCELED' || e?.message === 'canceled') {
-      alert('已取消 AI 标注')
+      showToast('已取消 AI 标注', 'info', 4000)
     } else {
-      alert('AI 预标注失败: ' + (e.response?.data?.detail || e.message))
+      if (!e?.__toastShown) showToast('AI 预标注失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
     }
   } finally {
     aiLabeling.value = false
@@ -3348,7 +3338,7 @@ const runAutoLabel = async () => {
 const applyAudit = (audit: any) => {
   imageAudit.value = audit && audit.ok ? audit : null
   if (audit && !audit.ok) {
-    alert('AI 审核失败: ' + (audit.error || '未知异常'))
+    showToast('AI 审核失败: ' + (audit.error || '未知异常'), 'error', 4000)
     return
   }
   const map = new Map<number, any>()
@@ -3376,7 +3366,7 @@ const applyAudit = (audit: any) => {
 const auditCurrentImage = async () => {
   if (!currentTask.value || !currentImage.value) return
   if (!currentBoxes.value.length) {
-    alert('当前图片没有标注框，无法审核')
+    showToast('当前图片没有标注框，无法审核', 'info', 4000)
     return
   }
   auditing.value = true
@@ -3389,12 +3379,12 @@ const auditCurrentImage = async () => {
       }))
     )
     if (res.message && !res.audit) {
-      alert(res.message)
+      showToast(res.message, 'info', 4000)
       return
     }
     applyAudit(res.audit)
   } catch (e: any) {
-    alert('AI 审核失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('AI 审核失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   } finally {
     auditing.value = false
   }
@@ -3414,7 +3404,7 @@ const refreshAuditIssues = async () => {
     const res = await listAuditIssues(currentTask.value)
     auditIssues.value = res?.issues || []
   } catch (e: any) {
-    alert('加载审核问题列表失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('加载审核问题列表失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   } finally {
     loadingIssueList.value = false
   }
@@ -3484,7 +3474,7 @@ const clearAudit = () => {
 const runBatchLabel = async () => {
   if (!currentTask.value) return
   if (!classes.value.length) {
-    alert('请先设置类别')
+    showToast('请先设置类别', 'info', 4000)
     return
   }
   if (!(await showConfirm(`确认对 ${items.value.length} 张图片执行批量 AI 预标注？已标注的类别不会被覆盖，仅会为尚未标注的新类别追加检测框。`))) return
@@ -3499,7 +3489,7 @@ const runBatchLabel = async () => {
     batchProgress.value = { status: 'running', total: result.total, done: 0, boxes_written: 0, current_image: '' }
     pollBatch()
   } catch (e: any) {
-    alert('启动批量预标注失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('启动批量预标注失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   }
 }
 
@@ -3517,7 +3507,7 @@ const pollBatch = async () => {
     batchId.value = null
     batchProgress.value = null
     saveAnnotateState()
-    alert('批量预标注任务已中断（可能因后端重启），之前已完成图片的标注已保存。')
+    showToast('批量预标注任务已中断（可能因后端重启），之前已完成图片的标注已保存。', 'info', 4000)
     await loadTaskItems()
     return
   }
@@ -3549,19 +3539,19 @@ const pollBatch = async () => {
       msg += ` · 通过 ${au.stats.keep} · 待修正 ${au.stats.modify} · 建议删除 ${au.stats.reject} · 粘连 ${au.stats.split} · 漏标 ${au.stats.missed}`
       if (au.errors > 0) msg += `（${au.errors} 张审核失败）`
     }
-    alert(msg)
+    showToast(msg, 'info', 5000)
     await loadTaskItems()
   } else if (res.status === 'cancelled') {
     batchId.value = null
     saveAnnotateState()
     const done = res.done || 0
     const annotated = res.annotated_images ?? done
-    alert(`批量预标注已取消，已标注 ${annotated} 张图片`)
+    showToast(`批量预标注已取消，已标注 ${annotated} 张图片`, 'info', 4000)
     await loadTaskItems()
   } else if (res.status === 'error') {
     batchId.value = null
     saveAnnotateState()
-    alert('批量预标注出错: ' + (res.error || '未知错误'))
+    showToast('批量预标注出错: ' + (res.error || '未知错误'), 'error', 4000)
   } else {
     saveAnnotateState()
     batchTimer.value = setTimeout(pollBatch, 1500)
@@ -3571,10 +3561,10 @@ const pollBatch = async () => {
 // 一键清除本任务所有 AI 预标注（误标过多时清理重标）
 const clearAllAiLabels = async () => {
   if (!currentTask.value) return
-  if (!confirm(`确定清除本任务全部 ${counts.value.ai} 张 AI 预标注图片吗？\n将删除这些图片的标注（含之后人工修改），不可恢复。`)) return
+  if (!(await showConfirm(`确定清除本任务全部 ${counts.value.ai} 张 AI 预标注图片吗？\n将删除这些图片的标注（含之后人工修改），不可恢复。`))) return
   try {
     const res = await clearAiAnnotations(currentTask.value)
-    alert(`已清除 ${res.removed ?? 0} 张图片的 AI 标注，可重新标注`)
+    showToast(`已清除 ${res.removed ?? 0} 张图片的 AI 标注，可重新标注`, 'info', 4000)
     await loadTaskItems()
     if (currentImage.value?.annotated) {
       await loadExistingAnnotation()
@@ -3584,7 +3574,7 @@ const clearAllAiLabels = async () => {
       loadImageToCanvas()
     }
   } catch (e: any) {
-    alert('清除失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('清除失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   }
 }
 
@@ -3636,15 +3626,15 @@ const clearAllLabels = async () => {
 // 一键清理本任务全部图片的高度重合标注框（历史遗留重叠框统一根治，对所有检测模型生效）
 const cleanOverlaps = async () => {
   if (!currentTask.value) return
-  if (!confirm(
+  if (!(await showConfirm(
     '将对本任务全部图片执行重叠框清理：\n' +
     '1. 跨类别高度重合（IoU≥0.5）只保留一个\n' +
     '2. 同类高度重叠/紧邻的框合并\n\n' +
     '此操作会覆盖图片标注，不可恢复，是否继续？'
-  )) return
+  ))) return
   try {
     const res = await cleanTaskOverlaps(currentTask.value)
-    alert(`清理完成：${res.images_cleaned ?? 0} 张图片、${res.boxes_removed ?? 0} 个重叠框被清理`)
+    showToast(`清理完成：${res.images_cleaned ?? 0} 张图片、${res.boxes_removed ?? 0} 个重叠框被清理`, 'info', 4000)
     await loadTaskItems()
     if (currentImage.value?.annotated) {
       await loadExistingAnnotation()
@@ -3654,7 +3644,7 @@ const cleanOverlaps = async () => {
       loadImageToCanvas()
     }
   } catch (e: any) {
-    alert('清理失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('清理失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   }
 }
 
@@ -3668,7 +3658,7 @@ const stopBatch = async () => {
     batchId.value = null
     batchProgress.value = null
     saveAnnotateState()
-    alert(`批量预标注已取消，已标注 ${annotated} 张图片`)
+    showToast(`批量预标注已取消，已标注 ${annotated} 张图片`, 'info', 4000)
     await loadTaskItems()
   } catch (e: any) {
     // 任务不存在（例如后端重启后内存任务清空），清理本地状态并友好提示
@@ -3676,10 +3666,10 @@ const stopBatch = async () => {
       batchId.value = null
       batchProgress.value = null
       saveAnnotateState()
-      alert('预标注任务已不存在（可能已重启），已停止')
+      showToast('预标注任务已不存在（可能已重启），已停止', 'info', 4000)
       return
     }
-    alert('停止失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('停止失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   }
 }
 
@@ -3716,10 +3706,10 @@ const persistAnnotation = async (silent = false): Promise<boolean> => {
     items.value[currentIndex.value].reviewed = items.value[currentIndex.value].reviewed || manualTouched.value
     items.value[currentIndex.value].has_polygon = currentBoxes.value.some((b: any) => (b.polygon?.length || 0) >= 3)
     dirty.value = false
-    if (!silent) alert('保存成功!')
+    if (!silent) showToast('保存成功!', 'success')
     return true
   } catch (error: any) {
-    if (!silent) alert('保存失败: ' + (error.response?.data?.detail || error.message))
+    if (!silent && !error?.__toastShown) showToast('保存失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
     return false
   } finally {
     savingAnnotation.value = false
@@ -3739,9 +3729,9 @@ const markDirty = () => {
 const onThreshChange = async () => {
   try {
     await updateSamConfig({ conf: aiConf.value, iou: aiIou.value })
-    alert(`已保存阈值：置信度 ${aiConf.value}，IoU ${aiIou.value}`)
+    showToast(`已保存阈值：置信度 ${aiConf.value}，IoU ${aiIou.value}`, 'info', 4000)
   } catch (e: any) {
-    alert('保存阈值失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('保存阈值失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   }
 }
 
@@ -3760,13 +3750,13 @@ const onImportYolo = async (e: any) => {
     const res = await importYoloLabels(currentTask.value, file)
     const msg = `导入完成：${res.imported ?? 0} 张图片`
     const skipped = (res.skipped || []).slice(0, 5).join('、')
-    alert(skipped ? `${msg}\n跳过未匹配: ${skipped}${res.skipped.length > 5 ? ' ...' : ''}` : msg)
+    showToast(skipped ? `${msg}\n跳过未匹配: ${skipped}${res.skipped.length > 5 ? ' ...' : ''}` : msg, 'info', 4000)
     await loadTaskItems()
     if (currentImage.value?.annotated) {
       await loadExistingAnnotation()
     }
   } catch (err: any) {
-    alert('导入失败: ' + (err.response?.data?.detail || err.message))
+    if (!err?.__toastShown) showToast('导入失败: ' + (err.response?.data?.detail || err.message), 'error', 4000)
   } finally {
     importing.value = false
   }
@@ -3790,12 +3780,14 @@ const exportTask = async () => {
     const segNote = result.segment_boxes
       ? `\n其中 ${result.segment_boxes} 条含分割轮廓（标签行大于 5 列，可训练分割模型）`
       : '\n注意：本次导出的标签全部只有 5 列（纯方框检测标注），无法用于训练分割模型'
-    alert(
+    showToast(
       `导出成功！共 ${cnt} 张已标注图片${segNote}\n` +
-      `YOLO 标注已写入数据集目录，划分随封板进行。`
+      `YOLO 标注已写入数据集目录，划分随封板进行。`,
+      'info',
+      5000
     )
   } catch (error: any) {
-    alert('导出失败: ' + (error.response?.data?.detail || error.message))
+    if (!error?.__toastShown) showToast('导出失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     exporting.value = false
   }
@@ -3812,9 +3804,11 @@ const exportReviewedPackage = async () => {
     const title = meta ? String(dsTitle(meta) || '').trim() : ''
     const prefix = title ? `${title}_` : ''
     downloadFile(blob, `${prefix}${currentTask.value}_reviewed.zip`)
-    alert(
+    showToast(
       `已开始下载 zip：包含您修过的 ${counts.value.reviewed} 张图片。\n` +
-      `解压后：images/ 是图片，labels/ 是 YOLO 标签（含分割轮廓），还有 classes.txt 和 data.yaml，可直接用于训练。`
+      `解压后：images/ 是图片，labels/ 是 YOLO 标签（含分割轮廓），还有 classes.txt 和 data.yaml，可直接用于训练。`,
+      'info',
+      5000
     )
   } catch (error: any) {
     // 出错时后端返回的也是 blob（JSON 内容），需要读出来才能看到具体原因
@@ -3829,7 +3823,7 @@ const exportReviewedPackage = async () => {
     } else {
       msg = data?.detail || error?.message || ''
     }
-    alert('导出失败: ' + (msg || '未知错误'))
+    if (!error?.__toastShown) showToast('导出失败: ' + (msg || '未知错误'), 'error', 4000)
   } finally {
     exportingReviewed.value = false
   }
@@ -3999,7 +3993,7 @@ const handleUrlEntry = async () => {
   await loadDatasets()
   const ds = datasets.value.find((d: any) => d.dataset_id === dsId)
   if (!ds) {
-    alert('未找到数据集 ' + dsId + '，请先上传并准备')
+    showToast('未找到数据集 ' + dsId + '，请先上传并准备', 'info', 4000)
     return
   }
   newTask.value.datasetId = dsId
@@ -4020,7 +4014,7 @@ const handleUrlEntry = async () => {
       await createTask()  // 无任务 → 自动创建（后端 prepare 已建则由 find 命中，此处兜底）
     }
   } catch (e: any) {
-    alert('进入标注任务失败: ' + (e.response?.data?.detail || e.message))
+    if (!e?.__toastShown) showToast('进入标注任务失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
   }
 }
 
@@ -5095,41 +5089,6 @@ canvas {
   gap: 0.5rem;
   padding: 2rem;
   color: #7f8c8d;
-}
-
-/* 删除图片等操作结果的页面内轻提示（iframe 内原生 alert 可能被拦截，用此提示保证可见） */
-.delete-toast {
-  position: fixed;
-  top: 18px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 9999;
-  max-width: 70vw;
-  padding: 10px 18px;
-  border-radius: 8px;
-  font-size: 13px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
-  animation: delete-toast-in 0.2s ease-out;
-  white-space: pre-line;
-}
-.delete-toast.success {
-  background: #d4edda;
-  color: #155724;
-  border: 1px solid #c3e6cb;
-}
-.delete-toast.error {
-  background: #f8d7da;
-  color: #721c24;
-  border: 1px solid #f5c6cb;
-}
-.delete-toast.info {
-  background: #d1ecf1;
-  color: #0c5460;
-  border: 1px solid #bee5eb;
-}
-@keyframes delete-toast-in {
-  from { opacity: 0; transform: translate(-50%, -8px); }
-  to   { opacity: 1; transform: translate(-50%, 0); }
 }
 
 .loading-indicator {
