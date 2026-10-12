@@ -11,6 +11,7 @@ import yaml
 from pathlib import Path
 from datetime import datetime
 import psutil
+from src.core.lifecycle import record_error, record_heartbeat
 from src.core.settings import settings
 from src.db import shadow
 from src.utils.fs_tree import build_tree
@@ -1430,10 +1431,12 @@ class TrainService:
         if settings.GPU_WATCH_POLL_SECONDS <= 0:
             return
         while True:
+            record_heartbeat("gpu_watch")
             try:
                 await asyncio.to_thread(self._gpu_watch_once)
             except Exception as e:
                 print(f"[gpu-watch] 熔断监控异常（忽略继续）: {e}")
+                record_error("gpu_watch", e)
             await asyncio.sleep(settings.GPU_WATCH_POLL_SECONDS)
 
     def _resolve_job_gpu(self, job_id: str, job_meta: dict) -> int | None:

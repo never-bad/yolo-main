@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from src.core.lifecycle import BG_LOOP_STATE
 from src.core.settings import settings, load_runtime_overrides
 from src.api.routes import datasets, annotations, train, logs, models, sam, sample_pool
 
@@ -77,4 +78,10 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "background_loops": {
+            name: {k: v for k, v in state.items() if v is not None}
+            for name, state in BG_LOOP_STATE.items()
+        },
+    }

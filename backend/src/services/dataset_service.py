@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Optional
 from PIL import Image
 from fastapi import UploadFile, HTTPException
+from src.core.lifecycle import record_error, record_heartbeat
 from src.core.settings import settings, seal_threshold_for
 from src.utils.fs_tree import build_tree
 from src.utils.class_labels import model_class_names, merge_classes_with_model
@@ -3321,6 +3322,7 @@ class DatasetService:
             return
         logger.info(f"bucket poll started, interval={interval}s")
         while True:
+            record_heartbeat("bucket_poll")
             try:
                 res = await self.advance_buckets()
                 if res.get("poured") or res.get("sealed"):
@@ -3332,6 +3334,7 @@ class DatasetService:
                 raise
             except Exception as e:
                 logger.warning(f"bucket poll: advance_buckets failed: {e}")
+                record_error("bucket_poll", e)
             await asyncio.sleep(interval)
 
     async def seal_poll_loop(self, poll_seconds: int | None = None) -> None:
@@ -3344,6 +3347,7 @@ class DatasetService:
             return
         logger.info(f"seal poll started (time-window={settings.SEAL_MAX_DAYS}天), interval={interval}s")
         while True:
+            record_heartbeat("seal_poll")
             try:
                 due = await self._collect_due_seal_datasets()
                 if due:
@@ -3358,6 +3362,7 @@ class DatasetService:
                 raise
             except Exception as e:
                 logger.warning(f"seal poll: scan failed: {e}")
+                record_error("seal_poll", e)
             await asyncio.sleep(interval)
 
     async def _collect_due_seal_datasets(self) -> list:

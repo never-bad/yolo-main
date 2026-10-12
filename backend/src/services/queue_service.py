@@ -21,6 +21,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from src.core.lifecycle import record_error, record_heartbeat
 from src.core.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -242,10 +243,12 @@ class ModelQueueService:
     async def poll_loop(self):
         """后台轮询（随 FastAPI lifespan 启动）：每 5 秒检查一次超时队列"""
         while True:
+            record_heartbeat("model_queue_poll")
             try:
                 await self.pack_timed()
             except Exception as e:
                 logger.warning(f"queue poll error: {e}")
+                record_error("model_queue_poll", e)
             await asyncio.sleep(5)
 
     # ------------------------------------------------------------------
