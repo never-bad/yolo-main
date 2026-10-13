@@ -353,7 +353,7 @@ GET /sam/download/status
 
 ## 5. 前端设计
 
-### 5.1 API 封装（`frontend/src/api/annotations.ts`）
+### 5.1 API 封装（`frontend/src/api/sam.ts`，2026-10 批次 J 拆分）
 
 ```ts
 // AIBox / getSamAvailable / uploadSamModel：前端未提供封装层（2026-10 批次 K-启动清理：删除 3 个死导出 getSamAvailable / uploadSamModel / AIBox，全仓零引用）
@@ -498,7 +498,7 @@ backend: sam_service.auto_label
 | `backend/src/api/routes/annotations.py` | 输出 `BBox` 结构完全一致，新增 `sam.py` 路由 |
 | `backend/src/services/annotation_service.py` | 复用 `save_annotation` 写 `annotations.json` |
 | `backend/src/main.py` | 注册 `sam.router` + `on_startup` 恢复批量任务 |
-| `frontend/src/api/annotations.ts` | 追加 SAM 相关 API 函数 |
+| `frontend/src/api/sam.ts` | SAM 全部 15 个接口（独立模块，2026-10 批次 J 拆分） |
 | `frontend/src/pages/DatasetAnnotate.vue` | 追加按钮、预设面板、反馈面板与状态逻辑 |
 
 ---
