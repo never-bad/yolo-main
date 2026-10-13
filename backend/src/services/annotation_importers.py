@@ -23,22 +23,12 @@ from PIL import Image
 from src.core.settings import settings
 # 分割轮廓工具：导入外部标注包时必须保留轮廓，否则会被静默截成矩形框
 from src.services.annotation_service import clean_polygon, strip_ann_bbox
+from src.utils.json_io import load_json, save_json_atomic
 
 # 支持的图片后缀（与 dataset_service 保持一致）
 IMG_SUFFIX = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 # 排除可视化预览图（如 *_result.jpg）
 EXCLUDE_KEYWORDS = ("_result", "_predict", "_detect")
-
-
-def _load_json(path: Path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _save_json(path: Path, data: dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 def _iter_images(root: Path):
@@ -102,7 +92,7 @@ def detect_format(root: Path) -> str:
         low = [x.lower() for x in p.relative_to(root).parts]
         if "annotations" in low or "coco" in p.name.lower():
             try:
-                d = _load_json(p)
+                d = load_json(p)
             except Exception:
                 continue
             if isinstance(d, dict) and "images" in d and "annotations" in d:
@@ -123,7 +113,7 @@ def detect_format(root: Path) -> str:
         if "annotations" in low:
             continue
         try:
-            d = _load_json(p)
+            d = load_json(p)
         except Exception:
             continue
         if isinstance(d, dict) and "shapes" in d and "imagePath" in d:
@@ -153,7 +143,7 @@ def _write_ann(root: Path, image_id: str, image_abs: Path, width: int, height: i
     }
     # dataset_id / version / model_id 由 prepare 阶段回填
     # 带轮廓的框只留轮廓点（与平台内标注同一存储形态：分割不存矩形）
-    _save_json(root / "annotations" / f"{image_id}.json", strip_ann_bbox(data))
+    save_json_atomic(root / "annotations" / f"{image_id}.json", strip_ann_bbox(data))
     return True
 
 
@@ -177,7 +167,7 @@ def _import_coco(root: Path) -> dict:
         if "annotations" in low:
             continue
         try:
-            d = _load_json(p)
+            d = load_json(p)
         except Exception:
             continue
         if not (isinstance(d, dict) and "images" in d and "annotations" in d):
@@ -273,7 +263,7 @@ def _import_labelme(root: Path) -> dict:
         if "annotations" in low:
             continue
         try:
-            d = _load_json(p)
+            d = load_json(p)
         except Exception:
             continue
         if not (isinstance(d, dict) and "shapes" in d and "imagePath" in d):
@@ -442,7 +432,7 @@ def refresh_image_paths(root: Path, dataset_id: str, version: str, model_id: str
         return
     for p in ann_dir.glob("*.json"):
         try:
-            data = _load_json(p)
+            data = load_json(p)
         except Exception:
             continue
         img_id = data.get("image_id", p.stem)
@@ -456,4 +446,4 @@ def refresh_image_paths(root: Path, dataset_id: str, version: str, model_id: str
         data["dataset_id"] = dataset_id
         data["version"] = version
         data["model_id"] = model_id
-        _save_json(p, data)
+        save_json_atomic(p, data)

@@ -23,6 +23,7 @@ from src.utils.fs_tree import build_tree
 from src.utils.class_labels import model_class_names, merge_classes_with_model
 from src.utils.class_labels import is_placeholder_classes as _is_placeholder_names
 from src.utils import zip_guard
+from src.utils.json_io import load_json, save_json_atomic
 from src.services.annotation_importers import import_external_annotations
 from src.services.annotation_service import (
     decode_yolo_line, yolo_label_line, clean_polygon, polygon_to_bbox, strip_ann_bbox, boxes_with_bbox,
@@ -66,7 +67,6 @@ TRAINABLE_STAGES = (STAGE_SEALED, STAGE_FAILED)
 TRAIN_STATUS_INCOMPLETE = "incomplete"   # 未完成训练（可参与聚合/回收雪球）
 TRAIN_STATUS_COMPLETED = "completed"     # 已完成训练（不再送训）
 
-
 def _ensure_stage_fields(meta: dict) -> dict:
     """为数据集 meta 补全状态机字段（兼容旧数据回填：uploaded/prepared → 标注中）"""
     meta.setdefault("stage", STAGE_ANNOTATING)
@@ -79,36 +79,20 @@ def _ensure_stage_fields(meta: dict) -> dict:
         meta["stage"] = STAGE_ANNOTATING
     return meta
 
-
-def _load_json(path: Path):
-    """同步加载 JSON 文件"""
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _save_json(path: Path, data: dict):
-    """同步保存 JSON 文件"""
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
 def _load_yaml(path: Path):
     """同步加载 YAML 文件"""
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
-
 
 def _save_yaml(path: Path, data: dict):
     """同步保存 YAML 文件"""
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, allow_unicode=True)
 
-
 def _write_bytes(path: Path, content: bytes):
     """同步写入二进制文件"""
     with open(path, "wb") as f:
         f.write(content)
-
 
 def _ensure_long_path(path_str: str) -> str:
     """确保路径支持 Windows 长路径（超过 260 字符）
@@ -126,7 +110,6 @@ def _ensure_long_path(path_str: str) -> str:
             else:
                 path_str = '\\\\?\\' + normalized_path
     return path_str
-
 
 def _extract_zip(zip_path: Path, extract_to: Path):
     """同步解压 ZIP 文件
@@ -188,7 +171,6 @@ def _extract_zip(zip_path: Path, extract_to: Path):
         
         logger.info(f"Extraction completed: {extracted_count} files extracted, {error_count} errors")
 
-
 def _extract_tar(archive_path: Path, extract_to: Path, mode: str):
     """同步解压 tar / tar.gz / tgz 文件（处理 Windows 长路径与路径安全）"""
     extract_to_str = _ensure_long_path(str(extract_to.absolute()))
@@ -236,7 +218,6 @@ def _extract_tar(archive_path: Path, extract_to: Path, mode: str):
 
         logger.info(f"Extraction completed: {extracted_count} files extracted, {error_count} errors")
 
-
 def _extract_archive(archive_path: Path, extract_to: Path):
     """按扩展名分发解压数据集压缩包（zip / tar / tar.gz / tgz）"""
     name = archive_path.name.lower()
@@ -249,10 +230,8 @@ def _extract_archive(archive_path: Path, extract_to: Path):
     else:
         raise ValueError(f"Unsupported archive format: {archive_path.name}")
 
-
 # P-03：抽样试解只认这三类后缀（与 IMG_SUFFIX 的交集，PIL 解码代价最低、覆盖最广）
 _VALIDATE_IMG_SUFFIXES = (".jpg", ".jpeg", ".png")
-
 
 def _validate_archive(archive_path: Path) -> tuple[bool, str]:
     """压缩包完整性与可解码抽样校验（P-03）。
@@ -364,7 +343,6 @@ def _validate_archive(archive_path: Path) -> tuple[bool, str]:
         return False, f"tar 完整性校验失败（无法打开：{e}）"
     return True, ""
 
-
 # ===== 后台删除队列（MLOps 优化：删除接口秒回，磁盘清理不阻塞请求）=====
 # 专用单线程工作线程：删除任务逐个排队执行，
 # 不占 asyncio.to_thread 的公共线程池，也不阻塞事件循环 / API 请求
@@ -372,7 +350,6 @@ _DELETE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="dataset-deleter"
 )
 _del_swept = False
-
 
 def _rmtree_retry(path: Path, attempts: int = 3):
     """删除目录；Windows 上被占用 / Defender 实时扫描导致失败时重试"""
@@ -384,7 +361,6 @@ def _rmtree_retry(path: Path, attempts: int = 3):
             if i == attempts - 1:
                 raise
             time.sleep(0.5)
-
 
 def _delete_file_retry(path: Path, attempts: int = 3):
     """删除文件；失败重试（跳过不存在的文件）"""
@@ -398,7 +374,6 @@ def _delete_file_retry(path: Path, attempts: int = 3):
                 raise
             time.sleep(0.3)
 
-
 def _rename_dir(src: Path, dst: Path) -> bool:
     """同卷改名（元数据操作，瞬时完成）；失败（文件被锁）返回 False"""
     try:
@@ -406,7 +381,6 @@ def _rename_dir(src: Path, dst: Path) -> bool:
         return True
     except OSError:
         return False
-
 
 def _sweep_stale_deletions(datasets_dir: Path):
     """清理上次进程崩溃遗留的「标记删除」目录（__deleting 后缀）"""
@@ -418,7 +392,6 @@ def _sweep_stale_deletions(datasets_dir: Path):
                 _rmtree_retry(p)
             except Exception:
                 pass
-
 
 def _enqueue_deletion(paths: list):
     """把待删路径提交给专用后台删除线程，接口侧不做任何等待"""
@@ -441,7 +414,6 @@ def _enqueue_deletion(paths: list):
                 logger.warning(f"后台删除失败（将残留，可手动清理）: {p}")
 
     _DELETE_EXECUTOR.submit(_job)
-
 
 class DatasetService:
     def __init__(self):
@@ -705,7 +677,7 @@ class DatasetService:
             matched_id = self._auto_match_model(detected_classes)
             if matched_id:
                 try:
-                    mcfg = _load_json(settings.REGISTRY_DIR / matched_id / "model.json")
+                    mcfg = load_json(settings.REGISTRY_DIR / matched_id / "model.json")
                 except Exception:
                     mcfg = {}
                 meta["model_id"] = matched_id
@@ -1324,7 +1296,7 @@ class DatasetService:
                 "sample_reasons": [],
                 "boxes": boxes,  # class_id 数字索引（已映射到目标模型空间）+ 像素框
             }
-            _save_json(ann_dir / f"{rec['image_id']}.json", strip_ann_bbox(doc))
+            save_json_atomic(ann_dir / f"{rec['image_id']}.json", strip_ann_bbox(doc))
             converted += 1
         return {"converted": converted, "dropped_boxes": dropped_boxes}
 
@@ -1336,7 +1308,7 @@ class DatasetService:
         n = 0
         for p in ann_dir.glob("*.json"):
             try:
-                data = _load_json(p)
+                data = load_json(p)
             except Exception:
                 continue
             if data.get("boxes"):
@@ -1367,7 +1339,7 @@ class DatasetService:
         for p in ann_dir.glob("*.json"):
             total += 1
             try:
-                data = _load_json(p)
+                data = load_json(p)
             except Exception:
                 continue
             if data.get("boxes"):
@@ -1383,7 +1355,7 @@ class DatasetService:
         if not model_id:
             return []
         try:
-            dic = _load_json(settings.REGISTRY_DIR / model_id / "labels_dict.json")
+            dic = load_json(settings.REGISTRY_DIR / model_id / "labels_dict.json")
             labels = dic.get("labels") or []
             return [
                 (lbl.get("english_code") or "").strip()
@@ -1567,7 +1539,7 @@ class DatasetService:
         if ann_dir.is_dir():
             for p in ann_dir.glob("*.json"):
                 try:
-                    data = _load_json(p)
+                    data = load_json(p)
                 except Exception:
                     continue
                 boxes = data.get("boxes")
@@ -1649,7 +1621,7 @@ class DatasetService:
         if ann_dir.exists():
             for p in ann_dir.glob("*.json"):
                 try:
-                    data = _load_json(p)
+                    data = load_json(p)
                 except Exception:
                     continue
                 # 读取兜底：分割框只存轮廓点，需要矩形的下游由外接框现算
@@ -1926,7 +1898,7 @@ class DatasetService:
                     meta_path = dataset_dir / "meta.json"
                     if meta_path.exists():
                         try:
-                            meta = _load_json(meta_path)
+                            meta = load_json(meta_path)
                             # 占位类别名回填为真实名（修复历史遗留的 class_N 占位）
                             real_classes = self._resolve_real_classes(dataset_dir, meta)
                             if real_classes != meta.get("classes"):
@@ -2083,7 +2055,7 @@ class DatasetService:
                     )
 
         def _bind_sync():
-            meta = _load_json(meta_path)
+            meta = load_json(meta_path)
             meta["model_id"] = model_id
             meta["library_root_id"] = library_root_id
             
@@ -2093,7 +2065,7 @@ class DatasetService:
                 labels_file = settings.REGISTRY_DIR / model_id / "labels_dict.json"
                 if labels_file.exists():
                     try:
-                        labels_dict = _load_json(labels_file)
+                        labels_dict = load_json(labels_file)
                     except Exception:
                         pass
             
@@ -2133,7 +2105,7 @@ class DatasetService:
                 
                 logger.info(f"bind {dataset_id}->{model_id}: synced {len(chinese_labels)} chinese labels")
             
-            _save_json(meta_path, meta)
+            save_json_atomic(meta_path, meta)
             return meta
 
         meta = await asyncio.to_thread(_bind_sync)
@@ -2326,7 +2298,7 @@ class DatasetService:
         model_code = meta.get("model_id") or ""
         if model_code:
             try:
-                mcfg = _load_json(settings.REGISTRY_DIR / model_code / "model.json")
+                mcfg = load_json(settings.REGISTRY_DIR / model_code / "model.json")
                 model_code = mcfg.get("model_code") or model_code
             except Exception:
                 pass
@@ -2450,7 +2422,7 @@ class DatasetService:
                 if not tf.is_file():
                     continue
                 try:
-                    m = _load_json(tf)
+                    m = load_json(tf)
                 except Exception:  # noqa: BLE001
                     continue
                 if m.get("dataset_id") == dataset_id:
@@ -2465,7 +2437,7 @@ class DatasetService:
         if not old_dir.exists():
             raise ValueError(f"数据集 {old_id} 不存在")
         if new_id == old_id:
-            return _load_json(old_dir / "meta.json")
+            return load_json(old_dir / "meta.json")
         if new_dir.exists():
             raise ValueError(f"目标数据集 {new_id} 已存在，无法更名")
 
@@ -2473,9 +2445,9 @@ class DatasetService:
 
         # 1) meta.dataset_id 更新（新目录下的 meta.json）
         mp = new_dir / "meta.json"
-        meta = _load_json(mp) if mp.exists() else {}
+        meta = load_json(mp) if mp.exists() else {}
         meta["dataset_id"] = new_id
-        _save_json(mp, meta)
+        save_json_atomic(mp, meta)
 
         # 2) 同源上传包跟随（{old}.zip → {new}.zip）
         old_zip = settings.UPLOADS_DIR / f"{old_id}.zip"
@@ -2489,10 +2461,10 @@ class DatasetService:
                 tf = tdir / "task.json"
                 if tf.exists() and not tdir.name.startswith("."):
                     try:
-                        m = _load_json(tf)
+                        m = load_json(tf)
                         if m.get("dataset_id") == old_id:
                             m["dataset_id"] = new_id
-                            _save_json(tf, m)
+                            save_json_atomic(tf, m)
                     except Exception:  # noqa: BLE001
                         pass
 
@@ -2500,7 +2472,7 @@ class DatasetService:
         try:
             bf = settings.DATA_DIR / "buckets.json"
             if bf.exists():
-                b = _load_json(bf)
+                b = load_json(bf)
                 changed = False
                 for mm in (b.get("models") or {}).values():
                     recv = mm.get("receiving") or {}
@@ -2513,7 +2485,7 @@ class DatasetService:
                             snap["dataset_id"] = new_id
                             changed = True
                 if changed:
-                    _save_json(bf, b)
+                    save_json_atomic(bf, b)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"rename {old_id}: bucket ledger update failed: {e}")
 
@@ -2545,7 +2517,7 @@ class DatasetService:
                         _fix_path_refs(it)
 
             _fix_path_refs(meta)
-            _save_json(mp, meta)
+            save_json_atomic(mp, meta)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"rename {old_id}: path refs update failed: {e}")
 
@@ -2560,7 +2532,7 @@ class DatasetService:
             raise ValueError(f"Dataset {dataset_id} not found")
 
         def _run():
-            meta = _load_json(meta_path)
+            meta = load_json(meta_path)
             # 数据集一律为 datasets/{dataset_id}（无 version 子目录）
             labels_dir = self._find_labels_dir(dataset_dir)
             if not labels_dir:
@@ -2571,11 +2543,11 @@ class DatasetService:
                     "note": "labels 已并入每图 JSON（txt_to_json），无 txt 需校验",
                 }
                 meta["label_validation"] = validation
-                _save_json(meta_path, meta)
+                save_json_atomic(meta_path, meta)
                 return validation
             validation = self._validate_labels(labels_dir, len(meta.get("classes") or []))
             meta["label_validation"] = validation
-            _save_json(meta_path, meta)
+            save_json_atomic(meta_path, meta)
             return validation
 
         validation = await asyncio.to_thread(_run)
@@ -2600,7 +2572,7 @@ class DatasetService:
         bucket_sealed = 0
         if await asyncio.to_thread(lambda: meta_path.exists()):
             try:
-                meta = await asyncio.to_thread(lambda: _load_json(meta_path))
+                meta = await asyncio.to_thread(lambda: load_json(meta_path))
                 archive_name = meta.get("archive")
                 model_id = meta.get("model_id") or ""
                 bucket_pending = int(meta.get("bucket_pending") or 0)
@@ -2613,7 +2585,7 @@ class DatasetService:
             try:
                 bf = settings.DATA_DIR / "buckets.json"
                 if bf.exists():
-                    state = _load_json(bf) or {"models": {}}
+                    state = load_json(bf) or {"models": {}}
                     models = state.get("models") or {}
                     mst = models.get(model_id)
                     if mst:
@@ -2639,7 +2611,7 @@ class DatasetService:
                                     m for m in snap_members
                                     if not (isinstance(m, dict) and m.get("dataset_id") == dataset_id)
                                 ]
-                    _save_json(bf, state)
+                    save_json_atomic(bf, state)
                     logger.info(
                         f"delete {dataset_id}: bucket cleanup model={model_id} "
                         f"removed={removed_count} poured={recv.get('poured', 0) if mst else 0}"
@@ -2681,7 +2653,7 @@ class DatasetService:
         def _sync():
             if not dataset_dir.exists():
                 raise ValueError(f"数据集 {dataset_id} 不存在")
-            meta = _load_json(meta_path) if meta_path.exists() else {}
+            meta = load_json(meta_path) if meta_path.exists() else {}
             if meta.get("status") != "prepared":
                 raise ValueError("数据集尚未准备（prepare），无法删除图片")
             if meta.get("stage") == STAGE_SEALED:
@@ -2735,7 +2707,7 @@ class DatasetService:
                 raise ValueError(f"图片 {image_id} 不存在于数据集 {dataset_id}")
 
             meta["image_count"] = max(0, int(meta.get("image_count") or 0) - 1)
-            _save_json(meta_path, meta)
+            save_json_atomic(meta_path, meta)
             logger.info(f"delete_image {dataset_id}: {stem} removed, image_count={meta['image_count']}")
             return {
                 "deleted": True,
@@ -2867,7 +2839,7 @@ class DatasetService:
         if not path.exists():
             return {"models": {}}  # 首次：正常
         try:
-            data = _load_json(path)
+            data = load_json(path)
         except json.JSONDecodeError as e:
             logger.error(f"buckets.json JSON 损坏，拒绝加载以防覆盖: {e}")
             raise
@@ -2902,7 +2874,7 @@ class DatasetService:
 
     def _model_code_of(self, model_id: str) -> str:
         try:
-            mcfg = _load_json(settings.REGISTRY_DIR / model_id / "model.json")
+            mcfg = load_json(settings.REGISTRY_DIR / model_id / "model.json")
             return mcfg.get("model_code") or model_id
         except Exception:
             return model_id
@@ -2934,7 +2906,7 @@ class DatasetService:
             if p.stem in sealed_stems:
                 continue
             try:
-                data = _load_json(p)
+                data = load_json(p)
             except Exception:
                 continue
             boxes = data.get("boxes")
@@ -2965,7 +2937,7 @@ class DatasetService:
                 uniq = f"p{idx:04d}_{rec['image_id']}"
                 ext = rec["img_abs"].suffix.lower() or ".jpg"
                 shutil.copy2(rec["img_abs"], wimg / f"{uniq}{ext}")
-                _save_json(wann / f"{uniq}.json", {
+                save_json_atomic(wann / f"{uniq}.json", {
                     "image_id": uniq,
                     "width": rec["width"],
                     "height": rec["height"],
@@ -3044,7 +3016,7 @@ class DatasetService:
             "is_bucket_snapshot": True,
             "bucket_index": sv,
         }
-        _save_json(ds_dir / "meta.json", meta)
+        save_json_atomic(ds_dir / "meta.json", meta)
         try:
             (ds_dir / "classes.txt").write_text("\n".join(names) + "\n", encoding="utf-8")
         except Exception:
@@ -3073,7 +3045,7 @@ class DatasetService:
                 continue
             ds_dir = self.datasets_dir / m["dataset_id"]
             meta_path = ds_dir / "meta.json"
-            pkg_meta = _load_json(meta_path) if meta_path.exists() else {}
+            pkg_meta = load_json(meta_path) if meta_path.exists() else {}
             # 数据集一律为 datasets/{dataset_id}（无 version 子目录）
             take = min(m["count"], remaining_need)
             records = self._pick_images_for_seal(ds_dir, pkg_meta, take)
@@ -3090,7 +3062,7 @@ class DatasetService:
             pkg_meta["sealed_stems"] = pkg_stems[-2000:]
             pkg_meta["bucket_index"] = int(recv["index"])
             if meta_path.exists():
-                _save_json(meta_path, pkg_meta)
+                save_json_atomic(meta_path, pkg_meta)
             remaining_need -= consumed
             m_remain = m["count"] - consumed
             if m_remain > 0:
@@ -3136,7 +3108,7 @@ class DatasetService:
                 if not meta_path.exists():
                     continue
                 try:
-                    meta = _load_json(meta_path)
+                    meta = load_json(meta_path)
                 except Exception:
                     continue
                 model_id = str(meta.get("model_id") or "")
@@ -3180,7 +3152,7 @@ class DatasetService:
                             meta["bucket_archived"] = True
                             meta["bucket_archived_at"] = datetime.now().isoformat()
                             meta["bucket_index"] = meta.get("bucket_index") or mst["receiving"]["index"]
-                            _save_json(meta_path, meta)
+                            save_json_atomic(meta_path, meta)
                             logger.info(f"bucket: {dataset_id} fully poured -> archived B{meta['bucket_index']}")
                         continue
                     pour_n = total - sealed_n - pending_n
@@ -3193,7 +3165,7 @@ class DatasetService:
                     meta["bucket_pending"] = pending_n + pour_n
                     meta["bucket_index"] = int(recv["index"])
                     meta["bucket_poured_at"] = datetime.now().isoformat()
-                    _save_json(meta_path, meta)
+                    save_json_atomic(meta_path, meta)
                     poured_events.append({
                         "model_id": model_id, "dataset_id": dataset_id,
                         "bucket_index": int(recv["index"]), "count": pour_n,
@@ -3273,7 +3245,7 @@ class DatasetService:
             meta_path = ds_dir / "meta.json"
             if not meta_path.exists():
                 raise ValueError(f"数据集 {dataset_id} 不存在")
-            meta = _load_json(meta_path)
+            meta = load_json(meta_path)
             _ensure_stage_fields(meta)
             if meta.get("bucket_archived"):
                 raise ValueError("该数据集已灌桶归档，无需审核确认；如需修改请使用「撤回」")
@@ -3285,7 +3257,7 @@ class DatasetService:
                 raise ValueError(f"标注未完成（{annotated}/{total}），请全部标注后再确认审核")
             meta["review_approved"] = True
             meta["review_approved_at"] = datetime.now().isoformat()
-            _save_json(meta_path, meta)
+            save_json_atomic(meta_path, meta)
             logger.info(f"review: {dataset_id} approved -> eligible for bucket pour")
             return meta
         result = await asyncio.to_thread(_approve_sync)
@@ -3302,7 +3274,7 @@ class DatasetService:
             meta_path = ds_dir / "meta.json"
             if not meta_path.exists():
                 raise ValueError(f"数据集 {dataset_id} 不存在")
-            meta = _load_json(meta_path)
+            meta = load_json(meta_path)
             sealed_n = int(meta.get("bucket_sealed") or 0)
             if sealed_n > 0:
                 raise ValueError(
@@ -3332,7 +3304,7 @@ class DatasetService:
             meta.pop("bucket_archived_at", None)
             meta["review_approved"] = False
             meta.pop("review_approved_at", None)
-            _save_json(meta_path, meta)
+            save_json_atomic(meta_path, meta)
             return meta
         result = await asyncio.to_thread(_unpour_sync)
         # 影子库收口：撤回同时改了桶账本与数据集 meta

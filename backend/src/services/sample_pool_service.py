@@ -13,21 +13,10 @@ import asyncio
 from pathlib import Path
 from datetime import datetime
 from src.core.settings import settings
+from src.utils.json_io import load_json, save_json_atomic
 
 # 支持的图片后缀（与 dataset_service 保持一致）
 IMG_SUFFIX = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-
-
-def _load_json(path: Path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _save_json(path: Path, data: dict):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
 def _load_yaml(path: Path):
     import yaml
     with open(path, "r", encoding="utf-8") as f:
@@ -133,7 +122,7 @@ class SamplePoolService:
             meta = {}
             if meta_p.exists():
                 try:
-                    meta = _load_json(meta_p)
+                    meta = load_json(meta_p)
                 except Exception:
                     meta = {}
             meta.update({
@@ -143,7 +132,7 @@ class SamplePoolService:
                 "label_count": len(used_lbl),
                 "updated_at": datetime.now().isoformat(),
             })
-            _save_json(meta_p, meta)
+            save_json_atomic(meta_p, meta)
 
             return {"model_id": model_id, "added": added, "skipped": skipped,
                     "pool_image_count": meta["image_count"]}
@@ -215,7 +204,7 @@ class SamplePoolService:
                     meta = {}
                     if meta_p.exists():
                         try:
-                            meta = _load_json(meta_p)
+                            meta = load_json(meta_p)
                         except Exception:
                             pass
                     image_count = 0

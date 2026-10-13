@@ -23,22 +23,11 @@ from pathlib import Path
 
 from src.core.lifecycle import record_error, record_heartbeat
 from src.core.settings import settings
+from src.utils.json_io import load_json, save_json_atomic
 
 logger = logging.getLogger(__name__)
 
 IMG_SUFFIX = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-
-
-def _load_json(path: Path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _save_json(path: Path, data: dict):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
 class ModelQueueService:
     def __init__(self):
         self.queues_dir = settings.QUEUES_DIR
@@ -52,7 +41,7 @@ class ModelQueueService:
     def _load_queue(self, model_id: str) -> dict:
         p = self._queue_path(model_id)
         try:
-            return _load_json(p)
+            return load_json(p)
         except Exception:
             return None
 
@@ -74,7 +63,7 @@ class ModelQueueService:
     def _save_queue(self, model_id: str, q: dict):
         p = self._queue_path(model_id)
         p.parent.mkdir(parents=True, exist_ok=True)
-        _save_json(p, q)
+        save_json_atomic(p, q)
 
     # ------------------------------------------------------------------
     # 辅助
@@ -103,7 +92,7 @@ class ModelQueueService:
     def _labels_dict_classes(self, model_id: str):
         """模型标签字典英文码（按 index 升序）；无字典返回 None（任务类别回退数据集文件）"""
         try:
-            dic = _load_json(settings.REGISTRY_DIR / model_id / "labels_dict.json")
+            dic = load_json(settings.REGISTRY_DIR / model_id / "labels_dict.json")
             labels = dic.get("labels") or []
             names = [
                 (l.get("english_code") or "").strip()

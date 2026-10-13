@@ -12,14 +12,9 @@ from PIL import Image
 from src.core.settings import settings
 from src.utils.class_labels import model_class_names, merge_classes_with_model
 from src.utils import zip_guard
+from src.utils.json_io import load_json, save_json_atomic
 
 logger = logging.getLogger(__name__)
-
-
-def _load_json(path: Path):
-    """同步加载 JSON 文件"""
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
 
 
 def live_classes(snapshot_classes: list, model_id: str) -> list:
@@ -35,7 +30,7 @@ def live_classes(snapshot_classes: list, model_id: str) -> list:
         return [str(c) for c in (snapshot_classes or [])]
 
 
-def _save_json(path: Path, data: dict):
+def save_json_atomic(path: Path, data: dict):
     """同步保存 JSON 文件"""
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -296,14 +291,14 @@ class AnnotationService:
     def _load_image_ann(self, dataset_id: str, version: str, image_id: str) -> dict:
         p = self._image_ann_path(dataset_id, version, image_id)
         try:
-            return ann_with_bbox(_load_json(p))
+            return ann_with_bbox(load_json(p))
         except Exception:
             return {}
 
     def _save_image_ann(self, dataset_id: str, version: str, image_id: str, data: dict):
         p = self._image_ann_path(dataset_id, version, image_id)
         p.parent.mkdir(parents=True, exist_ok=True)
-        _save_json(p, strip_ann_bbox(data))
+        save_json_atomic(p, strip_ann_bbox(data))
 
     def _delete_image_ann(self, dataset_id: str, version: str, image_id: str):
         p = self._image_ann_path(dataset_id, version, image_id)
@@ -320,7 +315,7 @@ class AnnotationService:
             return out
         for p in ann_dir.glob("*.json"):
             try:
-                data = ann_with_bbox(_load_json(p))
+                data = ann_with_bbox(load_json(p))
                 out[data.get("image_id", p.stem)] = data
             except Exception:
                 continue
@@ -338,7 +333,7 @@ class AnnotationService:
         if not model_id:
             return {}
         try:
-            dic = _load_json(settings.REGISTRY_DIR / model_id / "labels_dict.json")
+            dic = load_json(settings.REGISTRY_DIR / model_id / "labels_dict.json")
         except Exception:
             return {}
         labels = dic.get("labels") or []
@@ -502,7 +497,7 @@ class AnnotationService:
             model_id, auto_classes = "", []
             try:
                 if ds_meta_path.exists():
-                    ds_meta = _load_json(ds_meta_path)
+                    ds_meta = load_json(ds_meta_path)
                     model_id = ds_meta.get("model_id", "")
                     auto_classes = ds_meta.get("classes") or []
                 else:
@@ -622,7 +617,7 @@ class AnnotationService:
                 "imported_annotations": loaded_count  # 记录导入的标注数量
             }
             
-            _save_json(task_dir / "task.json", task_meta)
+            save_json_atomic(task_dir / "task.json", task_meta)
             
             return {
                 "task_id": task_id,
@@ -655,7 +650,7 @@ class AnnotationService:
             if not task_file.is_file():
                 continue
             try:
-                meta = _load_json(task_file)
+                meta = load_json(task_file)
             except Exception:
                 continue
             if meta.get("dataset_id") == dataset_id and meta.get("version", "v1") == version:
@@ -682,7 +677,7 @@ class AnnotationService:
             task_file = task_dir / "task.json"
             if not task_file.exists():
                 raise ValueError(f"标注任务 {task_id} 不存在")
-            return _load_json(task_file)
+            return load_json(task_file)
 
         meta = await asyncio.to_thread(_sync)
         ds_id = meta.get("dataset_id") or ""
@@ -699,7 +694,7 @@ class AnnotationService:
 
         def _save():
             task_dir = self.annotations_dir / task_id
-            _save_json(task_dir / "task.json", meta)
+            save_json_atomic(task_dir / "task.json", meta)
 
         await asyncio.to_thread(_save)
         # 影子库收口：任务图片删除后同步移除 task_items 行，避免列表残留
@@ -803,7 +798,7 @@ class AnnotationService:
             return None
         
         def _get_task_items_sync():
-            task_meta = _load_json(task_file)
+            task_meta = load_json(task_file)
             dataset_id, version = self._task_to_ds(task_meta)
             
             # 读取标注状态（优先每图 JSON，兼容历史任务集中式 annotations.json）
@@ -812,7 +807,7 @@ class AnnotationService:
             legacy_file = task_dir / "annotations.json"
             try:
                 if legacy_file.exists():
-                    for img_id, ann in _load_json(legacy_file).items():
+                    for img_id, ann in load_json(legacy_file).items():
                         annotations.setdefault(img_id, ann)
             except Exception:
                 pass
@@ -857,7 +852,7 @@ class AnnotationService:
             return None
         
         def _get_image_annotation_sync():
-            task_meta = _load_json(task_file)
+            task_meta = load_json(task_file)
             dataset_id, version = self._task_to_ds(task_meta)
             
             # 查找图片信息
@@ -876,7 +871,7 @@ class AnnotationService:
                 legacy_file = task_dir / "annotations.json"
                 try:
                     if legacy_file.exists():
-                        annotation = _load_json(legacy_file).get(image_id, {})
+                        annotation = load_json(legacy_file).get(image_id, {})
                 except Exception:
                     annotation = {}
             # 类别清单跟随算法库（#6）：下拉框与框下标必须同源，否则前端渲染错位
@@ -935,7 +930,7 @@ class AnnotationService:
             return {"ok": False, "error": "Task not found"}
         
         def _save_annotation_sync():
-            task_meta = _load_json(task_file)
+            task_meta = load_json(task_file)
             dataset_id, version = self._task_to_ds(task_meta)
             
             # 读取该图已有标注（保留 AI 标注标记：人工保存不应清掉标记）
@@ -1037,7 +1032,7 @@ class AnnotationService:
             return {"ok": False, "error": "Task not found"}
 
         def _clear_sync():
-            task_meta = _load_json(task_file)
+            task_meta = load_json(task_file)
             dataset_id, version = self._task_to_ds(task_meta)
             removed = 0
 
@@ -1052,13 +1047,13 @@ class AnnotationService:
             legacy_file = task_dir / "annotations.json"
             try:
                 if legacy_file.exists():
-                    legacy = _load_json(legacy_file)
+                    legacy = load_json(legacy_file)
                     before = len(legacy)
                     for image_id in list(legacy.keys()):
                         if legacy[image_id].get("ai_annotated"):
                             del legacy[image_id]
                     if len(legacy) != before:
-                        _save_json(legacy_file, legacy)
+                        save_json_atomic(legacy_file, legacy)
                         removed += before - len(legacy)
             except Exception:
                 pass
@@ -1085,7 +1080,7 @@ class AnnotationService:
             task_file = task_dir / "task.json"
             if not task_file.exists():
                 raise ValueError(f"标注任务 {task_id} 不存在")
-            task_meta = _load_json(task_file)
+            task_meta = load_json(task_file)
             dataset_id, version = self._task_to_ds(task_meta)
             if not dataset_id:
                 raise ValueError("标注任务未绑定数据集，无法清除标注")
@@ -1094,7 +1089,7 @@ class AnnotationService:
             meta_path = dataset_dir / "meta.json"
             if not meta_path.exists():
                 raise ValueError(f"数据集 {dataset_id} 不存在")
-            meta = _load_json(meta_path)
+            meta = load_json(meta_path)
             if meta.get("status") != "prepared":
                 raise ValueError("数据集尚未准备（prepare），无法清除标注")
             if meta.get("stage") == "sealed":
@@ -1152,7 +1147,7 @@ class AnnotationService:
             # 3) 历史任务集中式标注文件一并清空，避免旧数据回灌
             legacy_file = task_dir / "annotations.json"
             if legacy_file.exists():
-                _save_json(legacy_file, {})
+                save_json_atomic(legacy_file, {})
 
             # 4) 删除派生的 YOLO txt（classes.txt 是类别表，不属于标注，保留）
             removed_txt = 0
@@ -1171,7 +1166,7 @@ class AnnotationService:
             meta["has_labels"] = False
             meta["review_approved"] = False
             meta.pop("review_approved_at", None)
-            _save_json(meta_path, meta)
+            save_json_atomic(meta_path, meta)
 
             logger.info(
                 f"clear-all annotations {dataset_id} (task={task_id}): "
@@ -1198,7 +1193,7 @@ class AnnotationService:
                     return {"ok": False, "error": "Task not found"}
                 
                 # 读取任务信息
-                task_meta = _load_json(task_file)
+                task_meta = load_json(task_file)
                 dataset_id = task_meta["dataset_id"]
                 version = task_meta["version"]
                 # 标注读取：优先每图 JSON，兼容历史任务集中式 annotations.json
@@ -1206,7 +1201,7 @@ class AnnotationService:
                 legacy_file = task_dir / "annotations.json"
                 try:
                     if legacy_file.exists():
-                        for img_id, ann in _load_json(legacy_file).items():
+                        for img_id, ann in load_json(legacy_file).items():
                             annotations.setdefault(img_id, ann)
                 except Exception:
                     pass
@@ -1316,13 +1311,13 @@ class AnnotationService:
                 if not task_file.exists():
                     return {"ok": False, "error": "Task not found"}
 
-                task_meta = _load_json(task_file)
+                task_meta = load_json(task_file)
                 dataset_id, version = self._task_to_ds(task_meta)
                 annotations = self._load_all_image_anns(dataset_id, version)
                 legacy_file = task_dir / "annotations.json"
                 try:
                     if legacy_file.exists():
-                        for img_id, ann in _load_json(legacy_file).items():
+                        for img_id, ann in load_json(legacy_file).items():
                             annotations.setdefault(img_id, ann)
                 except Exception:
                     pass
@@ -1469,7 +1464,7 @@ class AnnotationService:
             return {"ok": False, "error": "Task not found"}
 
         def _import_sync():
-            task_meta = _load_json(task_file)
+            task_meta = load_json(task_file)
             items = task_meta["items"]
             classes = task_meta.get("classes", [])
             dataset_id, version = self._task_to_ds(task_meta)

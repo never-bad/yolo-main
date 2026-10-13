@@ -20,6 +20,7 @@ import numpy as np
 from src.core.settings import settings
 from src.services.device_manager import get_best_device
 from src.services.annotation_service import AnnotationService
+from src.utils.json_io import load_json, save_json_atomic
 
 
 DEFAULT_CONFIG = {
@@ -77,18 +78,6 @@ DEFAULT_CONFIG = {
     "qwen_keep_alive": "5m",         # Ollama keep_alive：模型驻留内存时长（"5m"/"30m"/"-1"=常驻），避免频繁换载
     "qwen_num_parallel": 1,          # OLLAMA_NUM_PARALLEL：同一模型并行处理请求数（GPU 显存充裕可调大）
 }
-
-
-def _load_json(path: Path) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _save_json(path: Path, data: dict):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
 class BatchTask:
     """内存中的批量预标注任务状态"""
 
@@ -154,7 +143,7 @@ class SAMService:
         p = self._config_path()
         if p.exists():
             try:
-                saved = _load_json(p)
+                saved = load_json(p)
                 cfg.update(saved)
                 overrides = saved
             except Exception:
@@ -191,7 +180,7 @@ class SAMService:
             if not task_file.exists():
                 print(f"qwen: [DEBUG] task.json 不存在: {task_file}")
                 return None
-            task_meta = _load_json(task_file)
+            task_meta = load_json(task_file)
             dataset_id = task_meta.get("dataset_id")
             if not dataset_id:
                 print(f"qwen: [DEBUG] task.json 没有 dataset_id: {task_meta}")
@@ -201,7 +190,7 @@ class SAMService:
             if not ds_meta_file.exists():
                 print(f"qwen: [DEBUG] meta.json 不存在: {ds_meta_file}")
                 return None
-            ds_meta = _load_json(ds_meta_file)
+            ds_meta = load_json(ds_meta_file)
             model_id = ds_meta.get("model_id")
             if not model_id:
                 print(f"qwen: [DEBUG] meta.json 没有 model_id: {ds_meta}")
@@ -210,7 +199,7 @@ class SAMService:
             if not dict_file.exists():
                 print(f"qwen: [DEBUG] labels_dict.json 不存在: {dict_file}")
                 return None
-            full_dict = _load_json(dict_file)
+            full_dict = load_json(dict_file)
             labels = (full_dict or {}).get("labels") or []
             print(f"qwen: [DEBUG] task={task_id} → dataset={dataset_id} → model={model_id} → labels_count={len(labels)} → chinese_names={[l.get('chinese_name') for l in labels]}")
             return {"model_id": model_id, "labels": labels}
@@ -358,7 +347,7 @@ class SAMService:
         if cand.exists():
             return cand
         try:
-            meta = _load_json(d / "model.json")
+            meta = load_json(d / "model.json")
         except Exception:
             return None
         p = str(meta.get("weights_path") or "").strip()
@@ -368,7 +357,7 @@ class SAMService:
 
     def _trained_meta(self, model_id: str) -> dict:
         try:
-            return _load_json(self._trained_dir(model_id) / "model.json")
+            return load_json(self._trained_dir(model_id) / "model.json")
         except Exception:
             return {}
 
@@ -461,11 +450,11 @@ class SAMService:
             task_file = settings.ANNOTATIONS_DIR / task_id / "task.json"
             if not task_file.exists():
                 return "", ""
-            dataset_id = _load_json(task_file).get("dataset_id") or ""
+            dataset_id = load_json(task_file).get("dataset_id") or ""
             ds_file = settings.DATASETS_DIR / dataset_id / "meta.json"
             if not dataset_id or not ds_file.exists():
                 return dataset_id, ""
-            return dataset_id, _load_json(ds_file).get("model_id") or ""
+            return dataset_id, load_json(ds_file).get("model_id") or ""
         except Exception as e:
             print(f"trained_model: 解析任务归属失败: {e}")
             return "", ""
@@ -1276,7 +1265,7 @@ class SAMService:
         if not task_file.exists():
             return {"ok": False, "error": "Task not found"}
         try:
-            task_meta = _load_json(task_file)
+            task_meta = load_json(task_file)
         except Exception:
             return {"ok": False, "error": "读取任务元数据失败"}
         dataset_id = task_meta.get("dataset_id", "")
@@ -1315,17 +1304,17 @@ class SAMService:
         if ann_dir.exists():
             for p in ann_dir.glob("*.json"):
                 try:
-                    ann = _load_json(p)
+                    ann = load_json(p)
                 except Exception:
                     continue
                 if _clean_one(ann):
-                    _save_json(p, ann)
+                    save_json_atomic(p, ann)
 
         # 旧版本任务集中式标注文件（兼容清洗）
         legacy_file = task_dir / "annotations.json"
         if legacy_file.exists():
             try:
-                legacy = _load_json(legacy_file)
+                legacy = load_json(legacy_file)
             except Exception as e:
                 return {"ok": False, "error": f"读取标注文件失败: {e}"}
             dirty = False
@@ -1333,7 +1322,7 @@ class SAMService:
                 if _clean_one(ann):
                     dirty = True
             if dirty:
-                _save_json(legacy_file, legacy)
+                save_json_atomic(legacy_file, legacy)
 
         return {
             "ok": True,
@@ -2004,7 +1993,7 @@ class SAMService:
     def _task_classes(self, task_id: str) -> list:
         """读取标注任务注册的类别清单（英文 code，与 labels_dict/labels 序号对齐）"""
         try:
-            meta = _load_json(settings.ANNOTATIONS_DIR / task_id / "task.json")
+            meta = load_json(settings.ANNOTATIONS_DIR / task_id / "task.json")
             return list(meta.get("classes") or [])
         except Exception:
             return []

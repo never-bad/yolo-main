@@ -13,26 +13,13 @@ from datetime import datetime
 from fastapi import UploadFile
 from src.core.settings import settings
 from src.db import shadow
+from src.utils.json_io import load_json, save_json_atomic
 from src.utils import zip_guard
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
 import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
-
-
-def _load_json(path: Path):
-    """同步加载 JSON 文件"""
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _save_json(path: Path, data: dict):
-    """同步保存 JSON 文件"""
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
 # ---------------------------------------------------------------------------
 # 阶段 0：模型统一定义（唯一 code）+ 统一标签字典（四字段）
 # ---------------------------------------------------------------------------
@@ -100,7 +87,7 @@ class ModelService:
                     if not mf.exists():
                         continue
                     try:
-                        metas[model_dir.name] = _load_json(mf)
+                        metas[model_dir.name] = load_json(mf)
                     except Exception:
                         continue
 
@@ -113,7 +100,7 @@ class ModelService:
                     if not mf.exists():
                         continue
                     try:
-                        ds_meta = _load_json(mf)
+                        ds_meta = load_json(mf)
                     except Exception:
                         continue
                     mid = ds_meta.get("library_root_id") or ds_meta.get("model_id")
@@ -188,7 +175,7 @@ class ModelService:
                 if model_info:
                     model_meta["model_info"] = model_info
                     try:
-                        save_meta = _load_json(model_file)
+                        save_meta = load_json(model_file)
                         save_meta["model_info"] = model_info
                         await asyncio.to_thread(_save_json, model_file, save_meta)
                     except Exception as e:
@@ -232,7 +219,7 @@ class ModelService:
             job_file = job_dir / "job.json"
             if job_file.exists():
                 try:
-                    job_meta = _load_json(job_file)
+                    job_meta = load_json(job_file)
                     metrics["job_config"] = {
                         "dataset_id": job_meta.get("dataset_id"),
                         "epochs": job_meta.get("epochs"),
@@ -371,7 +358,7 @@ class ModelService:
             return None
         
         def _update_model_sync():
-            model_meta = _load_json(model_file)
+            model_meta = load_json(model_file)
             
             # 更新字段
             if request.name is not None:
@@ -391,9 +378,9 @@ class ModelService:
                 dict_file = model_dir / "labels_dict.json"
                 if dict_file.exists():
                     try:
-                        dic = _load_json(dict_file)
+                        dic = load_json(dict_file)
                         dic["model_code"] = code
-                        _save_json(dict_file, dic)
+                        save_json_atomic(dict_file, dic)
                     except Exception:
                         pass
             if request.display_name is not None:
@@ -425,7 +412,7 @@ class ModelService:
             
             model_meta["updated_at"] = datetime.now().isoformat()
             
-            _save_json(model_file, model_meta)
+            save_json_atomic(model_file, model_meta)
             
             return model_meta
         
@@ -446,7 +433,7 @@ class ModelService:
             if not mf.exists():
                 continue
             try:
-                if (str(_load_json(mf).get("model_code", "") or "")).lower() == code:
+                if (str(load_json(mf).get("model_code", "") or "")).lower() == code:
                     return True
             except Exception:
                 continue
@@ -455,7 +442,7 @@ class ModelService:
     def _is_library_record(self, model_id: str) -> bool:
         """registry 中的库根占位记录（首页「新建算法库」产生的 empty 模型）。"""
         try:
-            m = _load_json(self.registry_dir / model_id / "model.json")
+            m = load_json(self.registry_dir / model_id / "model.json")
         except Exception:
             return False
         return bool(m.get("empty"))
@@ -477,7 +464,7 @@ class ModelService:
             if not mf.exists():
                 continue
             try:
-                meta = _load_json(mf)
+                meta = load_json(mf)
             except Exception:
                 continue
             if (str(meta.get("display_name", "") or "")).strip().lower() == target:
@@ -498,7 +485,7 @@ class ModelService:
             if not mf.exists():
                 continue
             try:
-                meta = _load_json(mf)
+                meta = load_json(mf)
                 if _normalize_model_code(meta.get("model_code") or "") == norm:
                     return meta
             except Exception:
@@ -514,7 +501,7 @@ class ModelService:
         if not model_id:
             return None
         try:
-            meta = _load_json(self.registry_dir / model_id / "model.json")
+            meta = load_json(self.registry_dir / model_id / "model.json")
         except Exception:
             return None
         return meta.get("library_root_id") or model_id
@@ -564,8 +551,8 @@ class ModelService:
                 "created_at": now,
                 "updated_at": now,
             }
-            _save_json(model_dir / "model.json", meta)
-            _save_json(model_dir / "labels_dict.json", {"model_code": norm, "labels": []})
+            save_json_atomic(model_dir / "model.json", meta)
+            save_json_atomic(model_dir / "labels_dict.json", {"model_code": norm, "labels": []})
             return meta
 
         result = await asyncio.to_thread(_create_sync)
@@ -584,11 +571,11 @@ class ModelService:
         file = model_dir / "labels_dict.json"
         if file.exists():
             try:
-                return [(str(l.get("english_code")) or "").strip() for l in (_load_json(file).get("labels") or [])]
+                return [(str(l.get("english_code")) or "").strip() for l in (load_json(file).get("labels") or [])]
             except Exception:
                 pass
         try:
-            meta = _load_json(model_dir / "model.json")
+            meta = load_json(model_dir / "model.json")
             return [str(c) for c in (meta.get("classes") or []) if c]
         except Exception:
             return []
@@ -609,7 +596,7 @@ class ModelService:
             if not mf.exists():
                 continue
             try:
-                if _load_json(mf).get("model_id") == model_id:
+                if load_json(mf).get("model_id") == model_id:
                     count += 1
             except Exception:
                 continue
@@ -633,7 +620,7 @@ class ModelService:
                 if not mf.exists():
                     continue
                 try:
-                    meta = _load_json(mf)
+                    meta = load_json(mf)
                 except Exception:
                     continue
                 codes = self._model_label_codes(model_dir)
@@ -728,19 +715,19 @@ class ModelService:
                     main_codes.add(self._norm_class_name(code))
                     added.append(code)
                 merged_detail.append({"model_id": mid, "added_classes": added})
-            _save_json(main_dir / "labels_dict.json", main_dict)
+            save_json_atomic(main_dir / "labels_dict.json", main_dict)
 
             # 2) 血缘与数据集重归属
-            main_meta = _load_json(main_dir / "model.json")
+            main_meta = load_json(main_dir / "model.json")
             merged_from = list(main_meta.get("merged_from") or [])
             rebind_map = {}     # 被合并模型 -> [数据集 id]
             original_map = {}   # 数据集 id -> 原模型 id（回滚依据）
             for mid in merged:
                 mdir = self.registry_dir / mid
-                mmeta = _load_json(mdir / "model.json")
+                mmeta = load_json(mdir / "model.json")
                 mmeta["merged_into"] = main_model_id
                 mmeta["merged_at"] = now
-                _save_json(mdir / "model.json", mmeta)
+                save_json_atomic(mdir / "model.json", mmeta)
                 merged_from.append({"model_id": mid, "merged_at": now, "reason": reason or "相似模型合并"})
                 # 数据集重新归属主模型
                 datasets_dir = settings.DATASETS_DIR
@@ -750,7 +737,7 @@ class ModelService:
                         if not mf.exists():
                             continue
                         try:
-                            dm = _load_json(mf)
+                            dm = load_json(mf)
                         except Exception:
                             continue
                         if dm.get("model_id") != mid:
@@ -758,11 +745,11 @@ class ModelService:
                         original_map[ds_dir.name] = mid
                         dm["model_id"] = main_model_id
                         dm["merged_from_model"] = mid
-                        _save_json(mf, dm)
+                        save_json_atomic(mf, dm)
                         rebind_map.setdefault(mid, []).append(ds_dir.name)
             main_meta["merged_from"] = merged_from
             main_meta["updated_at"] = now
-            _save_json(main_dir / "model.json", main_meta)
+            save_json_atomic(main_dir / "model.json", main_meta)
 
             # 3) 合并日志（含 rebind 原始映射，供回滚）
             log_entry = {
@@ -778,11 +765,11 @@ class ModelService:
             logs = []
             if log_file.exists():
                 try:
-                    logs = _load_json(log_file)
+                    logs = load_json(log_file)
                 except Exception:
                     logs = []
             logs.append(log_entry)
-            _save_json(log_file, logs)
+            save_json_atomic(log_file, logs)
 
             return {
                 "ok": True,
@@ -809,7 +796,7 @@ class ModelService:
             if not log_file.exists():
                 return []
             try:
-                logs = _load_json(log_file)
+                logs = load_json(log_file)
                 if not isinstance(logs, list):
                     return []
                 logs = sorted(logs, key=lambda x: x.get("at", ""), reverse=True)
@@ -827,7 +814,7 @@ class ModelService:
             log_file = self.registry_dir / "_merge_log.json"
             if not log_file.exists():
                 raise ValueError("无合并日志可回滚")
-            logs = _load_json(log_file)
+            logs = load_json(log_file)
             if not isinstance(logs, list) or not logs:
                 raise ValueError("无合并日志可回滚")
             entry = logs[log_index]
@@ -839,10 +826,10 @@ class ModelService:
                 if not mf.exists():
                     continue
                 try:
-                    dm = _load_json(mf)
+                    dm = load_json(mf)
                     dm["model_id"] = orig_mid
                     dm.pop("merged_from_model", None)
-                    _save_json(mf, dm)
+                    save_json_atomic(mf, dm)
                     restored.append(ds_id)
                 except Exception:
                     continue
@@ -853,16 +840,16 @@ class ModelService:
                 if not mf.exists():
                     continue
                 try:
-                    mmeta = _load_json(mf)
+                    mmeta = load_json(mf)
                     mmeta.pop("merged_into", None)
                     mmeta.pop("merged_at", None)
-                    _save_json(mf, mmeta)
+                    save_json_atomic(mf, mmeta)
                     unmarked.append(mid)
                 except Exception:
                     continue
             logs.pop(log_index)
             if logs:
-                _save_json(log_file, logs)
+                save_json_atomic(log_file, logs)
             else:
                 log_file.unlink(missing_ok=True)
             return {
@@ -957,12 +944,12 @@ class ModelService:
                     "chinese_desc": (item.get("chinese_desc") or "").strip(),
                     "ai_prompt_en": (item.get("ai_prompt_en") or "").strip(),
                 })
-            model_meta = _load_json(model_dir / "model.json")
+            model_meta = load_json(model_dir / "model.json")
             dic = {
                 "model_code": model_meta.get("model_code"),
                 "labels": new_labels,
             }
-            _save_json(model_dir / "labels_dict.json", dic)
+            save_json_atomic(model_dir / "labels_dict.json", dic)
             return dic
         result = await asyncio.to_thread(_sync)
         # 影子库收口：labels_dict.json 是 models.labels / labels_file 列的来源，改字典即改库中真值
@@ -998,7 +985,7 @@ class ModelService:
             {"index": i, "english_code": c, "chinese_name": "", "chinese_desc": "", "ai_prompt_en": ""}
             for i, c in enumerate(uniq)
         ]
-        meta = _load_json(model_dir / "model.json")
+        meta = load_json(model_dir / "model.json")
         meta["classes"] = uniq
         # 注意：绝不能用 empty 表达"标签字典已初始化"。empty 的唯一语义是
         # 「算法库占位记录（非训练产出）」——模型管理页靠 !empty 把它过滤出模型列表，
@@ -1008,8 +995,8 @@ class ModelService:
         meta["labels_auto_init"] = True
         meta["labels_auto_init_at"] = datetime.now().isoformat()
         meta["updated_at"] = meta["labels_auto_init_at"]
-        _save_json(model_dir / "model.json", meta)
-        _save_json(model_dir / "labels_dict.json", {
+        save_json_atomic(model_dir / "model.json", meta)
+        save_json_atomic(model_dir / "labels_dict.json", {
             "model_code": meta.get("model_code"),
             "labels": labels,
         })
@@ -1047,7 +1034,7 @@ class ModelService:
         root_id = self.resolve_library_root_id(model_id) or model_id
         for ds_dir in self._library_dataset_dirs_sync(root_id):
             try:
-                ds_meta = _load_json(ds_dir / "meta.json") or {}
+                ds_meta = load_json(ds_dir / "meta.json") or {}
             except Exception:
                 continue
             # 判据②：数据集自带的类名清单
@@ -1063,7 +1050,7 @@ class ModelService:
                 continue
             for p in ann_dir.glob("*.json"):
                 try:
-                    boxes = (_load_json(p) or {}).get("boxes") or []
+                    boxes = (load_json(p) or {}).get("boxes") or []
                 except Exception:
                     continue
                 seen = set()
@@ -1140,7 +1127,7 @@ class ModelService:
 
         def _collect_sync():
             try:
-                _load_json(meta_file)
+                load_json(meta_file)
             except Exception:
                 pass
             ann_dir = ds_dir / "annotations"
@@ -1148,7 +1135,7 @@ class ModelService:
             if ann_dir.exists():
                 for p in ann_dir.glob("*.json"):
                     try:
-                        data = _load_json(p)
+                        data = load_json(p)
                     except Exception:
                         continue
                     boxes = data.get("boxes") or []
@@ -1222,7 +1209,7 @@ class ModelService:
                 })
                 added.append(code)
             if added:
-                _save_json(model_dir / "labels_dict.json", {"model_code": dic.get("model_code"), "labels": labels})
+                save_json_atomic(model_dir / "labels_dict.json", {"model_code": dic.get("model_code"), "labels": labels})
             return {"added": added, "skipped": skipped}
         result = await asyncio.to_thread(_sync)
         # 影子库收口：采纳建议等于扩写标签字典，同步 models.labels
@@ -1246,7 +1233,7 @@ class ModelService:
                 if not mf.exists():
                     continue
                 try:
-                    metas[mdir.name] = _load_json(mf)
+                    metas[mdir.name] = load_json(mf)
                 except Exception:
                     continue
         out = []
@@ -1258,7 +1245,7 @@ class ModelService:
             if not mf.exists():
                 continue
             try:
-                ds_meta = _load_json(mf)
+                ds_meta = load_json(mf)
             except Exception:
                 continue
             owner = ds_meta.get("library_root_id") or ds_meta.get("model_id")
@@ -1310,7 +1297,7 @@ class ModelService:
                     continue
                 for fp in sorted(ann_dir.glob("*.json")):
                     try:
-                        data = _load_json(fp)
+                        data = load_json(fp)
                     except Exception:
                         continue
                     stats["files_scanned"] += 1
@@ -1356,7 +1343,7 @@ class ModelService:
                     bk.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(fp, bk)
                 for fp, data, _bk in touched:
-                    _save_json(fp, data)
+                    save_json_atomic(fp, data)
 
             result = {
                 "model_id": model_id,
@@ -1368,7 +1355,7 @@ class ModelService:
             }
             meta_path = model_dir / "model.json"
             try:
-                meta = _load_json(meta_path)
+                meta = load_json(meta_path)
                 lb = meta.get("labels_sync_backup")
                 if lb:
                     result["last_backup"] = {
@@ -1388,7 +1375,7 @@ class ModelService:
                     "boxes": stats["boxes_changed"],
                 }
                 meta["updated_at"] = meta["labels_sync_backup"]["at"]
-                _save_json(meta_path, meta)
+                save_json_atomic(meta_path, meta)
                 result["last_backup"] = meta["labels_sync_backup"]
             return result
 
@@ -1405,7 +1392,7 @@ class ModelService:
             meta_path = model_dir / "model.json"
             if not meta_path.exists():
                 return None
-            meta = _load_json(meta_path)
+            meta = load_json(meta_path)
             lb = meta.get("labels_sync_backup") or {}
             backup_id = str(lb.get("backup_id") or "")
             if not backup_id or "/" in backup_id or "\\" in backup_id or ".." in backup_id:
@@ -1426,7 +1413,7 @@ class ModelService:
                 restored += 1
             meta.pop("labels_sync_backup", None)
             meta["updated_at"] = datetime.now().isoformat()
-            _save_json(meta_path, meta)
+            save_json_atomic(meta_path, meta)
             return {"model_id": model_id, "restored_files": restored, "backup_id": backup_id}
 
         result = await asyncio.to_thread(_sync)
@@ -1439,11 +1426,11 @@ class ModelService:
         """读取标签字典；不存在则从 model.json 的 classes 懒初始化并写回"""
         file = model_dir / "labels_dict.json"
         if file.exists():
-            return _load_json(file)
+            return load_json(file)
         model_code = None
         classes = []
         try:
-            model_meta = _load_json(model_dir / "model.json")
+            model_meta = load_json(model_dir / "model.json")
             classes = model_meta.get("classes") or []
             model_code = model_meta.get("model_code")
         except Exception:
@@ -1456,7 +1443,7 @@ class ModelService:
             "model_code": model_code,
             "labels": labels,
         }
-        _save_json(file, dic)
+        save_json_atomic(file, dic)
         return dic
     
     async def delete_model(self, model_id: str):
@@ -1486,7 +1473,7 @@ class ModelService:
         if not lib_file.exists():
             raise ValueError(f"算法库不存在：{lib_id}")
         try:
-            lib_meta = _load_json(lib_file)
+            lib_meta = load_json(lib_file)
         except Exception:
             raise ValueError(f"算法库记录读取失败：{lib_id}")
 
@@ -1501,15 +1488,15 @@ class ModelService:
         model_meta["updated_at"] = datetime.now().isoformat()
 
         model_dir = self.registry_dir / mid
-        _save_json(model_dir / "model.json", model_meta)
+        save_json_atomic(model_dir / "model.json", model_meta)
         # 标签字典跟着对齐 model_code（条目按 index/english_code 组织，内容不受影响）
         dict_file = model_dir / "labels_dict.json"
         if dict_file.exists() and model_meta.get("model_code"):
             try:
-                dic = _load_json(dict_file)
+                dic = load_json(dict_file)
                 if (dic.get("model_code") or "") != model_meta["model_code"]:
                     dic["model_code"] = model_meta["model_code"]
-                    _save_json(dict_file, dic)
+                    save_json_atomic(dict_file, dic)
             except Exception:
                 pass
         return model_meta
@@ -1589,7 +1576,7 @@ class ModelService:
                 # 读取或创建model.json
                 # N-5：id 一律由 _reserve_model_dir 原子占位，同秒导入两个 ZIP 不再互相覆盖
                 if model_json_path and model_json_path.exists():
-                    model_meta = _load_json(model_json_path)
+                    model_meta = load_json(model_json_path)
                     # 如果ZIP中有model_id，检查是否已存在
                     original_model_id = model_meta.get("model_id")
                     if original_model_id and not (self.registry_dir / original_model_id).exists():
@@ -1659,12 +1646,12 @@ class ModelService:
                 
                 # 保存model.json
                 model_file = model_dir / "model.json"
-                _save_json(model_file, model_meta)
+                save_json_atomic(model_file, model_meta)
                 
                 # 标签字典缺失时懒初始化（与 get_labels_dict 语义一致；在复制循环之后，避免挡住 ZIP 自带字典）
                 labels_file = model_dir / "labels_dict.json"
                 if not labels_file.exists():
-                    _save_json(labels_file, {
+                    save_json_atomic(labels_file, {
                         "model_code": model_meta.get("model_code", model_id),
                         "labels": [
                             {"index": i, "english_code": c, "chinese_name": "", "chinese_desc": ""}
@@ -1708,7 +1695,7 @@ class ModelService:
                 "created_at": datetime.now().isoformat(),
                 "updated_at": datetime.now().isoformat(),
             }
-            _save_json(model_dir / "model.json", model_meta)
+            save_json_atomic(model_dir / "model.json", model_meta)
             return model_meta
         
         if filename.endswith('.pt'):
@@ -1804,7 +1791,7 @@ class ModelService:
             temp_zip_path = temp_zip.name
             temp_zip.close()
             
-            meta = _load_json(model_file) if model_file.exists() else {}
+            meta = load_json(model_file) if model_file.exists() else {}
             weight_name = self._export_weight_filename(meta or {}, model_id)
             
             with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
@@ -1996,7 +1983,7 @@ class ModelService:
         model_file = model_dir / "model.json"
         if not model_file.exists():
             raise ValueError("模型不存在")
-        model_meta = _load_json(model_file)
+        model_meta = load_json(model_file)
 
         weights_path = model_meta.get("weights_path")
         if not weights_path or not Path(weights_path).exists():
@@ -2052,7 +2039,7 @@ class ModelService:
         p = settings.SAM_CONFIG_FILE
         if p.exists():
             try:
-                cfg.update(_load_json(p))
+                cfg.update(load_json(p))
             except Exception:
                 pass
         return cfg
@@ -2071,7 +2058,7 @@ class ModelService:
         job_file = self.jobs_dir / f"{job_id}.json"
         if not job_file.exists():
             return None
-        job_meta = _load_json(job_file)
+        job_meta = load_json(job_file)
         dataset_id = job_meta.get("dataset_id")
         if not dataset_id:
             return None
@@ -2175,7 +2162,7 @@ class ModelService:
                 if not model_file.exists():
                     continue
                 try:
-                    model_meta = _load_json(model_file)
+                    model_meta = load_json(model_file)
                 except Exception:
                     continue
                 if model_meta.get("status") != "production_ready":
@@ -2213,7 +2200,7 @@ class ModelService:
             raise ValueError(f"模型 {model_id} 不存在")
 
         def _override_sync():
-            meta = _load_json(model_file)
+            meta = load_json(model_file)
             weights_path = meta.get("weights_path")
             if not weights_path or not Path(weights_path).exists():
                 raise ValueError("模型权重文件不存在，无法强制设为生产")
@@ -2239,7 +2226,7 @@ class ModelService:
                     if not of.exists():
                         continue
                     try:
-                        om = _load_json(of)
+                        om = load_json(of)
                     except Exception:
                         continue
                     if om.get("model_id") == model_id or om.get("status") != "production_ready":
@@ -2256,13 +2243,13 @@ class ModelService:
             for s in superseded:
                 sf = self.registry_dir / s["model_id"] / "model.json"
                 try:
-                    sm = _load_json(sf)
+                    sm = load_json(sf)
                     sm["status"] = "superseded"
-                    _save_json(sf, sm)
+                    save_json_atomic(sf, sm)
                     superseded_records.append(s["model_id"])
                 except Exception:
                     pass
-            _save_json(model_file, meta)
+            save_json_atomic(model_file, meta)
             return {"meta": meta, "superseded": superseded_records}
 
         result = await asyncio.to_thread(_override_sync)
@@ -2290,7 +2277,7 @@ class ModelService:
                 if not model_file.exists():
                     continue
                 try:
-                    model_meta = _load_json(model_file)
+                    model_meta = load_json(model_file)
                 except Exception:
                     continue
                 if model_meta.get("status") != "production_ready":
@@ -2316,7 +2303,7 @@ class ModelService:
             raise ValueError(f"模型 {model_id} 不存在")
 
         def _confirm_sync():
-            meta = _load_json(model_file)
+            meta = load_json(model_file)
             if meta.get("status") != "production_ready":
                 raise ValueError(f"模型 {model_id} 当前状态 {meta.get('status')}，不可确认发布（需先通过守门员）")
             meta["publish_status"] = "published"
@@ -2335,7 +2322,7 @@ class ModelService:
                     if not of.exists():
                         continue
                     try:
-                        om = _load_json(of)
+                        om = load_json(of)
                     except Exception:
                         continue
                     if om.get("model_id") == model_id or om.get("status") != "production_ready":
@@ -2348,9 +2335,9 @@ class ModelService:
                     if (om.get("publish_status") or "pending") != "published":
                         continue
                     om["status"] = "superseded"
-                    _save_json(of, om)
+                    save_json_atomic(of, om)
                     superseded.append(om.get("model_id"))
-            _save_json(model_file, meta)
+            save_json_atomic(model_file, meta)
             return {"meta": meta, "superseded": superseded}
 
         result = await asyncio.to_thread(_confirm_sync)

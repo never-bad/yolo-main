@@ -15,6 +15,7 @@ from src.core.lifecycle import record_error, record_heartbeat
 from src.core.settings import settings
 from src.db import shadow
 from src.utils.fs_tree import build_tree
+from src.utils.json_io import load_json, save_json_atomic
 from src.yolo.gatekeeper import infer_business, _normalize_classes
 from src.yolo.train_script import ensure_local_base_weights, parse_architecture
 from src.services.device_manager import get_gpu_utilization, get_available_gpus
@@ -23,18 +24,6 @@ from src.services.dataset_service import (
     TRAIN_STATUS_COMPLETED,
     TRAINABLE_STAGES, _ensure_stage_fields,
 )
-
-
-def _load_json(path: Path):
-    """同步加载 JSON 文件"""
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _save_json(path: Path, data: dict):
-    """同步保存 JSON 文件"""
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 def _delete_file(path: Path):
@@ -524,7 +513,7 @@ class TrainService:
         best_score, best_path, best_id = None, None, None
         for meta_file in self.registry_dir.glob("*/model.json"):
             try:
-                meta = _load_json(meta_file)
+                meta = load_json(meta_file)
             except Exception:
                 continue
             if meta.get("business") != business or meta.get("status") != "production_ready":
@@ -556,7 +545,7 @@ class TrainService:
             return data_yaml, None
 
         try:
-            dic = _load_json(dict_file)
+            dic = load_json(dict_file)
         except Exception:
             return data_yaml, None
 
@@ -654,7 +643,7 @@ class TrainService:
                 with open(dst, "w", encoding="utf-8") as f:
                     f.writelines(new_lines)
                 filter_log["converted_txt"] += 1
-            _save_json(filtered_dir / "filter.json", filter_log)
+            save_json_atomic(filtered_dir / "filter.json", filter_log)
 
         new_yaml = {
             "path": str(filtered_dir.absolute()),
@@ -690,7 +679,7 @@ class TrainService:
             dict_file = self.registry_dir / base_model_id / "labels_dict.json"
             if dict_file.exists():
                 try:
-                    _dic = _load_json(dict_file)
+                    _dic = load_json(dict_file)
                     _labels = sorted(_dic.get("labels") or [], key=lambda x: int(x.get("index", 0)))
                     model_codes = [(l.get("english_code") or "").strip() for l in _labels]
                 except Exception:
@@ -824,7 +813,7 @@ class TrainService:
             "total_images": total_images,
             "yaml": str(agg_dir / "data.yaml"),
         }
-        _save_json(agg_dir / "aggregation.json", agg_info)
+        save_json_atomic(agg_dir / "aggregation.json", agg_info)
         print(f"[create_job] 聚合完成: {len(specs)} 个数据集 → {len(unified_names)} 类"
               f"（{unified_names}），共 {total_images} 张图: {agg_dir}")
         return agg_dir / "data.yaml", agg_info
@@ -842,7 +831,7 @@ class TrainService:
             if not meta_p.exists():
                 continue
             try:
-                meta = _load_json(meta_p)
+                meta = load_json(meta_p)
                 _ensure_stage_fields(meta)
             except Exception:
                 continue
@@ -880,7 +869,7 @@ class TrainService:
             if not meta_p.exists():
                 continue
             try:
-                meta = _load_json(meta_p)
+                meta = load_json(meta_p)
                 _ensure_stage_fields(meta)
             except Exception:
                 continue
@@ -1005,7 +994,7 @@ class TrainService:
             hard_dir = settings.HARD_POOL_DIR / base_model_id
             if hard_dir.exists():
                 try:
-                    pool_meta = _load_json(hard_dir / "meta.json")
+                    pool_meta = load_json(hard_dir / "meta.json")
                 except Exception:
                     pool_meta = {}
                 pool_names = pool_meta.get("names") or []
@@ -1080,7 +1069,7 @@ class TrainService:
             "dir": str(sp_dir),
             "yaml": str(sp_dir / "data.yaml"),
         }
-        _save_json(sp_dir / "extra.json", info)
+        save_json_atomic(sp_dir / "extra.json", info)
         print(f"[merge_training_extras] 训练增强混入: 回忆集 {merged['recall']} 张，"
               f"困难样本 {merged['hard']} 张，空白负样本 {merged['background']} 张 → {sp_dir}")
         return sp_dir / "data.yaml", info
@@ -1402,7 +1391,7 @@ class TrainService:
             if not meta_path.exists():
                 continue
             try:
-                meta = _load_json(meta_path)
+                meta = load_json(meta_path)
                 _ensure_stage_fields(meta)
                 meta["stage"] = STAGE_TRAINING
                 with open(meta_path, "w", encoding="utf-8") as f:
@@ -1479,7 +1468,7 @@ class TrainService:
             if not job_file.exists():
                 continue
             try:
-                job_meta = _load_json(job_file)
+                job_meta = load_json(job_file)
             except Exception:
                 continue
             if job_meta.get("status") != "running":
@@ -1529,7 +1518,7 @@ class TrainService:
 
         job_file = self.jobs_dir / f"{job_id}.json"
         try:
-            job_meta = _load_json(job_file)
+            job_meta = load_json(job_file)
             job_meta["status"] = "failed"
             job_meta["reason"] = "gpu_abnormal"
             job_meta["error"] = reason
@@ -1537,7 +1526,7 @@ class TrainService:
             job_meta["failed_at"] = datetime.now().isoformat()
             # g6 M5 状态机统一：失败 → Rejected（查询回填同值）
             job_meta["unified_status"] = "Rejected"
-            _save_json(job_file, job_meta)
+            save_json_atomic(job_file, job_meta)
         except Exception as e:
             print(f"[gpu-watch] 状态回写失败: {e}")
 
@@ -1650,9 +1639,9 @@ class TrainService:
         try:
             job_file_path = self.jobs_dir / f"{job_id}.json"
             if job_file_path.exists():
-                meta = _load_json(job_file_path)
+                meta = load_json(job_file_path)
                 meta["pid"] = process.pid
-                _save_json(job_file_path, meta)
+                save_json_atomic(job_file_path, meta)
         except Exception:
             pass
     
@@ -1669,7 +1658,7 @@ class TrainService:
             
             for job_file in self.jobs_dir.glob("*.json"):
                 try:
-                    job_meta = _load_json(job_file)
+                    job_meta = load_json(job_file)
                 except Exception:
                     continue
                 
@@ -1701,7 +1690,7 @@ class TrainService:
                             # 清理进程记录
                             del self.running_processes[job_id]
                             # 保存更新后的状态
-                            _save_json(job_file, job_meta)
+                            save_json_atomic(job_file, job_meta)
                     else:
                         # 不在运行进程列表中，但状态是 running，可能是崩溃后重启
                         # 检查是否有 checkpoint，如果有则标记为可恢复
@@ -1717,13 +1706,13 @@ class TrainService:
                             job_meta["failed_at"] = datetime.now().isoformat()
                             # g6 M5 状态机统一：失败 → Rejected
                             job_meta["unified_status"] = "Rejected"
-                            _save_json(job_file, job_meta)
+                            save_json_atomic(job_file, job_meta)
                         elif checkpoint.exists():
                             job_meta["status"] = "crashed"
                             job_meta["crashed_at"] = datetime.now().isoformat()
                             # g6 M5 状态机统一：崩溃 → Archived
                             job_meta["unified_status"] = "Archived"
-                            _save_json(job_file, job_meta)
+                            save_json_atomic(job_file, job_meta)
                 
                 # 检查是否有 checkpoint 但状态不是可恢复状态
                 train_dir = self.jobs_dir / job_id / "train"
@@ -1735,7 +1724,7 @@ class TrainService:
                     if "can_resume" not in job_meta:
                         job_meta["can_resume"] = True
                         # 保存更新
-                        _save_json(job_file, job_meta)
+                        save_json_atomic(job_file, job_meta)
                 
                 # g6 M5 状态机统一：查询回填 unified_status（真实 status → 统一枚举），
                 # 前端/下游按统一枚举消费，旧 status 字段保留兼容
@@ -1814,7 +1803,7 @@ class TrainService:
             return
         for job_file in self.jobs_dir.glob("*.json"):
             try:
-                meta = _load_json(job_file)
+                meta = load_json(job_file)
             except Exception:
                 continue
             job_id = meta.get("job_id")
@@ -1868,12 +1857,12 @@ class TrainService:
             
             def _update_status():
                 if job_file.exists():
-                    job_meta = _load_json(job_file)
+                    job_meta = load_json(job_file)
                     job_meta["status"] = "stopped"
                     job_meta["stopped_at"] = datetime.now().isoformat()
                     # g6 M5 状态机统一：手动停止 → Archived
                     job_meta["unified_status"] = "Archived"
-                    _save_json(job_file, job_meta)
+                    save_json_atomic(job_file, job_meta)
             
             await asyncio.to_thread(_update_status)
             
