@@ -2863,13 +2863,42 @@ class DatasetService:
     #   - 只增不减：已灌入桶的数据不重排、不调出
 
     def _load_bucket_state(self) -> dict:
+        path = settings.DATA_DIR / "buckets.json"
+        if not path.exists():
+            return {"models": {}}  # 首次：正常
         try:
-            return _load_json(settings.DATA_DIR / "buckets.json") or {"models": {}}
-        except Exception:
+            data = _load_json(path)
+        except json.JSONDecodeError as e:
+            logger.error(f"buckets.json JSON 损坏，拒绝加载以防覆盖: {e}")
+            raise
+        except Exception as e:
+            logger.warning(f"buckets.json 加载失败: {type(e).__name__}: {e}")
+            raise
+        if not isinstance(data, dict):
             return {"models": {}}
+        data.setdefault("models", {})
+        return data
 
     def _save_bucket_state(self, state: dict):
-        _save_json(settings.DATA_DIR / "buckets.json", state)
+        path = settings.DATA_DIR / "buckets.json"
+        # 写前备份：原文件存在则保留最后已知良好状态
+        if path.exists():
+            try:
+                shutil.copy2(path, path.with_suffix(".json.bak"))
+            except Exception as e:
+                logger.warning(f"buckets.json 备份失败（继续写）: {type(e).__name__}: {e}")
+        # 原子写：先 .tmp 再 os.replace
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".json", dir=str(path.parent), prefix=".buckets_")
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
 
     def _model_code_of(self, model_id: str) -> str:
         try:
