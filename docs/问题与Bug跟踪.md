@@ -30,7 +30,7 @@
 | D-03 | 口径漂移 | 🟡 | `_` 前缀归档目录：PG 有行、列表页不可见 | 待处理 | — |
 | D-04 | 文档漂移 | 🟡 | API_DOCUMENTATION「推理服务」章节无对应路由 | 已解决（10-06 905a535：API_DOCUMENTATION L1028 推理章节加未实现警示） | X-08 |
 | D-05 | 文档漂移 | 🟢 | 平台细节说明「满 1500 封板」≠ 代码 `SEAL_MIN_IMAGES=5000`；**09-30 复审：代码注释亦有 4 处过期写 1500**（dataset_service L2601/L2828/L2928 + main.py L18 docstring，后者还漏列 GPU 熔断任务） | 已解决（10-06 905a535：后端注释改引用 settings.SEAL_MIN_IMAGES，全后端零 1500） | I-12 |
-| D-06 | 文档漂移 | 🟢 | 文档称状态"一套口径"，实际 `USE_UNIFIED_STATUS=False` | 已解决（10-06 905a535：平台细节说明 L54 声明口径现状；读侧切换仍待 I-03 拍板） | I-03 |
+| D-06 | 文档漂移 | 🟢 | 文档称状态"一套口径"，实际 `USE_UNIFIED_STATUS=False` | 已解决（10-06 905a535：平台细节说明 L54 声明口径现状；I-03 10-13 拍板=选项 B PG 影子库优先+1-2min 窗口容差，正式收口） | I-03 |
 | P-03 | 健壮性 | 🟢 | 损坏 zip（如 1.15 MB 的 person.zip）可入库，训练时才炸 | 待处理 | — |
 | P-04 | 体验 | 🟢 | axios 无统一错误拦截，各调用点各自 try/catch | 已解决（10-11 批次 J：全局 toast + axios 拦截器 + unhandledrejection 兜底 + 143 alert/11 confirm 全量迁移） | I-08 |
 | B-06 | 死代码 | 🟢 | components/Logs/* 预留未接入任何页面 | 已解决（10-10 批次 I：删除未接入的预留组件） | I-07 |
