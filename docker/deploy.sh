@@ -72,13 +72,20 @@ docker compose ps
 log "等待后端就绪..."
 backend_ready=0
 for i in $(seq 1 90); do
-    if (echo > "/dev/tcp/127.0.0.1/8000") 2>/dev/null; then backend_ready=1; break; fi
+    # 优先：容器内 /health 探测（与 publish.sh 对齐，不依赖宿主端口映射，规避宿主 8000 被同事 nginx-server 占用）
+    if docker compose exec -T yolo-platform python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)" >/dev/null 2>&1; then
+        backend_ready=1; break
+    fi
+    # 兜底：宿主端口可达探测（YOLO 平台映射 8001；docker-compose.yml L26 已声明 PORT_API=8001）
+    if (echo > "/dev/tcp/127.0.0.1/8001") 2>/dev/null; then
+        backend_ready=1; break
+    fi
     sleep 2
 done
 if [ "$backend_ready" -eq 1 ]; then
-    log "后端健康检查通过（端口 8000）"
+    log "后端健康检查通过"
 else
-    warn "90 秒内未探测到后端端口，请检查日志: docker logs yolo-platform"
+    warn "90 秒内未探测到后端就绪，请检查日志: docker logs yolo-platform"
 fi
 
 # ---------- 6. 影子库回填（I-05：并入部署防人工漏跑，B-03 缓解措施落地） ----------
