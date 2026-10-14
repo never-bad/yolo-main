@@ -6,8 +6,9 @@
 > 紧急程度：🔴 紧急（近期部署/交付前必须处理）｜🟡 中（本迭代内处理）｜🟢 低（待处理，后期统一修正）
 > 状态：`待拍板` = 需用户决策后才能动工；`待处理` = 已确认但排期靠后；`已缓解` = 有临时对策；`已修复` = 进 §5
 > 交叉引用：改进项 `I-xx` 查《功能实现与改进点跟踪》；文件位置查《项目文件功能说明》；页面/接口行为查《平台功能与页面关联》。
-> 更新时间：2026-10-13（批次 L 后置：P-02 实测确认 O(N²) 风险，预留改进项 I-13；I-10 同步关闭——`7f757a8` 已落地 `lifecycle.py`，文档漏更本批次补齐）
-> 上次更新：2026-10-10（批次 I 前置：P-01/D-01/D-02/D-04/D-05/D-06/B-07 经核实已于 10-06 由 905a535/305756e 修复，状态更正；I-11 结案）
+> 更新时间：2026-10-14（**首次实际部署验证**：真机抓到 N 批次回归 **B-08**——JSON IO 收口漏改 29 处函数对象引用致 `seal_poll` NameError，`a48a6fc` 已修复 + 重新部署验证通过；本批次新增 B-08 一条）
+> 上次更新：2026-10-13（批次 L 后置：P-02 实测确认 O(N²) 风险，预留改进项 I-13；I-10 同步关闭——`7f757a8` 已落地 `lifecycle.py`，文档漏更本批次补齐）
+> 更早更新：2026-10-10（批次 I 前置：P-01/D-01/D-02/D-04/D-05/D-06/B-07 经核实已于 10-06 由 905a535/305756e 修复，状态更正；I-11 结案）
 
 ---
 
@@ -19,6 +20,7 @@
 | S-01 | 安全 | 🔴 | 模型上传 extractall 无路径遍历防护 | 已修复（d0a81fb，zip_guard 收口） | I-02 |
 | S-02 | 安全 | 🔴 | YOLO 标签导入 extractall 无 member 校验 | 已修复（ffe2c79，zip_guard 收口） | I-02 |
 | B-05 | 功能缺陷 | 🔴 | CI/bat 引用不存在的 docker/{backend,frontend}/Dockerfile | 已解决（10-10，de6850e 批次 G-1 删 .cnb.yml） | 文件说明 §4 |
+| B-08 | 功能缺陷 | 🔴 | N 批次 JSON IO 收口漏改 29 处**函数对象引用**（`_load_json`/`_save_json`），运行时 NameError，封板兜底循环每轮失败 | 已修复（2026-10-14 `a48a6fc`，首次实际部署验证真机抓到） | 批次 N · I-13 |
 | S-03 | 安全 | 🟡 | 全平台无鉴权 + CORS `*` + 20 GB 上传上限 | 已拍板（10-10）：嵌入宿主，网关鉴权 | X-04 |
 | B-02 | 功能缺陷 | 🟡 | 清除标注后 PG `has_label` 虚高（有意不回填） | 已拍板（10-10）：接受虚高，重标覆盖 | I-04 |
 | B-03 | 功能缺陷 | 🟡 | 全量重灌会冲掉 has_label，必须二步入库流程 | 已缓解 | 改进跟踪 §2.3 |
@@ -73,6 +75,17 @@
 - **拍板结论**：**删除 `.cnb.yml` 整份**（实际部署一直是本地 `build_push.sh --app-only` + 服务器 `deploy.sh`，CI 从未启用）。
 - **实施**：`de6850e chore(G-1)` 仓库根 `git rm .cnb.yml`（89 行整份删除），`docker/` 其余 7 个 tracked 文件一字未动。
 - **验证（验收方独立复核）**：`git diff bf5454c..HEAD -- .cnb.yml` = 89 deletions；`grep -rn cnb docker/` 零命中；`bash -n docker/build_push.sh` EXIT=0；`.cnb.yml` 已不存在于工作区。**B-05 终结**。
+
+### B-08　N 批次 JSON IO 收口漏改 29 处**函数对象引用** → 运行时 NameError —— 功能缺陷（已修复 ✅ 2026-10-14，`a48a6fc`）
+
+- **发现场景**：**首次实际部署验证**（服务器本地 build + `compose up -d --force-recreate`）后，容器启动日志每轮出现 `seal poll: scan failed: name '_load_json' is not defined`；`/health` 的 `background_loops.seal_poll.last_error` 同步暴露同一 NameError（前三个循环无 `last_error` 字段）。
+- **根因**：批次 N（`0ec2a10`）把各 service 的私有 `_load_json` / `_save_json` 收敛为共享的 `utils/json_io.py` 的 `load_json` / `save_json_atomic`，并**删除了各文件的本地 `def`**。但改名**只覆盖了 `_load_json(` 左括号直接调用形式，漏掉「函数对象传递」形式**——典型写法 `await asyncio.to_thread(_load_json, path)`（函数名后跟逗号）。定义已删、引用未改 → 运行时 `NameError`。
+- **清单（29 处）**：`dataset_service.py` **15**（含 `_collect_due_seal_datasets` 内 → seal_poll 每轮必踩，故启动约 8 秒即稳定复现）、`model_service.py` **6**、`train_service.py` **7**、`sam_service.py` **1**。除 seal_poll 这条「稳定复现」外，其余 28 处是随数据集/模型/训练元数据读写随时引爆的**暗雷**（如逐图标注保存、模型元数据读写、训练任务状态读写）。
+- **为何此前未发现**：后端无 pyflakes/ruff 等静态检查，`vue-tsc` 只管前端；此类「未定义名」只在运行时暴露。本次全靠 seal_poll 定时循环 + `/health.last_error` 观测抓到（**M-1 双重探测 / K-3 lifecycle 心跳的投入直接见效**）。
+- **修复**：`a48a6fc fix(json_io): 补漏 N 批次 29 处 _load_json/_save_json 对象引用改名（seal_poll NameError）` —— 改名 `_load_json`→`load_json`、`_save_json`→`save_json_atomic`（两名字本就在各文件顶部 `from ...json_io import` 中存在，仅改引用）。**4 files changed, 29 insertions(+), 29 deletions(-)**；`ast.parse` 语法全过；`grep -rn "_load_json\|_save_json" backend/src/services/` **0 残留**。
+- **验证（真机闭环，全绿）**：本机修复 → push `backup/v2-dataflow-20261013`（`c5793a7..a48a6fc`）→ 服务器 `git pull --ff-only`（快进 4 files +29/-29）→ 重新 build（新镜像 `ded9b02e2431`）→ `cd /opt/yolo-main/docker && docker compose up -d --force-recreate yolo-platform` → 日志 `(无 seal poll / Traceback ✓)`、`/health` 的 `seal_poll` **不再出现 `last_error` 字段**、四循环心跳齐全。
+- **有意未改**：`utils/class_labels.py`（自带 `def _load_json`，自洽）；`scripts/migrate_to_pg.py` / `scripts/backfill_has_label.py`（各自 `def`；其中 `migrate_to_pg.py` 属红线 B-03，不动）。
+- **教训沉淀**：批量改名必须**同时覆盖 `f(` 与 `f,`**（`asyncio.to_thread` 等把函数当对象传递）两种形式；建议后续把 **pyflakes 纳入提交前检查**（可捕获全类别未定义名，成本极低）——关联改进项待登《功能实现与改进点跟踪》。
 
 ---
 
@@ -194,8 +207,8 @@
 
 | 分类 | 🔴 | 🟡 | 🟢 | 已归档 |
 |---|---|---|---|---|
-| B 功能缺陷 | 0 | 1（B-03 已缓解） | 0 | 3 + 当日关闭 2（B-04/B-05）+ I-01/B-01 + 批次 I 前置更正 1（B-07）+ 批次 I 删除 1（B-06） |
-| P 性能/健壮性 | 0 | 1（P-02 需验证） | 1（P-03） | 2（批次 I 前置更正：P-01 + 批次 J：P-04） |
+| B 功能缺陷 | 0 | 1（B-03 已缓解） | 0 | 3 + 当日关闭 2（B-04/B-05）+ I-01/B-01 + 批次 I 前置更正 1（B-07）+ 批次 I 删除 1（B-06）+ 批次 N 补漏 1（B-08） |
+| P 性能/健壮性 | 0 | 1（P-02 已确认·预留） | 1（P-03） | 2（批次 I 前置更正：P-01 + 批次 J：P-04） |
 | S 安全 | 0（S-01/S-02 已修复） | 1（S-03 已拍板关闭） | 0 | 0 |
 | D 文档/口径漂移 | 0 | 1（D-03） | 0 | 5（批次 I 前置更正：D-01/D-02/D-04/D-05/D-06） |
 | C 兼容性 | 0 | 0 | 0 | 1（C-01，见下） |
@@ -205,6 +218,8 @@
 > **2026-10-10 批次 I 前置更正说明**：本表按更正后口径重算——此前 7 项（P-01/D-01/D-02/D-04/D-05/D-06/B-07）实际已由 10-06 的 `305756e`（P-01/D-02）与 `905a535`（D-01/D-04/D-05/D-06/B-07）修复，但文档状态漏改仍标「待处理/约定防护」，现全部移入「已归档」列（B 🟢 2→0、P 🟡 2→1 且已归档 0→1、D 🟡 4→1 且 🟢 2→0 已归档 0→5）。另：**I-11**（悬空目录 `backend/data/inference_results/`）本批次结案并删除空目录，该项在 §1 总览单列为「悬空目录」类、原表无对应分类行，故不计入上表五行，仅在此登记；git 不跟踪空目录，删除不产生 diff。**B-06**（死代码 `components/Logs/*`）已于批次 I 随 `git rm` 两文件关闭，B 类 🟢 归 0。当前全表在册**未关闭项仅剩 5 条**：B-03（已缓解，靠 I-05 落地——本批次已并入 `deploy.sh`）、P-02（需实测）、P-03、P-04、D-03（待批次 K）。
 >
 > **2026-10-11 批次 J 更新说明**：**P-04** 于批次 J 结案（详见 §1 总览 L35 与 §4 低优先表），P 类 🟢 由 2 归 1（仅剩 P-03）、已归档由 1 增 2。连带关闭《功能实现与改进点跟踪》的 **I-08**（全局轻提示 + 统一错误拦截）与 **I-09**（SAM 接口从 `api/annotations.ts` 拆出为 `api/sam.ts`）。批次 J 全部为前端 + 文档改动，**零 backend 改动**。当前全表在册**未关闭项仅剩 4 条**：B-03（已缓解）、P-02（需实测）、P-03、D-03（待批次 K）。批次 J 遗留待拍板一项：`api/sam.ts` 内 3 个疑似死导出 `getSamAvailable` / `uploadSamModel` / `AIBox`（全仓仅定义处或仅文档提及、无代码调用方），按「拆分为纯搬迁、零逻辑变更」原则随迁保留未删，已在《功能实现与改进点跟踪》I-09 行登记。
+>
+> **2026-10-14 首次实际部署验证更新说明**：本批为「部署验证」性质，**新增 B-08**（N 批次 JSON IO 收口漏改 29 处函数对象引用 → 运行时 `NameError`，🔴），已在同日 `a48a6fc` 修复并**真机重部署验证通过**（详见 §2 B-08 详情节），B 类「已归档」+1、🔴 在册仍为 0。本次部署验证同时完成：服务器本地 build（复用本地 env 层 `yolo-app-env:latest`，免推阿里云 ~10GB）、`compose up -d --force-recreate` 换用新镜像、容器内代码哈希与本机一致、`/health` 的 `background_loops` 四循环心跳齐全（M-1 双重探测 / K-3 lifecycle 心跳**落地验证通过**）、前端 200。**在册未关闭项仍为 4 条**：B-03（已缓解）、P-02（已确认·预留）、P-03、D-03（待批次 K）。
 
 **C-01（归档）**：`data.yaml` 曾用绝对路径导致跨平台（Windows 开发 / Linux 容器）训练失败 → 已定硬约束：**一律相对路径 `.`**。后续任何改 `seal_dataset`/`prepare` 的任务不得回退。
 
