@@ -2748,7 +2748,7 @@ class SAMService:
         task_file = settings.ANNOTATIONS_DIR / task_id / "task.json"
         if not task_file.exists():
             return None
-        return await asyncio.to_thread(_load_json, task_file)
+        return await asyncio.to_thread(load_json, task_file)
 
     async def _get_item(self, task_id: str, image_id: str) -> Optional[dict]:
         meta = await self._load_task_meta(task_id)

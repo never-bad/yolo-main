@@ -146,7 +146,7 @@ class ModelService:
         if not await asyncio.to_thread(lambda: model_file.exists()):
             return None
         
-        model_meta = await asyncio.to_thread(_load_json, model_file)
+        model_meta = await asyncio.to_thread(load_json, model_file)
         
         # 添加模型文件大小
         def _get_file_size():
@@ -177,7 +177,7 @@ class ModelService:
                     try:
                         save_meta = load_json(model_file)
                         save_meta["model_info"] = model_info
-                        await asyncio.to_thread(_save_json, model_file, save_meta)
+                        await asyncio.to_thread(save_json_atomic, model_file, save_meta)
                     except Exception as e:
                         print(f"Error caching model_info: {e}")
             return model_meta.get("model_info")
@@ -1711,7 +1711,7 @@ class ModelService:
             model_meta["updated_at"] = datetime.now().isoformat()
             # 下方 model_info 回填仅在解析成功时才回写 model.json，故此处必须自行落盘
             await asyncio.to_thread(
-                _save_json,
+                save_json_atomic,
                 self.registry_dir / model_meta["model_id"] / "model.json",
                 model_meta,
             )
@@ -1733,11 +1733,11 @@ class ModelService:
             model_dir = self.registry_dir / model_meta["model_id"]
             if model_changed:
                 # 更新model.json
-                await asyncio.to_thread(_save_json, model_dir / "model.json", model_meta)
+                await asyncio.to_thread(save_json_atomic, model_dir / "model.json", model_meta)
             # 标签字典缺失时懒初始化（按最终 classes 生成）
             labels_file = model_dir / "labels_dict.json"
             if not labels_file.exists():
-                await asyncio.to_thread(_save_json, labels_file, {
+                await asyncio.to_thread(save_json_atomic, labels_file, {
                     "model_code": model_meta.get("model_code", model_meta["model_id"]),
                     "labels": [
                         {"index": i, "english_code": c, "chinese_name": "", "chinese_desc": ""}
@@ -1834,7 +1834,7 @@ class ModelService:
         if not await asyncio.to_thread(lambda: model_file.exists()):
             return None
         
-        model_meta = await asyncio.to_thread(_load_json, model_file)
+        model_meta = await asyncio.to_thread(load_json, model_file)
         job_id = model_meta.get("job_id")
         
         if not job_id:

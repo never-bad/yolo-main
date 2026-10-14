@@ -479,7 +479,7 @@ class DatasetService:
         }
         
         meta_path = dataset_dir / "meta.json"
-        await asyncio.to_thread(_save_json, meta_path, meta)
+        await asyncio.to_thread(save_json_atomic, meta_path, meta)
         
         from src.db import shadow
         await shadow.sync_dataset(dataset_id)
@@ -490,10 +490,10 @@ class DatasetService:
         try:
             if not await asyncio.to_thread(lambda: meta_path.exists()):
                 return
-            meta = await asyncio.to_thread(_load_json, meta_path)
+            meta = await asyncio.to_thread(load_json, meta_path)
             if meta.get("model_id"):
                 meta["model_id"] = None
-                await asyncio.to_thread(_save_json, meta_path, meta)
+                await asyncio.to_thread(save_json_atomic, meta_path, meta)
                 if settings.PG_ENABLED:
                     from src.db import meta_store
                     await meta_store.upsert_dataset(meta)
@@ -510,7 +510,7 @@ class DatasetService:
         
         # 读取元数据
         meta_path = dataset_dir / "meta.json"
-        meta = await asyncio.to_thread(_load_json, meta_path)
+        meta = await asyncio.to_thread(load_json, meta_path)
 
         # 按 meta 记录的文件名找到上传的压缩包（兼容旧版本固定 .zip 命名）
         # 位置刻意排在 clear_dir 之前：P-03 双重校验之二，坏包在清空数据子目录
@@ -816,7 +816,7 @@ class DatasetService:
                 auto_task = None
         meta["annotation_task_id"] = (auto_task or {}).get("task_id")
 
-        await asyncio.to_thread(_save_json, meta_path, meta)
+        await asyncio.to_thread(save_json_atomic, meta_path, meta)
         from src.db import shadow
         await shadow.sync_dataset(dataset_id)
 
@@ -1580,7 +1580,7 @@ class DatasetService:
         meta_path = dataset_dir / "meta.json"
         if not await asyncio.to_thread(lambda: meta_path.exists()):
             raise ValueError(f"Dataset {dataset_id} not found")
-        meta = await asyncio.to_thread(_load_json, meta_path)
+        meta = await asyncio.to_thread(load_json, meta_path)
         return await asyncio.to_thread(self._bind_conflict_sync, dataset_dir, meta, model_id)
 
     def _build_training_artifacts(self, dataset_dir: Path, meta: dict, split_ratio: dict,
@@ -2042,7 +2042,7 @@ class DatasetService:
 
         # 换库校验：目标库与当前归属不同才比对（解绑、原地重绑不打扰）
         if model_id:
-            meta_now = await asyncio.to_thread(_load_json, meta_path)
+            meta_now = await asyncio.to_thread(load_json, meta_path)
             if (meta_now.get("model_id") or "") != model_id:
                 report = await asyncio.to_thread(
                     self._bind_conflict_sync, dataset_dir, meta_now, model_id
@@ -2133,7 +2133,7 @@ class DatasetService:
         if not await asyncio.to_thread(lambda: meta_path.exists()):
             return None
         
-        meta = await asyncio.to_thread(_load_json, meta_path)
+        meta = await asyncio.to_thread(load_json, meta_path)
         # 状态机字段回填（兼容旧数据）
         _ensure_stage_fields(meta)
         
@@ -2184,7 +2184,7 @@ class DatasetService:
         if not await asyncio.to_thread(lambda: meta_path.exists()):
             return None
         
-        meta = await asyncio.to_thread(_load_json, meta_path)
+        meta = await asyncio.to_thread(load_json, meta_path)
         _ensure_stage_fields(meta)
         if meta["stage"] == STAGE_SEALED:
             raise ValueError("数据集已封板（只读），不可再修改；如需修改请删除后重建")
@@ -2197,7 +2197,7 @@ class DatasetService:
         
         meta["updated_at"] = datetime.now().isoformat()
         
-        await asyncio.to_thread(_save_json, meta_path, meta)
+        await asyncio.to_thread(save_json_atomic, meta_path, meta)
         from src.db import shadow
         await shadow.sync_dataset(dataset_id)
         
@@ -2231,7 +2231,7 @@ class DatasetService:
         if not await asyncio.to_thread(lambda: meta_path.exists()):
             raise ValueError(f"Dataset {dataset_id} not found")
 
-        meta = await asyncio.to_thread(_load_json, meta_path)
+        meta = await asyncio.to_thread(load_json, meta_path)
         _ensure_stage_fields(meta)
 
         if meta["stage"] == STAGE_SEALED:
@@ -2343,7 +2343,7 @@ class DatasetService:
                 if model_code
                 else f"ds_v{int(meta.get('sealed_version_count') or 1)}"
             )
-        await asyncio.to_thread(_save_json, meta_path, meta)
+        await asyncio.to_thread(save_json_atomic, meta_path, meta)
 
         # 封板即更名：dataset_id（目录/任务绑定/PG/桶账本）整体迁到 display_name（名=id）
         new_id = meta.get("display_name")
@@ -2375,7 +2375,7 @@ class DatasetService:
         except Exception as e:
             logger.warning(f"dataset {dataset_id} 补生成封板产物失败: {e}")
             meta["seal_artifacts_error"] = str(e)
-            await asyncio.to_thread(_save_json, meta_path, meta)
+            await asyncio.to_thread(save_json_atomic, meta_path, meta)
             from src.db import shadow
             await shadow.sync_dataset(dataset_id)
             return meta
@@ -2387,7 +2387,7 @@ class DatasetService:
             meta["split_counts"] = payload["counts"]
         if payload.get("sample_type_stats"):
             meta["sample_type_stats"] = payload["sample_type_stats"]
-        await asyncio.to_thread(_save_json, meta_path, meta)
+        await asyncio.to_thread(save_json_atomic, meta_path, meta)
         from src.db import shadow
         await shadow.sync_dataset(dataset_id)
         logger.info(f"dataset {dataset_id} seal artifacts backfilled: split={payload.get('counts')}")
@@ -3380,7 +3380,7 @@ class DatasetService:
             meta_path = d / "meta.json"
             if not await asyncio.to_thread(lambda: meta_path.exists()):
                 continue
-            meta = await asyncio.to_thread(_load_json, meta_path)
+            meta = await asyncio.to_thread(load_json, meta_path)
             _ensure_stage_fields(meta)
             if meta.get("stage") == STAGE_SEALED or meta.get("sealed_at"):
                 continue

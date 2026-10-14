@@ -1160,7 +1160,7 @@ class TrainService:
         if not library_root_id:
             try:
                 ds_meta = await asyncio.to_thread(
-                    _load_json, self.datasets_dir / primary_id / "meta.json"
+                    load_json, self.datasets_dir / primary_id / "meta.json"
                 )
                 cand = ds_meta.get("library_root_id") or ds_meta.get("model_id") or None
                 # 老数据集的 model_id 可能指向已删除的模型记录：记录不存在就不认，
@@ -1180,7 +1180,7 @@ class TrainService:
             if not await asyncio.to_thread(lambda: base_model_file.exists()):
                 raise ValueError(f"Base model {base_model_id} not found")
             
-            base_model_meta = await asyncio.to_thread(_load_json, base_model_file)
+            base_model_meta = await asyncio.to_thread(load_json, base_model_file)
             # 继承基座模型的库归属；基座自身就是库根（无 library_root_id 的旧记录）时归到基座
             library_root_id = library_root_id or base_model_meta.get("library_root_id") or base_model_id
             
@@ -1339,7 +1339,7 @@ class TrainService:
         }
         
         job_file = self.jobs_dir / f"{job_id}.json"
-        await asyncio.to_thread(_save_json, job_file, job_meta)
+        await asyncio.to_thread(save_json_atomic, job_file, job_meta)
 
         # 启动训练进程（在线程中执行）。先启动成功再标记数据集状态，
         # 启动失败（如 Popen 异常）则清理任务文件并回滚，避免留下"训练中"残留
@@ -1829,7 +1829,7 @@ class TrainService:
         if not await asyncio.to_thread(lambda: job_file.exists()):
             return None
         
-        meta = await asyncio.to_thread(_load_json, job_file)
+        meta = await asyncio.to_thread(load_json, job_file)
         # g6 M5 状态机统一：详情同样回填 unified_status
         try:
             from src.db.status import task_unified
@@ -1926,7 +1926,7 @@ class TrainService:
         if not await asyncio.to_thread(lambda: job_file.exists()):
             raise ValueError(f"Job {job_id} not found")
         
-        job_meta = await asyncio.to_thread(_load_json, job_file)
+        job_meta = await asyncio.to_thread(load_json, job_file)
         
         # 检查是否有训练输出目录和 checkpoint
         train_dir = self.jobs_dir / job_id / "train"
@@ -1960,7 +1960,7 @@ class TrainService:
                 base_model_dir = self.registry_dir / base_model_id
                 base_model_file = base_model_dir / "model.json"
                 if await asyncio.to_thread(lambda: base_model_file.exists()):
-                    base_model_meta = await asyncio.to_thread(_load_json, base_model_file)
+                    base_model_meta = await asyncio.to_thread(load_json, base_model_file)
                     weights_path = Path(base_model_meta["weights_path"])
                     if await asyncio.to_thread(lambda: weights_path.exists()):
                         model_to_use = str(weights_path)
@@ -2037,7 +2037,7 @@ class TrainService:
             if "crashed_at" not in job_meta:
                 job_meta["crashed_at"] = datetime.now().isoformat()
         
-        await asyncio.to_thread(_save_json, job_file, job_meta)
+        await asyncio.to_thread(save_json_atomic, job_file, job_meta)
         
         # 模型守门员：恢复训练同样自动选择当前同业务生产模型作为对比基准
         resume_business = job_meta.get("business", "general")
