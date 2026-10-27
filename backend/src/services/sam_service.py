@@ -87,6 +87,12 @@ DEFAULT_CONFIG = {
     # 批量预标注是否也做 L2 审核。批量里审核结论只进统计、不改变落盘框，
     # 却要多吃一半多的时间，所以默认关；想统计问题分布再打开。
     "qwen_audit_batch": False,
+    # 框级二次校验（反幻觉）：整图检测出的每个候选框外扩裁剪成小图，让模型对着
+    # 小图回答「图里是不是X」，回答否就丢弃。真机实测 4b 会把红安全帽/人头误标成
+    # 自救器——整图检测的固有幻觉，提示词压不干净，裁剪复问最有效（小图 token 少，
+    # 单框约 0.3~0.6s）。关闭后误检只能靠人工删除。
+    "qwen_verify_enabled": True,
+    "qwen_verify_margin": 0.35,      # 裁剪时四周外扩比例（相对框宽高），给足上下文又不引入干扰
 }
 class BatchTask:
     """内存中的批量预标注任务状态"""
@@ -1777,6 +1783,9 @@ class SAMService:
             + coord_hint +
             "i 是类别清单中的序号（0 起）。必须逐行输出，每行只能有一个实例，不要输出任何其他文字或解释。\n"
             "如果某个类别没有目标，不要输出它的行。\n"
+            "严格判据：只框「目标本体」，宁缺毋滥——先把整张图看一遍确认目标确实存在再定位；\n"
+            "人、头部、安全帽、矿灯、衣物、随身设备等相似或相关的物体都不是目标，绝不能框；\n"
+            "看不清、只露一角、无法确认是什么的，一律不输出。\n"
         )
         user_msg = f"类别清单：\n{label_text}\n请检测这张图片中的所有目标实例。"
         content = self._qwen_image_chat(cfg, sys_msg, user_msg, img_abs)
@@ -1789,6 +1798,14 @@ class SAMService:
             for b in boxes:
                 b["x1"], b["y1"], b["x2"], b["y2"] = self._qwen_model_to_orig(
                     (b["x1"], b["y1"], b["x2"], b["y2"]), img_abs, cfg)
+            # 框级二次校验（反幻觉）：VLM 整图检测会"脑补"出目标（真机：画面里没有
+            # 自救器，却把红安全帽/人头框成自救器）。把每个候选框外扩裁剪成小图复问
+            # 一次「图里是不是X」，否就丢弃——比整图提示词可靠得多。
+            if cfg.get("qwen_verify_enabled", True):
+                kept, dropped = self._qwen_verify_boxes(img_abs, boxes, classes, cfg)
+                if dropped:
+                    print(f"qwen verify: 拦截 {dropped} 个疑似幻觉框（裁剪复问为否） 剩余={len(kept)}")
+                boxes = kept
         return boxes
 
     def _parse_qwen_boxes(self, content: str, classes) -> list:
@@ -1874,13 +1891,18 @@ class SAMService:
         - 同时兼容 Ollama /api/chat 与 OpenAI 兼容 /v1/chat/completions
         检测（_detect_qwen）与审核（qwen_audit_detections）共用；图片编码走缓存。
         """
-        import json as _json
-        import urllib.request
         try:
             b64 = self._qwen_encode_b64(cfg, img_abs)
         except Exception as e:
             print(f"qwen: 图片编码失败 {img_abs}: {e}")
             return ""
+        return self._qwen_chat_raw(cfg, sys_msg, user_msg, b64, img_abs)
+
+    def _qwen_chat_raw(self, cfg: dict, sys_msg: str, user_msg: str, b64: str,
+                       img_abs=None) -> str:
+        """真正发 HTTP 的一层：_qwen_image_chat（整图）与框级校验（裁剪小图）共用。"""
+        import json as _json
+        import urllib.request
         endpoint = (cfg.get("qwen_endpoint") or "http://localhost:11434").rstrip("/")
         api_key = cfg.get("qwen_api_key") or ""
         headers = {"Content-Type": "application/json"}
@@ -1920,8 +1942,77 @@ class SAMService:
                     or (body.get("choices") or [{}])[0].get("message", {}).get("content")
                     or "")
         except Exception as e:
-            print(f"qwen: 推理失败 {img_abs}: {e}")
+            print(f"qwen: 推理失败 {img_abs or ''}: {e}")
             return ""
+
+    # ------------------------------------------------------------------
+    # 框级二次校验（反幻觉）：把整图检测出的候选框裁剪成小图复问一次
+    # ------------------------------------------------------------------
+    def _qwen_crop_b64(self, image, box: tuple, margin: float) -> str:
+        """按原图坐标裁剪候选框（四周外扩 margin 比例，clamp 到图内）→ base64 JPEG。
+
+        小图直接按裁剪尺寸编码（不放大、不进缓存——每个框都不同，缓存命中率≈0）。
+        """
+        import base64, io
+        W, H = image.size
+        x1, y1, x2, y2 = box
+        mx = (x2 - x1) * margin
+        my = (y2 - y1) * margin
+        cx1 = max(0, int(x1 - mx)); cy1 = max(0, int(y1 - my))
+        cx2 = min(W, int(x2 + mx) + 1); cy2 = min(H, int(y2 + my) + 1)
+        if cx2 - cx1 < 8 or cy2 - cy1 < 8:
+            cx1, cy1 = max(0, int(x1)), max(0, int(y1))
+            cx2, cy2 = min(W, max(int(x2), cx1 + 8)), min(H, max(int(y2), cy1 + 8))
+        crop = image.crop((cx1, cy1, cx2, cy2))
+        buf = io.BytesIO()
+        crop.save(buf, format="JPEG", quality=88)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    def _qwen_verify_boxes(self, img_abs, boxes: list, classes: list, cfg: dict) -> tuple:
+        """对每个候选框裁剪外扩小图，让模型回答「图里是不是X」，否→丢弃。
+
+        返回 (保留的 boxes, 拦截数)。任一框的校验调用失败/无输出时**保留**该框
+        （fail-open：网络抖动不该把真目标丢掉），只有模型明确回答「否」才拦截。
+        """
+        from PIL import Image as PILImage
+        try:
+            image = PILImage.open(img_abs).convert("RGB")
+        except Exception as e:
+            print(f"qwen verify: 打不开图 {img_abs}，跳过校验: {e}")
+            return boxes, 0
+        desc_info = cfg.get("qwen_labels_desc") or {}
+        labels_desc = desc_info.get("labels") or []
+        margin = float(cfg.get("qwen_verify_margin") or 0.35)
+
+        def target_name(cid: int) -> str:
+            if 0 <= cid < len(labels_desc) and (labels_desc[cid].get("chinese_name") or "").strip():
+                return labels_desc[cid]["chinese_name"].strip()
+            return str(classes[cid]) if 0 <= cid < len(classes) else str(cid)
+
+        sys_msg = (
+            "你是严格的图片质检员。判断图片里是否出现了指定的目标物体。\n"
+            "判据：必须是目标本体清晰可见；相似但不同的物体、人体部位、佩戴的其他装备都不算。\n"
+            "只回答一个字：是 或 否。不要任何解释。"
+        )
+        keep, dropped = [], 0
+        for b in boxes:
+            name = target_name(b["class_id"])
+            user_msg = (f"请判断：这张图片里是否出现了至少一个完整的「{name}」？\n"
+                        "注意：相似但不同的物体（安全帽、头盔、矿灯、人体、衣物等）不算。\n"
+                        "只回答 是 或 否。")
+            try:
+                b64 = self._qwen_crop_b64(
+                    image, (b["x1"], b["y1"], b["x2"], b["y2"]), margin)
+                ans = (self._qwen_chat_raw(cfg, sys_msg, user_msg, b64, img_abs) or "").strip()
+            except Exception as e:
+                print(f"qwen verify: 框校验失败，保留原框: {e}")
+                keep.append(b)
+                continue
+            if ans[:1] == "否" or ans[:2].lower() == "no":
+                dropped += 1
+                continue
+            keep.append(b)
+        return keep, dropped
 
     # ------------------------------------------------------------------
     # L2 千问审核（设计文档 §6.2.2）：对 AI 预标注结果做中文语义二次审核

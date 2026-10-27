@@ -627,6 +627,12 @@
         </label>
         <!-- 速度开关：实测 qwen3-vl:4b 上"检测"约 0.45s、"L2 审核"约 1.35s，
              审核比检测还贵，所以单独给开关；批量里审核只进统计，默认不做。 -->
+        <span class="cfg-title" style="display:block;margin-top:10px">准确性</span>
+        <label class="row">
+          <input type="checkbox" v-model="modelCfg.qwen_verify_enabled" />
+          <span>框级二次校验（防乱标）
+            <em class="dim">（每个候选框裁剪小图再问一次模型"是不是"，回答否则丢弃；每框约 +0.3~0.6s，强烈建议开着）</em></span>
+        </label>
         <span class="cfg-title" style="display:block;margin-top:10px">速度</span>
         <label class="row">
           <input type="checkbox" v-model="modelCfg.qwen_audit_enabled" />
@@ -746,6 +752,7 @@ const modelCfg = ref<any>({
   qwen_keep_alive: '5m',
   qwen_num_parallel: 1,
   qwen_image_max_side: 1024,
+  qwen_verify_enabled: true,
   qwen_audit_enabled: true,
   qwen_audit_batch: false,
 })
@@ -3195,6 +3202,7 @@ const openModelCfg = async () => {
     modelCfg.value.qwen_keep_alive = cfg.qwen_keep_alive || '5m'
     modelCfg.value.qwen_num_parallel = typeof cfg.qwen_num_parallel === 'number' ? cfg.qwen_num_parallel : 1
     modelCfg.value.qwen_image_max_side = typeof cfg.qwen_image_max_side === 'number' ? cfg.qwen_image_max_side : 1024
+    modelCfg.value.qwen_verify_enabled = cfg.qwen_verify_enabled !== false
     modelCfg.value.qwen_audit_enabled = cfg.qwen_audit_enabled !== false
     modelCfg.value.qwen_audit_batch = cfg.qwen_audit_batch === true
     showModelCfg.value = true
@@ -3242,6 +3250,7 @@ const saveModelCfg = async () => {
       qwen_keep_alive: modelCfg.value.qwen_keep_alive,
       qwen_num_parallel: modelCfg.value.qwen_num_parallel,
       qwen_image_max_side: modelCfg.value.qwen_image_max_side,
+      qwen_verify_enabled: !!modelCfg.value.qwen_verify_enabled,
       qwen_audit_enabled: !!modelCfg.value.qwen_audit_enabled,
       qwen_audit_batch: !!modelCfg.value.qwen_audit_batch,
     })

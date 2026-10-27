@@ -37,6 +37,8 @@ class ConfigRequest(BaseModel):
     qwen_coord_mode: Optional[str] = None       # 坐标约定：auto | norm1000 | pixel
     qwen_audit_enabled: Optional[bool] = None   # 单图预标注后是否自动做 L2 审核（关掉约快 4 倍）
     qwen_audit_batch: Optional[bool] = None     # 批量预标注是否也做 L2 审核（默认关）
+    qwen_verify_enabled: Optional[bool] = None  # 框级二次校验（反幻觉：候选框裁剪复问，回答否则丢弃）
+    qwen_verify_margin: Optional[float] = None  # 校验裁剪的四周外扩比例（默认 0.35）
 
 
 class AutoLabelRequest(BaseModel):
