@@ -291,6 +291,15 @@ class SAMService:
         device = cfg.get("device", "auto")
         if device == "auto":
             return get_best_device()
+        # 兼容各种写法：数字索引 "0"/1 → cuda:N；"gpu" → 自动；"cuda" → cuda:0。
+        # 直接把 "0" 传给 torch 会报 Invalid device string: '0'。
+        device = str(device).strip()
+        if device in ("", "none", "cpu"):
+            return "cpu"
+        if device.isdigit():
+            return f"cuda:{device}"
+        if device in ("gpu", "cuda"):
+            return "cuda:0"
         return device
 
     # ------------------------------------------------------------------
