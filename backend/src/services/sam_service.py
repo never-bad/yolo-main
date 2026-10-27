@@ -11,6 +11,7 @@ import json
 import asyncio
 import uuid
 import os
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -77,6 +78,15 @@ DEFAULT_CONFIG = {
     # Qwen3-VL 服务器部署配套（仅 ollama 后端生效，随每次请求传递）：
     "qwen_keep_alive": "5m",         # Ollama keep_alive：模型驻留内存时长（"5m"/"30m"/"-1"=常驻），避免频繁换载
     "qwen_num_parallel": 1,          # OLLAMA_NUM_PARALLEL：同一模型并行处理请求数（GPU 显存充裕可调大）
+    "qwen_image_max_side": 1024,     # 送大模型前把图压到最长边 ≤ 该值（实测 768 并不比 1024 快，别盲目调小）
+    "qwen_coord_mode": "auto",       # 模型输出坐标约定：auto（qwen3 系列=0~1000 归一化）| norm1000 | pixel
+    # ---- 耗时开关（实测 qwen3-vl:4b 单图：检测 ≈0.45s、L2 审核 ≈1.35s）----
+    # 单图预标注是否自动附 L2 审核。关掉单图 2.2s → 0.5s（约 4.5 倍），
+    # 需要审核时用标注页「⋯更多 → AI 审核当前图」手动跑一张即可。
+    "qwen_audit_enabled": True,
+    # 批量预标注是否也做 L2 审核。批量里审核结论只进统计、不改变落盘框，
+    # 却要多吃一半多的时间，所以默认关；想统计问题分布再打开。
+    "qwen_audit_batch": False,
 }
 class BatchTask:
     """内存中的批量预标注任务状态"""
@@ -102,6 +112,16 @@ class BatchTask:
         self.audit_checked = 0    # 已自动审核的图片数
         self.audit_boxes = 0      # 已审核的 AI 新增框数
         self.audit_errors = 0     # 审核失败/无输出次数
+        # 耗时累计（毫秒）：批量结束后算均值，用于判断瓶颈在检测还是审核
+        self.time_detect_ms = 0.0
+        self.time_audit_ms = 0.0
+        # 引擎预加载告警（如 grounding_dino 加载失败但千问可用）：不阻断批量，
+        # 但要能看见，否则用户会以为「配了多个引擎其实都在跑」
+        self.preload_warnings: List[str] = []
+        # 单图处理异常计数（坏图、显存波动等）：本批一张都没标成时据此判定为失败，
+        # 而不是报「完成 0 张」让用户以为任务正常结束
+        self.failed_images = 0
+        self.last_error: Optional[str] = None
         self.audit_summary = {"keep": 0, "modify": 0, "reject": 0, "split": 0, "missed": 0}
 
 
@@ -127,6 +147,11 @@ class SAMService:
         self._trained_id = None              # 当前缓存对应的模型版本 id（换版本时自动重载）
         self._trained_map_key = None         # 类别映射缓存的指纹（类别集合变了就重算）
         self._trained_map: Optional[dict] = None
+        # 送大模型前的图片编码缓存：同一张图「检测」「L2 审核」会各自调用一次千问，
+        # 旧版每次都在 Python 里重做一遍 PIL 缩放+JPEG 编码（1920 图 50~180ms/次）。
+        # 以 (路径, mtime, 大小, 最长边, 质量) 为键，只留最近 4 张，防内存堆积。
+        from collections import OrderedDict
+        self._qwen_img_cache: "OrderedDict[tuple, str]" = OrderedDict()
         self._lock = asyncio.Lock()
         self.batch_tasks: Dict[str, BatchTask] = {}
         self.annotation_service = AnnotationService()
@@ -287,20 +312,29 @@ class SAMService:
     # ------------------------------------------------------------------
     # 设备解析
     # ------------------------------------------------------------------
-    def _resolve_device(self, cfg: dict) -> str:
-        device = cfg.get("device", "auto")
-        if device == "auto":
-            return get_best_device()
-        # 兼容各种写法：数字索引 "0"/1 → cuda:N；"gpu" → 自动；"cuda" → cuda:0。
-        # 直接把 "0" 传给 torch 会报 Invalid device string: '0'。
-        device = str(device).strip()
+    @staticmethod
+    def _normalize_device(device) -> str:
+        """把各种设备写法统一成 torch 认识的字符串。
+
+        裸数字 "0" 直接交给 torch 会抛 Invalid device string: '0'（真机踩过：
+        GroundingDINO 每张图都推理失败、日志里刷 "Invalid device string: '0'"）。
+        所以 auto 分支的结果也要过这里——device_manager 早先返回的正是裸索引 "0"。
+        """
+        device = str(device if device is not None else "").strip()
         if device in ("", "none", "cpu"):
             return "cpu"
         if device.isdigit():
             return f"cuda:{device}"
-        if device in ("gpu", "cuda"):
+        if device.lower() in ("gpu", "cuda"):
             return "cuda:0"
         return device
+
+    def _resolve_device(self, cfg: dict) -> str:
+        device = cfg.get("device", "auto")
+        if device == "auto":
+            # 兼容各种写法：数字索引 "0"/1 → cuda:N；"gpu"/"cuda" → cuda:0。
+            return self._normalize_device(get_best_device())
+        return self._normalize_device(device)
 
     # ------------------------------------------------------------------
     # 模型加载（单例缓存）
@@ -541,7 +575,16 @@ class SAMService:
         self._gd_processor = AutoProcessor.from_pretrained(model_name)
         self._gd_model = AutoModelForZeroShotObjectDetection.from_pretrained(model_name)
         self._gd_name = model_name
-        self._gd_model.to(self._resolve_device(cfg))
+        try:
+            self._gd_model.to(self._resolve_device(cfg))
+        except Exception:
+            # 关键：搬设备失败不能把半初始化的模型留在缓存里。否则 self._gd_model 非 None，
+            # 后续每张图都直接复用这个还躺在 CPU 上的模型 / 或继续抛同样的错，
+            # 看起来"模型已加载成功"实则永远不工作（真机 '0' 事故就是这样被掩盖的）。
+            self._gd_model = None
+            self._gd_processor = None
+            self._gd_name = None
+            raise
         self._gd_model.eval()
         return self._gd_processor, self._gd_model
 
@@ -668,18 +711,29 @@ class SAMService:
             cfg["qwen_labels_desc"] = ld
 
         # 模型推理非线程安全，加锁串行化，避免并发访问导致模型状态损坏
+        t_det = time.perf_counter()
         async with self._lock:
             boxes = await asyncio.to_thread(self._run_auto_label_sync, img_abs, classes, conf, cfg, prompts)
+        det_ms = (time.perf_counter() - t_det) * 1000
         # L2 千问审核（设计文档 §6.2/§6.3）：qwen 启用时对预标注结果自动二次审核。
         # box_id = 返回列表下标，前端按此映射审核结论到对应框。
+        # 实测（qwen3-vl:4b）审核比检测还贵：检测 ≈450ms、审核 ≈1350ms，
+        # 所以给了 qwen_audit_enabled 开关；关掉后需要审核再点「AI 审核当前图」。
         audit, audit_msg = None, None
-        if boxes and cfg.get("qwen_enabled", False):
+        audit_ms = 0.0
+        if boxes and cfg.get("qwen_enabled", False) and cfg.get("qwen_audit_enabled", True):
             for i, b in enumerate(boxes):
                 b["box_id"] = i
+            t_audit = time.perf_counter()
             audit, audit_msg = await asyncio.to_thread(
                 self.qwen_audit_detections, img_abs, boxes,
                 cfg.get("qwen_labels_desc"), cfg, classes
             )
+            audit_ms = (time.perf_counter() - t_audit) * 1000
+        elif boxes and cfg.get("qwen_enabled", False):
+            audit_msg = "已关闭自动 L2 审核（AI 标注模型设置里可开），需要时点「AI 审核当前图」"
+        print(f"qwen: 单图耗时 检测={det_ms:.0f}ms 审核={audit_ms:.0f}ms "
+              f"合计={det_ms + audit_ms:.0f}ms 框数={len(boxes)} 图={image_id}")
         return {
             "image_id": image_id,
             "width": item["width"],
@@ -1779,27 +1833,51 @@ class SAMService:
         print(f"qwen IN-MOCK: {len(classes)} boxes for {img_abs}（本地联调模式，未调用真实模型）")
         return out
 
+    def _qwen_encode_b64(self, cfg: dict, img_abs: Path) -> str:
+        """图片 → base64(JPEG)，带缓存。
+
+        检测与 L2 审核是两次独立的千问调用，但看的是同一张图；旧版各自
+        PIL 缩放 + JPEG 编码一次，纯粹是重复劳动（1920 图实测 47~180ms/次）。
+        """
+        import base64, io
+        from PIL import Image as PILImage
+        max_side = int(cfg.get("qwen_image_max_side") or 1024)
+        quality = int(cfg.get("qwen_jpeg_quality") or 88)
+        try:
+            st = Path(img_abs).stat()
+            key = (str(img_abs), st.st_mtime_ns, st.st_size, max_side, quality)
+        except Exception:
+            key = None
+        if key is not None:
+            hit = self._qwen_img_cache.get(key)
+            if hit is not None:
+                self._qwen_img_cache.move_to_end(key)
+                return hit
+        image = PILImage.open(img_abs).convert("RGB")
+        w, h = image.size
+        if max(w, h) > max_side:
+            scale = max_side / max(w, h)
+            image = image.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=quality)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        if key is not None:
+            self._qwen_img_cache[key] = b64
+            while len(self._qwen_img_cache) > 4:
+                self._qwen_img_cache.popitem(last=False)
+        return b64
+
     def _qwen_image_chat(self, cfg: dict, sys_msg: str, user_msg: str, img_abs: Path) -> str:
         """统一调千问 VL（ollama / OpenAI 兼容接口），返回模型文本输出；失败返回 ''。
 
         - 自动压缩图片（最长边 ≤1024，VLM 输入过大既慢又易超 MaxInputError）
         - 同时兼容 Ollama /api/chat 与 OpenAI 兼容 /v1/chat/completions
-        检测（_detect_qwen）与审核（qwen_audit_detections）共用。
+        检测（_detect_qwen）与审核（qwen_audit_detections）共用；图片编码走缓存。
         """
-        import base64, io
         import json as _json
         import urllib.request
-        from PIL import Image as PILImage
         try:
-            image = PILImage.open(img_abs).convert("RGB")
-            max_side = int(cfg.get("qwen_image_max_side") or 1024)
-            w, h = image.size
-            if max(w, h) > max_side:
-                scale = max_side / max(w, h)
-                image = image.resize((max(1, int(w * scale)), max(1, int(h * scale))))
-            buf = io.BytesIO()
-            image.save(buf, format="JPEG", quality=88)
-            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            b64 = self._qwen_encode_b64(cfg, img_abs)
         except Exception as e:
             print(f"qwen: 图片编码失败 {img_abs}: {e}")
             return ""
@@ -2243,15 +2321,7 @@ class SAMService:
         agg = {}  # code -> {meta, images}
         for img_abs in image_paths:
             try:
-                image = PILImage.open(img_abs).convert("RGB")
-                max_side = 1024
-                w, h = image.size
-                if max(w, h) > max_side:
-                    scale = max_side / max(w, h)
-                    image = image.resize((max(1, int(w * scale)), max(1, int(h * scale))))
-                buf = io.BytesIO()
-                image.save(buf, format="JPEG", quality=88)
-                b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                b64 = self._qwen_encode_b64(cfg, img_abs)
             except Exception as e:
                 print(f"qwen suggest: 图片编码失败 {img_abs}: {e}")
                 continue
@@ -2642,10 +2712,43 @@ class SAMService:
             if bt.cancelled:
                 bt.status = "cancelled"
                 return
-            for det in self._active_detectors(cfg):
-                await asyncio.to_thread(self._load_engine, det, cfg)
+            # 单个引擎加载失败不能拖垮整批：多引擎配置下（如 qwen_vl + grounding_dino），
+            # 以前任一引擎抛错就直接 status=error，用户看到「批量预标注出错: Invalid device
+            # string: '0'」，其实主引擎完全可用（真机 2026-10-27 踩到：单图标注能标，
+            # 批量一开就整批失败）。改为逐引擎隔离：失败的引擎从本次批量的 detectors 里
+            # 剔除（避免每张图再白试一次、白打一行日志），只有「一个都没加载成功」才报错。
+            active = self._active_detectors(cfg)
+            usable, failed = [], []
+            for det in active:
+                try:
+                    await asyncio.to_thread(self._load_engine, det, cfg)
+                    usable.append(det)
+                except Exception as e:
+                    failed.append(f"{det}: {e}")
+                    print(f"批量预标注：引擎 {det} 预加载失败，已跳过（其余引擎继续）: {e}")
+            if active and not usable:
+                raise RuntimeError(
+                    "所有检测引擎均加载失败：" + "；".join(failed)
+                    + f"（device={self._resolve_device(cfg)}，可在「AI 标注模型设置」把设备改成 auto 或 cpu）"
+                )
+            if failed:
+                bt.preload_warnings = failed
+                cfg = dict(cfg)
+                if cfg.get("detectors"):
+                    cfg["detectors"] = usable
+                else:
+                    cfg["detector"] = usable[0]
+            print(f"qwen: 批量开始 引擎={usable} 设备={self._resolve_device(cfg)} "
+                  f"已跳过={failed or '无'}")
             if cfg.get("sam_enabled", True):
-                await asyncio.to_thread(self._load_sam, cfg)
+                # SAM 精修只是锦上添花：权重缺失/加载失败时降级成「只出方框」，
+                # 不该让整批直接失败
+                try:
+                    await asyncio.to_thread(self._load_sam, cfg)
+                except Exception as e:
+                    cfg = dict(cfg)
+                    cfg["sam_enabled"] = False
+                    print(f"批量预标注：SAM 加载失败，本批改为只出方框: {e}")
             # 模型加载完成后再次检查取消，避免加载期间点停止无效
             if bt.cancelled:
                 bt.status = "cancelled"
@@ -2698,6 +2801,7 @@ class SAMService:
                         continue
 
                     boxes = []
+                    t_det = time.perf_counter()
                     if img_abs.exists():
                         # 加锁串行化推理，避免与单图标注并发访问模型
                         async with self._lock:
@@ -2717,20 +2821,29 @@ class SAMService:
                                 except Exception as e:
                                     print(f"批量预标注降阈重试失败 {image_id}: {e}")
                                 if not boxes:
-                                    alt_cfg = dict(cfg)
-                                    alt_cfg["detector"] = "grounding_dino" if cfg.get("detector") != "grounding_dino" else "yolo_world"
+                                    # 换引擎兜底：只在「本次批量确认可用」的引擎里换（坏引擎
+                                    # 每张图都重试只会白等一次模型加载），并且必须同时改
+                                    # detectors——_active_detectors 优先读 detectors，只改
+                                    # detector 字段等于没换引擎（旧实现的隐藏问题）
+                                    primary = (cfg.get("detectors") or [cfg.get("detector")])[0]
+                                    alt = next((d for d in usable if d != primary), None)
                                     bt.skipped_candidates.append(image_id)
-                                    try:
-                                        boxes = await asyncio.to_thread(
-                                            self._run_auto_label_sync, img_abs, bt.classes, fallback_conf, alt_cfg, bt.prompts
-                                        )
-                                        if boxes:
-                                            bt.retried += 1
-                                    except Exception as e:
-                                        print(f"批量预标注换引擎重试失败 {image_id}: {e}")
+                                    if alt:
+                                        alt_cfg = dict(cfg)
+                                        alt_cfg["detectors"] = [alt]
+                                        alt_cfg["detector"] = alt
+                                        try:
+                                            boxes = await asyncio.to_thread(
+                                                self._run_auto_label_sync, img_abs, bt.classes, fallback_conf, alt_cfg, bt.prompts
+                                            )
+                                            if boxes:
+                                                bt.retried += 1
+                                        except Exception as e:
+                                            print(f"批量预标注换引擎重试失败 {image_id}: {e}")
                                 # 兜底重试③：本地引擎均检空且千问启用时，交给 VLM 再试（缓解"标不了"）
-                                if not boxes and cfg.get("qwen_enabled", False):
+                                if not boxes and cfg.get("qwen_enabled", False) and "qwen_vl" in usable:
                                     qwen_cfg = dict(cfg)
+                                    qwen_cfg["detectors"] = ["qwen_vl"]
                                     qwen_cfg["detector"] = "qwen_vl"
                                     try:
                                         boxes = await asyncio.to_thread(
@@ -2740,20 +2853,25 @@ class SAMService:
                                             bt.retried += 1
                                     except Exception as e:
                                         print(f"批量预标注千问重试失败 {image_id}: {e}")
+                    bt.time_detect_ms += (time.perf_counter() - t_det) * 1000
                     # 只保留缺失类别的检测框（class_id 为全局索引，与 bt.classes 对齐）
                     missing_set = set(missing_indices)
                     new_boxes = [b for b in boxes if b["class_id"] in missing_set]
                     # L2 千问审核（设计文档 §6.2/§6.3）：每张图检测后自动二次审核，
                     # 只统计汇总（keep/modify/reject/split/漏标）供批量进度展示，结论不落盘；
-                    # 失败仅计数，不影响批量主流程
-                    if new_boxes and cfg.get("qwen_enabled", False):
+                    # 失败仅计数，不影响批量主流程。
+                    # 默认关（qwen_audit_batch=False）：批量里审核结论只进统计，却要多花
+                    # 一倍多时间（实测 0.45s → 2.2s/图），想统计问题分布再打开。
+                    if new_boxes and cfg.get("qwen_enabled", False) and cfg.get("qwen_audit_batch", False):
                         for i, b in enumerate(new_boxes):
                             b["box_id"] = i
+                        t_audit = time.perf_counter()
                         try:
                             audit, audit_msg = await asyncio.to_thread(
                                 self.qwen_audit_detections, img_abs, new_boxes,
                                 cfg.get("qwen_labels_desc"), cfg, bt.classes
                             )
+                            bt.time_audit_ms += (time.perf_counter() - t_audit) * 1000
                             if audit and audit.get("ok"):
                                 st = audit.get("stats") or {}
                                 bt.audit_checked += 1
@@ -2810,11 +2928,28 @@ class SAMService:
                     bt.done += 1
                 except Exception as e:
                     print(f"批量预标注跳过图片 {image_id}: {e}")
+                    bt.failed_images += 1
+                    bt.last_error = str(e)
                     bt.done += 1
                     continue
 
+            processed = max(1, bt.done - (bt.total - len(remaining)))
+            # 一张都没标成却报「完成」会掩盖真故障（模型加载失败、显存不足、路径错等），
+            # 这种情况下把最后一条错误抛给前端，用户才知道要去查配置而不是等结果
+            if bt.failed_images and bt.failed_images >= processed and not bt.boxes_written:
+                raise RuntimeError(
+                    f"全部 {bt.failed_images} 张图片处理失败，最后一条错误：{bt.last_error}"
+                )
             bt.status = "done"
-            bt.result_summary = {"total": bt.total, "annotated": bt.boxes_written}
+            bt.result_summary = {
+                "total": bt.total,
+                "annotated": bt.boxes_written,
+                "avg_detect_ms": round(bt.time_detect_ms / processed),
+                "avg_audit_ms": round(bt.time_audit_ms / processed),
+            }
+            print(f"qwen: 批量结束 图片={bt.total} 写入={bt.boxes_written} "
+                  f"检出均值={bt.result_summary['avg_detect_ms']}ms/图 "
+                  f"审核均值={bt.result_summary['avg_audit_ms']}ms/图")
         except Exception as e:
             bt.status = "error"
             bt.error = str(e)
@@ -2835,6 +2970,8 @@ class SAMService:
             "skipped_candidates": bt.skipped_candidates,
             "current_image": bt.current_image,
             "error": bt.error,
+            "preload_warnings": bt.preload_warnings,
+            "failed_images": bt.failed_images,
             "summary": bt.result_summary,
             "audit": {
                 "checked": bt.audit_checked,

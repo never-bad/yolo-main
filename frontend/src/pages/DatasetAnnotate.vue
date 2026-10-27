@@ -625,6 +625,24 @@
           <input type="checkbox" v-model="modelCfg.qwen_mock" />
           <span>模拟框模式（本地联调，不调用真实模型）</span>
         </label>
+        <!-- 速度开关：实测 qwen3-vl:4b 上"检测"约 0.45s、"L2 审核"约 1.35s，
+             审核比检测还贵，所以单独给开关；批量里审核只进统计，默认不做。 -->
+        <span class="cfg-title" style="display:block;margin-top:10px">速度</span>
+        <label class="row">
+          <input type="checkbox" v-model="modelCfg.qwen_audit_enabled" />
+          <span>单图预标注后自动做 L2 审核
+            <em class="dim">（关掉单图约 0.5s，开着约 2.2s；需要审核时点「⋯更多 → AI 审核当前图」）</em></span>
+        </label>
+        <label class="row">
+          <input type="checkbox" v-model="modelCfg.qwen_audit_batch" />
+          <span>批量预标注也做 L2 审核
+            <em class="dim">（默认关：批量里审核只进统计不改框，却让每图从 ~0.5s 涨到 ~2.2s）</em></span>
+        </label>
+        <label class="row">
+          <span>送模型图片最长边：</span>
+          <input type="number" v-model.number="modelCfg.qwen_image_max_side" min="320" max="2048" step="64" class="w-input short" />
+          <span class="dim">px（1024 够用；实测压到 768 并不会更快）</span>
+        </label>
       </div>
       <div class="modal-footer">
         <button @click="closeModelCfg">取消</button>
@@ -727,6 +745,9 @@ const modelCfg = ref<any>({
   qwen_mock: false,
   qwen_keep_alive: '5m',
   qwen_num_parallel: 1,
+  qwen_image_max_side: 1024,
+  qwen_audit_enabled: true,
+  qwen_audit_batch: false,
 })
 // 自动保存（防抖）
 const autoSaveTimer = ref<any>(null)
@@ -3173,6 +3194,9 @@ const openModelCfg = async () => {
     modelCfg.value.qwen_mock = !!cfg.qwen_mock
     modelCfg.value.qwen_keep_alive = cfg.qwen_keep_alive || '5m'
     modelCfg.value.qwen_num_parallel = typeof cfg.qwen_num_parallel === 'number' ? cfg.qwen_num_parallel : 1
+    modelCfg.value.qwen_image_max_side = typeof cfg.qwen_image_max_side === 'number' ? cfg.qwen_image_max_side : 1024
+    modelCfg.value.qwen_audit_enabled = cfg.qwen_audit_enabled !== false
+    modelCfg.value.qwen_audit_batch = cfg.qwen_audit_batch === true
     showModelCfg.value = true
   } catch (e: any) {
     if (!e?.__toastShown) showToast('读取 AI 标注配置失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
@@ -3217,6 +3241,9 @@ const saveModelCfg = async () => {
       qwen_mock: !!modelCfg.value.qwen_mock,
       qwen_keep_alive: modelCfg.value.qwen_keep_alive,
       qwen_num_parallel: modelCfg.value.qwen_num_parallel,
+      qwen_image_max_side: modelCfg.value.qwen_image_max_side,
+      qwen_audit_enabled: !!modelCfg.value.qwen_audit_enabled,
+      qwen_audit_batch: !!modelCfg.value.qwen_audit_batch,
     })
     // 同步页面阈值并刷新本地配置
     aiConf.value = modelCfg.value.conf

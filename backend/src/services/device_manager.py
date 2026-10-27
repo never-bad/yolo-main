@@ -51,12 +51,16 @@ def get_best_device() -> str:
     """返回最佳设备字符串
 
     逻辑：显存可用量最大的 GPU 优先；无 GPU 时退回 CPU。
+
+    必须返回 torch 认识的写法（"cuda:0" 而不是 "0"）：裸索引 "0" 传给
+    torch.device()/Tensor.to() 会抛 `Invalid device string: '0'`，
+    这是 GroundingDINO 在真机上一直报错、静默不工作的根因。
     """
     gpus = get_available_gpus()
     if not gpus:
         return "cpu"
     best = max(gpus, key=lambda g: g["memory_free_mb"])
-    return str(best["index"])
+    return f"cuda:{best['index']}"
 
 
 def get_gpu_utilization(index: int = 0) -> int | None:

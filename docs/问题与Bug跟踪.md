@@ -39,6 +39,8 @@
 | B-07 | 风险约定 | 🟢 | models.py 通配路由 `/{model_id}` 顺序陷阱（新增路由易被吞） | 已解决（10-06 905a535：routes/models.py 通配路由前加顺序警示注释） | 页面关联 §6 |
 | B-09 | 功能缺陷 | 🔴 | 封板 data.yaml 写死源目录绝对 path，改名/删源/换机器后训练报 images not found，需手动改 yaml | 已修复（10-06 b365934） | 安全升级文档 |
 | B-10 | 体验 | 🟡 | 每次切页（首页/数据集/模型）组件销毁重建，整页重新加载 | 已修复（10-06 d99ff5b） | — |
+| B-11 | 功能缺陷 | 🔴 | GroundingDINO 恒报 `Invalid device string: '0'`，多引擎检测里 GD 一路从未生效（auto 分支返回裸索引） | 已修复（2026-10-27，含 `get_best_device` 返回 `cuda:N` + 坏实例不缓存） | B-08 · I-15 |
+| B-12 | 功能缺陷 | 🔴 | 批量预标注一开就整批失败「批量预标注出错: Invalid device string: '0'」，同一配置下单图标注却正常出框（预加载不隔离单引擎失败） | 已修复（2026-10-27，逐引擎隔离预加载 + 换引擎兜底真正生效 + 全失败不再假报完成） | B-11 · I-16 |
 | I-11* | 悬空目录 | 🟢 | `data/inference_results/` 无对应路由/服务 | 已结案（10-10：目录空且无代码引用，随批次 I 删除） | I-11 |
 
 > `*` 两项以改进项为主编号（`I-01`、`I-11`），此处仅登记存在性，避免双号漂移。
@@ -86,6 +88,37 @@
 - **验证（真机闭环，全绿）**：本机修复 → push `backup/v2-dataflow-20261013`（`c5793a7..a48a6fc`）→ 服务器 `git pull --ff-only`（快进 4 files +29/-29）→ 重新 build（新镜像 `ded9b02e2431`）→ `cd /opt/yolo-main/docker && docker compose up -d --force-recreate yolo-platform` → 日志 `(无 seal poll / Traceback ✓)`、`/health` 的 `seal_poll` **不再出现 `last_error` 字段**、四循环心跳齐全。
 - **有意未改**：`utils/class_labels.py`（自带 `def _load_json`，自洽）；`scripts/migrate_to_pg.py` / `scripts/backfill_has_label.py`（各自 `def`；其中 `migrate_to_pg.py` 属红线 B-03，不动）。
 - **教训沉淀**：批量改名必须**同时覆盖 `f(` 与 `f,`**（`asyncio.to_thread` 等把函数当对象传递）两种形式；建议后续把 **pyflakes 纳入提交前检查**（可捕获全类别未定义名，成本极低）——关联改进项待登《功能实现与改进点跟踪》。
+
+### B-11　GroundingDINO 每张图都推理失败（`Invalid device string: '0'`）—— 功能缺陷（已修复 ✅ 2026-10-27）
+
+- **现象**：标注页每次 AI 预标注，日志固定出现两行：
+  `multi-detect: 引擎 grounding_dino 推理失败: Invalid device string: '0'`、
+  `multi-detect: 引擎 grounding_dino 推理失败: GroundingDINO 检测器不可用：Invalid device string: '0'`。
+  界面上千问仍在出框，所以**看起来只是"刷日志"**，实际是 GD 引擎从第一次调用起就**从未真正工作过**（多引擎合并里永远只有千问一路结果）。
+- **根因**：`device_manager.get_best_device()` 返回的是裸索引 `str(best["index"])` = `"0"`，而 `sam_service._resolve_device()` 只在「配置文件里手写 device」这条路径上做了 `"0" → "cuda:0"` 归一化，**`device="auto"` 分支直接 return 了 `get_best_device()` 的裸值**。于是 torch 收到 `"0"` 抛 `Invalid device string: '0'`。上一轮 `b9ae200` 只修了配置侧（用户手写 `device: "0"` 的场景），auto 分支漏改 —— **同一个 bug 的第二个入口**。
+- **加重因素**：`_load_grounding_dino()` 先把模型赋给 `self._gd_model` 再 `.to(device)`；`.to` 抛异常后**半初始化的模型仍留在缓存里**（非 None），后续每张图都"复用"这个躺在 CPU 上的模型或继续抛同样的错，把「加载失败」伪装成「已加载」。
+- **修复**：
+  1. `device_manager.get_best_device()` 直接返回 `cuda:N`（注释写明为何不能返回裸索引）；
+  2. 抽 `_normalize_device()`，`_resolve_device()` 的 **auto 分支与显式分支都过它**（双保险，任何来源的设备字符串都不会裸奔到 torch）；
+  3. `_load_grounding_dino()` 的 `.to()` 失败时清空 `_gd_model/_gd_processor/_gd_name` 再 raise，坏实例不进缓存。
+- **验证**：`py_compile` 通过。**真机待部署后确认**：日志不再出现 `Invalid device string`。
+- **行为提醒**：修好之后 GD 会**真的开始出框**（此前等于关闭）。若当前只靠千问的结果已够用，建议在「AI 标注模型设置」里取消勾选 GroundingDINO —— 少一路引擎更快，也不会引入 GD 的误检。
+
+### B-12　批量预标注整批失败（`批量预标注出错: Invalid device string: '0'`）—— 功能缺陷（已修复 ✅ 2026-10-27）
+
+- **现象**：同一套配置下，单图「AI 预标注」能出框（日志只刷两行 GD 失败），但一点「批量预标注」，进度条没动就弹 `批量预标注出错: Invalid device string: '0'`，一张都标不了。用户视角像是"新问题"，其实是 B-11 的**第二个出口**。
+- **根因（错误传播，不是设备本身）**：`_run_batch` 在进入主循环前会**预加载所有启用的引擎**（`for det in self._active_detectors(cfg): self._load_engine(det, cfg)`），这一步没有任何 per-engine 的 try/except。GD 因 B-11 的裸 `'0'` 抛异常 → 直接冒泡到 `_run_batch` 最外层 `except` → `bt.status="error"`。而单图链路 `_detect()` 是**逐引擎 try/except**（失败只打日志、继续下一个引擎），所以千问照常工作。**同一个坏引擎，一条链路容错、另一条链路不容错**，才出现"单图行、批量不行"的错觉。
+- **顺带发现的两个隐藏问题**：
+  1. **换引擎兜底从未生效**：`alt_cfg["detector"] = "grounding_dino"` 只改了 `detector` 字段，而 `_active_detectors()` 优先读 `detectors` 列表 → 多引擎配置下"换引擎"实际还是跑原来那批引擎；且它会**无条件尝试 GD**，即使 GD 本次已确认不可用（每张图都白等一次模型加载）。
+  2. **全失败假报完成**：单图异常被 `批量预标注跳过图片` 吞掉并 `bt.done += 1`，若所有图都失败，任务以 `status=done, 标注 0 张` 收场，用户以为"图里没目标"而不是"服务坏了"。
+- **修复**（`sam_service.py`）：
+  1. 预加载**逐个引擎 try/except**，失败引擎记入 `bt.preload_warnings` 并从本次批量的 `detectors` 里剔除（不再每张图重试一次）；只有**一个引擎都没加载成功**才 `raise`，错误信息带上 `device=` 与「设备改成 auto/cpu」的指引；
+  2. SAM 精修加载失败降级为「只出方框」，不再中断整批；
+  3. 换引擎兜底改为**只用本次确认可用的引擎**（`usable`），并同时覆盖 `detectors` + `detector` 两个字段，换引擎才真的换；
+  4. 单图异常累计 `bt.failed_images` / `bt.last_error`，若「全部图片都失败且一个框都没写入」则以 `error` 结束并回传最后一条错误，杜绝假 `done`；
+  5. 批量开始打一行 `qwen: 批量开始 引擎=[...] 设备=cuda:0 已跳过=...`，一眼看清实际跑的是哪几路引擎、设备解析成了什么。
+- **验证**：`py_compile` 通过；`/batch/{id}` 状态新增 `preload_warnings`、`failed_images` 字段（前端不读也不受影响）。**真机待部署后确认**：批量能正常开跑，日志出现「批量开始」那行且 `已跳过` 为空。
+- **部署提醒**：本次修复与 B-11 的设备归一化都在**代码层**，`docker compose up -d` 不会自动生效 —— 必须重新 build 镜像（`bash docker/publish.sh` 或服务器本地 build），否则容器里仍是旧代码，症状完全一样。
 
 ---
 
