@@ -1604,6 +1604,27 @@ class SAMService:
             print(f"trained_model: mask 连通域拆分失败（退化为一块轮廓/矩形框）: {e}")
             return []
 
+    @staticmethod
+    def _qwen_to_orig_scale(img_abs, cfg: dict = None) -> float:
+        """千问链路会把图片缩到最长边 qwen_image_max_side（默认 1024）后再发给模型，
+        模型返回的坐标属于「缩放空间」。本方法返回把坐标还原回原图所需的倍率。
+
+        - 未发生缩放 / 读不到图片尺寸 → 1.0（保持历史行为，不改变既有结果）
+        - 例：1920x1080 → max_side=1024 时返回 1920/1024 = 1.875
+
+        检测（_detect_qwen）与审核（_parse_qwen_audit 的 missed_targets）两条链路共用。
+        """
+        try:
+            from PIL import Image as PILImage
+            w, h = PILImage.open(img_abs).size
+        except Exception:
+            return 1.0
+        max_side = int((cfg or {}).get("qwen_image_max_side") or 1024)
+        longest = max(w, h)
+        if longest <= max_side or longest <= 0:
+            return 1.0
+        return longest / max_side
+
     def _detect_qwen(self, img_abs, classes, conf, cfg, prompts=None) -> list:
         """千问 VL 大模型预标注（本地预留接口）。
 
@@ -1640,7 +1661,17 @@ class SAMService:
         content = self._qwen_image_chat(cfg, sys_msg, user_msg, img_abs)
         if not content:
             return []
-        return self._parse_qwen_boxes(content, classes)
+        boxes = self._parse_qwen_boxes(content, classes)
+        # 模型看到的是缩放后的图（最长边 ≤ qwen_image_max_side），坐标需还原到原图空间。
+        # 缺失这一步时：1920x1080 的图会整体框偏左上且缩小 1.875 倍。
+        scale = self._qwen_to_orig_scale(img_abs, cfg)
+        if boxes and scale != 1.0:
+            for b in boxes:
+                b["x1"] = float(b["x1"]) * scale
+                b["y1"] = float(b["y1"]) * scale
+                b["x2"] = float(b["x2"]) * scale
+                b["y2"] = float(b["y2"]) * scale
+        return boxes
 
     def _parse_qwen_boxes(self, content: str, classes) -> list:
         """解析千问输出：<box>x1,y1,x2,y2</box> <class>i</class> → 标准 boxes"""
@@ -1697,7 +1728,7 @@ class SAMService:
         from PIL import Image as PILImage
         try:
             image = PILImage.open(img_abs).convert("RGB")
-            max_side = 1024
+            max_side = int(cfg.get("qwen_image_max_side") or 1024)
             w, h = image.size
             if max(w, h) > max_side:
                 scale = max_side / max(w, h)
@@ -1788,6 +1819,15 @@ class SAMService:
                 "score": round(float(b.get("score") or b.get("confidence") or 0.9), 3),
             })
 
+        # 千问链路会把图缩到最长边 ≤ qwen_image_max_side 再发模型，模型看到的是缩放后的画面。
+        # 因此送审的框坐标必须先换算到「模型可见空间」，否则模型会认为框在画面之外；
+        # 模型回传的 missed_targets 则由 _parse_qwen_audit 按同一倍率还原回原图。
+        _scale = self._qwen_to_orig_scale(img_abs, cfg)
+        if _scale != 1.0:
+            _down = 1.0 / _scale
+            for d in audit_dets:
+                d["bbox"] = [round(v * _down, 1) for v in d["bbox"]]
+
         if cfg.get("qwen_mock", False):
             print(f"qwen audit IN-MOCK: {len(audit_dets)} boxes for {img_abs}（本地联调模式，未调用真实模型）")
             return self._mock_qwen_audit(audit_dets, classes), ""
@@ -1837,9 +1877,10 @@ class SAMService:
         content = self._qwen_image_chat(cfg, sys_msg, user_msg, img_abs)
         if not content:
             return None, "千问审核推理失败（无输出）"
-        return self._parse_qwen_audit(content, audit_dets, labels, classes), ""
+        return self._parse_qwen_audit(content, audit_dets, labels, classes, scale=_scale), ""
 
-    def _parse_qwen_audit(self, content: str, audit_dets: list, labels: list, classes: list) -> dict:
+    def _parse_qwen_audit(self, content: str, audit_dets: list, labels: list, classes: list,
+                          scale: float = 1.0) -> dict:
         """解析千问审核输出 JSON → 归一化 audit 结构（容错：模型可能加 ```json 包裹或解释文字）"""
         import re
         m = re.search(r"\{[\s\S]*\}", content)
@@ -1944,6 +1985,9 @@ class SAMService:
                 x1, y1, x2, y2 = (float(v) for v in bb)
             except (TypeError, ValueError):
                 continue
+            # 模型坐标属于缩放空间，还原到原图（与送审框的换算互为逆运算）
+            if scale and scale != 1.0:
+                x1, y1, x2, y2 = x1 * scale, y1 * scale, x2 * scale, y2 * scale
             missed.append({
                 "class_id": cid, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "reason": (str(mt.get("reason") or ""))[:50],
