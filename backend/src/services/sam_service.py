@@ -1634,6 +1634,59 @@ class SAMService:
             return 1.0
         return longest / max_side
 
+    @staticmethod
+    def _qwen_coord_mode(cfg: dict) -> str:
+        """千问返回框坐标的约定：'norm1000'（0~1000 归一化）或 'pixel'（缩放图绝对像素）。
+
+        实测：qwen3-vl 系列输出的是 **0~1000 归一化**坐标——1920x1080 的图缩到 1024x576 后，
+        模型仍会返回 y=584 这类超出 576 的值，且按归一化解释后框正好落在人物腰部（原按像素
+        解释会整体下移到地板）。故对 qwen3 系列默认 norm1000；其他 VLM 后端保持历史行为 pixel。
+
+        配置项 qwen_coord_mode：auto（默认）| norm1000 | pixel
+        """
+        mode = str(cfg.get("qwen_coord_mode") or "auto").strip().lower()
+        if mode in ("norm1000", "norm", "normalized", "norm_1000"):
+            return "norm1000"
+        if mode in ("pixel", "abs", "absolute"):
+            return "pixel"
+        model = str(cfg.get("qwen_model") or "").lower()
+        return "norm1000" if "qwen3" in model else "pixel"
+
+    @staticmethod
+    def _qwen_img_size(img_abs):
+        try:
+            from PIL import Image as PILImage
+            return PILImage.open(img_abs).size
+        except Exception:
+            return (0, 0)
+
+    def _qwen_model_to_orig(self, bbox, img_abs, cfg: dict) -> list:
+        """模型空间坐标 → 原图像素坐标（检测框、漏标补框共用）"""
+        x1, y1, x2, y2 = (float(v) for v in bbox)
+        if self._qwen_coord_mode(cfg) == "norm1000":
+            w, h = self._qwen_img_size(img_abs)
+            if w and h:
+                return [x1 / 1000.0 * w, y1 / 1000.0 * h, x2 / 1000.0 * w, y2 / 1000.0 * h]
+            return [x1, y1, x2, y2]
+        scale = self._qwen_to_orig_scale(img_abs, cfg)
+        if scale == 1.0:
+            return [x1, y1, x2, y2]
+        return [x1 * scale, y1 * scale, x2 * scale, y2 * scale]
+
+    def _qwen_orig_to_model(self, bbox, img_abs, cfg: dict) -> list:
+        """原图像素坐标 → 模型空间坐标（送审框用，与 _qwen_model_to_orig 互逆）"""
+        x1, y1, x2, y2 = (float(v) for v in bbox)
+        if self._qwen_coord_mode(cfg) == "norm1000":
+            w, h = self._qwen_img_size(img_abs)
+            if w and h:
+                return [x1 / w * 1000.0, y1 / h * 1000.0, x2 / w * 1000.0, y2 / h * 1000.0]
+            return [x1, y1, x2, y2]
+        scale = self._qwen_to_orig_scale(img_abs, cfg)
+        if scale in (0.0, 1.0):
+            return [x1, y1, x2, y2]
+        down = 1.0 / scale
+        return [x1 * down, y1 * down, x2 * down, y2 * down]
+
     def _detect_qwen(self, img_abs, classes, conf, cfg, prompts=None) -> list:
         """千问 VL 大模型预标注（本地预留接口）。
 
@@ -1658,11 +1711,16 @@ class SAMService:
             )
         else:
             label_text = ", ".join([f"{i}:{c}" for i, c in enumerate(classes)])
+        if self._qwen_coord_mode(cfg) == "norm1000":
+            coord_hint = ("其中 x1,y1,x2,y2 是该目标的归一化坐标边界框，取值 0~1000"
+                          "（相对图片宽高的千分比，左上角与右下角，整数即可），\n")
+        else:
+            coord_hint = "其中 x1,y1,x2,y2 是该目标在图片中的像素坐标边界框（左上角与右下角，整数即可），\n"
         sys_msg = (
             "你是一个精细的视觉目标检测助手。对给定的图片和类别清单，找出图中出现的每一个目标实例。\n"
             "对所有找到的实例，输出格式为每行一个：\n"
             "<box>x1,y1,x2,y2</box> <class>i</class>\n"
-            "其中 x1,y1,x2,y2 是该目标在图片中的像素坐标边界框（左上角与右下角，整数即可），\n"
+            + coord_hint +
             "i 是类别清单中的序号（0 起）。必须逐行输出，每行只能有一个实例，不要输出任何其他文字或解释。\n"
             "如果某个类别没有目标，不要输出它的行。\n"
         )
@@ -1671,15 +1729,12 @@ class SAMService:
         if not content:
             return []
         boxes = self._parse_qwen_boxes(content, classes)
-        # 模型看到的是缩放后的图（最长边 ≤ qwen_image_max_side），坐标需还原到原图空间。
-        # 缺失这一步时：1920x1080 的图会整体框偏左上且缩小 1.875 倍。
-        scale = self._qwen_to_orig_scale(img_abs, cfg)
-        if boxes and scale != 1.0:
+        # 模型返回的坐标属于「模型空间」：qwen3-vl 为 0~1000 归一化（实测），其余按缩放图像素。
+        # 缺失这一步时：1920x1080 的图会整体纵向偏低约 1.74 倍（框落到地面）且横向略偏。
+        if boxes:
             for b in boxes:
-                b["x1"] = float(b["x1"]) * scale
-                b["y1"] = float(b["y1"]) * scale
-                b["x2"] = float(b["x2"]) * scale
-                b["y2"] = float(b["y2"]) * scale
+                b["x1"], b["y1"], b["x2"], b["y2"] = self._qwen_model_to_orig(
+                    (b["x1"], b["y1"], b["x2"], b["y2"]), img_abs, cfg)
         return boxes
 
     def _parse_qwen_boxes(self, content: str, classes) -> list:
@@ -1828,14 +1883,11 @@ class SAMService:
                 "score": round(float(b.get("score") or b.get("confidence") or 0.9), 3),
             })
 
-        # 千问链路会把图缩到最长边 ≤ qwen_image_max_side 再发模型，模型看到的是缩放后的画面。
-        # 因此送审的框坐标必须先换算到「模型可见空间」，否则模型会认为框在画面之外；
-        # 模型回传的 missed_targets 则由 _parse_qwen_audit 按同一倍率还原回原图。
-        _scale = self._qwen_to_orig_scale(img_abs, cfg)
-        if _scale != 1.0:
-            _down = 1.0 / _scale
-            for d in audit_dets:
-                d["bbox"] = [round(v * _down, 1) for v in d["bbox"]]
+        # 模型看到的坐标空间与我方原图不同（qwen3-vl 用 0~1000 归一化；其他后端用缩放图像素）。
+        # 送审的框必须先换算到「模型空间」，否则模型会认为框在画面之外；
+        # 模型回传的 missed_targets 再由 _parse_qwen_audit 按同一约定还原回原图。
+        for d in audit_dets:
+            d["bbox"] = [round(v, 1) for v in self._qwen_orig_to_model(d["bbox"], img_abs, cfg)]
 
         if cfg.get("qwen_mock", False):
             print(f"qwen audit IN-MOCK: {len(audit_dets)} boxes for {img_abs}（本地联调模式，未调用真实模型）")
@@ -1850,18 +1902,22 @@ class SAMService:
             defs.append(f"{i}. {zh}{('：' + desc) if desc else ''}")
         labels_text = "\n".join(defs)
         dets_text = json.dumps(audit_dets, ensure_ascii=False)
+        if self._qwen_coord_mode(cfg) == "norm1000":
+            bbox_hint = "bbox 为 0~1000 归一化坐标 [x1,y1,x2,y2]（相对图片宽高的千分比）"
+        else:
+            bbox_hint = "bbox 为图片像素坐标 [x1,y1,x2,y2]"
         sys_msg = (
             "# Role\n"
             "你是资深的工业视觉数据审核专家。请对当前图片及 AI 预标注的边界框进行严苛的二次审核。\n\n"
             "# Context\n"
             f"- 目标类别定义（含审核标准）：\n{labels_text}\n"
             f"- 预标注结果：{dets_text}\n"
-            "（JSON 格式：box_id 唯一标识每个框，bbox 为图片像素坐标 [x1,y1,x2,y2]，class_id 对应上面的类别序号）\n\n"
+            f"（JSON 格式：box_id 唯一标识每个框，{bbox_hint}，class_id 对应上面的类别序号）\n\n"
             "# Audit Dimensions（审核维度）\n"
             "请严格执行以下检查：\n"
             "1. 语义准确性：框内物体是否与类别定义（desc）严格匹配？输出 keep / modify / reject。\n"
             "2. 标签错误检测：框内物体是否被错误分类？若发现标签错误，输出 reject 并给出 suggested_class（建议的正确类别序号）。\n"
-            "3. 漏标排查：仔细扫描全图，是否还有符合类别定义的目标没有被框出来？输出到 missed_targets，bbox 为像素坐标。\n"
+            f"3. 漏标排查：仔细扫描全图，是否还有符合类别定义的目标没有被框出来？输出到 missed_targets，{bbox_hint}。\n"
             "4. 粘连框检测：是否有框内包含两个或多个独立目标？输出到 merged_boxes，action=split 或 reject。\n"
             "5. 边界质量：框是否过大、过小或未贴合边缘？过大/过小输出 modify。\n"
             "6. 业务合规：目标是否存在违规行为（如未戴安全帽、未穿反光衣）？在对应框的 tags 中加入 #compliance_issue。\n\n"
@@ -1886,10 +1942,11 @@ class SAMService:
         content = self._qwen_image_chat(cfg, sys_msg, user_msg, img_abs)
         if not content:
             return None, "千问审核推理失败（无输出）"
-        return self._parse_qwen_audit(content, audit_dets, labels, classes, scale=_scale), ""
+        return self._parse_qwen_audit(content, audit_dets, labels, classes,
+                                      img_abs=img_abs, cfg=cfg), ""
 
     def _parse_qwen_audit(self, content: str, audit_dets: list, labels: list, classes: list,
-                          scale: float = 1.0) -> dict:
+                          img_abs=None, cfg: dict = None) -> dict:
         """解析千问审核输出 JSON → 归一化 audit 结构（容错：模型可能加 ```json 包裹或解释文字）"""
         import re
         m = re.search(r"\{[\s\S]*\}", content)
@@ -1994,9 +2051,9 @@ class SAMService:
                 x1, y1, x2, y2 = (float(v) for v in bb)
             except (TypeError, ValueError):
                 continue
-            # 模型坐标属于缩放空间，还原到原图（与送审框的换算互为逆运算）
-            if scale and scale != 1.0:
-                x1, y1, x2, y2 = x1 * scale, y1 * scale, x2 * scale, y2 * scale
+            # 模型空间坐标 → 原图像素（与送审框的换算互逆；含 0~1000 归一化 / 缩放像素两种约定）
+            if img_abs is not None:
+                x1, y1, x2, y2 = self._qwen_model_to_orig((x1, y1, x2, y2), img_abs, cfg or {})
             missed.append({
                 "class_id": cid, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "reason": (str(mt.get("reason") or ""))[:50],
