@@ -441,7 +441,13 @@
       <div class="job-files-dialog">
         <div class="viewer-header">
           <h3>任务文件 - {{ jobFiles.job_id }}</h3>
-          <button class="secondary viewer-close" @click="closeJobFiles">关闭</button>
+          <div class="viewer-header-actions">
+            <button class="secondary" :disabled="jobExporting" @click="exportJobFiles">
+              <span v-if="jobExporting" class="loading-spinner"></span>
+              {{ jobExporting ? '打包中...' : '⬇ 导出文件夹(zip)' }}
+            </button>
+            <button class="secondary viewer-close" @click="closeJobFiles">关闭</button>
+          </div>
         </div>
         <div class="viewer-section-title">文件夹结构</div>
         <div v-if="jobFilesLoading" class="loading-state">
@@ -471,12 +477,20 @@
       <div class="file-preview-dialog">
         <div class="viewer-header">
           <h3>{{ jobFilePreview.name }}</h3>
-          <button class="secondary viewer-close" @click="closeJobFilePreview">关闭</button>
+          <div class="viewer-header-actions">
+            <a class="secondary" :href="'/static/' + jobFilePreview.path" :download="jobFilePreview.name">⬇ 下载原文件</a>
+            <button class="secondary viewer-close" @click="closeJobFilePreview">关闭</button>
+          </div>
         </div>
         <div v-if="jobFilePreviewIsImage" class="file-preview-img-wrap">
           <img :src="'/static/' + jobFilePreview.path" @error="handleFileImgError" />
         </div>
-        <pre v-else class="file-preview-text">{{ jobFilePreviewContent || '加载中...' }}</pre>
+        <div v-else-if="jobFilePreviewIsText" class="text-preview-wrap">
+          <pre class="file-preview-text">{{ jobFilePreviewContent || '加载中...' }}</pre>
+        </div>
+        <div v-else class="binary-file-note">
+          该文件为二进制格式（{{ jobFilePreview.ext }}），不支持在线预览，请点击上方「下载原文件」获取。
+        </div>
       </div>
     </div>
 
@@ -1812,7 +1826,29 @@ const jobTree = ref<any | null>(null)  // 任务目录树
 const jobTreeExpanded = reactive(new Set<string>())
 const jobFilePreview = ref<any | null>(null)
 const jobFilePreviewIsImage = ref(false)
+const jobFilePreviewIsText = ref(false)
 const jobFilePreviewContent = ref('')
+const jobExporting = ref(false)
+
+// 导出整个任务文件夹（zip 下载；打包由后端完成，大任务需数秒）
+const exportJobFiles = async () => {
+  if (!jobFiles.value?.job_id || jobExporting.value) return
+  jobExporting.value = true
+  try {
+    const res = await fetch('/prod-api/train/jobs/' + jobFiles.value.job_id + '/export')
+    if (!res.ok) throw new Error('HTTP ' + res.status)
+    const blob = await res.blob()
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = jobFiles.value.job_id + '_export.zip'
+    a.click()
+    URL.revokeObjectURL(a.href)
+  } catch (e: any) {
+    showAlert('导出失败: ' + (e.message || e), '错误')
+  } finally {
+    jobExporting.value = false
+  }
+}
 
 // 打开任务文件浏览器
 const openJobFiles = async (jobId: string) => {
@@ -1845,13 +1881,18 @@ const toggleJobDir = (node: any) => {
 }
 
 const JOB_IMG_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp']
+const JOB_TEXT_EXTS = ['yaml', 'yml', 'csv', 'txt', 'log', 'json', 'py', 'md']
 
-// 点击文件：图片直接预览，文本读取内容
+// 后端 build_tree 的 ext 自带点（'.png'），归一化为不带点再比对（B-19 乱码根因）
+const fileExt = (ext?: string) => (ext || '').replace(/^\./, '').toLowerCase()
+
+// 点击文件：图片直接预览，文本读取内容，二进制提示下载
 const openJobFile = async (node: any) => {
   jobFilePreview.value = node
   jobFilePreviewContent.value = ''
-  jobFilePreviewIsImage.value = JOB_IMG_EXTS.includes((node.ext || '').toLowerCase())
-  if (jobFilePreviewIsImage.value) return
+  jobFilePreviewIsImage.value = JOB_IMG_EXTS.includes(fileExt(node.ext))
+  jobFilePreviewIsText.value = JOB_TEXT_EXTS.includes(fileExt(node.ext))
+  if (jobFilePreviewIsImage.value || !jobFilePreviewIsText.value) return
   try {
     const res = await fetch('/static/' + node.path)
     if (!res.ok) throw new Error('HTTP ' + res.status)
@@ -1864,6 +1905,8 @@ const openJobFile = async (node: any) => {
 const closeJobFilePreview = () => {
   jobFilePreview.value = null
   jobFilePreviewContent.value = ''
+  jobFilePreviewIsImage.value = false
+  jobFilePreviewIsText.value = false
 }
 
 const handleFileImgError = (e: any) => {
@@ -2627,6 +2670,33 @@ button {
 .viewer-close {
   padding: 0.35rem 0.9rem;
   font-size: 0.875rem;
+}
+
+.viewer-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.viewer-header-actions a.secondary {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}
+
+.binary-file-note {
+  padding: 1.5rem 1.25rem;
+  color: #666;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.binary-file-note::before {
+  content: '📦';
+  display: block;
+  font-size: 2rem;
+  margin-bottom: 0.5rem;
 }
 
 .viewer-section-title {

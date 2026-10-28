@@ -1,4 +1,7 @@
+import os
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from typing import Optional
 from src.services.train_service import TrainService
@@ -110,6 +113,20 @@ async def get_train_job_tree(job_id: str):
     if not result:
         raise HTTPException(404, "Job not found")
     return result
+
+@router.get("/jobs/{job_id}/export")
+async def export_train_job(job_id: str):
+    """导出训练任务输出目录（zip 下载）"""
+    zip_path = await train_service.export_job(job_id)
+    if not zip_path:
+        raise HTTPException(404, "Job not found")
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=f"{job_id}_export.zip",
+        headers={"Content-Disposition": f"attachment; filename={job_id}_export.zip"},
+        background=BackgroundTask(os.unlink, zip_path),
+    )
 
 @router.post("/jobs/{job_id}/stop")
 async def stop_train_job(job_id: str):

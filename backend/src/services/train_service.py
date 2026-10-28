@@ -6,6 +6,8 @@ import subprocess
 import signal
 import shutil
 import asyncio
+import tempfile
+import zipfile
 import time
 import yaml
 from pathlib import Path
@@ -1815,6 +1817,31 @@ class TrainService:
             except ValueError:
                 pass
         return {"tree": tree, "job_id": job_id, "log_file": log_rel}
+
+    async def export_job(self, job_id: str):
+        """打包导出训练任务输出目录（zip）。
+
+        权重(.pt)/图片本身已难压缩，用 ZIP_STORED 打包提速（110MB 任务秒级完成）；
+        返回临时文件路径，由路由层在响应完成后删除。
+        """
+        job_file = self.jobs_dir / f"{job_id}.json"
+        if not await asyncio.to_thread(lambda: job_file.exists()):
+            return None
+        job_dir = self.jobs_dir / job_id
+        if not await asyncio.to_thread(lambda: job_dir.exists()):
+            return None
+
+        def _create_zip():
+            temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+            temp_zip_path = temp_zip.name
+            temp_zip.close()
+            with zipfile.ZipFile(temp_zip_path, "w", zipfile.ZIP_STORED) as zipf:
+                for f in sorted(job_dir.rglob("*")):
+                    if f.is_file() and not f.name.startswith("."):
+                        zipf.write(f, f.relative_to(job_dir).as_posix())
+            return temp_zip_path
+
+        return await asyncio.to_thread(_create_zip)
 
     def _recover_running_processes(self):
         """后端重启后，重新接管仍在运行但句柄已丢失的训练进程"""
