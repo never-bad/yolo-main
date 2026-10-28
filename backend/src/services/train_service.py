@@ -129,6 +129,8 @@ class TrainService:
         # P6 GPU 熔断（2.3）：任务 → GPU 索引；任务 → 首次低利用率时间戳
         self._job_gpu_index = {}
         self._gpu_low_since = {}
+        # B-16：训练进程自报的 GPU 指纹（torch 视角 ↔ nvidia-smi 视角映射）
+        self._gpu_fingerprint = {}
 
     @staticmethod
     def _count_images(path: Path) -> int:
@@ -1430,9 +1432,81 @@ class TrainService:
                 record_error("gpu_watch", e)
             await asyncio.sleep(settings.GPU_WATCH_POLL_SECONDS)
 
+    def _read_gpu_fingerprint(self, job_id: str) -> dict | None:
+        """读取训练进程写入的 GPU 指纹 sidecar（{job_id}.gpu.json）。
+
+        容器内 torch 的 cuda:N 序号与 nvidia-smi 的 index 可能不一致（B-16：
+        配 gpu_index=1 的训练实际跑在 nvidia-smi 的 0 号卡上），直接用
+        job_meta["gpu_index"] 去查 nvidia-smi 会看错卡。sidecar 由训练进程
+        在选卡后写入，含按 UUID / name+显存匹配出的真实 nvidia-smi index。
+        """
+        cached = self._gpu_fingerprint.get(job_id)
+        if cached is not None:
+            return cached
+        fp = self.jobs_dir / f"{job_id}.gpu.json"
+        try:
+            if fp.exists():
+                data = load_json(fp)
+                if isinstance(data, dict) and data.get("nvml_index") is not None:
+                    self._gpu_fingerprint[job_id] = data
+                    return data
+        except Exception:
+            pass
+        return None
+
+    def _progress_age_seconds(self, job_id: str) -> float | None:
+        """训练进展证据：任务日志 / results.csv 距上次更新的秒数。
+
+        B-14 与 B-16 同源：GPU 利用率不是可靠的「在干活」证据——
+        · 卡在联网下载权重时利用率天然 0%（B-14）
+        · 监控看错卡时利用率恒为 0%（B-16）
+        训练正常时 tqdm 每几秒刷一行，日志文件 mtime 必然在推进；
+        results.csv 每轮验证后更新。取两者较新者作为进展时间戳。
+        返回 None 表示两个文件都不存在（无法判断进展）。
+        """
+        candidates = [
+            self.jobs_dir / f"{job_id}.log",
+            self.jobs_dir / job_id / "train" / "results.csv",
+        ]
+        mtimes = []
+        for p in candidates:
+            try:
+                if p.exists():
+                    mtimes.append(p.stat().st_mtime)
+            except Exception:
+                continue
+        if not mtimes:
+            return None
+        return max(0.0, time.time() - max(mtimes))
+
+    def _any_gpu_busy(self, threshold: int) -> bool:
+        """是否有任意一张 GPU 利用率达到阈值（无进展时的二次确认）。
+
+        只看单张卡会重演 B-16（看错卡 → 恒闲），所以这里扫描全部可见 GPU：
+        只要有卡在忙，就说明训练进程大概率还在干活（日志可能只是缓冲未刷盘，
+        或正处于验证/保存权重阶段）。
+        """
+        for g in get_available_gpus():
+            u = get_gpu_utilization(g["index"])
+            if u is not None and u >= threshold:
+                return True
+        return False
+
     def _resolve_job_gpu(self, job_id: str, job_meta: dict) -> int | None:
-        """确定任务使用的 GPU 索引：优先任务显式指定；否则首次采样时按全部 GPU
-        实时利用率推断（训练为计算密集，取利用率最高者）。返回 None 表示 CUDA 不可用。"""
+        """确定任务使用的 GPU 索引（仅用于展示/日志，不参与熔断判定）。
+
+        优先级：训练进程自报的 nvidia-smi index（B-16 指纹 sidecar）>
+        任务显式指定的 gpu_index > 首次采样时按利用率推断。
+        返回 None 表示 CUDA 不可用。
+        """
+        fp = self._read_gpu_fingerprint(job_id)
+        if fp and fp.get("nvml_index") is not None:
+            try:
+                idx = int(fp["nvml_index"])
+                if any(g["index"] == idx for g in get_available_gpus()):
+                    return idx
+            except (TypeError, ValueError):
+                pass
         idx = job_meta.get("gpu_index")
         if idx is not None:
             return int(idx)
@@ -1496,32 +1570,60 @@ class TrainService:
                     pass  # 时间戳缺失/格式异常 → 退回原逻辑，保持原有的监控强度
 
             gpu_idx = self._resolve_job_gpu(job_id, job_meta)
-            if gpu_idx is None:
-                continue  # 无 CUDA → 无法做 GPU 熔断判断
-            util = get_gpu_utilization(gpu_idx)
-            if util is None:
-                continue  # 采样失败本轮跳过（如 GPU 暂不可查询）
+            util = get_gpu_utilization(gpu_idx) if gpu_idx is not None else None
 
-            if util < threshold:
-                if job_id not in self._gpu_low_since:
-                    self._gpu_low_since[job_id] = now
-                    print(f"[gpu-watch] {job_id} GPU{gpu_idx} 利用率 {util}%"
-                          f"< {threshold}%，开始计时（{warn_seconds}s 后熔断）")
-                elif (now - self._gpu_low_since[job_id]) >= warn_seconds:
-                    self._circuit_break(job_id, proc, gpu_idx, util)
-            else:
+            # ---- B-16：进展证据优先 -------------------------------------------
+            # 日志 / results.csv 还在推进 = 训练确实在干活，无论利用率多少都不熔断。
+            # 只信利用率会误杀：卡在联网下载时利用率天然 0%（B-14）、
+            # 监控看错卡时利用率恒为 0%（B-16，配 gpu_index=1 的训练实际跑在
+            # nvidia-smi 的 0 号卡上，监控盯着闲置的 1 号卡读 0%，20 分钟后误杀）。
+            age = self._progress_age_seconds(job_id)
+            no_progress = getattr(settings, "GPU_NO_PROGRESS_SECONDS", 600)
+            if age is not None and age < no_progress:
                 if job_id in self._gpu_low_since:
-                    print(f"[gpu-watch] {job_id} GPU{gpu_idx} 利用率恢复 {util}%，计时清零")
+                    print(f"[gpu-watch] {job_id} 检测到训练进展"
+                          f"（{int(age)}s 前有输出），熔断计时清零")
                 self._gpu_low_since.pop(job_id, None)
+                continue
 
-    def _circuit_break(self, job_id: str, proc, gpu_idx: int, util: int):
-        """触发熔断：停止训练进程 → 任务状态 failed(reason=gpu_abnormal) → 写日志"""
+            # 无进展 → 二次确认：任意一张 GPU 在忙也算在干活
+            # （不看单张卡，避免重演 B-16 的「看错卡恒闲」）
+            if self._any_gpu_busy(threshold):
+                if job_id in self._gpu_low_since:
+                    print(f"[gpu-watch] {job_id} 有 GPU 活动，熔断计时清零")
+                self._gpu_low_since.pop(job_id, None)
+                continue
+
+            # 既无进展、又无任何 GPU 活动 → 才开始计时应熔断
+            if job_id not in self._gpu_low_since:
+                self._gpu_low_since[job_id] = now
+                stall = f"{int(age)}s" if age is not None else "未知"
+                print(f"[gpu-watch] {job_id} 无训练进展（最后输出于 {stall} 前）"
+                      f"且无 GPU 活动，开始计时（{warn_seconds}s 后熔断）")
+            elif (now - self._gpu_low_since[job_id]) >= warn_seconds:
+                self._circuit_break(job_id, proc, gpu_idx, util, stall_seconds=age)
+
+    def _circuit_break(self, job_id: str, proc, gpu_idx: int | None,
+                       util: int | None, stall_seconds: float | None = None):
+        """触发熔断：停止训练进程 → 任务状态 failed(reason=gpu_abnormal) → 写日志
+
+        B-16：判据改为「无进展 + 无 GPU 活动」，文案按实际配置动态生成
+        （旧文案写死「5 分钟」，与 GPU_ABNORMAL_SECONDS 实际值不符）。
+        """
+        secs = settings.GPU_ABNORMAL_SECONDS
+        dur = f"{secs // 60} 分钟" if secs >= 60 else f"{secs} 秒"
+        if stall_seconds is not None:
+            stall = f"训练日志已 {int(stall_seconds)} 秒无更新"
+        else:
+            stall = "未检测到任何训练输出"
+        gpu_txt = f"GPU{gpu_idx}" if gpu_idx is not None else "目标 GPU"
         reason = (
-            f"GPU 异常熔断：训练所在 GPU{gpu_idx} 利用率持续低于 "
-            f"{settings.GPU_ABNORMAL_UTIL_PCT}%（当前 {util}%）超过 "
-            f"{settings.GPU_ABNORMAL_SECONDS // 60} 分钟，判定 GPU 异常/训练卡死，"
-            f"系统已自动停止训练。请检查显卡状态（nvidia-smi）、驱动或显存占用，"
-            f"确认恢复后人工重新发起训练（本平台不做自动重排队）。"
+            f"训练无进展熔断：{stall}，且所有 GPU 利用率均低于 "
+            f"{settings.GPU_ABNORMAL_UTIL_PCT}%（{gpu_txt} 采样 {util if util is not None else 0}%），"
+            f"持续 {dur} 判定训练卡死，系统已自动停止训练。"
+            f"请先查看任务日志最后几行确认是否只是权重下载/数据加载较慢；"
+            f"若为真实卡死，检查显卡状态（nvidia-smi）、驱动与显存占用后，"
+            f"人工重新发起训练（本平台不做自动重排队）。"
         )
         print(f"[gpu-watch] ⚡ 熔断 {job_id}: {reason}")
         try:

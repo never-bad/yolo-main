@@ -259,6 +259,121 @@ def patch_amp_check_offline():
         print(f"[{datetime.now().isoformat()}] AMP 自检离线化失败（忽略，按原逻辑运行）: {e}")
 
 
+def _torch_uuid_str(props) -> str | None:
+    """把 torch 的 device uuid 归一化成 nvidia-smi 的 GPU-xxxx 形式。
+
+    torch 侧 cuda:N 的序号与 nvidia-smi 的 index 在容器内可能不一致
+    （受 CUDA_VISIBLE_DEVICES / 枚举序影响），只靠序号会把监控引向错误的卡
+    （2026-10-28 B-16：配 gpu_index=1 的训练实际跑在 nvidia-smi 的 0 号卡上，
+    监控盯着 1 号卡读 0% → 判定卡死误杀）。UUID 是唯一跨视角稳定的标识。
+    转换失败返回 None，由调用方退回 name+显存容量指纹匹配。
+    """
+    u = getattr(props, "uuid", None)
+    if u is None:
+        return None
+    if isinstance(u, str):
+        return u if u.upper().startswith("GPU-") else None
+    try:
+        h = f"{int(u):032x}"
+        return f"GPU-{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+    except Exception:
+        return None
+
+
+def _write_gpu_fingerprint(job_id: str, job_file: str, device: str):
+    """把训练进程视角的 GPU 指纹写入 sidecar（{job_id}.gpu.json），供监控与排障。
+
+    sidecar 与 job.json 同目录，train_service 侧可据此把 torch 视角的 cuda:N
+    映射回 nvidia-smi 的真实 index，并在日志里留下可比对的两视角快照。
+    任何异常都不影响训练本身。
+    """
+    try:
+        import subprocess
+        import torch
+        from pathlib import Path as _P
+
+        info = {
+            "job_id": job_id,
+            "torch_device": device,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "torch_count": torch.cuda.device_count(),
+            "written_at": datetime.now().isoformat(),
+        }
+
+        idx = None
+        dev = str(device or "")
+        if dev.startswith("cuda:") and dev.split(":")[1].isdigit():
+            idx = int(dev.split(":")[1])
+        if idx is not None and idx < torch.cuda.device_count():
+            props = torch.cuda.get_device_properties(idx)
+            info.update({
+                "torch_index": idx,
+                "torch_name": props.name,
+                "torch_total_mb": round(props.total_memory / (1024 ** 2)),
+                "torch_uuid": _torch_uuid_str(props),
+            })
+
+        # 同一进程内再枚举一次 nvidia-smi 视角，用于精确匹配 + 排障留痕
+        rows = []
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=index,name,memory.total,uuid",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in (out.stdout or "").strip().splitlines():
+                parts = [x.strip() for x in line.split(",")]
+                if len(parts) >= 4 and parts[0].isdigit():
+                    try:
+                        rows.append({
+                            "nvml_index": int(parts[0]),
+                            "name": parts[1],
+                            "total_mb": int(float(parts[2])),
+                            "uuid": parts[3],
+                        })
+                    except ValueError:
+                        continue
+        except Exception:
+            pass
+        info["nvml_devices"] = rows
+
+        tuuid = (info.get("torch_uuid") or "").upper()
+        if tuuid:
+            for r in rows:
+                if (r.get("uuid") or "").upper() == tuuid:
+                    info["nvml_index"] = r["nvml_index"]
+                    info["match_by"] = "uuid"
+                    break
+        if info.get("nvml_index") is None and info.get("torch_name"):
+            cand = [r for r in rows
+                    if r.get("name") == info["torch_name"]
+                    and abs(r.get("total_mb", 0) - info.get("torch_total_mb", 0)) <= 64]
+            if len(cand) == 1:
+                info["nvml_index"] = cand[0]["nvml_index"]
+                info["match_by"] = "name+memory"
+
+        try:
+            sidecar = _P(job_file).with_name(f"{job_id}.gpu.json")
+            sidecar.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+        # 日志留痕：两视角对照，一眼看出编号是否错位
+        if info.get("torch_index") is not None:
+            tv = (f"cuda:{info['torch_index']}={info.get('torch_name')}"
+                  f"({round(info.get('torch_total_mb', 0) / 1024, 1)}G)")
+        else:
+            tv = str(device)
+        nv = ", ".join(f"idx{r['nvml_index']}={r['name']}"
+                       f"({round(r['total_mb'] / 1024, 1)}G)" for r in rows) or "(nvidia-smi 不可用)"
+        print(f"[{datetime.now().isoformat()}] [GPU-DIAG] torch视角 {tv} | nvidia-smi视角 {nv}"
+              f" | 映射 nvml_index={info.get('nvml_index')}"
+              f"（依据 {info.get('match_by', '未匹配')}）"
+              f" | CUDA_VISIBLE_DEVICES={info.get('cuda_visible_devices')}")
+    except Exception as e:
+        print(f"[{datetime.now().isoformat()}] [GPU-DIAG] 指纹写入失败（忽略）: {e}")
+
+
 def parse_architecture(base_model: str) -> dict:
     """M11：从 base_model 解析 architecture 三字段（写入模型元数据标准字段集）。
 
@@ -396,7 +511,9 @@ def main():
             device = detect_device()
         if device:
             print(f"[{datetime.now().isoformat()}] 选择的训练设备: {device.upper()}")
-        
+        # B-16：写 GPU 指纹 sidecar（torch 视角 ↔ nvidia-smi 视角映射），供监控与排障
+        _write_gpu_fingerprint(args.job_id, args.job_file, device)
+
         train_dir = Path(args.project) / args.name
         resume_path = None
         

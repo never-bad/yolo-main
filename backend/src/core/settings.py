@@ -86,6 +86,11 @@ class Settings(BaseSettings):
     # yolo11n.pt 卡了十几分钟，被误判"GPU 卡死"杀掉，一个 epoch 都没跑）。
     # 设 0 可恢复为"启动即监控"的旧行为。
     GPU_ABNORMAL_GRACE_SECONDS: int = 900
+    # 进展证据窗口（秒）：任务日志 / results.csv 在该秒数内有更新，即判定训练正常在跑，
+    # 无论 GPU 利用率多少都不熔断（B-16）。
+    # GPU 利用率不是可靠的"在干活"证据：卡在联网下载时天然 0%（B-14）、
+    # 监控看错卡时恒为 0%（B-16）。正常训练 tqdm 每几秒刷一行，日志 mtime 必然推进。
+    GPU_NO_PROGRESS_SECONDS: int = 600
 
     # ===== PostgreSQL 元数据库（元数据入库；连接参数由 .env / 环境变量覆盖，服务器部署只改这里）=====
     PG_HOST: str = "127.0.0.1"
