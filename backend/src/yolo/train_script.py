@@ -78,16 +78,21 @@ def ensure_local_base_weights(weights: str, timeout: int = 300) -> str:
         ultralytics 内置下载兜底）。
     """
     p = Path(weights)
+    backend_dir = Path(__file__).resolve().parent.parent.parent
+    custom_dir = backend_dir / "models" / "custom"
+    custom_dir.mkdir(parents=True, exist_ok=True)
+    # 持久化目录优先：models/custom 落在命名卷 docker_yolo-models，重建镜像不丢。
+    # 不能让下面的 `p.exists()` 先命中——那是按"当前进程 cwd"（/app/backend，镜像内
+    # 目录）判断的，一旦命中就直接返回裸文件名，权重永远存不进持久化目录，
+    # 于是重建镜像后又要重新下载一遍（yolo11n.pt 每次都下的根因之一）。
+    custom_target = custom_dir / weights
+    if custom_target.exists():
+        return str(custom_target)
     if p.exists() or p.suffix != ".pt" or "/" in weights or "\\" in weights:
         return weights
     import shutil
     import urllib.request
-    backend_dir = Path(__file__).resolve().parent.parent.parent
-    custom_dir = backend_dir / "models" / "custom"
-    custom_dir.mkdir(parents=True, exist_ok=True)
-    target = custom_dir / weights
-    if target.exists():
-        return str(target)
+    target = custom_target
     for mirror in BASE_WEIGHT_MIRRORS:
         url = mirror.format(name=weights)
         tmp = target.with_suffix(".pt.tmp")
@@ -156,6 +161,42 @@ def normalize_class_names(names) -> list:
     if isinstance(names, list):
         return [str(n) for n in names]
     return []
+
+
+# ultralytics 内部会偷偷联网下载的权重（AMP 自检探针模型）。训练本身用不到它，
+# 但它会拖垮启动：见 patch_amp_check_offline 的说明。
+ULTRALYTICS_INTERNAL_WEIGHTS = ("yolo11n.pt",)
+
+
+def stage_internal_weights_to_cwd():
+    """把 ultralytics 内部会下载的权重预置到训练进程工作目录（cwd）。
+
+    为什么需要：平台的 `resolve_model_file` / `ensure_local_base_weights` 只管**训练指定
+    的模型**，管不到 ultralytics 内部触发的 `YOLO("yolo11n.pt")`（AMP 自检）。后者只在
+    **训练进程 cwd**（容器内 `/app/backend`，镜像内目录）找文件，找不到就直连 GitHub。
+
+    于是形成"每次都下载"：即使下下来了也存在 `/app/backend` —— 那是**镜像内目录，不在
+    命名卷里，重建镜像即丢**；而持久化的 `models/custom`（命名卷 `docker_yolo-models`）
+    里的同名文件它又不会去找。
+
+    做法：启动时若 cwd 缺该文件，就从 `models/custom`（持久化）复制一份过来；
+    两边都没有则跳过（此时由 patch_amp_check_offline 兜底，已不依赖联网）。
+    """
+    backend_dir = Path(__file__).resolve().parent.parent.parent
+    custom_dir = backend_dir / "models" / "custom"
+    for name in ULTRALYTICS_INTERNAL_WEIGHTS:
+        in_cwd = backend_dir / name
+        if in_cwd.exists():
+            continue
+        src = custom_dir / name
+        if src.exists():
+            try:
+                import shutil
+                shutil.copyfile(src, in_cwd)
+                print(f"[{datetime.now().isoformat()}] 已把 {name} 从持久化目录预置到工作目录"
+                      f"（避免 ultralytics 内部联网下载）")
+            except Exception as e:
+                print(f"[{datetime.now().isoformat()}] 预置 {name} 失败（忽略）: {e}")
 
 
 def patch_amp_check_offline():
@@ -314,6 +355,7 @@ def main():
               f"首次运行约需 10~30 秒，请耐心等待...")
         from ultralytics import YOLO
         patch_amp_check_offline()
+        stage_internal_weights_to_cwd()
         
         # 选择训练设备：优先使用用户指定的 GPU 索引；否则自动检测
         if args.gpu is not None:
