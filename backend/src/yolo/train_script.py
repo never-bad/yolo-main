@@ -167,6 +167,23 @@ def normalize_class_names(names) -> list:
 # 但它会拖垮启动：见 patch_amp_check_offline 的说明。
 ULTRALYTICS_INTERNAL_WEIGHTS = ("yolo11n.pt",)
 
+# 内部权重的最小合理体积（yolo11n.pt 完整约 5.4MB）。下载被中断产生的半截文件
+# 通常只有几百 KB，torch.load 会报 "PytorchStreamReader failed reading zip
+# archive"，据此识别并用持久化副本覆盖修复，避免"一次下残、永久报错"。
+_MIN_INTERNAL_WEIGHT_BYTES = 1 * 1024 * 1024
+
+
+def _weight_looks_valid(p: Path) -> bool:
+    """粗检权重文件是否完整：存在且体积达标。
+
+    不做 torch.load —— 启动阶段为了校验去加载 5MB 权重不划算，且真实损坏
+    场景（下载中断）体积差距在数量级上，阈值足够可靠。
+    """
+    try:
+        return p.is_file() and p.stat().st_size >= _MIN_INTERNAL_WEIGHT_BYTES
+    except OSError:
+        return False
+
 
 def stage_internal_weights_to_cwd():
     """把 ultralytics 内部会下载的权重预置到训练进程工作目录（cwd）。
@@ -179,22 +196,27 @@ def stage_internal_weights_to_cwd():
     命名卷里，重建镜像即丢**；而持久化的 `models/custom`（命名卷 `docker_yolo-models`）
     里的同名文件它又不会去找。
 
-    做法：启动时若 cwd 缺该文件，就从 `models/custom`（持久化）复制一份过来；
-    两边都没有则跳过（此时由 patch_amp_check_offline 兜底，已不依赖联网）。
+    做法：启动时检查 cwd 里的该文件——缺失**或体积异常小（下载中断留下的半截
+    文件）**时，就从 `models/custom`（持久化）复制一份过来覆盖修复；两边都没有
+    则跳过（此时由 patch_amp_check_offline 兜底，已不依赖联网）。
     """
     backend_dir = Path(__file__).resolve().parent.parent.parent
     custom_dir = backend_dir / "models" / "custom"
     for name in ULTRALYTICS_INTERNAL_WEIGHTS:
         in_cwd = backend_dir / name
-        if in_cwd.exists():
+        if _weight_looks_valid(in_cwd):
             continue
         src = custom_dir / name
-        if src.exists():
+        if _weight_looks_valid(src):
+            # 用 exists() 而非体积判断，是历史的坑：cwd 里残留半截文件会被判为
+            # "已存在"从而永远跳过修复，下次加载直接崩。故这里覆盖写。
+            fixing = in_cwd.exists()
             try:
                 import shutil
                 shutil.copyfile(src, in_cwd)
-                print(f"[{datetime.now().isoformat()}] 已把 {name} 从持久化目录预置到工作目录"
-                      f"（避免 ultralytics 内部联网下载）")
+                action = "修复损坏的" if fixing else "预置"
+                print(f"[{datetime.now().isoformat()}] 已{action} {name} —— 从持久化目录 "
+                      f"{custom_dir} 复制到工作目录（避免 ultralytics 内部联网下载）")
             except Exception as e:
                 print(f"[{datetime.now().isoformat()}] 预置 {name} 失败（忽略）: {e}")
 
