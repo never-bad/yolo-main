@@ -158,6 +158,44 @@ def normalize_class_names(names) -> list:
     return []
 
 
+def patch_amp_check_offline():
+    """让 ultralytics 的 AMP 自检不再联网下载 yolo11n.pt。
+
+    背景（2026-10-28 真机事故）：ultralytics 的 ``check_amp()`` 内部会执行
+    ``YOLO("yolo11n.pt")``，从 GitHub 拉取约 5.4MB 权重做 FP16/FP32 前向比对。
+    弱网环境（实测 10~30KB/s，且 TLS 连接被反复重置、3 次重试全失败）下这一步
+    能卡住十几分钟，期间 GPU 利用率恒为 0%，最终被 gpu_watch 熔断判定为
+    "GPU 异常/训练卡死"而 SIGTERM 杀掉——训练一个 epoch 都没跑起来。
+
+    改为按设备能力直接判定：CUDA / MPS 启用 AMP，CPU 关闭。跳过联网比对。
+    本文件原有的 AMP 失败自动降级（[Errno 22] → amp=False）逻辑不受影响。
+    """
+    try:
+        from ultralytics.utils import checks as _checks
+
+        def _check_amp_by_device(model):
+            try:
+                dev = next(model.parameters()).device
+            except Exception:
+                return False
+            return dev is not None and dev.type in ("cuda", "mps")
+
+        _checks.check_amp = _check_amp_by_device
+        # engine/trainer.py 顶部是 `from ..utils.checks import check_amp` 的模块级绑定，
+        # 只改 checks 模块的属性对 trainer 无效，必须一并替换 trainer 里的引用
+        try:
+            from ultralytics.engine import trainer as _trainer
+            if hasattr(_trainer, "check_amp"):
+                _trainer.check_amp = _check_amp_by_device
+        except Exception:
+            pass
+        print(f"[{datetime.now().isoformat()}] AMP 自检已改为离线判定"
+              f"（跳过 yolo11n.pt 联网下载，避免弱网环境卡住启动）")
+    except Exception as e:
+        # 打补丁失败不阻塞训练：退回 ultralytics 原生逻辑（可能联网）
+        print(f"[{datetime.now().isoformat()}] AMP 自检离线化失败（忽略，按原逻辑运行）: {e}")
+
+
 def parse_architecture(base_model: str) -> dict:
     """M11：从 base_model 解析 architecture 三字段（写入模型元数据标准字段集）。
 
@@ -275,6 +313,7 @@ def main():
         print(f"[{datetime.now().isoformat()}] 正在加载深度学习环境（PyTorch / Ultralytics），"
               f"首次运行约需 10~30 秒，请耐心等待...")
         from ultralytics import YOLO
+        patch_amp_check_offline()
         
         # 选择训练设备：优先使用用户指定的 GPU 索引；否则自动检测
         if args.gpu is not None:

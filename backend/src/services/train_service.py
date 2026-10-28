@@ -1435,7 +1435,12 @@ class TrainService:
         if idx is not None:
             return int(idx)
         if job_id in self._job_gpu_index:
-            return self._job_gpu_index[job_id]
+            cached = self._job_gpu_index[job_id]
+            # 缓存的索引必须仍真实存在：GPU 掉卡 / 驱动重置后 nvidia-smi 会少列出设备，
+            # 此时沿用旧索引会去查一块不存在的卡（采样失败或恒为 0，进而误熔断）。
+            if any(g["index"] == cached for g in get_available_gpus()):
+                return cached
+            self._job_gpu_index.pop(job_id, None)
         gpus = get_available_gpus()
         if not gpus:
             return None
@@ -1473,6 +1478,20 @@ class TrainService:
                 continue
             if job_meta.get("status") != "running":
                 continue
+
+            # 启动宽限期：本轮训练启动后 grace 秒内不做熔断判定。
+            # 训练启动阶段（环境/权重加载、数据集扫描、AMP 自检）GPU 利用率天然为 0，
+            # 弱网下还可能卡在权重下载上十几分钟——这段窗口内熔断只会误杀正常任务
+            # （2026-10-28：job_20261028_011142 卡在 AMP 自检下载 yolo11n.pt 被误熔断）。
+            grace = getattr(settings, "GPU_ABNORMAL_GRACE_SECONDS", 900)
+            if grace > 0:
+                started_raw = job_meta.get("resumed_at") or job_meta.get("created_at")
+                try:
+                    started = datetime.fromisoformat(str(started_raw))
+                    if (datetime.now() - started).total_seconds() < grace:
+                        continue
+                except Exception:
+                    pass  # 时间戳缺失/格式异常 → 退回原逻辑，保持原有的监控强度
 
             gpu_idx = self._resolve_job_gpu(job_id, job_meta)
             if gpu_idx is None:
@@ -2030,6 +2049,12 @@ class TrainService:
         job_meta["resume_count"] = job_meta.get("resume_count", 0) + 1
         # g6 M5 状态机统一：恢复训练 → Running
         job_meta["unified_status"] = "Running"
+        # 清掉上一轮的失败残留：任务由 failed（OOM / GPU 熔断）续训后 status 已是 running，
+        # 但 error/reason/gpu_abnormal/failed_at 等字段还在，前端会出现「训练中」却带着
+        # 失败原因的自相矛盾状态（2026-10-28 job_20261028_011142）。本轮重新开始，归零。
+        for _k in ("error", "reason", "gpu_abnormal", "oom", "oom_recovery",
+                   "failed_at", "crashed_at", "crashed"):
+            job_meta.pop(_k, None)
         
         # 如果之前是崩溃（状态为 running 但进程已死），记录崩溃恢复
         if was_crashed:

@@ -80,6 +80,12 @@ class Settings(BaseSettings):
     GPU_ABNORMAL_SECONDS: int = 300
     # GPU 监控轮询间隔（秒）：后台定时采样各运行中任务的 GPU 利用率（0 关闭熔断监控）
     GPU_WATCH_POLL_SECONDS: int = 30
+    # 启动宽限期（秒）：本轮训练启动后这段时间内**不做**熔断判定。
+    # 训练从启动到吃满 GPU 之间要经历环境加载、权重加载、数据集扫描等 CPU/IO 阶段，
+    # GPU 利用率天然为 0；弱网下还可能卡在权重下载上（2026-10-28 事故：AMP 自检下载
+    # yolo11n.pt 卡了十几分钟，被误判"GPU 卡死"杀掉，一个 epoch 都没跑）。
+    # 设 0 可恢复为"启动即监控"的旧行为。
+    GPU_ABNORMAL_GRACE_SECONDS: int = 900
 
     # ===== PostgreSQL 元数据库（元数据入库；连接参数由 .env / 环境变量覆盖，服务器部署只改这里）=====
     PG_HOST: str = "127.0.0.1"

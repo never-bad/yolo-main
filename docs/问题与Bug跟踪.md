@@ -42,6 +42,7 @@
 | B-11 | 功能缺陷 | 🔴 | GroundingDINO 恒报 `Invalid device string: '0'`，多引擎检测里 GD 一路从未生效（auto 分支返回裸索引） | 已修复（2026-10-27，含 `get_best_device` 返回 `cuda:N` + 坏实例不缓存） | B-08 · I-15 |
 | B-12 | 功能缺陷 | 🔴 | 批量预标注一开就整批失败「批量预标注出错: Invalid device string: '0'」，同一配置下单图标注却正常出框（预加载不隔离单引擎失败） | 已修复（2026-10-27，逐引擎隔离预加载 + 换引擎兜底真正生效 + 全失败不再假报完成） | B-11 · I-16 |
 | B-13 | 模型幻觉 | 🔴 | 千问把红安全帽/人头等近似物误标成「自救器」（画面中根本没有目标也出框）——VLM 整图检测固有幻觉，score 还是硬编码 0.9 无真置信度 | 已缓解（2026-10-27：提示词收紧 + 框级裁剪复问校验默认开，见 I-17；根治靠标签字典写视觉描述） | I-15 · I-17 |
+| B-14 | 功能缺陷 | 🔴 | **训练启动后一个 epoch 都没跑就被熔断中断**：ultralytics AMP 自检会联网下载 yolo11n.pt（5.4MB），弱网（10~30KB/s + TLS 反复重置）卡住十几分钟，GPU 全程 0% 被 `gpu_watch` 判为"GPU 卡死"误杀（**不是 OOM**，见 B-15 排障记录）。真机 job_20261028_011142 / 012750 均因此中断，续训后原样再卡一次 | 已修复（2026-10-28：AMP 自检改离线判定 + 熔断启动宽限期 900s + 续训清理失败残留） | B-15 · I-18 |
 | I-11* | 悬空目录 | 🟢 | `data/inference_results/` 无对应路由/服务 | 已结案（10-10：目录空且无代码引用，随批次 I 删除） | I-11 |
 
 > `*` 两项以改进项为主编号（`I-01`、`I-11`），此处仅登记存在性，避免双号漂移。
@@ -131,6 +132,35 @@
   3. **数据侧（用户可立即做，效果最直接）**：标签字典里把「自救器」的 `chinese_desc` 写成**视觉描述**——外观（颜色/形状/大小/佩戴位置，如"悬挂在腰间的橙黄色扁盒，带背带"）+ 易混淆物否定（"不是安全帽、不是矿灯、不在头上"）。整图检测与校验复问都吃这段描述。
 - **验证**：`py_compile` + `vue-tsc` 通过。真机待部署后确认：对截图同款场景重标，日志出现 `qwen verify: 拦截 N 个疑似幻觉框` 或不再出框。
 - **遗留**：根治仍建议训练自有模型（本库已训模型引擎 `_detect_trained`），零样本 VLM 只能缓解不能消灭幻觉。
+
+---
+
+### B-14　训练启动即被熔断中断（AMP 自检联网下载卡死）—— 功能缺陷（已修复 ✅ 2026-10-28）
+
+- **现象**：任务 `job_20261028_011142`（数据集 `zijiuqi_20261028_010001_v1`，模型 `/app/models/custom/yolov8m.pt`，batch=12 / imgsz=640 / epochs=300）启动约 15 分钟后被中断；用户怀疑**服务器显存 OOM**。
+- **排查结论：不是 OOM。** 三条硬证据：
+  1. 日志 `Transferred 475/475 items from pretrained weights` —— yolov8m 权重**加载成功**，模型文件正常；
+  2. GPU 为 `NVIDIA A10 (24114MiB)`，batch=12 的 yolov8m 训练远用不满 22GB，且日志全程**无** `CUDA out of memory` / `RuntimeError` 字样；
+  3. 过滤掉下载进度行后，日志从 `AMP: running Automatic Mixed Precision (AMP) checks...` **直接跳到熔断**——中间约 180 行全是 `Downloading ... yolo11n.pt` 进度条，**一个 epoch 都没开始**。
+- **根因**：ultralytics 8.3.251 的 `check_amp()` 内部会执行 `YOLO("yolo11n.pt")`，从 `github.com/ultralytics/assets` 拉约 5.4MB 权重做 FP16/FP32 前向比对。服务器访问 GitHub 实测 **10~30 KB/s** 且 TLS 连接被反复重置（日志有 `Download failure, retrying 1/3 2/3 3/3 ... SSL: UNEXPECTED_EOF_WHILE_READING`）。训练进程卡在下载上十几分钟，期间 GPU 利用率恒为 0%。
+- **致命连锁**：`gpu_watch` 后台循环只看 GPU 利用率——利用率 <10% 持续 300s 即判"GPU 异常/训练卡死"并 SIGTERM 杀掉训练。**"启动阶段的网络等待"被误判为"GPU 卡死"**。续训（resume）后会原样再走一遍 AMP 下载，再卡再熔断，形成死循环（该任务熔断两次：01:26:35、01:33:37）。另一个任务 `job_20261028_012750` 同一死法（01:33:07）。
+- **修复（三处）**：
+  1. **`train_script.py` 新增 `patch_amp_check_offline()`**：在 `from ultralytics import YOLO` 后打补丁，把 `check_amp` 换成本地判定（CUDA/MPS → 启用 AMP，CPU → 关闭），彻底跳过联网比对。注意 `engine/trainer.py` 是 `from ..utils.checks import check_amp` 的模块级绑定，**必须同时替换 `checks` 与 `trainer` 两处引用**，只改一处无效。打补丁失败不阻塞训练（退回原生逻辑）；
+  2. **`settings.GPU_ABNORMAL_GRACE_SECONDS = 900`**：本轮训练启动后 15 分钟内不做熔断判定（覆盖环境加载/权重加载/数据集扫描等天然 0% 利用率阶段）。取 `resumed_at or created_at` 计时，续训会重新计时；
+  3. **续训清理失败残留**：`resume_training` 把 status 改回 running 时，一并清掉 `error / reason / gpu_abnormal / oom / oom_recovery / failed_at / crashed_at / crashed`——否则前端显示"训练中"却带着失败原因，状态自相矛盾。
+  4. **顺带加固** `_resolve_job_gpu`：缓存的 GPU 索引若已不在 `get_available_gpus()` 列表里（掉卡/驱动重置）则重新推断，避免拿着失效索引去采样。
+- **即时绕行方案（不等重建镜像）**：把 `yolo11n.pt` 放到训练进程工作目录 `BASE_DIR`（容器内 `/app/backend/`）即可——`YOLO("yolo11n.pt")` 会优先加载本地同名文件，不再联网。可从能联网的机器下载后 scp 进去（本机实测 91 秒，5,613,764 字节）。
+- **验证**：`py_compile` 通过；部署后训练日志应出现 `AMP 自检已改为离线判定（跳过 yolo11n.pt 联网下载）`，且启动到第一个 epoch 应在 1~2 分钟内完成。
+
+---
+
+### B-15　熔断信息里的 GPU 索引与实际 GPU 数不符 —— 待确认（🟡 可能是掉卡信号）
+
+- **现象**：`job_20261028_011142` 的 `error` 字段写「训练所在 **GPU1** 利用率持续低于 10%」，但训练日志首行是「检测到 NVIDIA GPU: NVIDIA A10 (**共 1 个设备**)」，且 `/train/gpus` 当前只返回 `index:0` 一块卡。同一任务的日志文件里，第二次熔断写的是 **GPU0**。
+- **疑点**：`get_gpu_utilization(1)` 用 `nvidia-smi -i 1`，卡不存在时 `returncode != 0` → 返回 `None` → 调用方 `continue` 跳过，**不会**触发熔断。因此"GPU1"只能是 `_resolve_job_gpu` 真的从 `get_available_gpus()` 里枚举到了 index=1，即**熔断那一刻 nvidia-smi 列出了 2 块卡，之后少了一块**。
+- **影响**：若属实，服务器存在**掉卡**风险（第二块 GPU 掉线），训练若被调度到该卡会直接失败或长期空转。
+- **待办（需上机确认，暂无免密 SSH）**：在服务器执行 `nvidia-smi -L`（看列出几块卡）、`nvidia-smi`（看是否有 `ERR!`/掉卡）、`dmesg | grep -i -E "xid|pcie|nvidia"`（Xid 错误常伴掉卡），并与 `lspci | grep -i nvidia`（看物理卡数）对比。若 PCI 层有 2 块而 nvidia-smi 只列 1 块，即为掉卡，需检查供电/散热/驱动。
+- **已做的防御**：`_resolve_job_gpu` 增加索引有效性校验（见 B-14 修复第 4 点），即使掉卡也会重新推断到存活的卡，不会拿着失效索引误判。
 
 ---
 
