@@ -149,8 +149,40 @@
   2. **`settings.GPU_ABNORMAL_GRACE_SECONDS = 900`**：本轮训练启动后 15 分钟内不做熔断判定（覆盖环境加载/权重加载/数据集扫描等天然 0% 利用率阶段）。取 `resumed_at or created_at` 计时，续训会重新计时；
   3. **续训清理失败残留**：`resume_training` 把 status 改回 running 时，一并清掉 `error / reason / gpu_abnormal / oom / oom_recovery / failed_at / crashed_at / crashed`——否则前端显示"训练中"却带着失败原因，状态自相矛盾。
   4. **顺带加固** `_resolve_job_gpu`：缓存的 GPU 索引若已不在 `get_available_gpus()` 列表里（掉卡/驱动重置）则重新推断，避免拿着失效索引去采样。
-- **即时绕行方案（不等重建镜像）**：把 `yolo11n.pt` 放到训练进程工作目录 `BASE_DIR`（容器内 `/app/backend/`）即可——`YOLO("yolo11n.pt")` 会优先加载本地同名文件，不再联网。可从能联网的机器下载后 scp 进去（本机实测 91 秒，5,613,764 字节）。
+- **即时绕行方案（不等重建镜像）**：把**完好的** `yolo11n.pt` 放到训练进程工作目录 `BASE_DIR`（容器内 `/app/backend/`）即可——`YOLO("yolo11n.pt")` 会优先加载本地同名文件，不再联网。可从能联网的机器下载后 scp 进去（本机实测 91 秒，5,613,764 字节）。⚠️ 文件必须完整，否则见下方「续」。
 - **验证**：`py_compile` 通过；部署后训练日志应出现 `AMP 自检已改为离线判定（跳过 yolo11n.pt 联网下载）`，且启动到第一个 epoch 应在 1~2 分钟内完成。
+
+#### B-14 续：损坏文件残留让训练**直接崩溃**（比卡住更严重，同日发现）
+
+重启训练时暴露了闭环最后一环——**连卡住的机会都没有，直接崩**：
+
+```
+01:56:23 启动 job_20261028_015623（yolov8m.pt，参数同 011142）
+01:56:28 Loading model 成功 → Starting new training...
+         ↓ 立刻崩溃，全程没有任何 Downloading 行
+RuntimeError: PytorchStreamReader failed reading zip archive:
+failed finding central directory
+  ... torch.load ← torch_safe_load ← YOLO("yolo11n.pt")
+```
+
+**完整闭环（四步环环相扣）**：
+
+1. 训练启动 → AMP 自检 `YOLO("yolo11n.pt")` → cwd（`/app/backend`）没有 → 直连 GitHub 下载；
+2. 下载慢 → 卡十几分钟 → 被 `gpu_watch` 熔断 SIGTERM 杀掉；
+3. **下了一半的损坏文件残留在 `/app/backend/yolo11n.pt`**；
+4. 下次训练 → `YOLO()` 找到它 → `torch.load` 失败 → **崩溃**（第 2 步是"下载慢"耗时，第 4 步是"加载坏文件"硬失败）。
+
+**为什么残留物能跨任务留存**：`/app/backend` 是**镜像内目录，不在命名卷** `docker_yolo-{data,models,runs}` 里 → 任务失败、容器重启都清不掉，**只有重建镜像才消失**。
+
+**为什么平台自带的本地化机制没兜住**：`resolve_model_file` / `ensure_local_base_weights` 只管**训练指定的模型**（本次 yolov8m.pt 就在 `models/custom`，加载正常 `Transferred 475/475`），**管不到 ultralytics 内部触发的** `YOLO("yolo11n.pt")`——后者只在训练进程 cwd 找，不走平台搜索链。
+
+**修复（提交 `2420e0d`，两层保险）**：
+
+1. **主**：`patch_amp_check_offline()`（上一条提交）——AMP 自检改离线判定，**根本不加载也不下载**该文件，损坏文件无从影响；
+2. **兜**：新增 `stage_internal_weights_to_cwd()`——训练启动时若 cwd 缺 `yolo11n.pt`，就从 `models/custom`（**命名卷 `docker_yolo-models`，重建镜像不丢**）复制一份过来，让 ultralytics 内部调用命中本地完好文件；
+3. **治本（缓存位置）**：修正 `ensure_local_base_weights` 查找顺序——**持久化目录 `models/custom` 优先于 `p.exists()`**。原实现用 `Path(weights).exists()` 按「当前进程 cwd」判断，一旦命中 cwd 里的同名文件就返回裸文件名，权重**永远存不进持久化目录**，重建镜像后又要重下一次（这是"每次都下载"的第二个根因）。
+
+**排障提示**：`POST /train/prepare-weights {"model_name":"yolo11n.pt"}` 返回 `{"status":"ready","path":"yolo11n.pt"}`（**裸文件名而非绝对路径**）即说明命中的是 cwd 里的文件——很可能是上次下载残留的损坏文件。`ready` 只代表"存在"，**不代表完好**。
 
 ---
 
