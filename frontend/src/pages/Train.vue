@@ -301,10 +301,14 @@
       </div>
       </div>
       <div v-if="suggestReason" class="suggest-reason">{{ suggestReason }}</div>
-      <button @click="startTraining" :disabled="training || preparingWeight || !trainForm.dataset_id">
-        <span v-if="training || preparingWeight" class="loading-spinner"></span>
-        {{ training ? '训练中...' : (preparingWeight ? '准备权重中（仅首次下载）...' : '开始训练') }}
-      </button>
+      <div class="train-actions">
+        <button @click="startTraining" :disabled="training || preparingWeight || !trainForm.dataset_id">
+          <span v-if="training || preparingWeight" class="loading-spinner"></span>
+          {{ training ? '训练中...' : (preparingWeight ? '准备权重中（仅首次下载）...' : '开始训练') }}
+        </button>
+        <!-- B-18：显式保存训练配置到 localStorage，切页/刷新不丢 -->
+        <button @click="saveTrainFormConfig" :disabled="training" class="secondary">保存配置</button>
+      </div>
     </div>
 
     <div class="card">
@@ -866,6 +870,47 @@ const migrationTargetName = computed(() => {
   const v = migrationTargetVersion.value === 'v11' ? 'yolo11' : `yolo${migrationTargetVersion.value}`
   return `${v}${migrationTargetSize.value}.pt`
 })
+
+// ===== 训练配置持久化（B-18）：保存按钮 + localStorage =====
+// 用户诉求：点"保存配置"后，切换页面 / 刷新浏览器都不丢配置，再次进入自动回填。
+// 注意：持久化是显式动作（用户点了保存才算数），不做隐式自动覆盖。
+const TRAIN_FORM_KEY = 'yolo-train-form-v1'
+
+const saveTrainFormConfig = () => {
+  try {
+    const snapshot = {
+      trainForm: trainForm.value,
+      recallRatio: recallRatio.value,
+      selectedDatasetIds: selectedDatasetIds.value,
+      aggregateIncomplete: aggregateIncomplete.value,
+      migrationEnabled: migrationEnabled.value
+    }
+    localStorage.setItem(TRAIN_FORM_KEY, JSON.stringify(snapshot))
+    showToast('训练配置已保存，切换页面/刷新后自动恢复', 'success')
+  } catch (e: any) {
+    showToast('保存配置失败: ' + (e?.message || e), 'error', 4000)
+  }
+}
+
+const restoreTrainFormConfig = () => {
+  try {
+    const raw = localStorage.getItem(TRAIN_FORM_KEY)
+    if (!raw) return false
+    const saved = JSON.parse(raw)
+    if (saved?.trainForm && typeof saved.trainForm === 'object') {
+      // 只合并不缺失，避免旧存档缺字段时把新增默认值冲掉
+      trainForm.value = { ...trainForm.value, ...saved.trainForm }
+    }
+    if (typeof saved?.recallRatio === 'number') recallRatio.value = saved.recallRatio
+    if (Array.isArray(saved?.selectedDatasetIds)) selectedDatasetIds.value = saved.selectedDatasetIds.filter((x: any) => typeof x === 'string')
+    if (typeof saved?.aggregateIncomplete === 'boolean') aggregateIncomplete.value = saved.aggregateIncomplete
+    if (typeof saved?.migrationEnabled === 'boolean') migrationEnabled.value = saved.migrationEnabled
+    return true
+  } catch {
+    // 存档损坏直接忽略，保持默认值
+    return false
+  }
+}
 
 // 自定义导入的 .pt 预训练模型
 const customModels = ref<any[]>([])
@@ -1535,20 +1580,36 @@ const updateJobProgress = (jobId: string, lines: string[]) => {
   }
 }
 
+// B-17：/logs/tail 的 offset 是字节偏移，必须做安全整数防御。
+// 后端历史版本曾返回 3.4e38 量级的污染值（文本模式 tell() cookie），
+// 超出 JS Number.MAX_SAFE_INTEGER 后精度丢失 → 后续请求 422 → 轮询静默死亡。
+const sanitizeOffset = (v: any): number => {
+  const n = typeof v === 'number' ? v : Number(v)
+  return Number.isFinite(n) && n >= 0 && n <= Number.MAX_SAFE_INTEGER ? Math.floor(n) : 0
+}
+
 // 为某个任务启动独立日志轮询（用于任务卡牌进度）
 const startJobPolling = async (jobId: string) => {
   if (jobPollers.has(jobId)) return
-  if (!jobOffsets.has(jobId)) jobOffsets.set(jobId, 0)
 
-  // 先读取历史日志，初始化进度
+  // B-17 修复：旧实现把 /logs/lines 的 total（行数）当作 /logs/tail 的 offset
+  // （字节偏移）使用，首轮增量后 offset 被污染、轮询 422 静默死亡，进度条永远
+  // 停在打开页面那一刻。现在：先 tail(-1) 锚定"文件末尾"字节位作为增量起点，
+  // 初始进度仍由全量日志解析（两者顺序保证无漏读：全量解析覆盖到最新，锚点
+  // 之后的少量新增行由下一轮增量补上，重叠解析幂等无害）。
+  try {
+    const anchor = await pollLogsTail(jobId, -1)
+    jobOffsets.set(jobId, sanitizeOffset(anchor?.offset))
+  } catch {
+    jobOffsets.set(jobId, 0)
+  }
   try {
     const result = await getLogLines(jobId, 0)
     if (result.lines && !result.error) {
       updateJobProgress(jobId, result.lines)
-      jobOffsets.set(jobId, result.total || result.lines.length)
     }
-  } catch (e) {
-    // 忽略历史读取失败
+  } catch {
+    // 初始进度读取失败不阻塞轮询，下一轮增量会补齐
   }
 
   const timer = setInterval(async () => {
@@ -1557,7 +1618,9 @@ const startJobPolling = async (jobId: string) => {
       const result = await pollLogsTail(jobId, off)
       if (result.lines && result.lines.length) {
         updateJobProgress(jobId, result.lines)
-        jobOffsets.set(jobId, result.offset)
+      }
+      if (result.offset !== undefined) {
+        jobOffsets.set(jobId, sanitizeOffset(result.offset))
       }
     } catch (error) {
       console.error('Job polling error', jobId, error)
@@ -1880,8 +1943,14 @@ onMounted(async () => {
   // 算法库详情页「发起训练」跳转：记住归属库，产出自动成为该库的新版本
   const libQ = route.query.library_root_id
   if (typeof libQ === 'string' && libQ) presetLibraryRootId.value = libQ
-  // 1.7 模型仓库跳转：/train?dataset_ids=ds1,ds2 自动预选聚合
+  // B-18：恢复上次"保存配置"的训练配置。
+  // 带 dataset_ids 查询参数的跳转（模型仓库/算法库预选聚合）以 URL 为准，跳过恢复，
+  // 避免旧存档的数据集选择与跳转预选混杂。
   const q = route.query.dataset_ids
+  if (!(typeof q === 'string' && q)) {
+    restoreTrainFormConfig()
+  }
+  // 1.7 模型仓库跳转：/train?dataset_ids=ds1,ds2 自动预选聚合
   if (typeof q === 'string' && q) {
     await loadDatasets()
     const ids = q.split(',').filter(Boolean)
@@ -2052,6 +2121,19 @@ onUnmounted(() => {
   font-size: 0.8rem;
   color: #1e7e46;
   line-height: 1.5;
+}
+
+/* B-18：开始训练 + 保存配置 并排 */
+.train-actions {
+  display: flex;
+  gap: 0.6rem;
+  align-items: stretch;
+}
+.train-actions button {
+  flex: 0 0 auto;
+}
+.train-actions button:not(.secondary) {
+  flex: 1;
 }
 
 /* ===== 2.2 黄金参数 L2 智能推荐区（只读高亮） ===== */

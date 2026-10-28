@@ -10,93 +10,73 @@ from src.core.settings import settings
 
 
 def _read_log_lines(log_file: Path, offset: int, max_lines: int = None):
-    """同步读取日志文件（尝试多种编码）
-    
+    """同步读取日志（B-17 重写：二进制模式，offset 恒为纯字节偏移）
+
+    旧实现用文本模式 open(..., encoding=...) + seek/tell：TextIOWrapper.tell()
+    返回的是 opaque cookie 而非字节位置，一旦 seek 到非法位置（前端曾把
+    /logs/lines 返回的 total「行数」当作 /logs/tail 的「字节 offset」传入），
+    后续 tell() 会返回 3.4e38 量级的污染值；该值经 JSON 传到浏览器后超出
+    Number.MAX_SAFE_INTEGER，前端增量轮询全部 422 静默死亡 —— 训练卡片进度
+    永远停在打开页面那一刻的快照（"最后更新 X 分钟前"持续增长）。
+
+    二进制模式下 seek/tell 即纯字节偏移，恒可靠；解码统一 utf-8 + replace
+    （日志由平台自身以 utf-8 写出）。行切分与旧文本模式（universal newlines）
+    保持一致：\\r / \\r\\n / \\n 都分行（tqdm 以 \\r 刷新进度行）。
+
     Args:
         log_file: 日志文件路径
-        offset: 读取起始位置
+        offset: 读取起始字节位置（负数由调用方 tail_logs 处理为"从末尾开始"）
         max_lines: 最多读取的行数，None表示读取所有
     """
     lines = []
     new_offset = offset
-    
-    # 尝试多种编码方式
-    encodings = ['utf-8', 'gbk', 'gb2312', 'cp936', 'latin-1']
-    
-    for encoding in encodings:
-        try:
-            with open(log_file, "r", encoding=encoding, errors="replace") as f:
-                f.seek(offset)
-                
-                # 如果指定了最大行数，逐行读取并限制数量
-                if max_lines is not None and max_lines > 0:
-                    lines = []
-                    for _ in range(max_lines):
-                        line = f.readline()
-                        if not line:  # 到达文件末尾
-                            break
-                        lines.append(line)
-                    new_offset = f.tell()
-                else:
-                    # 读取所有剩余行
-                    lines = f.readlines()
-                    new_offset = f.tell()
-                
-                # 如果成功读取，跳出循环
-                break
-        except (UnicodeDecodeError, UnicodeError):
-            # 如果编码失败，尝试下一个
-            continue
-        except Exception:
-            # 其他错误（如文件不存在），返回空结果
-            return [], offset
-    
-    return lines, new_offset
+
+    try:
+        with open(log_file, "rb") as f:
+            f.seek(offset)
+
+            if max_lines is not None and max_lines > 0:
+                read_rows = 0
+                while read_rows < max_lines:
+                    raw = f.readline()
+                    if not raw:  # 到达文件末尾
+                        break
+                    new_offset = f.tell()  # 二进制模式：纯字节偏移，恒可靠
+                    # tqdm 单个进度行内含多个 \r 刷新帧，拆分成多行与旧行为一致
+                    for seg in raw.decode("utf-8", errors="replace").splitlines():
+                        lines.append(seg)
+                        read_rows += 1
+            else:
+                data = f.read()
+                new_offset = f.tell()
+                lines = data.decode("utf-8", errors="replace").splitlines()
+    except Exception:
+        # 文件不存在 / offset 非法（负数、超界）等：返回已读内容与当前 offset，
+        # 调用方按"本轮无新行"处理，绝不抛出污染值
+        return lines, max(0, new_offset)
+
+    return lines, max(0, new_offset)
 
 
 def _get_file_tail_offset(log_file: Path, n_lines: int = 50):
-    """获取文件最后N行的起始位置（字节偏移量）
-    
-    Args:
-        log_file: 日志文件路径
-        n_lines: 要获取的最后N行，默认50行
-    
+    """获取文件最后N行的起始字节偏移（B-17：二进制实现，与 _read_log_lines 的
+    字节 offset 语义严格一致；旧文本模式实现返回 TextIOWrapper cookie，不可靠）
+
     Returns:
-        int: 最后N行的起始位置（字节偏移量），如果文件总行数少于N行，返回0
+        int: 最后N行的起始字节偏移；文件总行数少于N行或读取失败时返回0
     """
-    # 尝试多种编码方式
-    encodings = ['utf-8', 'gbk', 'gb2312', 'cp936', 'latin-1']
-    
-    for encoding in encodings:
-        try:
-            with open(log_file, "r", encoding=encoding, errors="replace") as f:
-                # 读取所有行
-                all_lines = f.readlines()
-                total_lines = len(all_lines)
-                
-                # 如果总行数少于等于n_lines，返回0（从开头开始）
-                if total_lines <= n_lines:
-                    return 0
-                
-                # 计算前 (total_lines - n_lines) 行的总字节数
-                # 重新打开文件，逐行读取并计算字节数
-                f.seek(0)
-                offset = 0
-                for i in range(total_lines - n_lines):
-                    f.readline()
-                    offset = f.tell()
-                
-                return offset
-                
-        except (UnicodeDecodeError, UnicodeError):
-            # 如果编码失败，尝试下一个
-            continue
-        except Exception:
-            # 其他错误（如文件不存在），返回0
-            return 0
-    
-    # 如果所有编码都失败，返回0
-    return 0
+    try:
+        with open(log_file, "rb") as f:
+            data = f.read()
+    except Exception:
+        # 文件不存在等：从0开始（下游把"读不到"当本轮无新行处理）
+        return 0
+
+    # keepends 保留行尾分隔符（\r / \r\n / \n），字节长度精确
+    rows = data.splitlines(keepends=True)
+    if len(rows) <= n_lines:
+        return 0
+    return len(data) - len(b"".join(rows[-n_lines:]))
 
 
 class LogService:
@@ -164,12 +144,35 @@ class LogService:
                 break
     
     async def tail_logs(self, job_id: str, offset: int):
-        """轮询获取增量日志，每次最多返回50条"""
+        """轮询获取增量日志，每次最多返回50条
+
+        offset 语义（B-17）：纯字节偏移。负数约定为"从文件末尾锚定"——
+        返回当前文件大小作为下一次请求的起点、不返回行；前端用 tail(-1)
+        完成初始锚定，避免任何行数/字节数混用。
+        """
         log_file = self.jobs_dir / f"{job_id}.log"
-        
+
         if not await asyncio.to_thread(lambda: log_file.exists()):
-            return {"offset": offset, "lines": []}
-        
+            return {"offset": max(0, offset), "lines": []}
+
+        if offset < 0:
+            def _file_size():
+                try:
+                    return log_file.stat().st_size
+                except Exception:
+                    return 0
+            size = await asyncio.to_thread(_file_size)
+            return {"offset": size, "lines": []}
+
+        # 防御（B-17）：offset 超出文件大小（历史污染值/文件被轮转）→ 钳制到文件
+        # 末尾，返回空行；前端下一轮从文件尾继续，避免拿天文数字反复空转
+        def _clamp():
+            try:
+                return min(offset, log_file.stat().st_size)
+            except Exception:
+                return offset
+        offset = await asyncio.to_thread(_clamp)
+
         try:
             # 在线程中读取日志（支持多种编码），限制最多50条
             lines, new_offset = await asyncio.to_thread(_read_log_lines, log_file, offset, 50)
