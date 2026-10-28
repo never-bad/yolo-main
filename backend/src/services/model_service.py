@@ -2,6 +2,7 @@ import json
 import shutil
 import csv
 import os
+import math
 import re
 import asyncio
 import tempfile
@@ -65,6 +66,43 @@ def _reserve_model_dir(registry_dir: Path, wanted_id: str = "") -> tuple:
             return model_id, model_dir
         except FileExistsError:
             n += 1
+
+
+def _safe_float(value, default=None):
+    """把 CSV 单元格转成 JSON 安全的 float（B-20）。
+
+    results.csv 可能含 nan/inf（如某轮验证损失为空）。`float('nan')` 解析会成功，
+    但 Starlette 的 JSONResponse 用 `json.dumps(..., allow_nan=False)` 序列化，
+    遇到非有限值直接抛 `ValueError: Out of range float values are not JSON compliant`
+    → 模型详情接口 500（业务函数本身完全正常，故难以从 traceback 定位）。
+    非有限值一律转成 None，前端图表留空隙即可。
+    """
+    if value is None:
+        return default
+    try:
+        f = float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
+
+
+def _last_valid(seq):
+    """取序列最后一个非 None 值（跳过被 _safe_float 置空的异常轮次）"""
+    for v in reversed(seq or []):
+        if v is not None:
+            return v
+    return None
+
+
+def _sanitize_for_json(obj):
+    """递归把 NaN/Infinity 替换为 None（纵深防御：任何来源的非有限值都不会再让接口 500）"""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
 
 
 class ModelService:
@@ -186,7 +224,9 @@ class ModelService:
         if training_metrics:
             model_meta["training_metrics"] = training_metrics
         
-        return model_meta
+        # B-20 纵深防御：任何来源的 NaN/Infinity 在此统一置空，
+        # 避免 Starlette(allow_nan=False) 序列化时抛 ValueError 导致整个接口 500
+        return _sanitize_for_json(model_meta)
     
     async def _load_training_metrics(self, job_id: str):
         """从训练任务加载训练指标"""
@@ -265,29 +305,29 @@ class ModelService:
                     
                     # 训练损失
                     if "train/box_loss" in row:
-                        history["train_box_loss"].append(float(row["train/box_loss"]))
+                        history["train_box_loss"].append(_safe_float(row["train/box_loss"]))
                     if "train/cls_loss" in row:
-                        history["train_cls_loss"].append(float(row["train/cls_loss"]))
+                        history["train_cls_loss"].append(_safe_float(row["train/cls_loss"]))
                     if "train/dfl_loss" in row:
-                        history["train_dfl_loss"].append(float(row["train/dfl_loss"]))
+                        history["train_dfl_loss"].append(_safe_float(row["train/dfl_loss"]))
                     
-                    # 验证损失
+                    # 验证损失（早期轮次可能为 nan → 转 None）
                     if "val/box_loss" in row:
-                        history["val_box_loss"].append(float(row["val/box_loss"]))
+                        history["val_box_loss"].append(_safe_float(row["val/box_loss"]))
                     if "val/cls_loss" in row:
-                        history["val_cls_loss"].append(float(row["val/cls_loss"]))
+                        history["val_cls_loss"].append(_safe_float(row["val/cls_loss"]))
                     if "val/dfl_loss" in row:
-                        history["val_dfl_loss"].append(float(row["val/dfl_loss"]))
+                        history["val_dfl_loss"].append(_safe_float(row["val/dfl_loss"]))
                     
                     # 指标
                     if "metrics/precision(B)" in row:
-                        history["metrics_precision"].append(float(row["metrics/precision(B)"]))
+                        history["metrics_precision"].append(_safe_float(row["metrics/precision(B)"]))
                     if "metrics/recall(B)" in row:
-                        history["metrics_recall"].append(float(row["metrics/recall(B)"]))
+                        history["metrics_recall"].append(_safe_float(row["metrics/recall(B)"]))
                     if "metrics/mAP50(B)" in row:
-                        history["metrics_mAP50"].append(float(row["metrics/mAP50(B)"]))
+                        history["metrics_mAP50"].append(_safe_float(row["metrics/mAP50(B)"]))
                     if "metrics/mAP50-95(B)" in row:
-                        history["metrics_mAP50_95"].append(float(row["metrics/mAP50-95(B)"]))
+                        history["metrics_mAP50_95"].append(_safe_float(row["metrics/mAP50-95(B)"]))
             
             # 清理空列表
             history = {k: v for k, v in history.items() if v}
@@ -295,10 +335,10 @@ class ModelService:
             # 添加最终指标摘要
             if history.get("metrics_mAP50"):
                 history["final_metrics"] = {
-                    "mAP50": history["metrics_mAP50"][-1] if history["metrics_mAP50"] else None,
-                    "mAP50_95": history["metrics_mAP50_95"][-1] if history.get("metrics_mAP50_95") else None,
-                    "precision": history["metrics_precision"][-1] if history.get("metrics_precision") else None,
-                    "recall": history["metrics_recall"][-1] if history.get("metrics_recall") else None
+                    "mAP50": _last_valid(history["metrics_mAP50"]),
+                    "mAP50_95": _last_valid(history.get("metrics_mAP50_95")),
+                    "precision": _last_valid(history.get("metrics_precision")),
+                    "recall": _last_valid(history.get("metrics_recall"))
                 }
             
             return history
