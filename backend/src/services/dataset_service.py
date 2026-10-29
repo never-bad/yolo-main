@@ -1551,6 +1551,108 @@ class DatasetService:
                     triples.append((b.get("class_id"), b.get("english_code") or "", img_id))
         return triples, len(imgs)
 
+    def _derive_labels_from_annotations(self, dataset_dir: Path) -> list:
+        """从标注数据反推标签字典（按 class_id 升序，含中文名/描述）。
+
+        用于「算法库标签字典为空」时封板前自愈。只取带数字 class_id 的框
+        （能定位 YOLO 序号）；按序号聚合英文名出现频次取众数，中文名/描述同理。
+        无法定位序号（仅存英文名的老框）不参与，避免错位。取不到任何类名返回 []。
+        """
+        ann_dir = dataset_dir / "annotations"
+        if not ann_dir.is_dir():
+            return []
+        by_idx: dict[int, dict] = {}
+        for p in ann_dir.glob("*.json"):
+            try:
+                data = load_json(p)
+            except Exception:
+                continue
+            for b in (data.get("boxes") or []):
+                cid = b.get("class_id")
+                if not (isinstance(cid, int) or (isinstance(cid, str) and str(cid).isdigit())):
+                    continue  # 只有英文名、没有序号的框无法定位 index，跳过
+                idx = int(cid)
+                rec = by_idx.setdefault(idx, {"en": {}, "zh": {}, "desc": {}})
+                ec = str(b.get("english_code") or "").strip()
+                zh = str(b.get("chinese_name") or "").strip()
+                dc = str(b.get("chinese_desc") or "").strip()
+                if ec and not ec.isdigit():  # 过滤脏值（把 id 当 code 写的 "0"）
+                    rec["en"][ec] = rec["en"].get(ec, 0) + 1
+                if zh:
+                    rec["zh"][zh] = rec["zh"].get(zh, 0) + 1
+                if dc:
+                    rec["desc"][dc] = rec["desc"].get(dc, 0) + 1
+        if not by_idx:
+            return []
+        labels = []
+        for idx in sorted(by_idx):
+            rec = by_idx[idx]
+            en = max(rec["en"].items(), key=lambda kv: kv[1])[0] if rec["en"] else f"class_{idx}"
+            zh = max(rec["zh"].items(), key=lambda kv: kv[1])[0] if rec["zh"] else ""
+            desc = max(rec["desc"].items(), key=lambda kv: kv[1])[0] if rec["desc"] else ""
+            labels.append({
+                "index": idx,
+                "english_code": en,
+                "chinese_name": zh,
+                "chinese_desc": desc,
+                "ai_prompt_en": en,  # GroundingDINO / YOLO-World 英文检测提示词默认同英文名
+            })
+        return labels
+
+    async def _ensure_labels_backfilled(self, dataset_dir: Path, meta: dict) -> bool:
+        """封板前兜底（B-22）：归属算法库标签字典为空/占位时，从本数据集标注数据回填，
+        避免 label_guard 把「第 N 类超出新库字典范围」误判成封板错误。
+
+        - 仅在字典当前为空/占位的「新库未配字典」场景触发；已有字典绝不覆盖，尊重人工维护。
+        - 从 annotations/*.json 的框按 class_id 反推类别（含中文名），写回 labels_dict.json
+          + 算法库 model.json classes（与 init_labels_from_classes 同口径：幂等、落 shadow）。
+        返回是否执行了回填。
+        """
+        model_id = meta.get("model_id") or ""
+        if not model_id:
+            return False
+        # 当前解析出的 data.yaml 类别名（与封板同口径）
+        names = self._resolve_seal_names(meta)
+        if names and not _is_placeholder_names(names):
+            return False  # 字典已就绪，无需回填
+        # 字典空/占位：尝试从标注数据反推
+        labels = await asyncio.to_thread(self._derive_labels_from_annotations, dataset_dir)
+        if not labels:
+            return False  # 标注里也取不到类名（仅老 txt / 无框），交回原流程报错提示
+        from src.services.model_service import ModelService
+        from src.db import shadow
+        # 写入目标 = 算法库根（与 read_label_rows 回退口径一致，确保封板能读到）
+        root_id = ModelService().resolve_library_root_id(model_id) or model_id
+        try:
+            await ModelService().update_labels_dict(root_id, labels)
+        except ValueError as e:
+            # 字典可能已被人工维护（与占位判定不一致的边缘情况）→ 不强行覆盖
+            logger.warning(
+                f"dataset {dataset_dir.name}: 封板前标签字典回填被拒（字典可能已有人维护）: {e}"
+            )
+            return False
+        # 同步算法库 model.json 快照（与 init_labels_from_classes 同口径），并落 shadow
+        try:
+            model_meta_path = settings.REGISTRY_DIR / root_id / "model.json"
+            model_meta = load_json(model_meta_path)
+            model_meta["classes"] = [l["english_code"] for l in labels]
+            model_meta["labels_auto_init"] = True
+            model_meta["labels_auto_init_at"] = datetime.now().isoformat()
+            model_meta["updated_at"] = model_meta["labels_auto_init_at"]
+            save_json_atomic(model_meta_path, model_meta)
+        except Exception as e:
+            logger.warning(
+                f"dataset {dataset_dir.name}: 回填后同步 model.json 失败（不影响封板）: {e}"
+            )
+        await shadow.sync_model(root_id)
+        # 同步数据集快照，保证 _resolve_seal_names 回退路径也读到新值（封板后会再次落盘）
+        meta["classes"] = [l["english_code"] for l in labels]
+        logger.info(
+            f"dataset {dataset_dir.name}: 封板前自动回填算法库 {root_id} 标签字典"
+            f"（{len(labels)} 类，来源=标注数据）：{[l['english_code'] for l in labels]}"
+        )
+        return True
+
     def _bind_conflict_sync(self, dataset_dir: Path, meta: dict, root_id: str) -> dict:
         """挂载冲突检查（同步实现）：把数据集已有标注对到目标库字典的序号上比一遍。"""
         names = self._resolve_seal_names({"model_id": root_id, "classes": meta.get("classes") or []})
@@ -2326,6 +2428,13 @@ class DatasetService:
                 pass
         seal_payload = None
         if has_artifact_source:
+            # 封板前兜底（B-22）：归属算法库标签字典空/占位时，先用标注数据反推回填，
+            # 避免 label_guard 把"第 N 类超出新库字典范围"误判成封板错误。
+            if meta.get("model_id"):
+                try:
+                    await self._ensure_labels_backfilled(dataset_dir, meta)
+                except Exception as e:
+                    logger.warning(f"dataset {dataset_id} 封板前标签字典回填异常（交回原流程）: {e}")
             ratio = split_ratio or meta.get("split_ratio") or {"train": 0.7, "val": 0.15, "test": 0.15}
             sv = int(meta.get("sealed_version_count") or 0) + 1
             # 封板产物直接输出到 dataset_dir（标准 YOLO 格式）
@@ -2389,6 +2498,13 @@ class DatasetService:
         """
         dataset_id = meta.get("dataset_id") or dataset_dir.name
         ratio = meta.get("split_ratio") or {"train": 0.7, "val": 0.15, "test": 0.15}
+        # 封板前兜底（B-22）：已封板但产物缺失的历史数据，若归属库标签字典为空同样先回填，
+        # 保证补生成的 data.yaml 类别名正确（label_guard=False 不会拦，但名字要对）。
+        if meta.get("model_id"):
+            try:
+                await self._ensure_labels_backfilled(dataset_dir, meta)
+            except Exception as e:
+                logger.warning(f"dataset {dataset_id} 补生成前标签字典回填异常（继续）: {e}")
         try:
             # label_guard=False：走到这里说明是 force 补救，序号冲突不重复拦
             payload = await asyncio.to_thread(
