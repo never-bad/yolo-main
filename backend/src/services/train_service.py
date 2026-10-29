@@ -1112,7 +1112,23 @@ class TrainService:
             use_ver = ds_version or version
             d_yaml = self._resolve_dataset_yaml(ds_id, use_ver)
             if not d_yaml.exists():
-                raise ValueError(f"Dataset {ds_id}/{use_ver} not prepared")
+                # B-21：英文原文对用户毫无信息量，改成能直接照做的中文指引，
+                # 并把封板中止的具体原因（若有）一起带上
+                reason = ""
+                try:
+                    _meta = load_json(self.datasets_dir / ds_id / "meta.json")
+                    reason = str(_meta.get("seal_skipped_reason") or "").strip().replace("\n", " ")
+                except Exception:
+                    reason = ""
+                if reason:
+                    raise ValueError(
+                        f"数据集 {ds_id} 缺少训练产物（data.yaml 未生成，可能是封板时类别校验未通过）。"
+                        f"原因：{reason}"
+                    )
+                raise ValueError(
+                    f"数据集 {ds_id} 尚未生成训练产物（data.yaml 不存在）。"
+                    f"请到「数据集」页面对该数据集执行封板后再训练。"
+                )
             self._heal_dataset_yaml(d_yaml)  # B-09：训练前自动修 stale path
             seen_ids.add(ds_id)
             specs.append((ds_id, use_ver, d_yaml))

@@ -26,7 +26,8 @@
               <span v-if="ds.image_count">{{ ds.image_count }} 张图片</span>
               <span v-if="ds.classes && ds.classes.length">{{ ds.classes.length }} 类</span>
             </div>
-            <div v-if="!isDatasetPrepared(ds)" class="ds-card-warn">需先"准备"</div>
+            <div v-if="ds.seal_skipped_reason" class="ds-card-warn" :title="ds.seal_skipped_reason">封板中止，需先处理</div>
+            <div v-else-if="!isDatasetPrepared(ds)" class="ds-card-warn">需先"准备"</div>
           </div>
           <div v-if="!loadingDatasets && datasets.length === 0" class="empty-state">暂无已标注导出的数据集，请先在标注页完成标注并导出</div>
         </div>
@@ -1155,13 +1156,22 @@ const getDatasetStatus = (dataset: any) => {
 
 // 检查数据集是否已准备（允许 prepared 和 uploaded 状态）
 const isDatasetPrepared = (dataset: any) => {
+  // 封板中止（类别与算法库字典冲突等）：产物 data.yaml 没生成，选了也训练不了
+  if (dataset.seal_skipped_reason) return false
   return dataset.status === 'prepared' || dataset.status === 'uploaded'
 }
 
 // 卡片式选择数据集（单选：点击替换，再次点击取消。原阶段1.3多选聚合已按用户要求下线）
 const selectDataset = (ds: any) => {
   if (!isDatasetPrepared(ds)) {
-    showToast('该数据集尚未准备，请先在"数据集"页面执行"准备"操作', 'info', 4000)
+    // 封板中止的具体原因直接说清楚，别让用户对着英文报错猜
+    const skip = String(ds.seal_skipped_reason || '')
+    showToast(
+      skip
+        ? '该数据集封板中止，未生成训练产物：' + skip.split('\n').slice(0, 2).join(' ')
+        : '该数据集尚未准备，请先在"数据集"页面执行"准备/封板"操作',
+      'info', 6000
+    )
     return
   }
   const idx = selectedDatasetIds.value.indexOf(ds.dataset_id)

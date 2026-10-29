@@ -2235,9 +2235,31 @@ class DatasetService:
         _ensure_stage_fields(meta)
 
         if meta["stage"] == STAGE_SEALED:
+            # B-21：产物齐全但历史标记残留（曾因字典冲突/force 终止过封板，
+            # 后来通过补生成或手工修好了产物）→ 直接自愈状态即可，
+            # 不重建产物（1051 张图级别的重建很贵，也没有意义）。
+            if (dataset_dir / "data.yaml").exists() and (dataset_dir / "labels" / "train").is_dir():
+                if meta.get("seal_skipped_reason"):
+                    meta.pop("seal_skipped_reason", None)
+                    try:
+                        split = meta.get("sealed_split") or {}
+                        nm = split.get("names") or []
+                        if nm:
+                            meta["classes"] = list(nm)
+                        boxes = int(sum(((split.get("class_stats") or {}).get("boxes_by_class") or {}).values()) or 0)
+                        if boxes:
+                            meta["label_count"] = boxes
+                            meta["has_labels"] = True
+                    except Exception:
+                        pass
+                    await asyncio.to_thread(save_json_atomic, meta_path, meta)
+                    from src.db import shadow
+                    await shadow.sync_dataset(dataset_id)
+                    logger.info(f"dataset {dataset_id} 清理残留的封板中止标记（产物已齐全）")
+                return meta
             # 幂等：已封板直接返回。例外——force 且产物缺失（历史数据只打了 sealed 标、
             # 没生成 data.yaml/划分目录）时补生成一次，否则"再点一次封板"永远无效。
-            if not force or (dataset_dir / "data.yaml").exists():
+            if not force:
                 return meta
             return await self._backfill_seal_artifacts(dataset_dir, meta_path, meta)
 
@@ -2380,6 +2402,20 @@ class DatasetService:
             await shadow.sync_dataset(dataset_id)
             return meta
         meta.pop("seal_artifacts_error", None)
+        # 产物补齐成功 → 清掉历史"封板中止"标记，并同步训练可用性统计（B-21）。
+        # 不清的话：列表/训练页仍按旧标记显示"未标注 / 封板中止"，
+        # 而 data.yaml 其实已生成、可以训练，用户会看到自相矛盾的状态。
+        meta.pop("seal_skipped_reason", None)
+        names = payload.get("names") or []
+        if names:
+            meta["classes"] = list(names)
+        try:
+            boxes = int(sum(((payload.get("class_stats") or {}).get("boxes_by_class") or {}).values()) or 0)
+        except Exception:
+            boxes = 0
+        if boxes:
+            meta["label_count"] = boxes
+            meta["has_labels"] = True
         meta["sealed_out"] = str(dataset_dir.relative_to(settings.DATA_DIR))
         meta["sealed_split"] = payload
         meta["label_validation"] = payload.get("label_validation")
