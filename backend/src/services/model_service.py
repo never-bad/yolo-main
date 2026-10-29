@@ -221,6 +221,12 @@ class ModelService:
             return model_meta.get("model_info")
         
         training_metrics, _ = await asyncio.gather(_load_metrics_async(), _load_info_async())
+        if not training_metrics:
+            # B-27：results.csv 找不到（如 jobs 目录被清理）时，兜底读本模型自己存的
+            # training_metrics，避免详情页指标整段丢失（"即使被拦截也应显示各项指标"）。
+            stored = model_meta.get("training_metrics")
+            if stored:
+                training_metrics = stored
         if training_metrics:
             model_meta["training_metrics"] = training_metrics
         
@@ -333,14 +339,28 @@ class ModelService:
             history = {k: v for k, v in history.items() if v}
             
             # 添加最终指标摘要
-            if history.get("metrics_mAP50"):
+            # 用 fitness(0.9*mAP50-95 + 0.1*mAP50) 取最优轮次，与 best.pt 选优口径一致；
+            # 旧逻辑用 _last_valid(末轮)，早停后末轮可能略低于最优轮，导致详情页指标偏低。
+            if history.get("metrics_mAP50_95") and history.get("epochs"):
+                best_i, best_f = 0, -1.0
+                for i in range(len(history["epochs"])):
+                    f = 0.9 * (history["metrics_mAP50_95"][i] or 0) + 0.1 * (history["metrics_mAP50"][i] or 0)
+                    if f > best_f:
+                        best_f, best_i = f, i
+                history["final_metrics"] = {
+                    "mAP50": history["metrics_mAP50"][best_i],
+                    "mAP50_95": history["metrics_mAP50_95"][best_i],
+                    "precision": history["metrics_precision"][best_i],
+                    "recall": history["metrics_recall"][best_i],
+                }
+            elif history.get("metrics_mAP50"):
                 history["final_metrics"] = {
                     "mAP50": _last_valid(history["metrics_mAP50"]),
                     "mAP50_95": _last_valid(history.get("metrics_mAP50_95")),
                     "precision": _last_valid(history.get("metrics_precision")),
                     "recall": _last_valid(history.get("metrics_recall"))
                 }
-            
+
             return history
             
         except Exception as e:
