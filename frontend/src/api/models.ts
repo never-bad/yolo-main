@@ -86,6 +86,8 @@ export interface ModelDetails {
   weights_path?: string
   name?: string
   display_name?: string         // 算法库显示名（新建时人工指定，可改）
+  model_code?: string               // 唯一标识（新建时人工指定）
+  library_root_id?: string          // 归属算法库根 ID（训练产出/导入记录指向库根；库根自身为自身 ID）
   description?: string
   tags?: string[]
   file_size?: number

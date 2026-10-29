@@ -11,7 +11,7 @@
       <div class="card wk-header">
         <div class="wk-header-top">
           <div class="wk-title">
-            <h1>{{ model.display_name || model.name || model.model_code || model.model_id }}</h1>
+            <h1>{{ libraryRoot?.display_name || libraryRoot?.name || libraryRoot?.model_code || '未命名算法库' }}</h1>
             <code class="model-code">{{ model.model_code || model.model_id }}</code>
             <span class="status-tag" :class="model.status">{{ statusLabel(model.status) }}</span>
           </div>
@@ -20,7 +20,7 @@
           </button>
         </div>
         <div class="wk-desc">
-          {{ model.description || '暂无业务场景描述，点击「编辑简介」补充该算法库的用途说明。' }}
+          {{ libraryRoot?.description || '暂无业务场景描述，点击「编辑简介」补充该算法库的用途说明。' }}
         </div>
         <div class="wk-meta">
           <span>算法架构：{{ archLabel }}</span>
@@ -208,7 +208,7 @@
         <!-- 主视图：使用中 / 待发布 / 训练中 / 已入库；退役版本折叠到底部「历史版本」 -->
         <div v-for="v in mainVersions" :key="v.model_id || ''" class="ver-card">
           <div class="ver-head">
-            <span class="ver-name">{{ verTitle(v) }}<span v-if="v.model_id === versions[0]?.model_id && v.version" class="ver-latest">最新</span><span v-if="!v.version" class="ver-latest">上传导入</span></span>
+            <span class="ver-name">{{ verTitle(v) }}<span v-if="v.model_id === latestOutputId && v.version" class="ver-latest">最新</span><span v-if="v.__lineage" class="ver-lineage">血缘上一代</span><span v-if="!v.version" class="ver-latest">上传导入</span></span>
             <span class="status-tag" :class="verBadge(v).cls">{{ verBadge(v).text }}</span>
             <button
               v-if="v.status === 'production_ready' && v.publish_status !== 'published'"
@@ -341,7 +341,8 @@
         <div class="set-group">
           <div class="set-label">静态信息</div>
           <div class="static-info">
-            <div><span>算法库 ID</span><code>{{ model.model_id }}</code></div>
+            <div><span>算法库 ID</span><code>{{ libraryRoot?.model_id || model.model_id }}</code></div>
+            <div v-if="model.library_root_id && model.library_root_id !== model.model_id"><span>当前查看版本</span><code>{{ model.model_id }}</code></div>
             <div v-if="model.model_code"><span>唯一标识</span><code>{{ model.model_code }}</code></div>
             <div><span>业务标签</span><span>{{ bizLabel }}</span></div>
             <div v-if="model.weights_path"><span>权重路径</span><code class="path">{{ model.weights_path }}</code></div>
@@ -911,6 +912,14 @@ async function removeDs(d: ModelDataset) {
 }
 
 // ===== 模型版本 =====
+// 库根记录：训练页「查看模型」等入口可能直接打开库下某个版本记录（/models/{versionId}），
+// 此时页面标题/简介必须展示「归属算法库」的信息，而不是兜底成版本记录自己的 model_id
+const libraryRoot = computed<any>(() => {
+  const cur: any = model.value
+  if (!cur) return null
+  const rootId = cur.library_root_id || cur.model_id
+  return allModels.value.find((x: any) => x.model_id === rootId) || cur
+})
 // 版本号 → 可比较数字（v1.10 → 1.1）；空库占位记录没有版本号，视为最旧排在最后
 const verNum = (v?: string) => {
   const n = parseFloat(String(v || '').replace(/^v/i, ''))
@@ -926,11 +935,12 @@ const versions = computed(() => {
   const list: any[] = allModels.value.filter(
     (m: any) => !m.empty && (m.library_root_id || m.model_id) === root
   )
-  // 兼容改动前的历史数据（产出没有库标识）：按血缘把上一代补进来
+  // 兼容改动前的历史数据（产出没有库标识）：按血缘把上一代补进来。
+  // 补入的记录打上 __lineage 标记：它们不属于本库产出，不得挂「最新」徽标
   const parentId = cur.lineage?.parent_model_id
   if (parentId && !list.some((m) => m.model_id === parentId)) {
     const p = allModels.value.find((m: any) => m.model_id === parentId)
-    if (p && !p.empty) list.push(p)
+    if (p && !p.empty) list.push({ ...p, __lineage: true })
   }
   // 倒序（最新在前）：先比版本号，版本号相同/缺失时比产出时间
   return list.sort((a: any, b: any) => {
@@ -940,6 +950,14 @@ const versions = computed(() => {
   })
 })
 const newestVersion = computed(() => versions.value[0] || null)
+// 「最新」徽标只挂在本库最新的训练产出上（按产出时间比，不比版本号）：
+// 血缘补入的历史模型（__lineage）版本号可能更大（如老链路的 v1.3），按版本号排会抢走徽标
+const latestOutputId = computed(() => {
+  const outs = versions.value.filter((v: any) => !v.__lineage && v.version)
+  if (!outs.length) return null
+  return [...outs]
+    .sort((a: any, b: any) => String(b.created_at || '').localeCompare(String(a.created_at || '')))[0]?.model_id || null
+})
 
 // ===== 版本状态简化展示：每卡只挂 1 个徽标，退役版本折叠 =====
 // 状态机不变（active/production_ready/superseded/rejected/training/evaluating + publish_status），
@@ -1262,11 +1280,14 @@ function saveBlob(blob: Blob, filename: string) {
 }
 
 // ===== 简介 / 名称保存 =====
+// 详情页可能打开的是库下某个版本记录：显示的是库根的名称/简介，保存也必须写回库根
+const rootEditId = computed(() => model.value?.library_root_id || modelId)
+
 function saveDescription() {
   savingDesc.value = true
   descSaveMsg.value = ''
   descSaveErr.value = false
-  updateModel(modelId, { description: descDraft.value })
+  updateModel(rootEditId.value, { description: descDraft.value })
     .then(async () => {
       descSaveMsg.value = '✓ 简介已保存'
       await refresh()
@@ -1283,7 +1304,7 @@ function saveName() {
   savingDesc.value = true
   descSaveMsg.value = ''
   descSaveErr.value = false
-  updateModel(modelId, { display_name: nameDraft.value, name: nameDraft.value })
+  updateModel(rootEditId.value, { display_name: nameDraft.value, name: nameDraft.value })
     .then(async () => {
       descSaveMsg.value = '✓ 名称已保存'
       await refresh()
@@ -1335,8 +1356,11 @@ async function refresh() {
       syncLabelRows()
     }
     if (lm) allModels.value = lm.models || []
-    descDraft.value = m?.description || ''
-    nameDraft.value = m?.name || m?.display_name || ''
+    // 简介/名称草稿取库根记录（与标题展示、保存目标保持一致）
+    const rid = m?.library_root_id || m?.model_id
+    const rootRec = allModels.value.find((x: any) => x.model_id === rid) || m
+    descDraft.value = rootRec?.description || ''
+    nameDraft.value = rootRec?.name || rootRec?.display_name || ''
   } finally {
     loading.value = false
   }
@@ -1484,6 +1508,7 @@ onMounted(async () => {
 .ver-name { font-size: 1.05rem; font-weight: 700; color: #1f2d3d; }
 .ver-latest { font-size: 0.7rem; background: #27ae60; color: #fff; padding: 1px 8px; border-radius: 10px; margin-left: 6px; }
 .ver-latest.prod { margin-left: 0; background: #1e8449; }
+.ver-lineage { font-size: 0.7rem; background: #8e9aaf; color: #fff; padding: 1px 8px; border-radius: 10px; margin-left: 6px; }
 .ver-dl { margin-left: auto; }
 .ver-metrics { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 8px; }
 .ver-metric { display: flex; flex-direction: column; gap: 2px; }
