@@ -30,8 +30,7 @@
           </div>
           <div v-if="!loadingDatasets && datasets.length === 0" class="empty-state">暂无已标注导出的数据集，请先在标注页完成标注并导出</div>
         </div>
-        <small v-if="selectedDatasetIds.length > 1">✓ 已选 {{ selectedDatasetIds.length }} 个数据集，将聚合为同一训练任务（统一类别命名空间，自动按已标注导出训练）</small>
-        <small v-else>提示：仅显示已标注的数据集；点击卡片可多选聚合训练（单数据集训练保持不变）</small>
+        <small>提示：仅显示已标注的数据集，点击卡片选择一个（再次点击取消）</small>
         <small v-if="!presetLibraryRootId && primaryLibraryId" class="lib-pick-info">
           主数据集归属算法库「{{ libraryNameOf(primaryLibraryId) }}」——训练产出会作为该库的新版本
         </small>
@@ -1159,7 +1158,7 @@ const isDatasetPrepared = (dataset: any) => {
   return dataset.status === 'prepared' || dataset.status === 'uploaded'
 }
 
-// 卡片式选择数据集（支持多选聚合：1.3）
+// 卡片式选择数据集（单选：点击替换，再次点击取消。原阶段1.3多选聚合已按用户要求下线）
 const selectDataset = (ds: any) => {
   if (!isDatasetPrepared(ds)) {
     showToast('该数据集尚未准备，请先在"数据集"页面执行"准备"操作', 'info', 4000)
@@ -1167,16 +1166,13 @@ const selectDataset = (ds: any) => {
   }
   const idx = selectedDatasetIds.value.indexOf(ds.dataset_id)
   if (idx >= 0) {
+    // 取消选择
     selectedDatasetIds.value.splice(idx, 1)
-    // 若取消的是主数据集，自动顺延首位为新的主数据集
-    if (trainForm.value.dataset_id === ds.dataset_id) {
-      trainForm.value.dataset_id = selectedDatasetIds.value[0] || ''
-    }
+    trainForm.value.dataset_id = ''
   } else {
-    selectedDatasetIds.value.push(ds.dataset_id)
-    if (!trainForm.value.dataset_id) {
-      trainForm.value.dataset_id = selectedDatasetIds.value[0]
-    }
+    // 替换为该数据集（恒单选）
+    selectedDatasetIds.value = [ds.dataset_id]
+    trainForm.value.dataset_id = ds.dataset_id
   }
 }
 
@@ -1405,10 +1401,7 @@ const retrainJob = async (job: any) => {
       weight_decay: job.weight_decay ?? undefined,
       patience: job.patience ?? undefined,
       gpu_index: job.gpu_index ?? undefined,
-      // 阶段1.3：聚合任务重跑时带原始数据集列表
-      ...(Array.isArray(job.dataset_ids) && job.dataset_ids.length > 1
-        ? { dataset_ids: job.dataset_ids }
-        : {}),
+      // 多选聚合已下线：重跑只使用主数据集（job.dataset_ids 不再透传）
       // 重跑保持原任务的算法库归属（产出仍落在同一个库下）
       library_root_id: job.library_root_id || undefined
     }
@@ -1993,14 +1986,13 @@ onMounted(async () => {
   if (!(typeof q === 'string' && q)) {
     restoreTrainFormConfig()
   }
-  // 1.7 模型仓库跳转：/train?dataset_ids=ds1,ds2 自动预选聚合
+  // 1.7 模型仓库跳转：/train?dataset_ids=ds1,ds2 预选（单选化后只取第一个）
   if (typeof q === 'string' && q) {
     await loadDatasets()
     const ids = q.split(',').filter(Boolean)
     const selectable = ids.filter((id: string) => datasets.value.some((d: any) => d.dataset_id === id))
     if (selectable.length) {
       selectDataset({ dataset_id: selectable[0] })
-      selectable.slice(1).forEach((id: string) => selectDataset({ dataset_id: id }))
     }
   } else {
     loadDatasets()
@@ -2166,17 +2158,15 @@ onUnmounted(() => {
   line-height: 1.5;
 }
 
-/* B-18：开始训练 + 保存配置 并排 */
+/* B-18：开始训练 + 保存配置 并排（等宽，避免"开始训练"撑满整行） */
 .train-actions {
   display: flex;
   gap: 0.6rem;
   align-items: stretch;
 }
 .train-actions button {
-  flex: 0 0 auto;
-}
-.train-actions button:not(.secondary) {
-  flex: 1;
+  flex: 1 1 0;
+  min-width: 0;
 }
 
 /* ===== 2.2 黄金参数 L2 智能推荐区（只读高亮） ===== */
