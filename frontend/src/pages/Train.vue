@@ -2757,9 +2757,14 @@ button {
   object-fit: contain;
 }
 
-.file-preview-text {
-  flex: 1;
+/* 文本日志容器：必须成为 flex 滚动容器，否则 <pre> 撑出对话框、overflow:auto 失效、滚轮穿透到背景页 */
+.text-preview-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: auto;
+}
+
+.file-preview-text {
   margin: 0;
   padding: 1rem 1.25rem;
   font-size: 0.8rem;
