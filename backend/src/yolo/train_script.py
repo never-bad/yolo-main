@@ -464,7 +464,9 @@ def main():
     # 模型守门员：业务隔离 + 与上一代同业务生产模型对比
     parser.add_argument("--business", type=str, default="general", help="业务/算法类型（守门员按此隔离对比）")
     parser.add_argument("--baseline", type=str, default=None, help="上一代同业务生产模型 best.pt（守门员对比基准，可空=首版）")
-    parser.add_argument("--baseline-model-id", type=str, default=None, help="上一代生产模型的 model_id（写入血缘）")
+    parser.add_argument("--baseline-model-id", type=str, default=None, help="上一代生产模型的 model_id（守门员对比基准，写入血缘）")
+    parser.add_argument("--base-model-id", type=str, default=None,
+                        help="真正微调父模型的 model_id（写入血缘 parent_model_id 用于展示；与守门员基线区分）")
     parser.add_argument("--library-root-id", type=str, default=None,
                         help="所属算法库根记录 model_id：产出版本写入该字段，库详情据此聚合版本")
     # 2.4 跨代迁移训练（训练模块规范 §3.2.2）：源/目标架构不同时 strict=False 加载
@@ -852,7 +854,8 @@ def main():
             # 算法库归属：继承基座模型所在库；无继承（直接用官方权重训练）时产出自身即库根
             "library_root_id": args.library_root_id or model_id,
             "lineage": {
-                "parent_model_id": args.baseline_model_id,
+                # 微调时 parent 指向真正的微调父（base_model_id）；从零训练退回守门员基线
+                "parent_model_id": args.base_model_id or args.baseline_model_id,
                 "base_model": args.model,
                 "dataset_id": dataset_id,
                 "job_id": args.job_id,

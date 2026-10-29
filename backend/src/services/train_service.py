@@ -505,16 +505,21 @@ class TrainService:
         # 无法识别架构 → 空架构（跨代检测跳过，保持普通微调语义）
         return {"architecture_family": "", "architecture_name": "", "model_scale": ""}
 
-    def _pick_baseline(self, business: str):
-        """模型守门员：自动选择同业务"上一代生产模型"作为对比基准。
+    def _pick_baseline(self, business: str, library_root_id: str = None):
+        """模型守门员：自动选择"上一代生产模型"作为对比基准。
 
-        扫描模型仓库中 business 相同且 status=production_ready 的模型，
-        取 version 最高者，返回 (weights_path, model_id)；无任何生产模型（首版）返回 (None, None)，
+        优先取同算法库（library_root_id 相同）内 status=production_ready 且 version 最高者；
+        库内无则退回同 business 全局最高版本（仅当 business 为真实业务，非通用兜底 "general"/空）；
+        任何情况下都返回 (weights_path, model_id)；无可用生产模型（首版）返回 (None, None)，
         此时由 gatekeeper 判定 first_version 直接晋升。
+
+        为什么加库约束 + 通用 business 不退回全局：此前只按 business 全局扫描，导致同属
+        "general" 的无关算法库旧生产模型（如 9 月 call_phone 的 v1.3）被当成"上一代"，
+        既污染血缘展示，又让守门员拿不同类别的数据做无意义对比。
         """
         if not self.registry_dir.exists():
             return None, None
-        best_score, best_path, best_id = None, None, None
+        best_in_lib = best_global = None  # (score, path, id)
         for meta_file in self.registry_dir.glob("*/model.json"):
             try:
                 meta = load_json(meta_file)
@@ -528,9 +533,22 @@ class TrainService:
             w = resolve_registry_weights(meta, self.registry_dir)
             if not w or not w.exists():
                 continue
-            if best_score is None or score > best_score:
-                best_score, best_path, best_id = score, str(w), meta.get("model_id")
-        return best_path, best_id
+            rec = (score, str(w), meta.get("model_id"))
+            meta_lib = meta.get("library_root_id") or meta.get("model_id")
+            if library_root_id and meta_lib == library_root_id:
+                if best_in_lib is None or score > best_in_lib[0]:
+                    best_in_lib = rec
+            else:
+                # 全局候选：仅在 business 为真实业务（非通用兜底 "general"/空）时采纳，
+                # 避免通用 business 下把无关算法库的旧生产模型误当成"上一代"
+                if business and business != "general":
+                    if best_global is None or score > best_global[0]:
+                        best_global = rec
+        # 库内优先；库内无且 business 为真实业务时退回全局；否则（库内无 / 通用 business）视为首版
+        chosen = best_in_lib or best_global
+        if chosen is None:
+            return None, None
+        return chosen[1], chosen[2]
 
     def _apply_label_filter(self, job_id: str, data_yaml: Path, base_model_id: str,
                             out_subdir: str = "filtered_data"):
@@ -1278,7 +1296,7 @@ class TrainService:
 
         # 模型守门员：自动选择同业务上一代生产模型作为对比基准
         # 训练结束后 train_script 内评测新模型 vs 该基准；无生产模型（首版）由 gatekeeper 直晋
-        baseline_path, baseline_model_id = self._pick_baseline(business)
+        baseline_path, baseline_model_id = self._pick_baseline(business, library_root_id)
 
         # ---------- 训练数据准备（单数据集 / 多数据集聚合） ----------
         actual_data_yaml = primary_yaml
@@ -1372,7 +1390,8 @@ class TrainService:
                 migration.get("target_model") if migration else None,
                 f"{migration['source_model_id']} [{migration['source_architecture']}]" if migration else None,
                 bool(migration and migration.get("lr0_degraded")),
-                library_root_id
+                library_root_id,
+                base_model_id
             )
         except Exception as e:
             try:
@@ -1685,7 +1704,8 @@ class TrainService:
                        baseline_path: str = None, baseline_model_id: str = None,
                        migration_target: str = None, migration_source: str = None,
                        migration_lr0_degraded: bool = False,
-                       library_root_id: str = None):
+                       library_root_id: str = None,
+                       base_model_id: str = None):
         """启动训练进程（同步方法，在线程中调用）
 
         2.4 迁移训练参数（训练模块规范 §3.2.2）：
@@ -1725,6 +1745,9 @@ class TrainService:
             cmd += ["--baseline", str(baseline_path)]
         if baseline_model_id:
             cmd += ["--baseline-model-id", str(baseline_model_id)]
+        # 真正微调父（用于血缘 parent_model_id 展示）：仅微调训练时有值，从零训练为 None
+        if base_model_id:
+            cmd += ["--base-model-id", str(base_model_id)]
         
         # 2.4 跨代迁移训练：目标架构 / 迁移来源 / lr0 自动降级标记（写入 [Migration] 日志）
         if migration_target:
