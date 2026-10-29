@@ -377,10 +377,19 @@ def run_gatekeeper(baseline_weights, new_weights, data_yaml, classes, margin: fl
         class_ap[name] = row
 
     if regressed:
-        detail = "; ".join(
-            f"{n}（{class_ap[n]['old_ap'] * 100:.1f}% → {class_ap[n]['new_ap'] * 100:.1f}%）"
-            for n in regressed
-        )
+        parts = []
+        try:
+            for n in regressed:
+                row = class_ap[n]
+                oa = row.get("old_ap")
+                na = row.get("new_ap")
+                oa_s = f"{oa * 100:.1f}%" if oa is not None else "无旧指标"
+                na_s = f"{na * 100:.1f}%" if na is not None else "无检出"
+                parts.append(f"{n}（{oa_s} → {na_s}）")
+            detail = "; ".join(parts)
+        except Exception:
+            # 报告拼接兜底：绝不让格式化异常中断评估，确保指标数据仍被返回
+            detail = "; ".join(regressed)
         return _build_result(
             "rejected", new_metrics, old_metrics, class_ap, regressed,
             f"以下类别出现明显退化（跌幅超过 {CLASS_REGRESSION_RATIO * 100:.0f}%）：{detail}。"
