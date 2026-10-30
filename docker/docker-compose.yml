@@ -46,6 +46,9 @@ services:
       - ${RUNS_DIR:-yolo-runs}:/app/runs
       # 模型 registry 持久化（上传/训练产出的模型不随容器重建丢失）
       - ${MODELS_DIR:-yolo-models}:/app/models
+      # 容器时区对齐宿主（宿主为 GMT+8，避免容器内 UTC 与本地时间差 8 小时）；只读挂载宿主时区文件，无需镜像内装 tzdata
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     depends_on:
       postgres:
         condition: service_healthy
