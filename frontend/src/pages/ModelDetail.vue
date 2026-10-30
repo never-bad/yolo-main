@@ -246,8 +246,10 @@
           </div>
           <div class="ver-meta">
             <span>产出时间：{{ fmtTime(v.created_at) }}</span>
-            <span v-if="v.lineage?.parent_model_id">基于 {{ v.lineage.parent_model_id }} 迭代</span>
-            <span v-if="v.lineage?.base_model">基座 {{ v.lineage.base_model }}</span>
+            <span v-if="v.model_id" title="模型页 / 训练页「查看模型」打开的就是这条记录">模型记录：{{ v.model_id }}</span>
+            <span v-if="v.lineage?.job_id" title="训练页任务列表里对应的任务号">训练任务：{{ v.lineage.job_id }}</span>
+            <span v-if="parentLabel(v)">基于 {{ parentLabel(v) }} 迭代</span>
+            <span v-if="baseLabel(v)">基底：{{ baseLabel(v) }}</span>
           </div>
           <!-- 守门员对比（当前 vs 上一代） -->
           <div v-if="v.gatekeeper" class="gk-compare">
@@ -283,7 +285,9 @@
               </div>
               <div class="ver-meta">
                 <span>产出时间：{{ fmtTime(v.created_at) }}</span>
-                <span v-if="v.lineage?.base_model">基座 {{ v.lineage.base_model }}</span>
+                <span v-if="v.model_id">模型记录：{{ v.model_id }}</span>
+                <span v-if="v.lineage?.job_id">训练任务：{{ v.lineage.job_id }}</span>
+                <span v-if="baseLabel(v)">基底：{{ baseLabel(v) }}</span>
               </div>
             </div>
           </div>
@@ -683,6 +687,33 @@ function metricOf(v: any, key: 'mAP50_95' | 'precision' | 'recall') {
 // 标题回退到显示名，指标全空时整行不渲染（改由文案说明）。
 const verTitle = (v: any) =>
   v?.version ? normVer(v.version) : (v?.display_name || v?.model_id || '未命名模型')
+
+// ===== 血缘/溯源可读化：让 v1.1/v1.2 能对上「训练页的任务」和「基底模型」 =====
+const modelById = (id?: string | null): any =>
+  id ? allModels.value.find((m: any) => m.model_id === id) || null : null
+// 上一代（微调父）→ 「名字（model_id）」；找不到记录时退回原始 id
+const parentLabel = (v: any) => {
+  const pid = v?.lineage?.parent_model_id
+  if (!pid) return ''
+  const p = modelById(pid)
+  return p ? `${verTitle(p)}（${pid}）` : String(pid)
+}
+// 基底权重路径 → 人话：库内某模型的权重 / 某次训练任务的产物 / 预训练权重
+const baseLabel = (v: any) => {
+  const bm = String(v?.lineage?.base_model || '')
+  if (!bm) return ''
+  const reg = bm.match(/models\/registry\/([^/]+)\//)
+  if (reg) {
+    const m = modelById(reg[1])
+    return m ? `${verTitle(m)}（${m.model_id}）的权重` : `${reg[1]} 的权重`
+  }
+  const job = bm.match(/jobs\/([^/]+)\/train\//)
+  if (job) {
+    const m = allModels.value.find((x: any) => x.lineage?.job_id === job[1])
+    return m ? `训练任务 ${job[1]} 产出的 ${verTitle(m)}（${m.model_id}）` : `训练任务 ${job[1]} 的产物`
+  }
+  return `预训练权重 ${bm.split('/').pop() || bm}`
+}
 const hasVerMetrics = (v: any) =>
   ['mAP50_95', 'precision', 'recall'].some((k) => metricOf(v, k as any) != null) ||
   !!v?.model_info?.total_params_m
