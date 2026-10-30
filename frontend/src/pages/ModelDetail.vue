@@ -1254,9 +1254,9 @@ async function handleImportModel(e: any) {
   }
 }
 
-// 外层 zip 名可读化：算法库名_版本_产出日期（如 安全帽检测_v1.2_20261028.zip）；
-// display_name/model_code 本身可读（非 model_日期_时间 的 id 形态）时优先用它；
-// 兜底 model_id。磁盘存储名保持 best.pt 不变（预标注引擎按约定路径找它）
+// 外层 zip 名可读化：库名_模型记录ID_版本_产出日期（如 安全帽检测_model_20261028_050107_v1.2.zip）；
+// 版本号作为属性挂后面。主标识优先「可读 display_name/model_code」，否则「库名_模型记录ID」，
+// 兜底 model_id；模型记录ID 已含日期时不再追加日期段避免重复。磁盘存储名保持 best.pt 不变。
 const downloadingVer = ref<string | null>(null)
 const ID_LIKE_RE = /^model[_-]?\d{8}[_-]?\d{6}/i
 function sanitizeFilePart(s: string): string {
@@ -1276,7 +1276,10 @@ function exportZipName(v: any): string {
   const readable = (s: string) => !!s && s !== v.model_id && !ID_LIKE_RE.test(s)
   const dn = String(v.display_name || '').trim()
   const code = String(v.model_code || '').trim()
-  const base = readable(dn) ? dn : readable(code) ? code : (lib || v.model_id)
+  let base: string
+  if (readable(dn)) base = dn
+  else if (readable(code)) base = code
+  else base = lib ? `${lib}_${v.model_id}` : v.model_id
   const parts = [base]
   const ver = String(v.version || '').trim()
   if (ver) {

@@ -1816,9 +1816,9 @@ class ModelService:
     
     @staticmethod
     def _export_weight_filename(meta: dict, model_id: str, lib_name: str = "") -> str:
-        """导出包内权重的可读文件名：算法库名_版本_日期（如 安全帽检测_v1.2_20261028.pt）。
-        display_name/model_code 本身可读（非 model_日期_时间 的 id 形态）时优先，
-        其次算法库名，兜底 model_id；末尾拼版本号与产出日期。
+        """导出包内权重的可读文件名：库名_模型记录ID_版本_日期（如 安全帽检测_model_20261028_050107_v1.2.pt）。
+        display_name/model_code 本身可读（非 model_日期_时间 的 id 形态）时优先；
+        否则库名_模型记录ID；兜底 model_id；末尾拼版本号与产出日期（模型记录ID 已含日期则不重复）。
         磁盘存储名保持 best.pt 不变（预标注引擎按约定路径找它）。"""
         import re as _re
         dn = str(meta.get("display_name") or "").strip()
@@ -1832,7 +1832,7 @@ class ModelService:
                 base = cand
                 break
         if not base and lib:
-            base = lib
+            base = f"{lib}_{model_id}"
         if not base:
             base = code if (code and safe.match(code)) else model_id
         ver = str(meta.get("version") or "").strip()
