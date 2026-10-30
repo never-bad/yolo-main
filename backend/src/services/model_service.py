@@ -1815,18 +1815,24 @@ class ModelService:
         return model_meta
     
     @staticmethod
-    def _export_weight_filename(meta: dict, model_id: str) -> str:
-        """导出包内权重的可读文件名：优先 ASCII 安全的 display_name，其次 model_code，兜底 model_id，
-        再拼版本号（display_name 已含版本后缀时不重复拼）。磁盘存储名保持 best.pt 不变。"""
+    def _export_weight_filename(meta: dict, model_id: str, lib_name: str = "") -> str:
+        """导出包内权重的可读文件名：算法库名_版本_日期（如 安全帽检测_v1.2_20261028.pt）。
+        display_name/model_code 本身可读（非 model_日期_时间 的 id 形态）时优先，
+        其次算法库名，兜底 model_id；末尾拼版本号与产出日期。
+        磁盘存储名保持 best.pt 不变（预标注引擎按约定路径找它）。"""
         import re as _re
         dn = str(meta.get("display_name") or "").strip()
         code = str(meta.get("model_code") or "").strip()
         safe = _re.compile(r"^[A-Za-z0-9._-]+$")
+        id_like = _re.compile(r"^model[_-]?\d{8}[_-]?\d{6}", _re.IGNORECASE)
+        lib = _re.sub(r'[\\/:*?"<>|\s]+', "_", str(lib_name or "").strip())
         base = ""
         for cand in (dn, code):
-            if cand and cand != model_id and safe.match(cand):
+            if cand and cand != model_id and safe.match(cand) and not id_like.match(cand):
                 base = cand
                 break
+        if not base and lib:
+            base = lib
         if not base:
             base = code if (code and safe.match(code)) else model_id
         ver = str(meta.get("version") or "").strip()
@@ -1834,6 +1840,20 @@ class ModelService:
             ver_part = ver if ver.lower().startswith("v") else f"v{ver}"
             if ver_part.lower() not in base.lower() and ver_part.lstrip("vV").lower() not in base.lower():
                 base = f"{base}_{ver_part}"
+        # 日期段：优先 created_at（ISO 形态），否则从 model_id 的 model_YYYYMMDD_HHMMSS 中提取，
+        # 保证同库同名版本不同天可区分
+        date_part = ""
+        created = str(meta.get("created_at") or "").strip()
+        if created and not created.isdigit():
+            digits = _re.sub(r"\D", "", created)
+            if len(digits) >= 8:
+                date_part = digits[:8]
+        if not date_part:
+            mid = _re.search(r"(\d{8})[_-]?\d{6}", model_id)
+            if mid:
+                date_part = mid.group(1)
+        if date_part and date_part not in base:
+            base = f"{base}_{date_part}"
         return f"{base}.pt"
 
     async def export_model(self, model_id: str):
@@ -1852,7 +1872,18 @@ class ModelService:
             temp_zip.close()
             
             meta = load_json(model_file) if model_file.exists() else {}
-            weight_name = self._export_weight_filename(meta or {}, model_id)
+            # 取归属算法库库名，用于拼可读权重文件名（库名_版本_日期）
+            lib_name = ""
+            try:
+                root_id = self.resolve_library_root_id(model_id)
+                if root_id and root_id != model_id:
+                    lib_meta = load_json(self.registry_dir / root_id / "model.json") or {}
+                    lib_name = str(
+                        lib_meta.get("display_name") or lib_meta.get("name") or lib_meta.get("model_code") or ""
+                    ).strip()
+            except Exception:
+                lib_name = ""
+            weight_name = self._export_weight_filename(meta or {}, model_id, lib_name=lib_name)
             
             with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 # 添加model.json

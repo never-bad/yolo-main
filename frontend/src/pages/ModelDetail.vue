@@ -1254,27 +1254,40 @@ async function handleImportModel(e: any) {
   }
 }
 
-// 版本下载：按该版本自己的 model_id 取权重（库下每个版本各有独立权重）
-// 外层 zip 名与包内权重名对齐：优先业务名（display_name，如 shuaidao_v1），
-// 其次 model_code，兜底 model_id；磁盘存储名保持 best.pt 不变（预标注引擎按约定路径找它）
+// 外层 zip 名可读化：算法库名_版本_产出日期（如 安全帽检测_v1.2_20261028.zip）；
+// display_name/model_code 本身可读（非 model_日期_时间 的 id 形态）时优先用它；
+// 兜底 model_id。磁盘存储名保持 best.pt 不变（预标注引擎按约定路径找它）
 const downloadingVer = ref<string | null>(null)
+const ID_LIKE_RE = /^model[_-]?\d{8}[_-]?\d{6}/i
+function sanitizeFilePart(s: string): string {
+  return String(s || '').trim().replace(/[\\/:*?"<>|\s]+/g, '_')
+}
+function datePartOf(t?: string | null): string {
+  if (!t) return ''
+  const d = new Date(t)
+  if (isNaN(d.getTime())) return ''
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`
+}
 function exportZipName(v: any): string {
-  const asciiSafe = /^[A-Za-z0-9._-]+$/
+  const lib = sanitizeFilePart(
+    libraryRoot.value?.display_name || libraryRoot.value?.name || libraryRoot.value?.model_code || ''
+  )
+  const readable = (s: string) => !!s && s !== v.model_id && !ID_LIKE_RE.test(s)
   const dn = String(v.display_name || '').trim()
   const code = String(v.model_code || '').trim()
-  let base = ''
-  if (dn && dn !== v.model_id && asciiSafe.test(dn)) base = dn
-  else if (code && code !== v.model_id && asciiSafe.test(code)) base = code
-  else if (dn) base = dn  // 中文名浏览器下载也能正常显示
-  else base = code || v.model_id
+  const base = readable(dn) ? dn : readable(code) ? code : (lib || v.model_id)
+  const parts = [base]
   const ver = String(v.version || '').trim()
   if (ver) {
     const vp = ver.toLowerCase().startsWith('v') ? ver : 'v' + ver
     if (!base.toLowerCase().includes(vp.toLowerCase()) && !base.toLowerCase().includes(vp.slice(1).toLowerCase())) {
-      base = base + '_' + vp
+      parts.push(vp)
     }
   }
-  return `${base}.zip`
+  const dp = datePartOf(v.created_at)
+  if (dp && !base.includes(dp)) parts.push(dp)
+  return parts.join('_') + '.zip'
 }
 async function downloadVersionWeights(v: any) {
   if (!v?.model_id) return
