@@ -371,9 +371,8 @@
               <button class="danger" @click="cleanOverlaps(); moreOpen = false" :disabled="counts.annotated === 0" title="清理历史遗留的高度重合标注框（跨类别/同类重复）">
                 清理重叠框
               </button>
-              <button @click="exportTask(); moreOpen = false" :disabled="exporting">
-                <span v-if="exporting" class="loading-spinner"></span>
-                {{ exporting ? '导出中...' : '导出' }}
+              <button class="danger" @click="deleteCurrentImage(); moreOpen = false" :disabled="deletingImage || !currentImage" title="删除当前图片（同时删除其标注与同名标签文件），不可恢复，批量标注中也可删除">
+                {{ deletingImage ? '删除中...' : '删除图片' }}
               </button>
               <button
                 v-if="approveEligible"
@@ -508,8 +507,9 @@
             <button class="danger" @click="clearCurrentBoxes" :disabled="!currentBoxes.length" title="清空本图所有标注框">
               清空本图
             </button>
-            <button class="danger" @click="deleteCurrentImage" :disabled="deletingImage || !currentImage" title="快捷键 X：删除当前图片（同时删除其标注与同名标签文件），不可恢复，批量标注中也可删除">
-              {{ deletingImage ? '删除中...' : '删除图片' }}
+            <button @click="exportTask" :disabled="exporting" title="把本数据集已标注结果导出为 YOLO 格式（labels/*.txt）写入数据集目录">
+              <span v-if="exporting" class="loading-spinner"></span>
+              {{ exporting ? '导出中...' : '导出' }}
             </button>
           </div>
         </div>
