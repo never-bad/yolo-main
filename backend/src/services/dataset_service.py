@@ -2016,6 +2016,27 @@ class DatasetService:
             annotated = self._collect_legacy_txt_annotations(dataset_dir)
         if not annotated:
             raise ValueError("没有已标注的图片可封板（annotations/*.json 与 labels/*.txt 均为空）")
+
+        # 未标注图片（images/ 中存在、但没有任何标注文件）→ 作为背景负样本一并纳入封板。
+        # 仅当已存在至少一张已标注图时才纳入，避免「整批完全没标」被误当成可封板的纯负样本集；
+        # 它们会被写进 images/{split} 并配 0 字节标签文件，训练时充当负样本（降低误检）。
+        _ann_paths = {str(r.get("img_abs")) for r in annotated}
+        _added_neg = 0
+        for _stem, _f in img_index.items():
+            if str(_f) in _ann_paths:
+                continue
+            annotated.append({
+                "image_id": _stem,
+                "img_abs": _f,
+                "width": 1,
+                "height": 1,
+                "boxes": [],
+            })
+            _added_neg += 1
+        if _added_neg:
+            logger.info(
+                f"dataset {dataset_dir.name} 纳入 {_added_neg} 张未标注图作为背景负样本"
+            )
         if not any(rec.get("boxes") for rec in annotated):
             # 全是空白标注（人工确认无目标 / AI 困难样本）：照样产出划分与 0 字节 txt，
             # 这类背景负样本集有训练价值，封板不该因为"一个框都没有"而空转（#3）。
