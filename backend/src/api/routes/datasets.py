@@ -26,6 +26,11 @@ class BindModelRequest(BaseModel):
     model_id: Optional[str] = None  # 归属模型；None 表示解除归属
     force: bool = False             # 类别序号对不上时仍强制挂载（前端确认弹窗后才传 True）
 
+class MergeRequest(BaseModel):
+    dataset_ids: list[str]          # 至少 2 个待合并的数据集 id
+    library_root_id: Optional[str] = None  # 归属算法库（缺省取第一个源的归属库）
+    display_name: Optional[str] = None    # 合并后数据集命名（缺省 merged_<时间>）
+
 @router.get("/{dataset_id}/bind-check")
 async def check_dataset_bind(dataset_id: str, model_id: str = Query(...)):
     """挂载前校验：该数据集换绑到 model_id 后，已标注类别的序号会不会错位
@@ -98,6 +103,20 @@ async def list_datasets():
 async def advance_buckets():
     """按模型滚动灌桶（幂等）：A 包标注完成自动灌桶，桶满 SEAL_MIN_IMAGES 自动封板出成品数据集"""
     return await dataset_service.advance_buckets()
+
+@router.post("/merge")
+async def merge_datasets_endpoint(request: MergeRequest):
+    """多数据集合并为持久新数据集（方案 B）：源数据集只读，产出新数据集可直接训练/封板/导出。
+
+    类目统一：提供 library_root_id 且库有标签字典 → 用库字典顺序（字典外类别剔除）；
+    否则各源类别取并集（首次出现顺序）。任一源未生成训练产物（缺 data.yaml / images / labels）则 400。
+    """
+    try:
+        return await dataset_service.merge_datasets(
+            request.dataset_ids, request.library_root_id, request.display_name
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 class SealThresholdRequest(BaseModel):

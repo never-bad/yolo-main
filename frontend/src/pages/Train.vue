@@ -5,6 +5,19 @@
       <div class="form-group">
         <label>选择数据集</label>
         <div class="ds-selectbar">
+          <div class="ds-select-left">
+            <button
+              type="button"
+              class="merge-btn"
+              :disabled="!canMerge || merging"
+              :title="canMerge ? '将选中的多个数据集合并为一个持久数据集（源不被覆盖）' : '请勾选 ≥2 个已准备的数据集'"
+              @click="mergeSelected"
+            >
+              <span v-if="merging" class="loading-spinner"></span>
+              {{ merging ? '合并中...' : '合并为新数据集' }}
+            </button>
+            <span v-if="selectedDatasetIds.length" class="ds-selected-count">已选 {{ selectedDatasetIds.length }} 个</span>
+          </div>
           <button type="button" @click="loadDatasets" class="refresh-btn" :disabled="loadingDatasets">
             <span v-if="loadingDatasets" class="loading-spinner"></span>
             {{ loadingDatasets ? '加载中...' : '刷新' }}
@@ -31,7 +44,7 @@
           </div>
           <div v-if="!loadingDatasets && datasets.length === 0" class="empty-state">暂无已标注导出的数据集，请先在标注页完成标注并导出</div>
         </div>
-        <small>提示：仅显示已标注的数据集，点击卡片选择一个（再次点击取消）</small>
+        <small>提示：仅显示已标注的数据集，点击卡片可多选（再次点击取消）；选中 ≥2 个后点「合并为新数据集」可把它们合成一个持久数据集一起训练（源数据集不会被覆盖）</small>
         <small v-if="!presetLibraryRootId && primaryLibraryId" class="lib-pick-info">
           主数据集归属算法库「{{ libraryNameOf(primaryLibraryId) }}」——训练产出会作为该库的新版本
         </small>
@@ -528,7 +541,7 @@ import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { createTrainJob, listTrainJobs, deleteTrainJob, resumeTrainJob, getTrainJobTree, suggestTrainParams, inferBusiness, listGpus, prepareWeights, type TrainJobRequest } from '@/api/train'
 import { listModels, uploadPretrainedPt, listCustomModels } from '@/api/models'
-import { listDatasets } from '@/api/datasets'
+import { listDatasets, mergeDatasets } from '@/api/datasets'
 import { dsTitle } from '@/utils/dsDisplay'
 import { subscribeLogsSSE, pollLogsTail, getLogLines } from '@/api/logs'
 import FolderTree from '@/components/FolderTree.vue'
@@ -1161,7 +1174,7 @@ const isDatasetPrepared = (dataset: any) => {
   return dataset.status === 'prepared' || dataset.status === 'uploaded'
 }
 
-// 卡片式选择数据集（单选：点击替换，再次点击取消。原阶段1.3多选聚合已按用户要求下线）
+// 卡片式选择数据集（多选切换：点击加入/取消；第一个选中者为主数据集，用于模型/版本推断与训练提交）
 const selectDataset = (ds: any) => {
   if (!isDatasetPrepared(ds)) {
     // 封板中止的具体原因直接说清楚，别让用户对着英文报错猜
@@ -1178,11 +1191,46 @@ const selectDataset = (ds: any) => {
   if (idx >= 0) {
     // 取消选择
     selectedDatasetIds.value.splice(idx, 1)
-    trainForm.value.dataset_id = ''
   } else {
-    // 替换为该数据集（恒单选）
-    selectedDatasetIds.value = [ds.dataset_id]
-    trainForm.value.dataset_id = ds.dataset_id
+    // 加入选中
+    selectedDatasetIds.value.push(ds.dataset_id)
+  }
+  // 主数据集 = 第一个选中（用于模型/版本推断与训练提交）
+  trainForm.value.dataset_id = selectedDatasetIds.value[0] || ''
+}
+
+// 合并数据集（方案 B）：选中 ≥2 且全部就绪 → 合并为持久新数据集，成功后刷新并自动选中它
+const merging = ref(false)
+const canMerge = computed(() =>
+  selectedDatasetIds.value.length >= 2 &&
+  selectedDatasetIds.value.every((id: string) => {
+    const d = datasets.value.find((x: any) => x.dataset_id === id)
+    return d && isDatasetPrepared(d)
+  })
+)
+const mergeSelected = async () => {
+  if (!canMerge.value) return
+  merging.value = true
+  try {
+    const ids = [...selectedDatasetIds.value]
+    const first = datasets.value.find((d: any) => d.dataset_id === ids[0])
+    const libraryRootId = first?.library_root_id || first?.model_id || null
+    const libName = first ? libraryNameOf(libraryRootId) : ''
+    const displayName = (libName ? libName + '合并' : '合并数据集') + `（${ids.length}源）`
+    const res = await mergeDatasets(ids, libraryRootId, displayName)
+    showToast(
+      `已合并为「${res.display_name}」：${res.total_images} 张图、${res.unified_names.length} 类。可直接开始训练`,
+      'info', 6000
+    )
+    await loadDatasets()
+    // 自动选中新合并的数据集（旧源保留，不覆盖）
+    selectedDatasetIds.value = [res.dataset_id]
+    trainForm.value.dataset_id = res.dataset_id
+  } catch (e: any) {
+    const detail = e?.response?.data?.detail || e?.message || '未知错误'
+    showToast('合并失败：' + detail, 'error', 6000)
+  } finally {
+    merging.value = false
   }
 }
 
@@ -2405,8 +2453,39 @@ onUnmounted(() => {
 
 .ds-selectbar {
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
+  align-items: center;
   margin-bottom: 0.5rem;
+}
+
+.ds-select-left {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.ds-selected-count {
+  font-size: 0.8rem;
+  color: #5b6472;
+}
+
+.merge-btn {
+  padding: 0.35rem 0.8rem;
+  border: 1px solid #2f7d3b;
+  background: #eaf6ec;
+  color: #2f7d3b;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.merge-btn:hover:not(:disabled) {
+  background: #d8efdc;
+}
+
+.merge-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .ds-grid {

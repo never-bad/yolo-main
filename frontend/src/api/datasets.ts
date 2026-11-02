@@ -126,6 +126,20 @@ export const advanceBuckets = async () => {
   return data
 }
 
+// 方案 B：多数据集合并为持久新数据集（源只读，产出新数据集可直接训练/封板/导出）
+export const mergeDatasets = async (
+  datasetIds: string[],
+  libraryRootId?: string | null,
+  displayName?: string | null
+) => {
+  const { data } = await api.post('/datasets/merge', {
+    dataset_ids: datasetIds,
+    library_root_id: libraryRootId ?? null,
+    display_name: displayName ?? null,
+  })
+  return data
+}
+
 // 封板/桶灌数量门槛：查询与在线修改（持久化到 data/seal_threshold.json）
 // modelId 传入 = 单独覆盖该库；不传 = 改全局默认；value 传 -1 = 该库恢复跟随全局
 export const getSealThreshold = async (): Promise<{ seal_min_images: number; default: number; seal_max_days: number; per_model: Record<string, number> }> => {

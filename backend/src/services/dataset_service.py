@@ -89,6 +89,35 @@ def _save_yaml(path: Path, data: dict):
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(data, f, allow_unicode=True)
 
+
+def _norm_class_name(name) -> str:
+    """类别名归一化（小写 + 去空白），用于跨数据集/算法库字典匹配"""
+    return re.sub(r"\s+", "", str(name or "")).strip().lower()
+
+
+def _names_list(names) -> list:
+    """将 data.yaml 的 names（list / dict）归一化为按类 ID 排序的类别名列表"""
+    if isinstance(names, dict):
+        return [str(names[k]) for k in sorted(names)]
+    if isinstance(names, list):
+        return [str(n) for n in names]
+    return []
+
+
+def _link_or_copy(src: Path, dst: Path):
+    """优先硬链接（零拷贝，同卷），失败（跨卷/无权限）回退普通复制"""
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _count_images(path: Path) -> int:
+    """统计目录下图片数量（jpg/jpeg/png/bmp/webp，含子目录）"""
+    if not path.exists():
+        return 0
+    return sum(1 for f in path.rglob("*") if f.is_file() and f.suffix.lower() in IMG_SUFFIX)
+
 def _write_bytes(path: Path, content: bytes):
     """同步写入二进制文件"""
     with open(path, "wb") as f:
@@ -484,7 +513,237 @@ class DatasetService:
         from src.db import shadow
         await shadow.sync_dataset(dataset_id)
         return meta
-    
+
+    # ---------- 多数据集合并为持久新数据集（方案 B） ----------
+    def _merge_copy_source(self, s_dir: Path, s_names: list, unified_index: dict,
+                           img_dir: Path, lbl_dir: Path, src_idx: int) -> dict:
+        """逐源复制（同步）：把单个源数据集的图片硬链接 + 标签按统一类目重写到合并目录。
+
+        - 图片：images/{split}/<src_idx>_<原名>（保留子目录结构，前缀隔离跨源重名）。
+        - 标签：labels/{split}/<src_idx>_<原名>.txt 按 class 序号重映射；被统一类目剔除的行丢弃。
+        - 返回该源的统计（图数/标签数/丢弃类/丢弃行/映射）。
+        源数据集只读，不改动。
+        """
+        mapping = {}
+        dropped = []
+        for old, nm in enumerate(s_names):
+            key = _norm_class_name(nm)
+            if key in unified_index:
+                mapping[str(old)] = str(unified_index[key])
+            else:
+                dropped.append(nm)
+        cnt_img = 0
+        cnt_txt = 0
+        dropped_rows = 0
+        for split in ("train", "val", "test"):
+            src_img = s_dir / "images" / split
+            src_lbl = s_dir / "labels" / split
+            if not src_img.exists():
+                continue
+            dst_img = img_dir / split
+            dst_lbl = lbl_dir / split
+            dst_img.mkdir(parents=True, exist_ok=True)
+            dst_lbl.mkdir(parents=True, exist_ok=True)
+            for img in src_img.rglob("*"):
+                if not img.is_file() or img.suffix.lower() not in IMG_SUFFIX:
+                    continue
+                rel = img.relative_to(src_img)
+                dst = dst_img / rel.parent / (f"{src_idx}_{rel.name}")
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                _link_or_copy(img, dst)
+                cnt_img += 1
+            if src_lbl.exists():
+                for txt in src_lbl.rglob("*.txt"):
+                    rel = txt.relative_to(src_lbl)
+                    dst = dst_lbl / rel.parent / (f"{src_idx}_{rel.name}")
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    new_lines = []
+                    with open(txt, "r", encoding="utf-8", errors="ignore") as fh:
+                        for line in fh:
+                            parts = line.split()
+                            if not parts:
+                                continue
+                            new_id = mapping.get(parts[0])
+                            if new_id is None:
+                                dropped_rows += 1
+                                continue
+                            parts[0] = new_id
+                            new_lines.append(" ".join(parts) + "\n")
+                    with open(dst, "w", encoding="utf-8") as fh:
+                        fh.writelines(new_lines)
+                    cnt_txt += 1
+        return {
+            "dataset_id": s_dir.name,
+            "images": cnt_img,
+            "labels": cnt_txt,
+            "dropped_classes": dropped,
+            "dropped_rows": dropped_rows,
+            "class_mapping": mapping,
+        }
+
+    async def merge_datasets(self, dataset_ids: list, library_root_id: str = None,
+                             display_name: str = None) -> dict:
+        """多数据集合并为持久新数据集（方案 B）：源数据集只读、不被破坏。
+
+        产出 ds_merged_<ts> 出现在数据集列表，可直接训练/封板/导出/再次合并。
+        - 类目统一：library_root_id 提供且库有标签字典 → 用库字典顺序（字典外类别剔除）；
+          否则各源类别并集（首次出现顺序）。
+        - 图片硬链接（回退复制）+ 标签按映射重写；写与封板同格式 data.yaml（无 path 键）
+          + meta.json（stage=SEALED, annotated=true）。
+        """
+        if not dataset_ids or len(dataset_ids) < 2:
+            raise ValueError("合并至少需要 2 个数据集")
+        dataset_ids = [str(x).strip() for x in dataset_ids if x]
+
+        # 解析归属库：优先传入，否则取第一个源的归属库
+        if not library_root_id:
+            first_meta_p = self.datasets_dir / dataset_ids[0] / "meta.json"
+            if await asyncio.to_thread(lambda p=first_meta_p: p.exists()):
+                first_meta = await asyncio.to_thread(load_json, first_meta_p)
+                library_root_id = first_meta.get("library_root_id") or first_meta.get("model_id")
+
+        # 1. 校验每个源就绪（根 data.yaml + images/ + labels/）
+        sources = []
+        for ds_id in dataset_ids:
+            ds_dir = self.datasets_dir / ds_id
+            yaml_p = ds_dir / "data.yaml"
+            if not await asyncio.to_thread(lambda p=yaml_p: p.exists()):
+                raise ValueError(
+                    f"数据集 {ds_id} 尚未生成训练产物（缺少 data.yaml），"
+                    f"请先在数据集页执行「准备/封板」再合并"
+                )
+            try:
+                cfg = await asyncio.to_thread(_load_yaml, yaml_p)
+            except Exception as e:
+                raise ValueError(f"数据集 {ds_id} 的 data.yaml 解析失败: {e}")
+            names = _names_list(cfg.get("names", []))
+            if not names:
+                raise ValueError(f"数据集 {ds_id} 的 data.yaml 未解析到类别名")
+            img_root = ds_dir / "images"
+            lbl_root = ds_dir / "labels"
+            if not (await asyncio.to_thread(lambda p=img_root: p.exists())
+                    and await asyncio.to_thread(lambda p=lbl_root: p.exists())):
+                raise ValueError(f"数据集 {ds_id} 缺少 images/labels 目录，无法合并")
+            sources.append({"dir": ds_dir, "names": names})
+
+        # 2. 统一类别命名空间
+        unified_names = []
+        model_codes = []
+        if library_root_id:
+            dict_file = settings.REGISTRY_DIR / library_root_id / "labels_dict.json"
+            if await asyncio.to_thread(lambda p=dict_file: p.exists()):
+                try:
+                    _dic = await asyncio.to_thread(load_json, dict_file)
+                    _labels = sorted(_dic.get("labels") or [], key=lambda x: int(x.get("index", 0)))
+                    model_codes = [(l.get("english_code") or "").strip() for l in _labels]
+                except Exception:
+                    model_codes = []
+        model_key_set = {_norm_class_name(c) for c in model_codes if c}
+        unified_index = {}
+        for s in sources:
+            for nm in s["names"]:
+                key = _norm_class_name(nm)
+                if model_key_set and key not in model_key_set:
+                    continue
+                if key not in unified_index:
+                    unified_index[key] = len(unified_names)
+                    if model_key_set:
+                        display = next((c for c in model_codes if _norm_class_name(c) == key), nm)
+                    else:
+                        display = nm
+                    unified_names.append(display)
+        if not unified_names:
+            raise ValueError(
+                "合并后类别为空：各源类别与算法库标签字典无交集，或各源均无任何类别"
+            )
+
+        # 3. 创建新数据集目录（ds_merged_<ts> 前缀，冲突自增）
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base_id = f"ds_merged_{ts}"
+        dataset_id = base_id
+        n = 1
+        ds_dir = self.datasets_dir / dataset_id
+        while await asyncio.to_thread(lambda p=ds_dir: p.exists()):
+            n += 1
+            dataset_id = f"{base_id}_{n}"
+            ds_dir = self.datasets_dir / dataset_id
+        await asyncio.to_thread(lambda p=ds_dir: p.mkdir(parents=True, exist_ok=True))
+        img_dir = ds_dir / "images"
+        lbl_dir = ds_dir / "labels"
+
+        # 4. 逐源复制（每个源一个同步块，避免成千上万次 to_thread）
+        per_ds = []
+        total_images = 0
+        total_labels = 0
+        for i, s in enumerate(sources):
+            stat = await asyncio.to_thread(
+                self._merge_copy_source, s["dir"], s["names"], unified_index, img_dir, lbl_dir, i
+            )
+            per_ds.append(stat)
+            total_images += stat["images"]
+            total_labels += stat["labels"]
+
+        # 按已写目录统计各 split 图数（决定 data.yaml 是否含 test / val 回退）
+        split_counts = {}
+        for split in ("train", "val", "test"):
+            d = img_dir / split
+            split_counts[split] = await asyncio.to_thread(_count_images, d) if d.exists() else 0
+
+        # 5. data.yaml（同封板格式，无 path 键；无独立 val 时回退 train 作验证集）
+        yaml_data = {"nc": len(unified_names), "names": unified_names, "task": "detect"}
+        if split_counts.get("train"):
+            yaml_data["train"] = "images/train"
+        if split_counts.get("val"):
+            yaml_data["val"] = "images/val"
+        elif split_counts.get("train"):
+            yaml_data["val"] = "images/train"
+        if split_counts.get("test"):
+            yaml_data["test"] = "images/test"
+        await asyncio.to_thread(_save_yaml, ds_dir / "data.yaml", yaml_data)
+
+        # 6. meta.json（stage=SEALED，可直接训练；记录 merged_from 溯源）
+        now = datetime.now().isoformat()
+        meta = {
+            "dataset_id": dataset_id,
+            "display_name": display_name or f"merged_{ts}",
+            "filename": display_name or f"merged_{ts}",
+            "size": 0,
+            "uploaded_at": now,
+            "status": "prepared",
+            "stage": STAGE_SEALED,
+            "training_status": TRAIN_STATUS_INCOMPLETE,
+            "version": "v1",
+            "image_count": total_images,
+            "label_count": total_labels,
+            "has_labels": total_labels > 0,
+            "classes": unified_names,
+            "annotated": True,
+            "merged_from": dataset_ids,
+            "merged_at": now,
+            "library_root_id": library_root_id,
+            "model_id": library_root_id,
+            "is_merged": True,
+            "split_counts": {k: v for k, v in split_counts.items() if v},
+        }
+        await asyncio.to_thread(save_json_atomic, ds_dir / "meta.json", meta)
+
+        # 7. 影子库收口 + 失效列表缓存
+        from src.db import shadow
+        await shadow.sync_dataset(dataset_id)
+        with _LIST_CACHE_LOCK:
+            _LIST_CACHE["sig"] = None
+            _LIST_CACHE["result"] = None
+
+        return {
+            "dataset_id": dataset_id,
+            "display_name": meta["display_name"],
+            "unified_names": unified_names,
+            "total_images": total_images,
+            "total_labels": total_labels,
+            "sources": per_ds,
+            "library_root_id": library_root_id,
+        }
+
     async def _rollback_model_binding_on_prepare_failure(self, meta_path: Path):
         """准备失败 → 解除数据集与模型的挂载（失败的不留半成品在算法库，省去手动删）。"""
         try:
