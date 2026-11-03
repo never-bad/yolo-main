@@ -350,7 +350,7 @@
             </div>
             <div class="viewer-grid">
               <div v-for="img in viewerImages" :key="img" class="viewer-thumb" :class="{ 'thumb-selected': !!poolSelected[img] }" @click="togglePoolSelect(img)">
-                <img :src="'/static/' + img" loading="lazy" @error="handleImgError" />
+                <img :src="'/prod-api/static/' + img" loading="lazy" @error="handleImgError" />
                 <span class="thumb-check" :class="{ checked: !!poolSelected[img] }">{{ poolSelected[img] ? '✓' : '' }}</span>
               </div>
             </div>
@@ -367,7 +367,7 @@
           <button class="secondary viewer-close" @click="closeFilePreview">关闭</button>
         </div>
         <div v-if="filePreviewIsImage" class="file-preview-img-wrap">
-          <img :src="'/static/' + filePreview.path" @error="handleImgError" />
+          <img :src="'/prod-api/static/' + filePreview.path" @error="handleImgError" />
         </div>
         <pre v-else class="file-preview-text">{{ filePreviewContent || '加载中...' }}</pre>
       </div>
@@ -807,7 +807,7 @@ const openFile = async (node: any) => {
   filePreviewIsImage.value = FILE_IMG_EXTS.includes((node.ext || '').toLowerCase())
   if (filePreviewIsImage.value) return
   try {
-    const res = await fetch('/static/' + node.path)
+    const res = await fetch('/prod-api/static/' + node.path)
     if (!res.ok) throw new Error('HTTP ' + res.status)
     filePreviewContent.value = await res.text()
   } catch (e: any) {

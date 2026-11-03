@@ -2016,10 +2016,10 @@ const loadImageToCanvas = () => {
   imagePath = imagePath.replace(/\\/g, '/')
   // 去掉可能的 backend/data/ 或 data/ 前缀（兼容旧格式）
   imagePath = imagePath.replace(/^(backend\/)?data\//, '')
-  // 确保路径不以 / 开头（因为会加上 /static/ 前缀）
+  // 确保路径不以 / 开头（因为会加上 /prod-api/static/ 前缀）
   imagePath = imagePath.replace(/^\//, '')
-  // 静态文件路径不使用 API 基础路径，直接使用 /static/
-  const imageUrl = '/static/' + imagePath
+  // 静态文件路径统一走 /prod-api/static 通道（经 nginx 重写到后端 /static，兼容外网隧道/反代）
+  const imageUrl = '/prod-api/static/' + imagePath
   
   img.value = new Image()
   img.value.crossOrigin = 'anonymous'

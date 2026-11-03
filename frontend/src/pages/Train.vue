@@ -491,12 +491,12 @@
         <div class="viewer-header">
           <h3>{{ jobFilePreview.name }}</h3>
           <div class="viewer-header-actions">
-            <a class="secondary" :href="'/static/' + jobFilePreview.path" :download="jobFilePreview.name">⬇ 下载原文件</a>
+            <a class="secondary" :href="'/prod-api/static/' + jobFilePreview.path" :download="jobFilePreview.name">⬇ 下载原文件</a>
             <button class="secondary viewer-close" @click="closeJobFilePreview">关闭</button>
           </div>
         </div>
         <div v-if="jobFilePreviewIsImage" class="file-preview-img-wrap">
-          <img :src="'/static/' + jobFilePreview.path" @error="handleFileImgError" />
+          <img :src="'/prod-api/static/' + jobFilePreview.path" @error="handleFileImgError" />
         </div>
         <div v-else-if="jobFilePreviewIsText" class="text-preview-wrap">
           <pre class="file-preview-text">{{ jobFilePreviewContent || '加载中...' }}</pre>
@@ -1966,7 +1966,7 @@ const openJobFile = async (node: any) => {
   jobFilePreviewIsText.value = JOB_TEXT_EXTS.includes(fileExt(node.ext))
   if (jobFilePreviewIsImage.value || !jobFilePreviewIsText.value) return
   try {
-    const res = await fetch('/static/' + node.path)
+    const res = await fetch('/prod-api/static/' + node.path)
     if (!res.ok) throw new Error('HTTP ' + res.status)
     jobFilePreviewContent.value = await res.text()
   } catch (e: any) {

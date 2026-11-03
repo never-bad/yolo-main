@@ -50,6 +50,17 @@ export default defineConfig(({ mode }) => {
               console.log('static proxy error', err)
             })
           }
+        },
+        // 生产通道：/prod-api/static/... 在 dev 下也需要 rewrite 剥前缀转发到后端（兼容外网隧道/反代的统一静态路径）
+        '/prod-api': {
+          target: apiTarget,
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/prod-api/, ''),
+          configure: (proxy, _options) => {
+            proxy.on('error', (err, _req, _res) => {
+              console.log('prod-api proxy error', err)
+            })
+          }
         }
       }
     }
