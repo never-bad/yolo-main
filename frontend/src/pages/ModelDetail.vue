@@ -283,11 +283,42 @@
                   @click="downloadVersionWeights(v)"
                 >{{ downloadingVer === v.model_id ? '下载中...' : '⬇ 下载 .pt' }}</button>
               </div>
+              <div v-if="hasVerMetrics(v)" class="ver-metrics">
+                <div class="ver-metric">
+                  <span class="vm-label">mAP50-95</span>
+                  <b>{{ fmtPct(metricOf(v, 'mAP50_95')) }}</b>
+                </div>
+                <div class="ver-metric">
+                  <span class="vm-label">Precision</span>
+                  <b>{{ fmtPct(metricOf(v, 'precision')) }}</b>
+                </div>
+                <div class="ver-metric">
+                  <span class="vm-label">Recall</span>
+                  <b>{{ fmtPct(metricOf(v, 'recall')) }}</b>
+                </div>
+                <div class="ver-metric">
+                  <span class="vm-label">参数量</span>
+                  <b>{{ v.model_info?.total_params_m ? v.model_info.total_params_m + 'M' : '—' }}</b>
+                </div>
+              </div>
               <div class="ver-meta">
                 <span>产出时间：{{ fmtTime(v.created_at) }}</span>
                 <span v-if="v.model_id">模型记录：{{ v.model_id }}</span>
                 <span v-if="v.lineage?.job_id">训练任务：{{ v.lineage.job_id }}</span>
                 <span v-if="baseLabel(v)">基底：{{ baseLabel(v) }}</span>
+              </div>
+              <div v-if="v.gatekeeper" class="gk-compare">
+                <div class="gk-box">
+                  <div class="gk-title">守门员评估</div>
+                  <div class="gk-report-text">{{ v.gatekeeper.report }}</div>
+                  <div v-if="v.gatekeeper.regressed_classes?.length" class="gk-regressed">
+                    退化类别：
+                    <span v-for="c in v.gatekeeper.regressed_classes" :key="c" class="gk-regressed-item">{{ c }}</span>
+                  </div>
+                  <div v-if="deltaOf(v)" class="gk-delta">
+                    对比上一代：mAP50-95 {{ deltaOf(v)?.deltaText }}
+                  </div>
+                </div>
               </div>
             </div>
           </div>
