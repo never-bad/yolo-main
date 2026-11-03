@@ -341,7 +341,7 @@
             <span class="job-pill" :class="'jp-' + jobPillKey(job.status)">{{ jobStatusText(job.status) }}</span>
           </div>
           <p>任务id: {{ job.job_id }}&nbsp;|&nbsp;模型: {{ (job.model_name || '').split(/[\\/]/).pop() }}&nbsp;|&nbsp;{{ job.epochs }} 轮&nbsp;|&nbsp;Img {{ job.imgsz }}&nbsp;|&nbsp;Batch {{ job.batch }}</p>
-          <p>节点: {{ job.gpu_index != null && job.gpu_index !== undefined ? 'GPU ' + job.gpu_index : '自动选择' }}&nbsp;|&nbsp;启动: {{ new Date(job.created_at).toLocaleString() }}</p>
+          <p>节点: {{ job.gpu_index != null && job.gpu_index !== undefined ? 'GPU ' + job.gpu_index : '自动选择' }}&nbsp;|&nbsp;启动: {{ new Date(job.created_at).toLocaleString() }}&nbsp;|&nbsp;训练时长: {{ jobDuration(job) }}</p>
           <p class="job-badges">
             <span v-if="job.gpu_abnormal" class="gpu-abnormal-badge" title="GPU 利用率持续过低，系统自动停止训练">⚠️ GPU 异常熔断</span>
             <span v-if="job.early_stopped" class="early-stop-badge" title="模型已收敛，系统自动提前停止训练以节省资源">✓ 已完成（早停）</span>
@@ -1315,6 +1315,27 @@ const jobOffsets = new Map<string, number>()
 // 每秒跳动一次，用于实时显示"最后更新 X 秒前"（判断训练是否卡住）
 const nowTick = ref(Date.now())
 let nowTimer: any = null
+
+// 训练时长：已完成用 completed_at - created_at；进行中/排队中实时用 nowTick - created_at
+const jobDuration = (job: any): string => {
+  const start = job?.created_at ? new Date(job.created_at).getTime() : 0
+  if (!start) return '—'
+  const end = job?.completed_at
+    ? new Date(job.completed_at).getTime()
+    : ['running', 'training', 'pending', 'queued'].includes(job?.status)
+      ? nowTick.value
+      : job?.failed_at ? new Date(job.failed_at).getTime()
+        : job?.stopped_at ? new Date(job.stopped_at).getTime()
+          : job?.crashed_at ? new Date(job.crashed_at).getTime()
+            : nowTick.value
+  const sec = Math.max(0, Math.floor((end - start) / 1000))
+  const h = Math.floor(sec / 3600)
+  const m = Math.floor((sec % 3600) / 60)
+  const s = sec % 60
+  if (h > 0) return `${h}时${m}分${s}秒`
+  if (m > 0) return `${m}分${s}秒`
+  return `${s}秒`
+}
 
 // 去除 ANSI 转义码
 const stripAnsi = (text: string): string => text.replace(/\x1B\[[0-9;]*[mK]/g, '')

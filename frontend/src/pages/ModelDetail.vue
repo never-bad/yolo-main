@@ -340,6 +340,7 @@
               <th>数据集</th>
               <th>模型 / 轮数</th>
               <th>启动时间</th>
+              <th>训练时长</th>
               <th>操作</th>
             </tr>
           </thead>
@@ -352,6 +353,7 @@
               <td>{{ j.dataset_id }}</td>
               <td>{{ j.model_name }} · {{ j.epochs }} 轮</td>
               <td>{{ fmtTime(j.created_at) }}</td>
+              <td>{{ fmtDuration(j) }}</td>
               <td>
                 <div class="row-actions">
                   <router-link :to="`/train`"><button class="ghost small">查看</button></router-link>
@@ -707,6 +709,25 @@ function fmtTime(t?: string | null): string {
 function fmtPct(v: number | null | undefined): string {
   if (v == null) return '—'
   return (v >= 0 && v <= 1.5 ? (v * 100).toFixed(1) + '%' : Number(v).toFixed(2))
+}
+
+function fmtDuration(job: any): string {
+  const start = job?.created_at ? new Date(job.created_at).getTime() : 0
+  if (!start) return '—'
+  const end = job?.completed_at
+    ? new Date(job.completed_at).getTime()
+    : job?.failed_at ? new Date(job.failed_at).getTime()
+      : job?.stopped_at ? new Date(job.stopped_at).getTime()
+        : job?.crashed_at ? new Date(job.crashed_at).getTime()
+          : 0
+  if (!end) return '—'
+  const sec = Math.max(0, Math.floor((end - start) / 1000))
+  const h = Math.floor(sec / 3600)
+  const m = Math.floor((sec % 3600) / 60)
+  const s = sec % 60
+  if (h > 0) return `${h}时${m}分${s}秒`
+  if (m > 0) return `${m}分${s}秒`
+  return `${s}秒`
 }
 
 function metricOf(v: any, key: 'mAP50_95' | 'precision' | 'recall') {
