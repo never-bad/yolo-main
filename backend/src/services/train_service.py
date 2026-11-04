@@ -1705,7 +1705,8 @@ class TrainService:
                        migration_target: str = None, migration_source: str = None,
                        migration_lr0_degraded: bool = False,
                        library_root_id: str = None,
-                       base_model_id: str = None):
+                       base_model_id: str = None,
+                       lineage_base_model: str = None):
         """启动训练进程（同步方法，在线程中调用）
 
         2.4 迁移训练参数（训练模块规范 §3.2.2）：
@@ -1760,7 +1761,11 @@ class TrainService:
         # 算法库归属：产出模型注册时带上该字段，使同一库的多个版本聚合在一起
         if library_root_id:
             cmd += ["--library-root-id", str(library_root_id)]
-        
+
+        # 血缘基座：断点续训时 --model 是 last.pt，另传最初的原始基座供档案/架构解析使用
+        if lineage_base_model:
+            cmd += ["--lineage-base-model", str(lineage_base_model)]
+
         if resume:
             cmd.append("--resume")
         
@@ -2262,7 +2267,12 @@ class TrainService:
             f"{resume_mig.get('source_model_id')} [{resume_mig.get('source_architecture')}]"
             if need_mig else None,
             bool(resume_mig.get("lr0_degraded")),
-            job_meta.get("library_root_id")
+            job_meta.get("library_root_id"),
+            # 修复：续训原来漏传 base_model_id，导致产出模型的 parent_model_id
+            # 退化成守门员基线（血缘链断裂）。job_meta 里本来就存着，补上即可
+            job_meta.get("base_model_id"),
+            # 血缘基座沿用最初的原始权重；--model 传的是 last.pt，只用于恢复训练
+            job_meta.get("original_model_path") or job_meta.get("model_name")
         )
         
         return {"job_id": job_id, "status": "running", "message": "Training resumed from checkpoint"}

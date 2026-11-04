@@ -467,6 +467,9 @@ def main():
     parser.add_argument("--baseline-model-id", type=str, default=None, help="上一代生产模型的 model_id（守门员对比基准，写入血缘）")
     parser.add_argument("--base-model-id", type=str, default=None,
                         help="真正微调父模型的 model_id（写入血缘 parent_model_id 用于展示；与守门员基线区分）")
+    parser.add_argument("--lineage-base-model", type=str, default=None,
+                        help="血缘基座（最初的基座权重/名称）：断点续训时 --model 是 last.pt（仅用于恢复），"
+                             "档案里的 base_model / architecture 仍要记最初基座，不能写成中间 checkpoint")
     parser.add_argument("--library-root-id", type=str, default=None,
                         help="所属算法库根记录 model_id：产出版本写入该字段，库详情据此聚合版本")
     # 2.4 跨代迁移训练（训练模块规范 §3.2.2）：源/目标架构不同时 strict=False 加载
@@ -478,7 +481,12 @@ def main():
                         help="lr0 已由后端自动降 10 倍（仅 [Migration] 日志标注）")
     
     args = parser.parse_args()
-    
+
+    # 断点续训时 --model 指向本任务的 last.pt（只用于 YOLO 恢复 epoch/优化器状态），
+    # 但模型档案里的「基座」必须沿用最初的原始基座。两者解耦，避免把中间 checkpoint
+    # 写进 base_model / 血缘，也避免 parse_architecture("last.pt") 把架构记成 "last"。
+    lineage_base = args.lineage_base_model or args.model
+
     print(f"[{datetime.now().isoformat()}] Starting training job: {args.job_id}")
     print(f"[{datetime.now().isoformat()}] Dataset: {args.data}")
     print(f"[{datetime.now().isoformat()}] Model: {args.model}")
@@ -832,21 +840,21 @@ def main():
         # 后续按任务展示/筛选/导出全部会串，故改为取模型真实任务，取不到再按文件名兜底。
         train_task = str(getattr(model, "task", "") or "").strip().lower()
         if train_task not in ("detect", "segment", "pose", "classify", "obb"):
-            train_task = "segment" if "-seg" in str(args.model).lower() else "detect"
-        print(f"[{datetime.now().isoformat()}] 模型任务类型: {train_task}（基座: {args.model}）")
+            train_task = "segment" if "-seg" in str(lineage_base).lower() else "detect"
+        print(f"[{datetime.now().isoformat()}] 模型任务类型: {train_task}（血缘基座: {lineage_base}）")
 
         model_meta = {
             "model_id": model_id,
             "job_id": args.job_id,
-            "base_model": args.model,
+            "base_model": lineage_base,
             "task": train_task,
             "classes": normalize_class_names(data_config.get("names", [])),
             "imgsz": args.imgsz,
             "epochs": args.epochs,
             "created_at": datetime.now().isoformat(),
             "weights_path": str(weights_path_abs),
-            # M11：architecture 三字段（从 base_model 解析，训练产出即写入）
-            **parse_architecture(args.model),
+            # M11：architecture 三字段（从血缘基座解析，续训时不从 last.pt 推架构）
+            **parse_architecture(lineage_base),
             # 模型仓库 / 守门员字段
             "business": args.business,
             "status": status,
@@ -856,7 +864,7 @@ def main():
             "lineage": {
                 # 微调时 parent 指向真正的微调父（base_model_id）；从零训练退回守门员基线
                 "parent_model_id": args.base_model_id or args.baseline_model_id,
-                "base_model": args.model,
+                "base_model": lineage_base,
                 "dataset_id": dataset_id,
                 "job_id": args.job_id,
             },
