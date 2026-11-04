@@ -2347,7 +2347,7 @@ class DatasetService:
                                 "dataset_id": dataset_dir.name,
                                 "display_name": dataset_dir.name,
                                 "filename": dataset_dir.name,
-                                "size": await asyncio.to_thread(_dir_size, dataset_dir),
+                                "size": _dir_size(dataset_dir),
                                 "uploaded_at": "",
                                 "status": "prepared",
                                 "stage": STAGE_SEALED,

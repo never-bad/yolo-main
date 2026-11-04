@@ -55,6 +55,12 @@ COPY backend/scripts /app/scripts
 # 数据目录：dataset 持久化在 /app/data（compose 用命名卷挂载）；训练输出写入 /app/runs
 RUN mkdir -p /app/data /app/runs
 
+# 离线化 ultralytics 画图字体（Arial.ttf）：默认缓存于容器内 /root/.config/Ultralytics/Arial.ttf，
+# 该路径不在命名卷，每次 force-recreate 会丢失 → 弱网重建时首幅图去 ultralytics.com 下载卡死。
+# 此处烤进镜像，根治“重建容器后首训卡死”问题（前端本地 Windows 字体已拷入 docker/Arial.ttf）。
+RUN mkdir -p /root/.config/Ultralytics
+COPY docker/Arial.ttf /root/.config/Ultralytics/Arial.ttf
+
 # 前端产物（阶段 A）与单容器 nginx 配置
 COPY --from=frontend-builder /app/dist /usr/share/nginx/html
 COPY docker/nginx.conf /etc/nginx/nginx.conf
