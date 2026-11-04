@@ -23,9 +23,19 @@
             {{ loadingDatasets ? '加载中...' : '刷新' }}
           </button>
         </div>
+        <div v-if="datasets.length > 0" class="ds-pager">
+          <span class="ds-pager-info">共 {{ datasets.length }} 个 · 第 {{ dsPage }}/{{ dsPageCount }} 页</span>
+          <span class="ds-pager-nav">
+            <button type="button" class="ds-pager-btn" :disabled="dsPage <= 1" @click="dsPage = dsPage - 1">上一页</button>
+            <button type="button" class="ds-pager-btn" :disabled="dsPage >= dsPageCount" @click="dsPage = dsPage + 1">下一页</button>
+          </span>
+          <select v-model.number="dsPageSize" class="ds-pager-size" :disabled="loadingDatasets">
+            <option v-for="n in DS_PAGE_SIZES" :key="n" :value="n">每页 {{ n }} 个</option>
+          </select>
+        </div>
         <div class="ds-grid">
           <div
-            v-for="ds in datasets"
+            v-for="ds in pagedDatasets"
             :key="ds.dataset_id"
             :class="['ds-card', { selected: isDsSelected(ds.dataset_id), disabled: !isDatasetPrepared(ds) }]"
             @click="selectDataset(ds)"
@@ -37,7 +47,9 @@
             <div class="ds-card-info">
               <span>数据集id：{{ ds.dataset_id }}</span>
               <span v-if="ds.image_count">{{ ds.image_count }} 张图片</span>
-              <span v-if="ds.classes && ds.classes.length">{{ ds.classes.length }} 类</span>
+              <span v-if="ds.classes && ds.classes.length" class="ds-classes" :title="ds.classes.join(', ')">
+                {{ ds.classes.length }} 类: {{ ds.classes.slice(0, 3).join(', ') }}<template v-if="ds.classes.length > 3"> 等</template>
+              </span>
             </div>
             <div v-if="ds.seal_skipped_reason" class="ds-card-warn" :title="ds.seal_skipped_reason">封板中止，需先处理</div>
             <div v-else-if="!isDatasetPrepared(ds)" class="ds-card-warn">需先"准备"</div>
@@ -824,6 +836,33 @@ const currentModelLabel = computed(() => {
   return hit ? modelOptTitle(hit) : trainForm.value.model_name
 })
 const datasets = ref<any[]>([])
+// 卡片网格分页（与标注页一致）：已标注数据集几十个，一次铺满会把「创建训练任务」卡片拉得很长。
+// 这里只切分渲染范围；多选状态 selectedDatasetIds 是全量的，不受分页影响。
+const dsPageSize = ref(10)          // 每页条数，默认 10
+const dsPage = ref(1)               // 当前页（1-based）
+const DS_PAGE_SIZES = [10, 20, 30, 50]
+const dsPageCount = computed(() => Math.max(1, Math.ceil(datasets.value.length / dsPageSize.value)))
+const pagedDatasets = computed(() => {
+  const start = (dsPage.value - 1) * dsPageSize.value
+  return datasets.value.slice(start, start + dsPageSize.value)
+})
+// 某个数据集落在第几页；不在列表里返回 0
+const dsPageOf = (id: string) => {
+  const i = datasets.value.findIndex((d: any) => d.dataset_id === id)
+  return i < 0 ? 0 : Math.floor(i / dsPageSize.value) + 1
+}
+// 分页后避免「已选 N 个」但当前页一个选中卡片都看不到（URL 预选 / 恢复配置 / 刷新数据）：
+// 仅当当前页完全没有选中项时才跳到主数据集所在页，避免刷新打断正在翻页的用户。
+const ensureSelectedVisible = () => {
+  if (!selectedDatasetIds.value.length) return
+  const visible = pagedDatasets.value.some((d: any) => selectedDatasetIds.value.includes(d.dataset_id))
+  if (visible) return
+  const p = dsPageOf(selectedDatasetIds.value[0])
+  if (p) dsPage.value = p
+}
+// 换页大小回到第 1 页；数据集减少时收敛页码（不无条件回第 1 页，避免刷新把多选用户踢走）
+watch(dsPageSize, () => { dsPage.value = 1 })
+watch(dsPageCount, (n) => { if (dsPage.value > n) dsPage.value = n })
 const loadingDatasets = ref(false)
 const loadingModels = ref(false)
 const loadingJobs = ref(false)
@@ -1157,6 +1196,8 @@ const loadDatasets = async () => {
     if (!error?.__toastShown) showToast('加载数据集失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     loadingDatasets.value = false
+    // 数据刷新后把「已选」数据集所在页带出来（仅当前页看不到时才跳）
+    ensureSelectedVisible()
   }
 }
 
@@ -2071,7 +2112,12 @@ onMounted(async () => {
     const ids = q.split(',').filter(Boolean)
     const selectable = ids.filter((id: string) => datasets.value.some((d: any) => d.dataset_id === id))
     if (selectable.length) {
-      selectDataset({ dataset_id: selectable[0] })
+      // 传真实数据集对象：假对象缺 status 会被 isDatasetPrepared 判为「未准备」而拒绝选中
+      const target = datasets.value.find((d: any) => d.dataset_id === selectable[0])
+      if (target) selectDataset(target)
+      // 分页后自动翻到预选数据集所在页，避免用户看不到高亮卡片
+      const p = dsPageOf(selectable[0])
+      if (p) dsPage.value = p
     }
   } else {
     loadDatasets()
@@ -2507,6 +2553,57 @@ onUnmounted(() => {
 .merge-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.ds-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+  font-size: 0.78rem;
+  color: #5b6770;
+}
+
+.ds-pager-info {
+  white-space: nowrap;
+}
+
+.ds-pager-nav {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.ds-pager-btn {
+  padding: 0.2rem 0.6rem;
+  font-size: 0.78rem;
+  color: #2c3e50;
+  background: #fff;
+  border: 1px solid #d0d3d8;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ds-pager-btn:hover:not(:disabled) {
+  border-color: #8e44ad;
+  color: #8e44ad;
+}
+
+.ds-pager-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 全局 select 是 width:100%，分页条里要收成内容宽度 */
+.ds-pager-size {
+  width: auto;
+  padding: 0.2rem 0.4rem;
+  font-size: 0.78rem;
+}
+
+.ds-classes {
+  word-break: break-all;
 }
 
 .ds-grid {
