@@ -6,21 +6,35 @@ export interface UpdateDatasetRequest {
 }
 
 /** 上传数据集压缩包；modelId 为归属的算法库（必填，后端会换算成库根记录）
- *  onProgress 可选：上传字节进度百分比回调，不传则与旧调用方完全一致 */
+ *  onProgress 可选：上传字节进度百分比回调，不传则与旧调用方完全一致
+ *  options 可选：uploadId（本次上传标识，供取消时精确清理服务端产物）+ signal（AbortSignal）
+ *  第 4 个参数缺省时与旧调用方完全兼容（ModelDetail.vue 的两参调用不受影响） */
 export const uploadDataset = async (
   file: File, modelId: string,
-  onProgress?: (percent: number) => void
+  onProgress?: (percent: number) => void,
+  options?: { uploadId?: string; signal?: AbortSignal }
 ) => {
   const formData = new FormData()
   formData.append('file', file)
   const { data } = await api.post('/datasets/upload', formData, {
-    params: { model_id: modelId },
+    params: {
+      model_id: modelId,
+      ...(options?.uploadId ? { upload_id: options.uploadId } : {})
+    },
+    signal: options?.signal,
     onUploadProgress: (e) => {
       if (!onProgress) return
       const total = e.total || e.loaded || 1
       onProgress(Math.min(100, Math.round((e.loaded / total) * 100)))
     }
   })
+  return data
+}
+
+/** 取消上传：通知服务端按 upload_id 清理在途产物（数据集目录/压缩包/PG 影子库）。
+ *  幂等，可与上传并发；即使上传请求已断开、拿不到 dataset_id 也能清干净。 */
+export const cancelUpload = async (uploadId: string) => {
+  const { data } = await api.post('/datasets/upload/cancel', { upload_id: uploadId })
   return data
 }
 

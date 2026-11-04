@@ -61,16 +61,23 @@ async def bind_dataset_model(dataset_id: str, request: BindModelRequest):
         raise HTTPException(400, str(e))
     return {"dataset_id": dataset_id, "model_id": result.get("model_id")}
 
+class CancelUploadRequest(BaseModel):
+    upload_id: str
+
+
 @router.post("/upload")
 async def upload_dataset(
     file: UploadFile = File(...),
     model_id: Optional[str] = None,
+    upload_id: Optional[str] = None,
 ):
     """上传数据集压缩包（zip / tar / tar.gz / tgz）
 
     数据集必须有归属的算法库（导入页强制选择，没有库就先在弹窗里新建）：
     model_id: 归属的算法库/库内任一版本记录 id —— 一律换算成它所属「库根记录」后写入，
               使库详情的挂载数据集列表、准备阶段的类别过滤、训练产出的库归属都按库生效
+    upload_id: 前端生成的本次上传标识；登记在途产物后，取消接口可据此精确清理，
+               避免「上传中断 / 请求断开」在服务端留下目录、压缩包或影子库记录。
     """
     allowed = (".zip", ".tar", ".tar.gz", ".tgz")
     if not (file.filename or "").lower().endswith(allowed):
@@ -82,7 +89,17 @@ async def upload_dataset(
     if not library_root_id:
         raise HTTPException(400, f"归属的算法库不存在：{model_id}")
 
-    return await dataset_service.upload_dataset(file, library_root_id, library_root_id)
+    return await dataset_service.upload_dataset(file, library_root_id, library_root_id, upload_id)
+
+
+@router.post("/upload/cancel")
+async def cancel_upload(request: CancelUploadRequest):
+    """取消上传：按 upload_id 清理服务端在途产物（数据集目录 / 原始压缩包 / PG 影子库）。
+
+    幂等且可与上传并发：即使上传请求已断开、前端拿不到 dataset_id，也能清干净；
+    尚未到达服务端的上传返回 no_pending_upload，本身不产生文件，无需清理。
+    """
+    return await dataset_service.cancel_upload(request.upload_id)
 
 @router.post("/{dataset_id}/prepare")
 async def prepare_dataset(dataset_id: str, request: PrepareRequest):

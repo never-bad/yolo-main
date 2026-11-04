@@ -12,14 +12,19 @@
           <span class="selected-file-icon">📦</span>
           <span class="selected-file-name">{{ selectedFile.name }}</span>
           <span class="selected-file-size">({{ formatSize(selectedFile.size) }})</span>
+          <button v-if="!uploading" type="button" class="clear-file-btn" @click="clearSelectedFile" title="取消选择，重新挑选压缩包">✕ 取消选择</button>
         </div>
         <div v-else class="selected-file empty">尚未选择文件</div>
         <div class="upload-row">
-          <input type="file" accept=".zip,.tar,.tgz,.tar.gz" id="datasetZip" @change="handleFileSelect" :disabled="uploading" class="file-input" />
+          <input ref="fileInputRef" type="file" accept=".zip,.tar,.tgz,.tar.gz" id="datasetZip" @change="handleFileSelect" :disabled="uploading" class="file-input" />
           <label for="datasetZip" class="file-btn" :disabled="uploading">选择文件</label>
           <button class="upload-btn" @click="uploadFile" :disabled="!selectedFile || uploading || !uploadLibraryId">
             <span v-if="uploading" class="loading-spinner"></span>
             {{ uploading ? '上传中...' : '上传' }}
+          </button>
+          <!-- 上传中可随时中断；服务端会同步清理已接收的临时文件，不留残留 -->
+          <button v-if="uploading" type="button" class="cancel-upload-btn" :disabled="cancellingUpload" @click="cancelUploadFlow">
+            {{ cancellingUpload ? '清理中...' : '取消上传' }}
           </button>
         </div>
         <!-- 大压缩包上传耗时长，给出字节级进度，避免用户以为卡死重复点 -->
@@ -27,6 +32,7 @@
           <div class="upload-progress-bar" :style="{ width: uploadPercent + '%' }"></div>
           <span class="upload-progress-text">{{ uploadPercent }}%</span>
         </div>
+        <small v-if="uploading" class="form-hint">取消会同时清理服务端已接收的临时文件，不会留下残留数据集。</small>
       </div>
       <div class="form-group">
         <label>归属算法库 <i class="required">*</i></label>
@@ -47,6 +53,14 @@
         <p v-if="preparingNew" class="auto-prepare-tip">
           <span class="loading-spinner"></span>正在自动准备数据集（解压/重组/统计），请稍候...
         </p>
+        <!-- 选错文件夹时一键撤销：复用删除接口，清掉目录 + 原始压缩包 + 桶账本 + PG 影子库 -->
+        <div class="result-undo">
+          <button type="button" class="danger" :disabled="preparingNew || undoingUpload" @click="undoLastUpload">
+            {{ undoingUpload ? '撤销中...' : '撤销本次上传（选错了）' }}
+          </button>
+          <small v-if="preparingNew">正在自动准备数据集，准备完成后即可撤销。</small>
+          <small v-else>会删除刚生成的数据集、上传的压缩包及全部关联记录，不保留任何文件。</small>
+        </div>
       </div>
     </div>
 
@@ -452,7 +466,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch, onMounted, onActivated, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { uploadDataset, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel, getSealThreshold, setSealThreshold } from '@/api/datasets'
+import { uploadDataset, cancelUpload, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel, getSealThreshold, setSealThreshold } from '@/api/datasets'
 import { listModels } from '@/api/models'
 import { addHardSamples, addBackgroundSamples } from '@/api/samplePool'
 import { downloadFile } from '@/utils/download'
@@ -472,6 +486,13 @@ const allModels = ref<any[]>([]) // registry 记录（算法库下拉数据源�
 const uploading = ref(false)
 const uploadPercent = ref(0)   // 上传字节进度（0~100），仅在 uploading 时显示
 const uploadResult = ref<any>(null)
+// ===== B-38 上传可取消（选中后清空 / 上传中中断 / 完成后撤销）=====
+const fileInputRef = ref<HTMLInputElement | null>(null)
+const uploadAbort = ref<AbortController | null>(null)  // 中断上传请求
+const currentUploadId = ref('')                        // 本次上传标识，服务端据此清理在途产物
+const uploadCancelled = ref(false)                     // 防止「取消后响应才回来」又走成功分支
+const cancellingUpload = ref(false)
+const undoingUpload = ref(false)
 const sealMinImages = ref(0)  // #6 封板数量门槛（来自后端），列表展示待封板进度
 // 门槛在线设置（独立弹窗，持久化到后端 data/seal_threshold.json）
 const thresholdOpen = ref(false)
@@ -1137,6 +1158,57 @@ const handleFileSelect = (event: Event) => {
   }
 }
 
+// 清空所选文件（含 input.value，保证重新选同一个文件也会触发 change）
+const clearSelectedFile = () => {
+  selectedFile.value = null
+  uploadResult.value = null
+  uploadPercent.value = 0
+  if (fileInputRef.value) fileInputRef.value.value = ''
+}
+
+const genUploadId = () => `u_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+
+// 取消上传：中断请求 + 通知服务端按 upload_id 清理在途产物（幂等，可与上传并发）
+const cancelUploadFlow = async () => {
+  if (!uploading.value) { clearSelectedFile(); return }
+  if (cancellingUpload.value) return
+  cancellingUpload.value = true
+  uploadCancelled.value = true
+  const id = currentUploadId.value
+  uploadAbort.value?.abort()
+  try {
+    await cancelUpload(id)
+    showToast('已取消上传，服务端临时文件已清理', 'info', 3000)
+  } catch (error: any) {
+    showToast('已中断上传，但服务端清理请求失败：' + (error.response?.data?.detail || error.message), 'error', 5000)
+  } finally {
+    clearSelectedFile()
+    cancellingUpload.value = false
+  }
+}
+
+// 撤销本次上传（选错文件夹）：复用删除接口，目录/压缩包/桶账本/PG 影子库一并清掉
+const undoLastUpload = async () => {
+  const dsId = uploadResult.value?.dataset_id
+  if (!dsId || undoingUpload.value) return
+  if (!(await showConfirm(`确定撤销本次上传吗？将删除数据集 ${dsId}、上传的压缩包及全部关联记录，不保留任何文件。`))) return
+  undoingUpload.value = true
+  try {
+    await deleteDataset(dsId)
+    // 顺带清掉服务端上传登记条目；失败不影响撤销结果（条目有 TTL 兜底）
+    if (currentUploadId.value) {
+      try { await cancelUpload(currentUploadId.value) } catch { /* 忽略 */ }
+    }
+    clearSelectedFile()
+    await loadDatasets()
+    showToast('已撤销本次上传，相关文件全部清理', 'success')
+  } catch (error: any) {
+    if (!error?.__toastShown) showToast('撤销失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
+  } finally {
+    undoingUpload.value = false
+  }
+}
+
 const uploadFile = async () => {
   if (!selectedFile.value) return
   libraryTouched.value = true
@@ -1145,18 +1217,29 @@ const uploadFile = async () => {
     return
   }
 
+  const controller = new AbortController()
+  uploadAbort.value = controller
+  currentUploadId.value = genUploadId()
+  uploadCancelled.value = false
   uploading.value = true
   uploadPercent.value = 0
   try {
-    const result = await uploadDataset(selectedFile.value, uploadLibraryId.value, (p) => { uploadPercent.value = p })
+    const result = await uploadDataset(
+      selectedFile.value, uploadLibraryId.value,
+      (p) => { uploadPercent.value = p },
+      { uploadId: currentUploadId.value, signal: controller.signal }
+    )
+    // 取消竞态：响应回来前用户已取消，不要再落结果、不要再触发自动准备
+    if (uploadCancelled.value) return
     uploadResult.value = result
     loadDatasets()
     // 上传成功后自动准备（无需用户额外操作）
     preparingNew.value = true
     try {
       await prepareDst(result.dataset_id)
+      if (uploadCancelled.value) return
       showToast(`上传并准备成功！数据集已归属算法库「${libraryName(uploadLibraryId.value)}」`, 'info', 4000)
-      uploadResult.value = null
+      // 保留 uploadResult，让「撤销本次上传」在准备完成后仍然可用
       loadDatasets()
       loadUploadModels()
     } catch (error: any) {
@@ -1165,9 +1248,12 @@ const uploadFile = async () => {
       preparingNew.value = false
     }
   } catch (error: any) {
+    // 用户主动取消：不弹「上传失败」，清理提示由 cancelUploadFlow 给出
+    if (uploadCancelled.value || controller.signal.aborted) return
     if (!error?.__toastShown) showToast('上传失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
     uploading.value = false
+    uploadAbort.value = null
   }
 }
 
@@ -1340,6 +1426,44 @@ onActivated(() => {
 .upload-progress { position: relative; height: 18px; margin-top: .4rem; background: #eef1f3; border-radius: 4px; overflow: hidden; }
 .upload-progress-bar { height: 100%; background: #3498db; transition: width .15s ease; }
 .upload-progress-text { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: .72rem; color: #2c3e50; }
+
+/* B-38：取消选择 / 取消上传 / 撤销本次上传 */
+.clear-file-btn {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.8rem;
+  color: #c0392b;
+  background: #fff;
+  border: 1px solid #e6b0aa;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.clear-file-btn:hover { background: #fdedec; }
+
+.cancel-upload-btn {
+  height: 38px;
+  padding: 0 1rem;
+  font-size: 0.95rem;
+  color: #c0392b;
+  background: #fff;
+  border: 1px solid #e6b0aa;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.cancel-upload-btn:hover:not(:disabled) { background: #fdedec; }
+.cancel-upload-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.result-undo {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+}
+.result-undo small { color: #7f8c8d; }
 
 .file-input {
   display: none;

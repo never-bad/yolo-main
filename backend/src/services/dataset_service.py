@@ -48,6 +48,86 @@ EXCLUDE_KEYWORDS = ("_result", "_predict", "_detect")
 _LIST_CACHE_LOCK = threading.Lock()
 _LIST_CACHE = {"sig": None, "result": None, "ts": 0.0}
 
+# ===== 上传在途注册表（「取消上传」用，杜绝半成品文件遗留）=====
+# 前端每次上传生成 upload_id 随请求带入；服务端在生成 dataset_id 后立刻登记产物路径。
+# 取消接口按 upload_id 就能精确删除「数据集目录 + 原始压缩包 + PG 影子库记录」，
+# 即使上传请求已断开、响应拿不到 dataset_id 也能清干净。
+# 在途的 upload_dataset 会在各检查点读取 cancelled 标记自行终止，避免竞态残留。
+_UPLOAD_LOCK = threading.Lock()
+_UPLOAD_REGISTRY: dict = {}   # upload_id -> {dataset_id, dataset_dir, archive_path, cancelled, done, ts}
+_UPLOAD_PRE_CANCEL: dict = {} # upload_id -> ts；取消请求早于上传请求到达时的预取消名单
+_UPLOAD_TTL = 3600.0          # 陈旧条目回收阈值（秒）
+
+
+def _upload_register(upload_id: str, dataset_id: str, dataset_dir: Path, archive_path: Path):
+    now = time.time()
+    with _UPLOAD_LOCK:
+        for k in [k for k, v in _UPLOAD_REGISTRY.items() if now - v["ts"] > _UPLOAD_TTL]:
+            _UPLOAD_REGISTRY.pop(k, None)
+        for k in [k for k, v in _UPLOAD_PRE_CANCEL.items() if now - v > _UPLOAD_TTL]:
+            _UPLOAD_PRE_CANCEL.pop(k, None)
+        # 取消请求可能比上传请求更早到达服务端：命中预取消名单就直接标记已取消，
+        # upload_dataset 的检查点 1 会立即终止，不产生任何文件
+        pre_cancelled = upload_id in _UPLOAD_PRE_CANCEL
+        if pre_cancelled:
+            _UPLOAD_PRE_CANCEL.pop(upload_id, None)
+        _UPLOAD_REGISTRY[upload_id] = {
+            "dataset_id": dataset_id,
+            "dataset_dir": dataset_dir,
+            "archive_path": archive_path,
+            "cancelled": pre_cancelled,
+            "done": False,
+            "ts": now,
+        }
+
+
+def _upload_pre_cancel(upload_id: Optional[str]):
+    """登记「预取消」：上传请求尚未到达服务端，等它到达时自检并立即终止。"""
+    if upload_id:
+        with _UPLOAD_LOCK:
+            _UPLOAD_PRE_CANCEL[upload_id] = time.time()
+
+
+def _upload_is_cancelled(upload_id: Optional[str]) -> bool:
+    if not upload_id:
+        return False
+    with _UPLOAD_LOCK:
+        rec = _UPLOAD_REGISTRY.get(upload_id)
+        return bool(rec and rec["cancelled"])
+
+
+def _upload_mark_done(upload_id: Optional[str]):
+    if upload_id:
+        with _UPLOAD_LOCK:
+            if upload_id in _UPLOAD_REGISTRY:
+                _UPLOAD_REGISTRY[upload_id]["done"] = True
+
+
+def _upload_mark_cancelled(upload_id: str) -> Optional[dict]:
+    with _UPLOAD_LOCK:
+        rec = _UPLOAD_REGISTRY.get(upload_id)
+        if rec:
+            rec["cancelled"] = True
+            return dict(rec)
+        return None
+
+
+def _upload_drop(upload_id: Optional[str]):
+    if upload_id:
+        with _UPLOAD_LOCK:
+            _UPLOAD_REGISTRY.pop(upload_id, None)
+
+
+def _purge_upload_artifacts(dataset_dir: Path, archive_path: Optional[Path]):
+    """删除一次上传产生的全部磁盘文件（幂等）；在线程池里调用，避免阻塞事件循环。"""
+    if dataset_dir and dataset_dir.exists():
+        shutil.rmtree(dataset_dir, ignore_errors=True)
+    if archive_path and archive_path.exists():
+        try:
+            archive_path.unlink()
+        except OSError:
+            pass
+
 # ===== 数据集生命周期状态机（MLOps 改造 1.1）=====
 # stage：主状态（对齐设计文档 1.2 状态机）
 STAGE_COLLECTING = "collecting"    # 采集/接收中（数据持续写入）
@@ -464,12 +544,15 @@ class DatasetService:
         self.uploads_dir = settings.UPLOADS_DIR
         self._bucket_state = None  # advance 期间持有的桶账本（跨 _seal_receiving_bucket 使用）
 
-    async def upload_dataset(self, file: UploadFile, model_id: str = None, library_root_id: str = None):
+    async def upload_dataset(self, file: UploadFile, model_id: str = None, library_root_id: str = None,
+                             upload_id: str = None):
         """上传数据集压缩包（zip / tar / tar.gz / tgz）
 
         model_id: 归属模型（1.7 模型仓库：数据挂到对应模型下）；为空则由后续采集/绑定流程归属
         library_root_id: 归属算法库的根记录 id；训练产出未显式指定库时以此为准。
                          为空时由调用方按 model_id 反查（模型自身即库根时取自身）
+        upload_id: 前端生成的本次上传标识；用于「取消上传」精确清理在途产物。
+                   不传时行为与旧版一致（仍保证异常不残留）。
         """
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         dataset_id = f"ds_{ts}"
@@ -483,50 +566,110 @@ class DatasetService:
             dataset_id = f"ds_{ts}_{n}"
             dataset_dir = self.datasets_dir / dataset_id
 
-        # 异步创建目录
-        await asyncio.to_thread(lambda: dataset_dir.mkdir(parents=True, exist_ok=True))
-        
         # 保存上传的压缩包，保留原始后缀便于 prepare 时按格式解压
         raw_name = (file.filename or "").lower()
         suffix = next((s for s in ARCHIVE_SUFFIXES if raw_name.endswith(s)), ".zip")
         archive_name = f"{dataset_id}{suffix}"
         archive_path = self.uploads_dir / archive_name
-        content = await file.read()
-        await asyncio.to_thread(_write_bytes, archive_path, content)
 
-        # P-03 双重校验之一：写盘后立即校验压缩包完整性与可解码抽样，
-        # 不通过则清掉半成品（目录 + archive），绝不让坏包写进 meta / PG 影子库
-        ok, reason = await asyncio.to_thread(_validate_archive, archive_path)
-        if not ok:
-            shutil.rmtree(dataset_dir, ignore_errors=True)
-            archive_path.unlink(missing_ok=True)
-            logger.warning(f"upload {dataset_id}: archive validation failed: {reason}")
-            raise HTTPException(400, f"压缩包校验失败：{reason}")
-        
-        # 保存元数据（stage=collecting：上传即进入采集/接收阶段）
-        meta = {
-            "dataset_id": dataset_id,
-            "filename": file.filename,
-            "archive": archive_name,
-            "size": len(content),
-            "uploaded_at": datetime.now().isoformat(),
-            "status": "uploaded",
-            "stage": STAGE_COLLECTING,
-            "training_status": TRAIN_STATUS_INCOMPLETE,
-            "sealed_at": None,
-            "trained_at": None,
-            "last_trained_round": 0,
-            "model_id": model_id,
-            # 归属算法库（库根记录 id）：训练未显式指定库时，产出继承这个库
-            "library_root_id": library_root_id,
-        }
-        
-        meta_path = dataset_dir / "meta.json"
-        await asyncio.to_thread(save_json_atomic, meta_path, meta)
-        
-        from src.db import shadow
-        await shadow.sync_dataset(dataset_id)
-        return meta
+        # 登记本次上传的全部产物路径：取消接口即便拿不到响应，也能按 upload_id 精确清理
+        if upload_id:
+            _upload_register(upload_id, dataset_id, dataset_dir, archive_path)
+
+        try:
+            # 检查点 1：传输途中用户可能已经点了取消
+            if _upload_is_cancelled(upload_id):
+                raise HTTPException(499, "上传已取消")
+
+            await asyncio.to_thread(lambda: dataset_dir.mkdir(parents=True, exist_ok=True))
+            content = await file.read()
+            await asyncio.to_thread(_write_bytes, archive_path, content)
+
+            # 检查点 2：大包写盘耗时，期间可能收到取消
+            if _upload_is_cancelled(upload_id):
+                raise HTTPException(499, "上传已取消")
+
+            # P-03 双重校验之一：写盘后立即校验压缩包完整性与可解码抽样
+            ok, reason = await asyncio.to_thread(_validate_archive, archive_path)
+            if not ok:
+                logger.warning(f"upload {dataset_id}: archive validation failed: {reason}")
+                raise HTTPException(400, f"压缩包校验失败：{reason}")
+
+            # 检查点 3：落 meta / PG 影子库之前，最后一道取消窗口
+            if _upload_is_cancelled(upload_id):
+                raise HTTPException(499, "上传已取消")
+
+            # 保存元数据（stage=collecting：上传即进入采集/接收阶段）
+            meta = {
+                "dataset_id": dataset_id,
+                "filename": file.filename,
+                "archive": archive_name,
+                "size": len(content),
+                "uploaded_at": datetime.now().isoformat(),
+                "status": "uploaded",
+                "stage": STAGE_COLLECTING,
+                "training_status": TRAIN_STATUS_INCOMPLETE,
+                "sealed_at": None,
+                "trained_at": None,
+                "last_trained_round": 0,
+                "model_id": model_id,
+                # 归属算法库（库根记录 id）：训练未显式指定库时，产出继承这个库
+                "library_root_id": library_root_id,
+            }
+            meta_path = dataset_dir / "meta.json"
+            await asyncio.to_thread(save_json_atomic, meta_path, meta)
+
+            from src.db import shadow
+            await shadow.sync_dataset(dataset_id)
+            if upload_id:
+                _upload_mark_done(upload_id)
+            return meta
+        except BaseException:
+            # 任何异常（取消 / 客户端断开 / 校验失败 / 写盘失败）都清掉已落盘产物，
+            # 绝不留空目录、半截压缩包或 PG 影子记录。
+            # 先摘登记，再逐步清理；每步独立兜底，避免清理本身出错反而留下残留
+            _upload_drop(upload_id)
+            try:
+                await asyncio.to_thread(_purge_upload_artifacts, dataset_dir, archive_path)
+            except Exception as e:
+                logger.warning(f"upload {dataset_id}: cleanup dir/archive failed: {e}")
+            try:
+                from src.db import shadow
+                await shadow.drop_dataset(dataset_id)
+            except Exception:
+                pass
+            raise
+
+    # ---------- 取消上传（B-38）：按 upload_id 幂等清理在途产物 ----------
+    async def cancel_upload(self, upload_id: str) -> dict:
+        """取消一次上传：标记取消 + 删除已落盘的目录/压缩包 + 清 PG 影子库。
+
+        幂等：upload_id 不存在（请求还没到服务端 / 已清理过）也返回 ok。
+        仍在执行的 upload_dataset 会在下一个检查点读到 cancelled 标记自行终止并再次清理，
+        因此上传与取消并发时也不会留下残留。
+        """
+        rec = _upload_mark_cancelled(upload_id) if upload_id else None
+        if not rec:
+            # 上传请求可能还没到服务端（或条目已被 TTL 回收）：登记预取消，
+            # 等它到达时自检并立即终止，堵住「取消先到、上传后到」的竞态残留
+            _upload_pre_cancel(upload_id)
+            return {"ok": True, "dataset_id": None, "reason": "no_pending_upload"}
+        dataset_id = rec["dataset_id"]
+        try:
+            await asyncio.to_thread(_purge_upload_artifacts, rec["dataset_dir"], rec["archive_path"])
+        except Exception as e:
+            logger.warning(f"cancel upload {dataset_id}: cleanup dir/archive failed: {e}")
+        try:
+            from src.db import shadow
+            await shadow.drop_dataset(dataset_id)
+        except Exception as e:
+            logger.warning(f"cancel upload {dataset_id}: shadow drop failed: {e}")
+        # 条目保留给在途的 upload_dataset 读取 cancelled 标记（其 except 会移除）；
+        # 若上传已正常结束则无需保留，直接清掉避免陈旧条目堆积
+        if rec.get("done"):
+            _upload_drop(upload_id)
+        return {"ok": True, "dataset_id": dataset_id, "cancelled": True}
+
 
     # ---------- 多数据集合并为持久新数据集（方案 B） ----------
     def _merge_copy_source(self, s_dir: Path, s_names: list, unified_index: dict,
