@@ -118,6 +118,20 @@ def _count_images(path: Path) -> int:
         return 0
     return sum(1 for f in path.rglob("*") if f.is_file() and f.suffix.lower() in IMG_SUFFIX)
 
+
+def _dir_size(path: Path) -> int:
+    """递归计算目录内所有文件的逻辑大小之和（字节）；目录不存在返回 0"""
+    if not path.exists():
+        return 0
+    total = 0
+    for f in path.rglob("*"):
+        if f.is_file():
+            try:
+                total += f.stat().st_size
+            except OSError:
+                pass
+    return total
+
 def _write_bytes(path: Path, content: bytes):
     """同步写入二进制文件"""
     with open(path, "wb") as f:
@@ -703,11 +717,12 @@ class DatasetService:
 
         # 6. meta.json（stage=SEALED，可直接训练；记录 merged_from 溯源）
         now = datetime.now().isoformat()
+        ds_size = await asyncio.to_thread(_dir_size, ds_dir)
         meta = {
             "dataset_id": dataset_id,
             "display_name": display_name or f"merged_{ts}",
             "filename": display_name or f"merged_{ts}",
-            "size": 0,
+            "size": ds_size,
             "uploaded_at": now,
             "status": "prepared",
             "stage": STAGE_SEALED,
@@ -2332,7 +2347,7 @@ class DatasetService:
                                 "dataset_id": dataset_dir.name,
                                 "display_name": dataset_dir.name,
                                 "filename": dataset_dir.name,
-                                "size": 0,
+                                "size": await asyncio.to_thread(_dir_size, dataset_dir),
                                 "uploaded_at": "",
                                 "status": "prepared",
                                 "stage": STAGE_SEALED,
@@ -3421,7 +3436,7 @@ class DatasetService:
             "dataset_id": ds_id,
             "filename": f"v{sv}",
             "archive": None,
-            "size": 0,
+            "size": _dir_size(ds_dir),
             "uploaded_at": now,
             "status": "prepared",
             "stage": STAGE_SEALED,
