@@ -550,6 +550,27 @@ class TrainService:
             return None, None
         return chosen[1], chosen[2]
 
+    def _baseline_by_id(self, model_id: str):
+        """按 model_id 取回原守门员基准的权重路径（续训沿用原口径用）。
+
+        与 _pick_baseline 不同：不重新挑选、也不检查 status。续训是同一个任务的延续，
+        对比基准必须固定为建任务时定下的那一版；即使该模型后来退役/换代，
+        仍应作为本任务的对比对象，否则前后两次判定不可比。
+        """
+        if not model_id or not self.registry_dir.exists():
+            return None, None
+        meta_file = self.registry_dir / model_id / "model.json"
+        if not meta_file.exists():
+            return None, None
+        try:
+            meta = load_json(meta_file)
+        except Exception:
+            return None, None
+        w = resolve_registry_weights(meta, self.registry_dir)
+        if not w or not w.exists():
+            return None, None
+        return str(w), meta.get("model_id") or model_id
+
     def _apply_label_filter(self, job_id: str, data_yaml: Path, base_model_id: str,
                             out_subdir: str = "filtered_data"):
         """阶段0.3：按基础模型的标签字典过滤数据集类别并生成训练副本（同步，线程内调用）。
@@ -2254,9 +2275,23 @@ class TrainService:
         
         await asyncio.to_thread(save_json_atomic, job_file, job_meta)
         
-        # 模型守门员：恢复训练同样自动选择当前同业务生产模型作为对比基准
+        # 模型守门员对比基准：续训必须沿用建任务时定下的那一版，不能重新挑。
+        # 否则训练中断期间若有其它模型晋升，同一个任务前后的「新模型 vs 上一代」
+        # 口径会变，晋升判定不可比。job_meta.baseline_model_id 保存了原基准
+        #（None = 首版直晋，也应保持 None，不能因为期间有人晋升就引入基准）。
         resume_business = job_meta.get("business", "general")
-        resume_baseline_path, resume_baseline_id = self._pick_baseline(resume_business)
+        resume_lib = job_meta.get("library_root_id")
+        if "baseline_model_id" in job_meta:
+            saved_id = job_meta.get("baseline_model_id")
+            resume_baseline_path, resume_baseline_id = self._baseline_by_id(saved_id)
+            if saved_id and not resume_baseline_path:
+                # 原基准被删/权重丢失 → 降级按当前状态重挑一次（补上库约束）
+                resume_baseline_path, resume_baseline_id = self._pick_baseline(
+                    resume_business, resume_lib)
+        else:
+            # M11 之前的历史任务没存该字段 → 只能按当前状态挑（补上库约束）
+            resume_baseline_path, resume_baseline_id = self._pick_baseline(
+                resume_business, resume_lib)
 
         # 启动训练进程
         resume_mig = job_meta.get("migration") or {}
