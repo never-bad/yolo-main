@@ -487,6 +487,22 @@ def main():
     # 写进 base_model / 血缘，也避免 parse_architecture("last.pt") 把架构记成 "last"。
     lineage_base = args.lineage_base_model or args.model
 
+    # M11 架构三字段：微调/跨代迁移时基座权重是 best.pt，按文件名只能解析出 "best"。
+    # 后端已把推断好的真实架构写入 job_meta.architecture_override，这里优先采用；
+    # 历史任务（无该字段）仍回退到按血缘基座文件名解析，行为不变。
+    architecture_override = None
+    try:
+        with open(args.job_file, "r", encoding="utf-8") as _jf:
+            _arch = (json.load(_jf) or {}).get("architecture_override")
+        if isinstance(_arch, dict) and str(_arch.get("architecture_name") or "").strip():
+            architecture_override = {
+                "architecture_family": _arch.get("architecture_family") or "ultralytics",
+                "architecture_name": str(_arch["architecture_name"]),
+                "model_scale": _arch.get("model_scale") or "",
+            }
+    except Exception as _ae:
+        print(f"[{datetime.now().isoformat()}] architecture_override 读取失败（回退文件名解析）: {_ae}")
+
     print(f"[{datetime.now().isoformat()}] Starting training job: {args.job_id}")
     print(f"[{datetime.now().isoformat()}] Dataset: {args.data}")
     print(f"[{datetime.now().isoformat()}] Model: {args.model}")
@@ -853,8 +869,9 @@ def main():
             "epochs": args.epochs,
             "created_at": datetime.now().isoformat(),
             "weights_path": str(weights_path_abs),
-            # M11：architecture 三字段（从血缘基座解析，续训时不从 last.pt 推架构）
-            **parse_architecture(lineage_base),
+            # M11：architecture 三字段优先用后端推断的真实架构，否则从血缘基座解析
+            # （续训不从 last.pt 推架构、微调不从 best.pt 推架构）
+            **(architecture_override or parse_architecture(lineage_base)),
             # 模型仓库 / 守门员字段
             "business": args.business,
             "status": status,

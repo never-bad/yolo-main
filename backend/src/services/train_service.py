@@ -1254,7 +1254,22 @@ class TrainService:
                     print(f"[create_job] 2.4 跨代迁移训练: {migration['source_architecture']}"
                           f" → {migration['target_architecture']}"
                           f"（源模型 {base_model_id}，strict=False，lr0 降 10 倍）")
-        
+
+        # M11 架构三字段：微调时基座是平台内模型的 best.pt，按文件名只能解析出
+        # architecture_name="best"。这里由后端按业务语义推断真实架构写入 job_meta，
+        # 训练脚本注册模型时优先采用；历史任务无该字段则回退按文件名兜底。
+        architecture_override = None
+        if migration:
+            # 跨代迁移：产出模型是「目标架构」，不是源模型架构
+            architecture_override = parse_architecture(
+                migration.get("target_model") or migration_target_model
+            )
+        elif base_model_id:
+            # 普通微调：继承父模型档案里记录的真实架构
+            architecture_override = self._model_architecture(base_model_meta, base_model_id)
+            if not architecture_override.get("architecture_name"):
+                architecture_override = None  # M11 之前的旧档案无架构信息 → 交给脚本兜底
+
         # 并发训练数限制：防止 CPU/GPU 资源被过多训练任务占满
         max_concurrent = settings.MAX_CONCURRENT_TRAIN_JOBS
         active = await asyncio.to_thread(self._active_training_count)
@@ -1355,6 +1370,8 @@ class TrainService:
             "sample_pool": sample_pool_info,       # 阶段1.5/1.6 采样并入信息（未混入为 None）
             "model_name": model_name,
             "base_model_id": base_model_id,
+            # M11：微调/迁移时由后端推断的真实架构（脚本注册模型时优先采用，避免 best.pt → "best"）
+            "architecture_override": architecture_override,
             "library_root_id": library_root_id,   # 产出模型归属的算法库（继承基座；None=独立模型）
             "original_model_path": actual_model_path,  # 保存原始模型路径，用于恢复
             "epochs": epochs,
