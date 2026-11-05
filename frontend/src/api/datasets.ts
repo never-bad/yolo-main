@@ -22,6 +22,7 @@ export const uploadDataset = async (
       ...(options?.uploadId ? { upload_id: options.uploadId } : {})
     },
     signal: options?.signal,
+    timeout: 0,
     onUploadProgress: (e) => {
       if (!onProgress) return
       const total = e.total || e.loaded || 1
@@ -42,7 +43,7 @@ export const prepareDataset = async (datasetId: string, splitRatio?: any, classe
   const { data } = await api.post(`/datasets/${datasetId}/prepare`, {
     split_ratio: splitRatio,
     classes
-  })
+  }, { timeout: 0 })
   return data
 }
 

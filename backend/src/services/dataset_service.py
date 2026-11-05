@@ -217,6 +217,31 @@ def _write_bytes(path: Path, content: bytes):
     with open(path, "wb") as f:
         f.write(content)
 
+
+class _UploadCancelled(Exception):
+    """流式写盘过程中检测到取消，立即中断（写盘不完整，由调用方清理）。"""
+    pass
+
+
+def _stream_write_archive(src_file, dst_path: Path, cancel_check, chunk_size: int = 1024 * 1024) -> int:
+    """流式分块写盘：1MB 一块边从上传流读、边写文件，内存恒定几十 MB。
+
+    替代原先 ``content = await file.read()`` 整包读入 RAM 的写法，避免大包（如 10G）
+    上传时容器内存峰值撑爆导致 OOM Kill（平台全接口 404）。
+    cancel_check 返回 True 时立即中断并抛 _UploadCancelled，使取消能及时生效、
+    避免写半截大文件。返回写入字节数。"""
+    written = 0
+    with open(dst_path, "wb") as f:
+        while True:
+            if cancel_check():
+                raise _UploadCancelled()
+            data = src_file.read(chunk_size)
+            if not data:
+                break
+            f.write(data)
+            written += len(data)
+    return written
+
 def _ensure_long_path(path_str: str) -> str:
     """确保路径支持 Windows 长路径（超过 260 字符）
     
@@ -582,8 +607,20 @@ class DatasetService:
                 raise HTTPException(499, "上传已取消")
 
             await asyncio.to_thread(lambda: dataset_dir.mkdir(parents=True, exist_ok=True))
-            content = await file.read()
-            await asyncio.to_thread(_write_bytes, archive_path, content)
+
+            # ③ 流式分块写盘：边从网络收边写盘，内存恒定几十 MB（不再整包读入 RAM）。
+            #    大包（如 10G）上传不再因内存峰值 OOM 崩平台；写盘循环内每 1MB 检测一次取消，
+            #    用户中途取消可立即中断、避免写半截大文件。
+            written = 0
+            try:
+                written = await asyncio.to_thread(
+                    _stream_write_archive,
+                    file.file,
+                    archive_path,
+                    (lambda: _upload_is_cancelled(upload_id)) if upload_id else (lambda: False),
+                )
+            except _UploadCancelled:
+                raise HTTPException(499, "上传已取消")
 
             # 检查点 2：大包写盘耗时，期间可能收到取消
             if _upload_is_cancelled(upload_id):
@@ -604,7 +641,7 @@ class DatasetService:
                 "dataset_id": dataset_id,
                 "filename": file.filename,
                 "archive": archive_name,
-                "size": len(content),
+                "size": written,
                 "uploaded_at": datetime.now().isoformat(),
                 "status": "uploaded",
                 "stage": STAGE_COLLECTING,
