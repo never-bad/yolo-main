@@ -1247,6 +1247,13 @@ const uploadFile = async () => {
     } finally {
       preparingNew.value = false
     }
+    // 上传成功已落库：释放选择区，腾出上传口接下一个数据集；
+    // 保留 uploadResult 供「撤销本次上传」，但 selectedFile 置空避免一直占着上传口、也防止误重复上传同一文件
+    if (!uploadCancelled.value) {
+      selectedFile.value = null
+      if (fileInputRef.value) fileInputRef.value.value = ''
+      uploadPercent.value = 0
+    }
   } catch (error: any) {
     // 用户主动取消：不弹「上传失败」，清理提示由 cancelUploadFlow 给出
     if (uploadCancelled.value || controller.signal.aborted) return
