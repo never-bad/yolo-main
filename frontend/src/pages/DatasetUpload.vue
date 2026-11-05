@@ -61,15 +61,15 @@
       </div>
       <div v-if="uploadResult" class="result">
         <p>✓ 上传成功: {{ uploadResult.dataset_id }}<span class="auto-create-tag">（已归属算法库 {{ libraryName(uploadLibraryId) }}）</span></p>
-        <p v-if="preparingNew" class="auto-prepare-tip">
-          <span class="loading-spinner"></span>正在自动准备数据集（解压/重组/统计），请稍候...
+        <p v-if="currentPreparing" class="auto-prepare-tip">
+          <span class="loading-spinner"></span>正在后台自动准备数据集（解压/重组/统计），期间可继续上传下一个数据集...
         </p>
         <!-- 选错文件夹时一键撤销：复用删除接口，清掉目录 + 原始压缩包 + 桶账本 + PG 影子库 -->
         <div class="result-undo">
-          <button type="button" class="danger" :disabled="preparingNew || undoingUpload" @click="undoLastUpload">
+          <button type="button" class="danger" :disabled="currentPreparing || undoingUpload" @click="undoLastUpload">
             {{ undoingUpload ? '撤销中...' : '撤销本次上传（选错了）' }}
           </button>
-          <small v-if="preparingNew">正在自动准备数据集，准备完成后即可撤销。</small>
+          <small v-if="currentPreparing">正在自动准备数据集，准备完成后即可撤销。</small>
           <small v-else>会删除刚生成的数据集、上传的压缩包及全部关联记录，不保留任何文件。</small>
         </div>
         <div v-if="uploadMode === 'test'" class="testset-result">
@@ -614,7 +614,9 @@ watch(bucketNotice, (v) => {
 const dismissBucketNotice = () => { bucketNotice.value = ''; bucketNoticeDismissed.value = true; localStorage.setItem(BN_KEY, '1') }
 const restoreBucketNotice = () => { bucketNotice.value = bucketNoticeLast.value; bucketNoticeDismissed.value = false; localStorage.removeItem(BN_KEY) }
 const loading = ref(false)
-const preparingNew = ref(false)  // 正在准备新上传的数据集
+const preparingIds = ref(new Set<string>())  // B-49：正在自动准备的数据集 id 集合（上传口释放后可多个并发准备）
+const preparingNew = computed(() => preparingIds.value.size > 0)
+const currentPreparing = computed(() => !!uploadResult.value && preparingIds.value.has(uploadResult.value.dataset_id))
 const editingDataset = ref<string | null>(null)  // 正在编辑的数据集ID
 const deletingDataset = ref<string | null>(null)  // 正在删除的数据集ID
 const exportingDataset = ref<string | null>(null)  // 正在导出的数据集ID
@@ -1179,14 +1181,15 @@ const handleFileSelect = (event: Event) => {
   const target = event.target as HTMLInputElement
   if (target.files && target.files[0]) {
     selectedFile.value = target.files[0]
-    uploadResult.value = null
+    // B-49：上一个数据集还在后台准备时，保留其结果卡（撤销/泄漏 verdict 仍可见）；否则立即清掉
+    if (!preparingNew.value) uploadResult.value = null
   }
 }
 
 // 清空所选文件（含 input.value，保证重新选同一个文件也会触发 change）
+// B-49：不再连带清 uploadResult —— 结果卡属于已落库的上传，「撤销本次上传」成功时才显式清卡
 const clearSelectedFile = () => {
   selectedFile.value = null
-  uploadResult.value = null
   uploadPercent.value = 0
   if (fileInputRef.value) fileInputRef.value.value = ''
 }
@@ -1224,6 +1227,8 @@ const undoLastUpload = async () => {
     if (currentUploadId.value) {
       try { await cancelUpload(currentUploadId.value) } catch { /* 忽略 */ }
     }
+    uploadResult.value = null  // B-49：撤销成功显式清结果卡（clearSelectedFile 已不再连带清）
+    preparingIds.value.delete(dsId)  // 兜底：若撤销时该数据集仍在准备队列，同步移除
     clearSelectedFile()
     await loadDatasets()
     showToast('已撤销本次上传，相关文件全部清理', 'success')
@@ -1242,6 +1247,7 @@ const uploadFile = async () => {
     return
   }
 
+  const mode = uploadMode.value  // B-49：快照上传目的，防止准备期间用户切换导致封板分支误判
   const controller = new AbortController()
   uploadAbort.value = controller
   currentUploadId.value = genUploadId()
@@ -1254,18 +1260,25 @@ const uploadFile = async () => {
     const result = await uploadDataset(
       selectedFile.value, uploadLibraryId.value,
       (p) => { uploadPercent.value = p },
-      { uploadId: currentUploadId.value, signal: controller.signal, role: uploadMode.value }
+      { uploadId: currentUploadId.value, signal: controller.signal, role: mode }
     )
     // 取消竞态：响应回来前用户已取消，不要再落结果、不要再触发自动准备
     if (uploadCancelled.value) return
     uploadResult.value = result
     loadDatasets()
-    // 上传成功后自动准备（无需用户额外操作）
-    preparingNew.value = true
+    // B-49：字节上传已完成、数据集已落库 —— 此刻立即释放上传口（清选择区 + 复位进度），
+    // 自动准备在后台继续，准备期间即可选择并上传下一个数据集（大包解压不再堵住上传口）
+    uploading.value = false
+    uploadAbort.value = null
+    uploadPercent.value = 0
+    selectedFile.value = null
+    if (fileInputRef.value) fileInputRef.value.value = ''
+    // 上传成功后自动准备（后台执行，无需用户额外操作）
+    preparingIds.value.add(result.dataset_id)
     try {
       await prepareDst(result.dataset_id)
       if (uploadCancelled.value) return
-      if (uploadMode.value === 'test') {
+      if (mode === 'test') {
         // 直接上传测试集：准备完成后自动封板为 held-out 测试集（含泄漏检查）
         await sealTestSetAfterPrepare(result.dataset_id)
       } else {
@@ -1277,14 +1290,7 @@ const uploadFile = async () => {
     } catch (error: any) {
       if (!error?.__toastShown) showToast('准备失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
     } finally {
-      preparingNew.value = false
-    }
-    // 上传成功已落库：释放选择区，腾出上传口接下一个数据集；
-    // 保留 uploadResult 供「撤销本次上传」，但 selectedFile 置空避免一直占着上传口、也防止误重复上传同一文件
-    if (!uploadCancelled.value) {
-      selectedFile.value = null
-      if (fileInputRef.value) fileInputRef.value.value = ''
-      uploadPercent.value = 0
+      preparingIds.value.delete(result.dataset_id)
     }
   } catch (error: any) {
     // 用户主动取消：不弹「上传失败」，清理提示由 cancelUploadFlow 给出
