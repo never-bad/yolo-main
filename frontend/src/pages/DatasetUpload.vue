@@ -59,27 +59,27 @@
         <small v-if="libraryTouched && !uploadLibraryId" class="form-hint error-hint">数据集必须归属一个算法库，请先选择；没有合适的库请点「+ 新建算法库」</small>
         <small v-else class="form-hint">归属决定训练产出的模型进入哪个算法库；导入后可在数据集列表里改归属</small>
       </div>
-      <div v-if="uploadResult" class="result">
-        <p>✓ 上传成功: {{ uploadResult.dataset_id }}<span class="auto-create-tag">（已归属算法库 {{ libraryName(uploadLibraryId) }}）</span></p>
-        <p v-if="currentPreparing" class="auto-prepare-tip">
+      <div v-for="task in uploadTasks" :key="task.datasetId" class="result">
+        <p>✓ 上传成功: {{ task.datasetId }}<span class="auto-create-tag">（已归属算法库 {{ libraryName(task.libraryId) }}）</span></p>
+        <p v-if="isPreparing(task.datasetId)" class="auto-prepare-tip">
           <span class="loading-spinner"></span>正在后台自动准备数据集（解压/重组/统计），期间可继续上传下一个数据集...
         </p>
         <!-- 选错文件夹时一键撤销：复用删除接口，清掉目录 + 原始压缩包 + 桶账本 + PG 影子库 -->
         <div class="result-undo">
-          <button type="button" class="danger" :disabled="currentPreparing || undoingUpload" @click="undoLastUpload">
-            {{ undoingUpload ? '撤销中...' : '撤销本次上传（选错了）' }}
+          <button type="button" class="danger" :disabled="isPreparing(task.datasetId) || task.undoing" @click="undoUpload(task)">
+            {{ task.undoing ? '撤销中...' : '撤销本次上传（选错了）' }}
           </button>
-          <small v-if="currentPreparing">正在自动准备数据集，准备完成后即可撤销。</small>
+          <small v-if="isPreparing(task.datasetId)">正在自动准备数据集，准备完成后即可撤销。</small>
           <small v-else>会删除刚生成的数据集、上传的压缩包及全部关联记录，不保留任何文件。</small>
         </div>
-        <div v-if="uploadMode === 'test'" class="testset-result">
-          <p v-if="testSetResult">✓ 已封板为算法库测试集：版本 v{{ testSetResult.sealed_version }}，共 {{ testSetResult.image_count }} 张，类别 {{ (testSetResult.names || []).join('、') }}</p>
-          <p v-if="testSetResult && testSetResult.leakage" :class="['leak-verdict', testSetResult.leakage.verdict]">
-            泄漏检查：{{ testSetResult.leakage.verdict === 'clean' ? '无重复（clean）' : ('命中 ' + testSetResult.leakage.overlap_md5 + ' 张重复图') }}
+        <div v-if="task.mode === 'test'" class="testset-result">
+          <p v-if="task.sealed">✓ 已封板为算法库测试集：版本 v{{ task.sealed.sealed_version }}，共 {{ task.sealed.image_count }} 张，类别 {{ (task.sealed.names || []).join('、') }}</p>
+          <p v-if="task.sealed && task.sealed.leakage" :class="['leak-verdict', task.sealed.leakage.verdict]">
+            泄漏检查：{{ task.sealed.leakage.verdict === 'clean' ? '无重复（clean）' : ('命中 ' + task.sealed.leakage.overlap_md5 + ' 张重复图') }}
           </p>
-          <p v-if="testSetLeak" class="leak-warn">⚠ 封板被拦截：{{ testSetLeak.detail }}</p>
-          <button v-if="testSetLeak" type="button" class="warning" :disabled="forcingTestSet" @click="forceAsTestSet">
-            {{ forcingTestSet ? '强制封板中...' : '强制放行（确认无泄漏风险）' }}
+          <p v-if="task.leak" class="leak-warn">⚠ 封板被拦截：{{ task.leak }}</p>
+          <button v-if="task.leak" type="button" class="warning" :disabled="task.sealing" @click="forceAsTestSet(task)">
+            {{ task.sealing ? '强制封板中...' : '强制放行（确认无泄漏风险）' }}
           </button>
         </div>
       </div>
@@ -504,20 +504,27 @@ const uploadLibraryId = ref('')   // 导入时必选的归属算法库（库根�
 const libraryTouched = ref(false) // 点过上传但没选库 → 显示红字提示
 const createLibraryOpen = ref(false)
 const uploadMode = ref<'train' | 'test'>('train')  // B-47：上传目的（训练集 / 测试集）
-const testSetResult = ref<any>(null)   // 直接上传测试集 → 封板结果
-const testSetLeak = ref<{ datasetId: string; detail: string } | null>(null)  // 泄漏拦截（需强制放行）
-const forcingTestSet = ref(false)
+// B-50：上传结果改为任务卡列表——每次上传一张卡，新上传不挤旧卡（撤销/泄漏 verdict 各自独立）
+interface UploadTaskCard {
+  datasetId: string
+  uploadId: string        // 服务端上传登记 id（撤销时按它清理登记条目）
+  libraryId: string       // 快照：归属算法库（下拉框上传后自动清空，卡片显示不受影响）
+  mode: 'train' | 'test'  // 快照：上传目的
+  sealed: any             // 测试集封板结果（role=test 时）
+  leak: string | null     // 泄漏拦截文案（非空时显示「强制放行」按钮）
+  sealing: boolean        // 强制封板请求进行中
+  undoing: boolean        // 撤销请求进行中
+}
+const uploadTasks = ref<UploadTaskCard[]>([])
 const allModels = ref<any[]>([]) // registry 记录（算法库下拉数据源）
 const uploading = ref(false)
 const uploadPercent = ref(0)   // 上传字节进度（0~100），仅在 uploading 时显示
-const uploadResult = ref<any>(null)
 // ===== B-38 上传可取消（选中后清空 / 上传中中断 / 完成后撤销）=====
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const uploadAbort = ref<AbortController | null>(null)  // 中断上传请求
 const currentUploadId = ref('')                        // 本次上传标识，服务端据此清理在途产物
 const uploadCancelled = ref(false)                     // 防止「取消后响应才回来」又走成功分支
 const cancellingUpload = ref(false)
-const undoingUpload = ref(false)
 const sealMinImages = ref(0)  // #6 封板数量门槛（来自后端），列表展示待封板进度
 // 门槛在线设置（独立弹窗，持久化到后端 data/seal_threshold.json）
 const thresholdOpen = ref(false)
@@ -615,8 +622,7 @@ const dismissBucketNotice = () => { bucketNotice.value = ''; bucketNoticeDismiss
 const restoreBucketNotice = () => { bucketNotice.value = bucketNoticeLast.value; bucketNoticeDismissed.value = false; localStorage.removeItem(BN_KEY) }
 const loading = ref(false)
 const preparingIds = ref(new Set<string>())  // B-49：正在自动准备的数据集 id 集合（上传口释放后可多个并发准备）
-const preparingNew = computed(() => preparingIds.value.size > 0)
-const currentPreparing = computed(() => !!uploadResult.value && preparingIds.value.has(uploadResult.value.dataset_id))
+const isPreparing = (dsId: string) => preparingIds.value.has(dsId)
 const editingDataset = ref<string | null>(null)  // 正在编辑的数据集ID
 const deletingDataset = ref<string | null>(null)  // 正在删除的数据集ID
 const exportingDataset = ref<string | null>(null)  // 正在导出的数据集ID
@@ -1181,13 +1187,12 @@ const handleFileSelect = (event: Event) => {
   const target = event.target as HTMLInputElement
   if (target.files && target.files[0]) {
     selectedFile.value = target.files[0]
-    // B-49：上一个数据集还在后台准备时，保留其结果卡（撤销/泄漏 verdict 仍可见）；否则立即清掉
-    if (!preparingNew.value) uploadResult.value = null
+    // B-50：结果卡是任务列表，选新文件/取消选择均不影响旧卡
   }
 }
 
 // 清空所选文件（含 input.value，保证重新选同一个文件也会触发 change）
-// B-49：不再连带清 uploadResult —— 结果卡属于已落库的上传，「撤销本次上传」成功时才显式清卡
+// B-50：结果卡是任务列表，与文件选择彻底解耦；「撤销本次上传」成功时才移除对应卡
 const clearSelectedFile = () => {
   selectedFile.value = null
   uploadPercent.value = 0
@@ -1215,19 +1220,17 @@ const cancelUploadFlow = async () => {
   }
 }
 
-// 撤销本次上传（选错文件夹）：复用删除接口，目录/压缩包/桶账本/PG 影子库一并清掉
-const undoLastUpload = async () => {
-  const dsId = uploadResult.value?.dataset_id
-  if (!dsId || undoingUpload.value) return
+// 撤销某次上传（选错文件夹）：复用删除接口，目录/压缩包/桶账本/PG 影子库一并清掉
+const undoUpload = async (task: UploadTaskCard) => {
+  const dsId = task.datasetId
+  if (!dsId || task.undoing) return
   if (!(await showConfirm(`确定撤销本次上传吗？将删除数据集 ${dsId}、上传的压缩包及全部关联记录，不保留任何文件。`))) return
-  undoingUpload.value = true
+  task.undoing = true
   try {
     await deleteDataset(dsId)
-    // 顺带清掉服务端上传登记条目；失败不影响撤销结果（条目有 TTL 兜底）
-    if (currentUploadId.value) {
-      try { await cancelUpload(currentUploadId.value) } catch { /* 忽略 */ }
-    }
-    uploadResult.value = null  // B-49：撤销成功显式清结果卡（clearSelectedFile 已不再连带清）
+    // 顺带清掉服务端上传登记条目（按本次上传自己的 upload_id）；失败不影响撤销结果（条目有 TTL 兜底）
+    try { await cancelUpload(task.uploadId) } catch { /* 忽略 */ }
+    uploadTasks.value = uploadTasks.value.filter(t => t.datasetId !== dsId)  // B-50：撤销成功移除对应卡
     preparingIds.value.delete(dsId)  // 兜底：若撤销时该数据集仍在准备队列，同步移除
     clearSelectedFile()
     await loadDatasets()
@@ -1235,7 +1238,7 @@ const undoLastUpload = async () => {
   } catch (error: any) {
     if (!error?.__toastShown) showToast('撤销失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
-    undoingUpload.value = false
+    task.undoing = false
   }
 }
 
@@ -1248,14 +1251,13 @@ const uploadFile = async () => {
   }
 
   const mode = uploadMode.value  // B-49：快照上传目的，防止准备期间用户切换导致封板分支误判
+  const libId = uploadLibraryId.value  // B-50：快照归属库（上传成功后下拉自动清空，卡片/toast 用快照）
   const controller = new AbortController()
   uploadAbort.value = controller
   currentUploadId.value = genUploadId()
   uploadCancelled.value = false
   uploading.value = true
   uploadPercent.value = 0
-  testSetResult.value = null
-  testSetLeak.value = null
   try {
     const result = await uploadDataset(
       selectedFile.value, uploadLibraryId.value,
@@ -1264,8 +1266,16 @@ const uploadFile = async () => {
     )
     // 取消竞态：响应回来前用户已取消，不要再落结果、不要再触发自动准备
     if (uploadCancelled.value) return
-    uploadResult.value = result
     loadDatasets()
+    // B-50：为本次上传建一张结果任务卡（快照归属库/上传目的），后续上传只增卡不覆盖
+    const task: UploadTaskCard = {
+      datasetId: result.dataset_id, uploadId: currentUploadId.value,
+      libraryId: libId, mode, sealed: null, leak: null, sealing: false, undoing: false,
+    }
+    uploadTasks.value.unshift(task)
+    // B-50：归属下拉自动清空（卡片已快照归属，显示不受影响），迎接下一个数据集
+    uploadLibraryId.value = ''
+    libraryTouched.value = false
     // B-49：字节上传已完成、数据集已落库 —— 此刻立即释放上传口（清选择区 + 复位进度），
     // 自动准备在后台继续，准备期间即可选择并上传下一个数据集（大包解压不再堵住上传口）
     uploading.value = false
@@ -1280,11 +1290,11 @@ const uploadFile = async () => {
       if (uploadCancelled.value) return
       if (mode === 'test') {
         // 直接上传测试集：准备完成后自动封板为 held-out 测试集（含泄漏检查）
-        await sealTestSetAfterPrepare(result.dataset_id)
+        await sealTestSetAfterPrepare(task)
       } else {
-        showToast(`上传并准备成功！数据集已归属算法库「${libraryName(uploadLibraryId.value)}」`, 'info', 4000)
+        showToast(`上传并准备成功！数据集已归属算法库「${libraryName(libId)}」`, 'info', 4000)
       }
-      // 保留 uploadResult，让「撤销本次上传」在准备完成后仍然可用
+      // B-50：任务卡一直保留，「撤销本次上传」在准备完成后仍然可用
       loadDatasets()
       loadUploadModels()
     } catch (error: any) {
@@ -1303,32 +1313,32 @@ const uploadFile = async () => {
 }
 
 // B-47：直接上传测试集——准备完成后自动封板为算法库 held-out 测试集（含泄漏检查）
-const sealTestSetAfterPrepare = async (datasetId: string) => {
+const sealTestSetAfterPrepare = async (task: UploadTaskCard) => {
   try {
-    const r = await setDatasetAsTestSet(datasetId, false)
-    testSetResult.value = r
-    testSetLeak.value = null
+    const r = await setDatasetAsTestSet(task.datasetId, false)
+    task.sealed = r
+    task.leak = null
     showToast('已封板为算法库测试集（held-out），可用于同库模型比对', 'success', 4000)
   } catch (error: any) {
     const detail = error.response?.data?.detail || error.message
-    testSetLeak.value = { datasetId, detail }
+    task.leak = detail
     if (!error?.__toastShown) showToast('测试集封板被拦截：' + detail, 'error', 5000)
   }
 }
 
 // 泄漏检查命中时，用户确认无风险后强制放行
-const forceAsTestSet = async () => {
-  if (!testSetLeak.value) return
-  forcingTestSet.value = true
+const forceAsTestSet = async (task: UploadTaskCard) => {
+  if (!task.leak) return
+  task.sealing = true
   try {
-    const r = await setDatasetAsTestSet(testSetLeak.value.datasetId, true)
-    testSetResult.value = r
-    testSetLeak.value = null
+    const r = await setDatasetAsTestSet(task.datasetId, true)
+    task.sealed = r
+    task.leak = null
     showToast('已强制封板为算法库测试集', 'success', 4000)
   } catch (error: any) {
     if (!error?.__toastShown) showToast('强制封板失败: ' + (error.response?.data?.detail || error.message), 'error', 5000)
   } finally {
-    forcingTestSet.value = false
+    task.sealing = false
   }
 }
 
