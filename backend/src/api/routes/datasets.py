@@ -226,6 +226,39 @@ async def seal_dataset(dataset_id: str, request: SealRequest):
         raise HTTPException(400, str(e))
     return result
 
+class SetAsTestSetRequest(BaseModel):
+    force: bool = False  # 存在泄漏（测试集与同库训练图 md5 重合）时强制放行（写审计）
+
+@router.post("/{dataset_id}/set-as-test-set")
+async def set_dataset_as_test_set(dataset_id: str, request: SetAsTestSetRequest):
+    """将该数据集封板为所属算法库的独立测试集（held-out）。
+
+    - 校验归属库 / 已标注 / 标签字典一致 / 与同库训练图无 md5 泄漏
+    - 封板产物仅 test split（images/test + labels/test + data.yaml 只含 test 键）
+    - 写 meta.role=test + 库根指针 test_dataset_id
+    - 未通过泄漏检查需 force=True 放行
+    """
+    try:
+        return await dataset_service.set_as_test_set(dataset_id, request.force)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+@router.post("/{dataset_id}/reseal-test-set")
+async def reseal_dataset_as_test_set(dataset_id: str):
+    """测试集动态增删图片后重新封板（版本号 +1，同库旧指标标 stale）。"""
+    try:
+        return await dataset_service.reseal_test_set(dataset_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
 @router.post("/{dataset_id}/approve")
 async def approve_review(dataset_id: str):
     """审核通过：人工确认标注无误后标记，之后才允许自动灌桶/封板"""

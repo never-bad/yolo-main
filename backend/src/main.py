@@ -33,6 +33,7 @@ async def lifespan(app: FastAPI):
         logger.warning("PG 影子库初始化跳过（服务继续以 JSON 为主存储运行）: %s", e)
     from src.services.queue_service import ModelQueueService
     from src.services.dataset_service import DatasetService
+    from src.services.test_eval_service import test_eval_loop
     from src.api.routes import train as train_routes
     poll_task = asyncio.create_task(ModelQueueService().poll_loop())
     bucket_task = asyncio.create_task(DatasetService().bucket_poll_loop())
@@ -40,6 +41,9 @@ async def lifespan(app: FastAPI):
     # P6 GPU 熔断（2.3）：复用路由层唯一 TrainService 实例（共享 running_processes），
     # GPU 利用率持续过低自动停训（配置关停时循环内直接 return）
     gpu_watch_task = asyncio.create_task(train_routes.train_service.gpu_watch_loop())
+    # B-44 测试集评测后台循环：扫描 model.json 中 status=pending 的 test_eval 串行评测，
+    # 训练在跑时避让 GPU；注册表按名写入 BG_LOOP_STATE，/health 可观测。
+    test_eval_task = asyncio.create_task(test_eval_loop())
     try:
         yield
     finally:
@@ -47,6 +51,7 @@ async def lifespan(app: FastAPI):
         bucket_task.cancel()
         seal_task.cancel()
         gpu_watch_task.cancel()
+        test_eval_task.cancel()
 
 
 app = FastAPI(title="YOLO Training Platform API", lifespan=lifespan)

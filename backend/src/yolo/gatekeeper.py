@@ -123,56 +123,73 @@ def _pick_eval_split(data_yaml: str) -> str:
     return split
 
 
-def evaluate_model(weights: str, data_yaml: str, classes: list) -> dict:
+def evaluate_model(weights: str, data_yaml: str, classes: list,
+                   conf: float = None, conf_preference: str = "miss",
+                   imgsz: int = None, iou: float = 0.7, device: str = "cuda:0") -> dict:
     """在数据集评估集（优先独立 test，其次 val）上评估模型。
 
-    Returns:
-        {
-            "mAP50": float|None, "mAP50_95": float|None,
-            "precision": float|None, "recall": float|None,
-            "speed_ms": float|None,           # 平均推理耗时（推理阶段，不含预处理/NMS）
-            "mask_mAP50": float|None,         # 分割轮廓指标（仅 segment 模型有值，检测模型为 None）
-            "mask_mAP50_95": float|None,
-            "class_ap": {class_name: ap},     # 逐类 AP@50:95
-            "eval_split": "val"|"test",       # 实际使用的评估集
-            "error": str|None
-        }
+    Args:
+        conf: 置信度工作点；None 时 best-effort 取 F1 最大的 conf（近似相等按 conf_preference
+              偏召回/偏精确），取不到则退回低 conf 高召回（=默认「在意漏检」）口径。
+        conf_preference: "miss"(默认,偏召回/防漏检) | "false"(偏精确/防误检)
+        imgsz / iou / device: 评测超参（imgsz 默认 640；device 默认 cuda:0）
+
+    Returns（在原有基础上派生）:
+        mAP50/mAP50_95/precision/recall/speed_ms/class_ap/eval_split/error
+        + f1 / miss_rate(=1-recall) / false_rate(=1-precision) / gpu_mem_mb（峰值显存）
+        + speed_breakdown / conf_used / conf_preference
     """
     from ultralytics import YOLO
 
     split = _pick_eval_split(data_yaml)
 
-    try:
+    def _measure(use_conf):
         model = YOLO(_resolve_weights(weights))
-        # YOLO-World 等文本驱动模型需先 set_classes 才能按数据集类别评估
         try:
             if hasattr(model.model, "set_classes") and classes:
                 model.set_classes(classes)
         except Exception:
             pass
-        res = model.val(data=str(data_yaml), split=split, verbose=False, plots=False)
+        gpu0 = None
+        try:
+            import torch
+            if "cuda" in (device or "") and torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+        res = model.val(data=str(data_yaml), split=split, conf=use_conf,
+                        iou=iou, imgsz=imgsz or 640, device=device or "cuda:0",
+                        verbose=False, plots=False)
+        try:
+            import torch
+            if "cuda" in (device or "") and torch.cuda.is_available():
+                gpu0 = round(torch.cuda.max_memory_allocated() / (1024 * 1024), 1)
+        except Exception:
+            pass
+        return res, gpu0
+
+    def _assemble(res, gpu0, use_conf):
         m = res.box
 
         def _num(v):
-            """指标安全取数：None / 非数字一律返回 None，不抛异常"""
             try:
                 return None if v is None else round(float(v), 4)
             except (TypeError, ValueError):
                 return None
 
         # 分割模型才有 res.mask（轮廓质量指标）；检测模型为 None。
-        # 只作为附加信息展示与留档，不参与晋升判定（判定仍以方框 mAP50-95 为准）。
         mk = getattr(res, "mask", None)
         mask_map50 = _num(getattr(mk, "map50", None)) if mk is not None else None
         mask_map50_95 = _num(getattr(mk, "map", None)) if mk is not None else None
 
         speed = getattr(res, "speed", None) or {}
-        speed_ms = None
-        if isinstance(speed, dict) and speed.get("inference") is not None:
+        def _spd(k):
             try:
-                speed_ms = round(float(speed["inference"]), 2)
+                return round(float(speed.get(k)), 2) if speed.get(k) is not None else None
             except Exception:
-                pass
+                return None
+        speed_ms = _spd("inference")
+        speed_breakdown = {k: _spd(k) for k in ("preprocess", "inference", "postprocess", "nms") if _spd(k) is not None}
 
         # 逐类 AP：优先 ap + ap_class_index（稳定字段），回退 maps
         class_ap = {}
@@ -194,24 +211,76 @@ def evaluate_model(weights: str, data_yaml: str, classes: list) -> dict:
         except Exception:
             class_ap = {}
 
+        p = None if m.mp is None else round(float(m.mp), 4)
+        r = None if m.mr is None else round(float(m.mr), 4)
+        f1 = round(2 * p * r / (p + r), 4) if (p is not None and r is not None and (p + r) > 0) else None
+        miss_rate = round(1 - r, 4) if r is not None else None
+        false_rate = round(1 - p, 4) if p is not None else None
+
         return {
             "mAP50": None if m.map50 is None else round(float(m.map50), 4),
             "mAP50_95": None if m.map is None else round(float(m.map), 4),
-            "precision": None if m.mp is None else round(float(m.mp), 4),
-            "recall": None if m.mr is None else round(float(m.mr), 4),
-            "mask_mAP50": mask_map50,
-            "mask_mAP50_95": mask_map50_95,
-            "speed_ms": speed_ms,
-            "class_ap": class_ap,
-            "eval_split": split,
+            "precision": p, "recall": r, "f1": f1,
+            "miss_rate": miss_rate, "false_rate": false_rate,
+            "mask_mAP50": mask_map50, "mask_mAP50_95": mask_map50_95,
+            "speed_ms": speed_ms, "speed_breakdown": speed_breakdown,
+            "gpu_mem_mb": gpu0,
+            "class_ap": class_ap, "eval_split": split,
+            "conf_used": use_conf, "conf_preference": conf_preference,
             "error": None,
         }
+
+    try:
+        use_conf = conf if conf is not None else 0.001
+        res, gpu0 = _measure(use_conf)
+        # best-effort 自动工作点：F1 最大 conf（近似相等按偏好偏召回/精确）
+        if conf is None:
+            auto_conf = _pick_f1_conf(res, conf_preference)
+            if auto_conf is not None and abs(auto_conf - use_conf) > 1e-3:
+                res, gpu0 = _measure(auto_conf)
+                use_conf = auto_conf
+        return _assemble(res, gpu0, use_conf)
     except Exception as e:
         return {
             "mAP50": None, "mAP50_95": None, "precision": None, "recall": None,
+            "f1": None, "miss_rate": None, "false_rate": None,
             "mask_mAP50": None, "mask_mAP50_95": None,
-            "speed_ms": None, "class_ap": {}, "eval_split": split, "error": str(e),
+            "speed_ms": None, "speed_breakdown": None, "gpu_mem_mb": None,
+            "class_ap": {}, "eval_split": split,
+            "conf_used": conf if conf is not None else 0.001,
+            "conf_preference": conf_preference, "error": str(e),
         }
+
+
+def _pick_f1_conf(res, preference: str = "miss"):
+    """best-effort：从 val 结果取 F1 最大的置信度工作点。
+    取不到（曲线不可用时）返回 None —— 调用方退回默认低 conf 高召回口径。"""
+    try:
+        curves = getattr(res, "curves", None)
+        if not curves:
+            return None
+        best_conf, best_f1 = None, -1.0
+        for c in curves:
+            title = str(getattr(c, "title", getattr(c, "name", "")) or "").lower()
+            xlabel = str(getattr(c, "xlabel", getattr(c, "kname", "")) or "").lower()
+            if "f1" not in title or "conf" not in xlabel:
+                continue
+            px = getattr(c, "px", None) or getattr(c, "x", None)
+            py = getattr(c, "py", None) or getattr(c, "y", None)
+            if px is None or py is None:
+                continue
+            for x, y in zip(px, py):
+                x, y = float(x), float(y)
+                if y > best_f1:
+                    best_f1, best_conf = y, x
+                elif abs(y - best_f1) <= 1e-3 and best_conf is not None:
+                    if preference == "miss" and x < best_conf:
+                        best_conf = x
+                    elif preference == "false" and x > best_conf:
+                        best_conf = x
+        return best_conf
+    except Exception:
+        return None
 
 
 def check_loss_stability(train_dir) -> dict:

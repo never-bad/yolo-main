@@ -4,10 +4,15 @@ from pydantic import BaseModel
 from typing import Optional
 from src.services.model_service import ModelService
 from src.services.dataset_service import DatasetService
+from src.services.test_eval_service import (
+    run_test_eval, get_test_eval_matrix, list_library_model_ids,
+    _load_model_meta, _stale_library_test_evals,
+)
 from src.services.queue_service import ModelQueueService
 from src.db import meta_store
 from src.core.settings import settings
 import shutil
+import asyncio
 
 router = APIRouter(prefix="/models", tags=["models"])
 model_service = ModelService()
@@ -598,3 +603,102 @@ async def promote_to_detector(model_id: str):
         import traceback
         traceback.print_exc()
         raise HTTPException(500, str(e))
+
+
+# --------------------------------------------------------------------------- #
+# B-44 测试集评测接口
+# --------------------------------------------------------------------------- #
+class TestEvalRequest(BaseModel):
+    focus_metrics: Optional[list] = None   # 用户勾选的主指标；空=用库默认关注集
+    extra_artifacts: Optional[list] = None  # 勾选才生成的重产物（混淆矩阵/PR 曲线）
+    conf: Optional[float] = None             # 置信度工作点；None=自动取 F1 最大
+    conf_preference: Optional[str] = None    # "miss"(在意漏检,默认) | "false"(在意误检)
+
+
+async def _run_test_eval_bg(model_id: str, req: TestEvalRequest):
+    """后台异步执行评测（GPU 评测耗时较长，不阻塞 HTTP 请求）。"""
+    await asyncio.to_thread(
+        run_test_eval, model_id, True,
+        req.focus_metrics, req.extra_artifacts, req.conf, req.conf_preference,
+    )
+
+
+@router.post("/{model_id}/test-eval")
+async def trigger_test_eval(model_id: str, req: TestEvalRequest):
+    """手动触发/重跑某模型的测试集评测（立即返回排队状态，结果写回 model.json）。"""
+    if not _load_model_meta(model_id):
+        raise HTTPException(404, f"模型不存在: {model_id}")
+    try:
+        asyncio.create_task(_run_test_eval_bg(model_id, req))
+        return {"ok": True, "status": "running", "message": "已加入评测队列"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.get("/{model_id}/test-eval")
+async def get_test_eval(model_id: str):
+    """单模型测试集指标 + 逐类明细 + 状态。"""
+    meta = _load_model_meta(model_id)
+    if not meta:
+        raise HTTPException(404, f"模型不存在: {model_id}")
+    return {"model_id": model_id, "test_eval": meta.get("test_eval") or {}}
+
+
+@router.get("/{root_id}/test-eval/matrix")
+async def test_eval_matrix(root_id: str, model_ids: str = Query(None)):
+    """同库多模型测试集指标比对矩阵；model_ids 逗号分隔，缺省取该库全部模型。"""
+    if not _load_model_meta(root_id):
+        raise HTTPException(404, f"算法库不存在: {root_id}")
+    ids = [s for s in model_ids.split(",") if s] if model_ids else list_library_model_ids(root_id)
+    return get_test_eval_matrix(root_id, ids)
+
+
+@router.get("/{root_id}/test-set")
+async def get_library_test_set(root_id: str):
+    """算法库测试集信息：图数/类数/封板版本/泄漏检查/已评测模型数/默认偏好。"""
+    root = _load_model_meta(root_id)
+    if not root:
+        raise HTTPException(404, f"算法库不存在: {root_id}")
+    from src.core.settings import settings
+    info = {
+        "library_root_id": root_id,
+        "test_dataset_id": root.get("test_dataset_id"),
+        "test_dataset_history": root.get("test_dataset_history") or [],
+        "test_eval_preference": root.get("test_eval_preference") or "miss",
+    }
+    ds_id = root.get("test_dataset_id")
+    if ds_id:
+        ds_p = settings.DATASETS_DIR / ds_id / "meta.json"
+        if ds_p.exists():
+            m = load_json(ds_p)
+            info.update({
+                "image_count": m.get("test_image_count"),
+                "names": m.get("test_names"),
+                "sealed_version": m.get("test_sealed_version"),
+                "leakage_check": m.get("leakage_check"),
+            })
+        info["evaluated_count"] = len([
+            mid for mid in list_library_model_ids(root_id)
+            if (_load_model_meta(mid) or {}).get("test_eval", {}).get("status") in ("done", "failed", "stale")
+        ])
+    return info
+
+
+@router.delete("/{root_id}/test-set")
+async def unbind_test_set(root_id: str):
+    """解绑算法库测试集（历史指标标 stale，不清历史；数据仍在磁盘）。"""
+    from src.core.settings import settings
+    root_p = settings.REGISTRY_DIR / root_id / "model.json"
+    if not root_p.exists():
+        raise HTTPException(404, f"算法库不存在: {root_id}")
+    root = load_json(root_p)
+    old = root.get("test_dataset_id")
+    if old:
+        hist = root.get("test_dataset_history") or []
+        if old not in hist:
+            hist.append(old)
+        root["test_dataset_history"] = hist
+        root["test_dataset_id"] = None
+        save_json_atomic(root_p, root)
+        _stale_library_test_evals(root_id, 0)
+    return {"ok": True, "unbound": old}

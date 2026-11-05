@@ -6,6 +6,7 @@ import asyncio
 import time
 import threading
 import concurrent.futures
+import hashlib
 import yaml
 import os
 import re
@@ -20,7 +21,7 @@ from fastapi import UploadFile, HTTPException
 from src.core.lifecycle import record_error, record_heartbeat
 from src.core.settings import settings, seal_threshold_for
 from src.utils.fs_tree import build_tree
-from src.utils.class_labels import model_class_names, merge_classes_with_model
+from src.utils.class_labels import model_class_names, merge_classes_with_model, resolve_library_root_id
 from src.utils.class_labels import is_placeholder_classes as _is_placeholder_names
 from src.utils import zip_guard
 from src.utils.json_io import load_json, save_json_atomic
@@ -149,6 +150,7 @@ TRAIN_STATUS_COMPLETED = "completed"     # 已完成训练（不再送训）
 
 def _ensure_stage_fields(meta: dict) -> dict:
     """为数据集 meta 补全状态机字段（兼容旧数据回填：uploaded/prepared → 标注中）"""
+    meta.setdefault("role", "train")  # B-44：数据集角色，默认训练集；设为测试集后改 test
     meta.setdefault("stage", STAGE_ANNOTATING)
     meta.setdefault("training_status", TRAIN_STATUS_INCOMPLETE)
     meta.setdefault("sealed_at", None)
@@ -2449,6 +2451,166 @@ class DatasetService:
         parts.append(_fp(Path(settings.DATA_DIR) / "buckets.json"))
         return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
 
+    # ---------- B-44 测试集（held-out，不参与灌桶/训练/封板兜底） ----------
+    async def set_as_test_set(self, dataset_id: str, force: bool = False) -> dict:
+        """把一个已标注完成的数据集封板为「该算法库的独立测试集」。
+
+        - 校验：归属算法库 / 已标注 / 标签字典一致（label_guard）/ 与同库训练图无 md5 泄漏
+        - 封板产物：images/test + labels/test + data.yaml（仅 test 键）
+        - 写 meta.role=test + 库根指针 test_dataset_id
+        """
+        def _seal_sync():
+            ds_dir = self.datasets_dir / dataset_id
+            meta_path = ds_dir / "meta.json"
+            if not meta_path.exists():
+                raise ValueError(f"数据集不存在: {dataset_id}")
+            meta = load_json(meta_path)
+            library_root_id = meta.get("library_root_id") or meta.get("model_id")
+            if not library_root_id:
+                raise ValueError("数据集未归属任何算法库，无法设为测试集")
+            # 泄漏检查：与同库训练集图片 md5 交集
+            leak = self._test_set_leak_check(dataset_id, library_root_id)
+            if leak["overlap"] and not force:
+                raise ValueError(
+                    f"泄漏风险：测试集与同库训练集存在 {leak['overlap']} 张相同图片（md5 一致）。"
+                    "测试集必须在训练/选权重全程未见过，请更换数据集或 force 强制放行（写审计）。"
+                )
+            # 封板为 test split（复用既有封板产物，train/val 比例置 0 → 全部归入 test）
+            result = self._build_training_artifacts(
+                ds_dir, meta, split_ratio={"train": 0.0, "val": 0.0, "test": 1.0},
+                label_guard=True,
+            )
+            # 清理空 train/val 目录，data.yaml 只保留 test 键
+            for _d in ("train", "val"):
+                for _base in (ds_dir / "images", ds_dir / "labels"):
+                    _dd = _base / _d
+                    if _dd.exists():
+                        shutil.rmtree(_dd, ignore_errors=True)
+            self._write_test_data_yaml(ds_dir, result["names"], result.get("task", "detect"))
+            meta["role"] = "test"
+            meta["test_sealed_version"] = (meta.get("test_sealed_version") or 0) + 1
+            meta["test_sealed_at"] = time.time()
+            meta["test_image_count"] = result["counts"].get("test", 0)
+            meta["test_names"] = result["names"]
+            meta["leakage_check"] = leak
+            save_json_atomic(meta_path, meta)
+            self._set_library_test_set(library_root_id, dataset_id)
+            return {
+                "dataset_id": dataset_id,
+                "sealed_version": meta["test_sealed_version"],
+                "names": result["names"],
+                "image_count": meta["test_image_count"],
+                "leakage": leak,
+            }
+        return await asyncio.to_thread(_seal_sync)
+
+    async def reseal_test_set(self, dataset_id: str) -> dict:
+        """测试集动态增删图片后，重新封板（版本号 +1，旧模型指标标 stale）。"""
+        def _r():
+            ds_dir = self.datasets_dir / dataset_id
+            meta_path = ds_dir / "meta.json"
+            meta = load_json(meta_path)
+            if meta.get("role") != "test":
+                raise ValueError("该数据集不是测试集，无法重新封板")
+            library_root_id = meta.get("library_root_id") or meta.get("model_id")
+            result = self._build_training_artifacts(
+                ds_dir, meta, split_ratio={"train": 0.0, "val": 0.0, "test": 1.0},
+                label_guard=True,
+            )
+            for _d in ("train", "val"):
+                for _base in (ds_dir / "images", ds_dir / "labels"):
+                    _dd = _base / _d
+                    if _dd.exists():
+                        shutil.rmtree(_dd, ignore_errors=True)
+            self._write_test_data_yaml(ds_dir, result["names"], result.get("task", "detect"))
+            meta["test_sealed_version"] = (meta.get("test_sealed_version") or 0) + 1
+            meta["test_sealed_at"] = time.time()
+            meta["test_image_count"] = result["counts"].get("test", 0)
+            meta["test_names"] = result["names"]
+            save_json_atomic(meta_path, meta)
+            self._stale_library_test_evals(library_root_id, meta["test_sealed_version"])
+            return {"dataset_id": dataset_id, "sealed_version": meta["test_sealed_version"]}
+        return await asyncio.to_thread(_r)
+
+    def _write_test_data_yaml(self, dataset_dir: Path, names: list, task: str):
+        yaml_data = {"test": "images/test", "nc": len(names), "names": names,
+                     "task": task or "detect"}
+        _save_yaml(dataset_dir / "data.yaml", yaml_data)
+
+    def _file_md5(self, p: Path) -> str:
+        h = hashlib.md5()
+        with open(p, "rb") as f:
+            for _chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(_chunk)
+        return h.hexdigest()
+
+    def _test_set_leak_check(self, dataset_id: str, library_root_id: str) -> dict:
+        """测试集与同库训练集图片 md5 交集（泄漏检查）。返回 overlap 数量。"""
+        test_md5 = set()
+        test_dir = self.datasets_dir / dataset_id / "images"
+        for f in test_dir.rglob("*"):
+            if f.is_file() and f.suffix.lower() in IMG_SUFFIX:
+                test_md5.add(self._file_md5(f))
+        train_md5 = set()
+        if self.datasets_dir.exists():
+            for ds in self.datasets_dir.iterdir():
+                if not ds.is_dir() or ds.name == dataset_id:
+                    continue
+                mp = ds / "meta.json"
+                if not mp.exists():
+                    continue
+                try:
+                    m = load_json(mp)
+                except Exception:
+                    continue
+                if m.get("role") == "test":
+                    continue
+                if (m.get("library_root_id") or m.get("model_id")) != library_root_id:
+                    continue
+                for f in (ds / "images").rglob("*"):
+                    if f.is_file() and f.suffix.lower() in IMG_SUFFIX:
+                        train_md5.add(self._file_md5(f))
+        overlap = len(test_md5 & train_md5)
+        return {"checked_at": time.time(), "overlap_md5": overlap,
+                "verdict": "clean" if overlap == 0 else "overlap",
+                "test_images": len(test_md5)}
+
+    def _set_library_test_set(self, library_root_id: str, dataset_id: str):
+        root_path = settings.REGISTRY_DIR / library_root_id / "model.json"
+        if not root_path.exists():
+            return
+        root = load_json(root_path)
+        history = root.get("test_dataset_history") or []
+        old = root.get("test_dataset_id")
+        if old and old != dataset_id and old not in history:
+            history.append(old)
+        root["test_dataset_id"] = dataset_id
+        root["test_dataset_history"] = history
+        save_json_atomic(root_path, root)
+
+    def _stale_library_test_evals(self, library_root_id: str, new_version: int):
+        """测试集换版后，把同库已评测模型的 test_eval 标 stale（不自动重跑）。"""
+        if not settings.REGISTRY_DIR.exists():
+            return
+        for d in settings.REGISTRY_DIR.iterdir():
+            if not d.is_dir():
+                continue
+            mf = d / "model.json"
+            if not mf.exists():
+                continue
+            try:
+                meta = load_json(mf)
+            except Exception:
+                continue
+            te = meta.get("test_eval") or {}
+            if te.get("status") in ("done", "failed") and te.get("dataset_id"):
+                rid = resolve_library_root_id(d.name) or d.name
+                if rid == library_root_id:
+                    te["status"] = "stale"
+                    te["stale_reason"] = "test_set_version_changed"
+                    te["current_sealed_version"] = new_version
+                    save_json_atomic(mf, meta)
+
     async def list_datasets(self):
         """列出所有数据集（带签名缓存：磁盘无变化时直接返回上次结果，秒出）"""
         # 缓存命中：签名（关键文件 mtime/size 聚合）未变且未过 TTL → 直接返回，
@@ -2476,6 +2638,9 @@ class DatasetService:
                     if meta_path.exists():
                         try:
                             meta = load_json(meta_path)
+                            # B-44：测试集不出现在常规数据集网格（独立 Tab 展示）
+                            if meta.get("role") == "test":
+                                continue
                             # 占位类别名回填为真实名（修复历史遗留的 class_N 占位）
                             real_classes = self._resolve_real_classes(dataset_dir, meta)
                             if real_classes != meta.get("classes"):
@@ -3738,6 +3903,8 @@ class DatasetService:
                     meta = load_json(meta_path)
                 except Exception:
                     continue
+                if meta.get("role") == "test":  # B-44：测试集不参与灌桶
+                    continue
                 model_id = str(meta.get("model_id") or "")
                 if not model_id:
                     continue
@@ -4009,6 +4176,8 @@ class DatasetService:
                 continue
             meta = await asyncio.to_thread(load_json, meta_path)
             _ensure_stage_fields(meta)
+            if meta.get("role") == "test":  # B-44：测试集不走时间窗自动封板
+                continue
             if meta.get("stage") == STAGE_SEALED or meta.get("sealed_at"):
                 continue
             if meta.get("status") != "prepared":
