@@ -2472,9 +2472,10 @@ class DatasetService:
                 raise ValueError("数据集未归属任何算法库，无法设为测试集")
             # 泄漏检查：与同库训练集图片 md5 交集
             leak = self._test_set_leak_check(dataset_id, library_root_id)
-            if leak["overlap"] and not force:
+            # 注意键名是 overlap_md5（B-49 曾误写 leak["overlap"] → KeyError → 500 'overlap'，泄漏检查从未生效）
+            if leak["overlap_md5"] and not force:
                 raise ValueError(
-                    f"泄漏风险：测试集与同库训练集存在 {leak['overlap']} 张相同图片（md5 一致）。"
+                    f"泄漏风险：测试集与同库训练集存在 {leak['overlap_md5']} 张相同图片（md5 一致）。"
                     "测试集必须在训练/选权重全程未见过，请更换数据集或 force 强制放行（写审计）。"
                 )
             # 封板为 test split（复用既有封板产物，train/val 比例置 0 → 全部归入 test）
