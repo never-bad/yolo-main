@@ -307,6 +307,15 @@
                 <span v-if="v.lineage?.job_id">训练任务：{{ v.lineage.job_id }}</span>
                 <span v-if="baseLabel(v)">基底：{{ baseLabel(v) }}</span>
               </div>
+              <!-- 守门员拦截但人工复核认可 → 强制覆盖为生产候选，再走「✓ 确认发布」 -->
+              <div v-if="v.status === 'rejected'" class="ver-override">
+                <button
+                  class="primary small"
+                  :disabled="overridingId === v.model_id"
+                  @click="forceProduction(v)"
+                >{{ overridingId === v.model_id ? '处理中...' : '⚠ 强制设为生产' }}</button>
+                <small>人工覆盖守门员判定并记录原因；同业务更高版本的在役模型将自动换代。覆盖后本页会出现「✓ 确认发布」按钮。</small>
+              </div>
               <div v-if="v.gatekeeper" class="gk-compare">
                 <div class="gk-box">
                   <div class="gk-title">守门员评估</div>
@@ -600,7 +609,7 @@ import {
   getModel, getModelDatasets, updateModel, exportModel,
   getLabelsDict, updateLabelsDict, generateTrainingCharts, listModels,
   uploadModel,
-  syncLabelsToAnnotations, rollbackLabelSync, getLabelsUsage, confirmPublish,
+  syncLabelsToAnnotations, rollbackLabelSync, getLabelsUsage, confirmPublish, overrideModel,
   type ModelDataset, type LabelsDict, type LabelSyncResult, type LabelsUsage
 } from '@/api/models'
 import {
@@ -608,7 +617,7 @@ import {
   uploadDataset, prepareDataset
 } from '@/api/datasets'
 import { listTrainJobs } from '@/api/train'
-import { deleteModelWithGuard, showConfirm } from '@/composables/useDialog'
+import { deleteModelWithGuard, showConfirm, showPrompt } from '@/composables/useDialog'
 import { showToast } from '@/utils/toast'
 
 const route = useRoute()
@@ -1088,6 +1097,36 @@ async function doPublish(v: any) {
   }
 }
 
+// ===== 人工强制覆盖（Override）：守门员拦截但人工复核认可的版本 =====
+// 后端 POST /models/{id}/override 把 status 改为 production_ready 并写审计记录，
+// 之后该版本回到主视图，复用现有 doPublish 的「✓ 确认发布」完成最后一步。
+const overridingId = ref<string | null>(null)
+async function forceProduction(v: any) {
+  const reason = await showPrompt(
+    '请输入人工覆盖原因（会写进模型档案，用于审计追溯）：',
+    '人工复核：指标满足业务要求',
+    `强制设为生产 · ${verTitle(v)}`
+  )
+  if (!reason) return
+  const ok = await showConfirm(
+    `确认将 ${verTitle(v)}（${v.model_id}）强制设为生产候选？\n\n` +
+    `· 状态由「守门员拦截」改为「生产就绪」，并记录本次人工覆盖；\n` +
+    `· 同业务更高版本的在役模型会被标记为「已换代」；\n` +
+    `· 覆盖后本页会出现「✓ 确认发布」，点它才正式成为使用中版本。`
+  )
+  if (!ok) return
+  overridingId.value = v.model_id
+  try {
+    await overrideModel(v.model_id, { reason })
+    showToast('已人工覆盖为生产候选，请点本页「✓ 确认发布」完成发布', 'success', 5000)
+    await refresh()
+  } catch (e: any) {
+    if (!e?.__toastShown) showToast('强制设为生产失败：' + (e?.response?.data?.detail || e?.message), 'error', 4000)
+  } finally {
+    overridingId.value = null
+  }
+}
+
 // ===== Tab（依赖引用于此处定义之后） =====
 const wkTabs = computed(() => [
   { key: 'overview', label: '概览' },
@@ -1102,11 +1141,27 @@ async function loadJobs() {
   loadingJobs.value = true
   try {
     const res = await listTrainJobs()
-    const jobs = res.jobs || []
+    const jobs = Array.isArray(res?.jobs) ? res.jobs : []
+    // 算法库根 id：页面「版本」区也是按它判定归属（见 versions computed）。
+    // 旧过滤只比 model_id / base_model_id / lineage.job_id，而任务 meta 里
+    // 「属于哪个算法库」的字段是 library_root_id（建任务时必写），漏掉它就会
+    // 让从零训练、或产出模型没直接等于库根 id 的任务全部不显示 → 历史恒为空。
+    const rootId = String(model.value?.library_root_id || modelId)
     const rela = model.value?.lineage?.job_id
+    // 本库各版本自带的任务号，兜底 M11 之前没写 library_root_id 的老任务
+    const versionJobIds = new Set<string>(
+      versions.value
+        .filter((v: any) => !v.__lineage && String(v.library_root_id || v.model_id) === rootId)
+        .map((v: any) => String(v.lineage?.job_id || ''))
+        .filter(Boolean)
+    )
     historyJobs.value = jobs.filter((j: any) =>
-      j.model_id === modelId || j.base_model_id === modelId || j.job_id === rela
-    ).sort((a: any, b: any) => String(b.created_at).localeCompare(String(a.created_at)))
+      (j.library_root_id && String(j.library_root_id) === rootId)
+      || j.model_id === modelId
+      || j.base_model_id === modelId
+      || j.job_id === rela
+      || versionJobIds.has(String(j.job_id || ''))
+    ).sort((a: any, b: any) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
   } catch (e) {
     console.error('加载训练任务失败:', e)
   } finally {
@@ -1614,6 +1669,19 @@ onMounted(async () => {
 .ver-metric b { font-size: 1.2rem; color: #8e44ad; }
 .vm-label { font-size: 0.72rem; color: #94a3b3; }
 .ver-meta { display: flex; gap: 14px; flex-wrap: wrap; font-size: 0.78rem; color: #7f8c8d; }
+
+.ver-override {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: #fff8e1;
+  border: 1px solid #ffe0a3;
+  border-radius: 8px;
+}
+.ver-override small { color: #8a6d3b; font-size: 0.76rem; line-height: 1.4; }
 
 .gk-compare { margin-top: 10px; padding: 10px 12px; background: #fafbfc; border: 1px solid #dde3ea; border-radius: 8px; }
 .gk-title { font-size: 0.78rem; font-weight: 700; color: #34495e; margin-bottom: 6px; }
