@@ -162,16 +162,20 @@ def _import_coco(root: Path) -> dict:
     classes = []          # 类别英文码列表（顺序=class_id）
     cat_id_to_idx = {}    # COCO category_id → 平台 class_id
     records = {}          # {image_id: {...}}
+    coco_files_found = 0
     for p in sorted(root.rglob("*.json")):
-        low = [x.lower() for x in p.relative_to(root).parts]
-        if "annotations" in low:
-            continue
         try:
             d = load_json(p)
         except Exception:
             continue
+        # 仅按结构判定是否为 COCO 源文件：含 images+annotations 键才是真源文件。
+        # 老逻辑用「路径含 annotations 就跳过」会把标准 COCO 布局
+        # (annotations/instances_*.json) 的标注一并漏读，导致静默丢标注；
+        # 平台自身「一图一 JSON」(含 image_id/boxes，无 images/annotations 键)
+        # 自然被下方断言跳过，无需靠路径黑名单。
         if not (isinstance(d, dict) and "images" in d and "annotations" in d):
             continue
+        coco_files_found += 1
         # 类别表（多文件时合并，先到先得保序）
         for cat in d.get("categories", []):
             cname = str(cat.get("name", "")).strip()
@@ -204,15 +208,19 @@ def _import_coco(root: Path) -> dict:
                 "class_id": cat_id_to_idx.get(int(ann["category_id"]), 0),
                 "x1": x, "y1": y, "x2": x + w, "y2": y + h,
             }
-            # 分割轮廓：COCO 的 segmentation 是"按图片宽高归一化"的扁平坐标
-            # polygon 形式 [[x1,y1,x2,y2,...], ...]；RLE（iscrowd=1）需要额外依赖，按矩形导入
+            # 分割轮廓：标准 COCO 的 segmentation polygon 是「绝对像素坐标」
+            # [[x1,y1,x2,y2,...], ...]，而非归一化值。RLE（iscrowd=1）需额外依赖，按矩形导入。
+            # 旧逻辑误把坐标当成「按宽高归一化」乘了 iw/ih，导致轮廓被放大几百倍、分割失效。
             iw, ih = rec["width"], rec["height"]
             seg = ann.get("segmentation")
             if iw > 0 and ih > 0 and isinstance(seg, list) and seg and isinstance(seg[0], list):
                 # 同一目标被拆成多块时取点数最多的主块（RLE/噪点块不在此列）
                 flat = [float(v) for v in max(seg, key=lambda s: len(s))]
-                pts = [[round(flat[i] * iw, 2), round(flat[i + 1] * ih, 2)]
-                       for i in range(0, len(flat) - 1, 2)]
+                # 绝对像素坐标：超出图像边界的夹紧到 [0,w]/[0,h]，避免越界脏数据
+                pts = [[
+                    round(min(max(flat[i], 0.0), iw), 2),
+                    round(min(max(flat[i + 1], 0.0), ih), 2),
+                ] for i in range(0, len(flat) - 1, 2)]
                 poly = clean_polygon(pts)
                 if poly:
                     box["polygon"] = poly
@@ -243,6 +251,14 @@ def _import_coco(root: Path) -> dict:
         _write_ann(root, img_abs.stem, img_abs, rec["width"], rec["height"], rec["boxes"])
         annotated += 1
 
+    # 安全网：识别出 COCO 源文件却一个框都没导入成功（通常是图片未匹配上 / 布局异常），
+    # 避免「假成功、真丢标注」——明确报错而非静默 0 标注。
+    if coco_files_found > 0 and annotated == 0:
+        errors.append(
+            "检测到 COCO 标注文件但未导入任何标注：请确认图片文件名能与 COCO 的 file_name 匹配"
+            "（或将 instances_*.json 放在压缩包根目录并改名含 coco）"
+        )
+
     return {"images": matched_images, "annotated": annotated, "classes": classes, "errors": errors}
 
 
@@ -259,13 +275,12 @@ def _import_labelme(root: Path) -> dict:
     annotated = 0
     matched_images = 0
     for p in sorted(root.rglob("*.json")):
-        low = [x.lower() for x in p.relative_to(root).parts]
-        if "annotations" in low:
-            continue
         try:
             d = load_json(p)
         except Exception:
             continue
+        # 仅按结构判定（含 shapes+imagePath 才是 LabelMe 源）；平台「一图一 JSON」
+        # 无这两个键，自然被下方断言跳过，不再靠「路径含 annotations 就跳过」的黑名单。
         if not (isinstance(d, dict) and "shapes" in d and "imagePath" in d):
             continue
 
