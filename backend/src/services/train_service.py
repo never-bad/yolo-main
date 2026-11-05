@@ -1862,11 +1862,18 @@ class TrainService:
                 return jobs
             
             for job_file in self.jobs_dir.glob("*.json"):
+                # B-43：跳过 GPU 指纹 sidecar（{job_id}.gpu.json）。它由训练子进程
+                # 写在 jobs_dir 与任务档案同目录，glob("*.json") 会把它误当任务
+                # 档案读进来——sidecar 只有 job_id/torch_* 字段，没有
+                # model_name/epochs/created_at/status，于是训练历史每个跑过的
+                # 任务下面多出一行只有任务号的空行。
+                if job_file.name.endswith(".gpu.json"):
+                    continue
                 try:
                     job_meta = load_json(job_file)
                 except Exception:
                     continue
-                
+
                 # 检查是否有运行中的任务实际已崩溃
                 job_id = job_meta.get("job_id")
                 if job_id and job_meta.get("status") == "running":
@@ -2032,6 +2039,8 @@ class TrainService:
         if not self.jobs_dir.exists():
             return
         for job_file in self.jobs_dir.glob("*.json"):
+            if job_file.name.endswith(".gpu.json"):
+                continue  # B-43：GPU 指纹 sidecar 不是任务档案
             try:
                 meta = load_json(job_file)
             except Exception:

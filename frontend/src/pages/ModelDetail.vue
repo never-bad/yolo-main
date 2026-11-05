@@ -1155,6 +1155,9 @@ async function loadJobs() {
         .map((v: any) => String(v.lineage?.job_id || ''))
         .filter(Boolean)
     )
+    // B-43 兜底：同 job_id 只保留一条，防止历史残留的重复条目导致
+    // 表格出现空行且 :key 重复告警（根因 .gpu.json 已在后端过滤）
+    const seen = new Set<string>()
     historyJobs.value = jobs.filter((j: any) =>
       (j.library_root_id && String(j.library_root_id) === rootId)
       || j.model_id === modelId
@@ -1162,6 +1165,12 @@ async function loadJobs() {
       || j.job_id === rela
       || versionJobIds.has(String(j.job_id || ''))
     ).sort((a: any, b: any) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+      .filter((j: any) => {
+        const id = String(j.job_id || '')
+        if (!id || seen.has(id)) return false
+        seen.add(id)
+        return true
+      })
   } catch (e) {
     console.error('加载训练任务失败:', e)
   } finally {
