@@ -1339,6 +1339,23 @@ const applyTestSet = async () => {
     await loadTestEval()
   } catch (e: any) {
     const detail = e.response?.data?.detail || e.message
+    // B-49b：泄漏命中（400 且文案含「泄漏」）→ 确认后强制放行，就地补设测试集不用回上传页
+    if (e.response?.status === 400 && String(detail).includes('泄漏')) {
+      settingTestSet.value = false
+      if (await showConfirm('检测到泄漏风险：\n' + detail + '\n\n确认无泄漏风险并强制放行吗？（将写审计）')) {
+        settingTestSet.value = true
+        try {
+          await setDsTestSet(testSetPickId.value, true)
+          testSetPickerOpen.value = false
+          testSetPickId.value = ''
+          showToast('已强制设为算法库测试集', 'success')
+          await loadTestEval()
+        } catch (e2: any) {
+          if (!e2?.__toastShown) showToast('强制设置失败: ' + (e2.response?.data?.detail || e2.message), 'error')
+        }
+      }
+      return
+    }
     if (!e?.__toastShown) showToast('设置失败: ' + detail, 'error')
   } finally {
     settingTestSet.value = false
