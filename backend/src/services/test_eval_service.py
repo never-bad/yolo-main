@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import time
 from pathlib import Path
 from typing import Optional
@@ -281,6 +282,18 @@ async def test_eval_loop(poll_seconds: int | None = None):
 # --------------------------------------------------------------------------- #
 # 多模型比对矩阵
 # --------------------------------------------------------------------------- #
+def _sanitize_json(obj):
+    """NaN/Inf → None。Starlette JSONResponse 是 allow_nan=False，指标里的 nan
+    （类别无 GT 时 ultralytics 给 nan AP）会让响应序列化 500 且无 detail（老坑）。"""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_json(v) for v in obj]
+    return obj
+
+
 def get_test_eval_matrix(root_id: str, model_ids: list) -> dict:
     """同库多模型测试集指标对比矩阵。
 
@@ -335,9 +348,9 @@ def get_test_eval_matrix(root_id: str, model_ids: list) -> dict:
     base_key = next((r["comparable_key"] for r in rows if r["comparable_key"]), None)
     for r in rows:
         r["comparable"] = bool(base_key) and r["comparable_key"] == base_key
-    return {
+    return _sanitize_json({
         "test_dataset_id": test_dataset_id,
         "models": rows,
         "classes": names_union,
         "base_key": base_key,
-    }
+    })

@@ -641,21 +641,37 @@ async def get_test_eval(model_id: str):
     meta = _load_model_meta(model_id)
     if not meta:
         raise HTTPException(404, f"模型不存在: {model_id}")
-    return {"model_id": model_id, "test_eval": meta.get("test_eval") or {}}
+    from src.services.test_eval_service import _sanitize_json
+    return {"model_id": model_id, "test_eval": _sanitize_json(meta.get("test_eval") or {})}
 
 
 @router.get("/{root_id}/test-eval/matrix")
 async def test_eval_matrix(root_id: str, model_ids: str = Query(None)):
     """同库多模型测试集指标比对矩阵；model_ids 逗号分隔，缺省取该库全部模型。"""
-    if not _load_model_meta(root_id):
-        raise HTTPException(404, f"算法库不存在: {root_id}")
-    ids = [s for s in model_ids.split(",") if s] if model_ids else list_library_model_ids(root_id)
-    return get_test_eval_matrix(root_id, ids)
+    try:
+        if not _load_model_meta(root_id):
+            raise HTTPException(404, f"算法库不存在: {root_id}")
+        ids = [s for s in model_ids.split(",") if s] if model_ids else list_library_model_ids(root_id)
+        return get_test_eval_matrix(root_id, ids)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"读取测试集比对矩阵失败: {e}")
 
 
 @router.get("/{root_id}/test-set")
 async def get_library_test_set(root_id: str):
     """算法库测试集信息：图数/类数/封板版本/泄漏检查/已评测模型数/默认偏好。"""
+    try:
+        return _get_library_test_set_impl(root_id)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        # 兜底转 500 并带上可读 detail（否则 FastAPI 默认 500 无 detail，前端只能显示「服务端错误：500」）
+        raise HTTPException(500, f"读取测试集信息失败: {e}")
+
+
+def _get_library_test_set_impl(root_id: str) -> dict:
     root = _load_model_meta(root_id)
     if not root:
         raise HTTPException(404, f"算法库不存在: {root_id}")
@@ -670,16 +686,23 @@ async def get_library_test_set(root_id: str):
     if ds_id:
         ds_p = settings.DATASETS_DIR / ds_id / "meta.json"
         if ds_p.exists():
-            m = load_json(ds_p)
-            info.update({
-                "image_count": m.get("test_image_count"),
-                "names": m.get("test_names"),
-                "sealed_version": m.get("test_sealed_version"),
-                "leakage_check": m.get("leakage_check"),
-            })
+            try:
+                m = load_json(ds_p)
+            except Exception as e:  # noqa: BLE001
+                m = None
+                info["meta_error"] = f"测试集 meta.json 读取失败: {e}"
+            if m:
+                info.update({
+                    "image_count": m.get("test_image_count"),
+                    "names": m.get("test_names"),
+                    "sealed_version": m.get("test_sealed_version"),
+                    "leakage_check": m.get("leakage_check"),
+                })
+        else:
+            info["meta_error"] = f"测试集数据集目录缺失: {ds_id}"
         info["evaluated_count"] = len([
             mid for mid in list_library_model_ids(root_id)
-            if (_load_model_meta(mid) or {}).get("test_eval", {}).get("status") in ("done", "failed", "stale")
+            if ((_load_model_meta(mid) or {}).get("test_eval") or {}).get("status") in ("done", "failed", "stale")
         ])
     return info
 

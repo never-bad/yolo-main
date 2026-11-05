@@ -60,6 +60,7 @@
         <small v-else class="form-hint">归属决定训练产出的模型进入哪个算法库；导入后可在数据集列表里改归属</small>
       </div>
       <div v-for="task in uploadTasks" :key="task.datasetId" class="result">
+        <button type="button" class="result-close" title="收起此卡片（数据集不受影响）" @click="removeTask(task)">✕</button>
         <p>✓ 上传成功: {{ task.datasetId }}<span class="auto-create-tag">（已归属算法库 {{ libraryName(task.libraryId) }}）</span></p>
         <p v-if="isPreparing(task.datasetId)" class="auto-prepare-tip">
           <span class="loading-spinner"></span>正在后台自动准备数据集（解压/重组/统计），期间可继续上传下一个数据集...
@@ -514,8 +515,24 @@ interface UploadTaskCard {
   leak: string | null     // 泄漏拦截文案（非空时显示「强制放行」按钮）
   sealing: boolean        // 强制封板请求进行中
   undoing: boolean        // 撤销请求进行中
+  prepareFailed?: boolean // 准备失败（保留卡片供撤销/重试判断）
+  dismissTimer?: any      // 自动消失定时器（完成态卡片挂一段合理时间后自动收起）
 }
 const uploadTasks = ref<UploadTaskCard[]>([])
+
+// B-51：任务卡生命周期 —— 完成态不永久挂屏
+// 手动 ✕ 随时可关（准备中关掉会失去撤销入口，仅提示）；成功完成后 15s 自动收起；
+// 泄漏待放行 / 准备失败的卡不自动消失，等用户处理完。
+const removeTask = (task: UploadTaskCard) => {
+  if (task.dismissTimer) { clearTimeout(task.dismissTimer); task.dismissTimer = null }
+  const i = uploadTasks.value.indexOf(task)
+  if (i >= 0) uploadTasks.value.splice(i, 1)
+}
+const scheduleTaskDismiss = (task: UploadTaskCard, delay = 15000) => {
+  if (task.leak) return  // 泄漏待放行：保留操作入口
+  if (task.dismissTimer) clearTimeout(task.dismissTimer)
+  task.dismissTimer = setTimeout(() => removeTask(task), delay)
+}
 const allModels = ref<any[]>([]) // registry 记录（算法库下拉数据源）
 const uploading = ref(false)
 const uploadPercent = ref(0)   // 上传字节进度（0~100），仅在 uploading 时显示
@@ -1230,7 +1247,7 @@ const undoUpload = async (task: UploadTaskCard) => {
     await deleteDataset(dsId)
     // 顺带清掉服务端上传登记条目（按本次上传自己的 upload_id）；失败不影响撤销结果（条目有 TTL 兜底）
     try { await cancelUpload(task.uploadId) } catch { /* 忽略 */ }
-    uploadTasks.value = uploadTasks.value.filter(t => t.datasetId !== dsId)  // B-50：撤销成功移除对应卡
+    removeTask(task)  // B-50/B-51：撤销成功移除对应卡（并清掉自动收起定时器）
     preparingIds.value.delete(dsId)  // 兜底：若撤销时该数据集仍在准备队列，同步移除
     clearSelectedFile()
     await loadDatasets()
@@ -1293,11 +1310,14 @@ const uploadFile = async () => {
         await sealTestSetAfterPrepare(task)
       } else {
         showToast(`上传并准备成功！数据集已归属算法库「${libraryName(libId)}」`, 'info', 4000)
+        // B-51：训练集全部完成 → 挂 15s 供确认/撤销，然后自动收起
+        scheduleTaskDismiss(task)
       }
       // B-50：任务卡一直保留，「撤销本次上传」在准备完成后仍然可用
       loadDatasets()
       loadUploadModels()
     } catch (error: any) {
+      task.prepareFailed = true  // B-51：准备失败保留卡片（撤销入口），不自动消失
       if (!error?.__toastShown) showToast('准备失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
     } finally {
       preparingIds.value.delete(result.dataset_id)
@@ -1319,6 +1339,8 @@ const sealTestSetAfterPrepare = async (task: UploadTaskCard) => {
     task.sealed = r
     task.leak = null
     showToast('已封板为算法库测试集（held-out），可用于同库模型比对', 'success', 4000)
+    // B-51：封板成功（含泄漏 clean）→ 挂 15s 供确认，然后自动收起
+    scheduleTaskDismiss(task)
   } catch (error: any) {
     const detail = error.response?.data?.detail || error.message
     task.leak = detail
@@ -1335,6 +1357,7 @@ const forceAsTestSet = async (task: UploadTaskCard) => {
     task.sealed = r
     task.leak = null
     showToast('已强制封板为算法库测试集', 'success', 4000)
+    scheduleTaskDismiss(task)  // B-51：强制放行成功也进入完成态自动收起
   } catch (error: any) {
     if (!error?.__toastShown) showToast('强制封板失败: ' + (error.response?.data?.detail || error.message), 'error', 5000)
   } finally {
@@ -1647,6 +1670,25 @@ onActivated(() => {
   padding: 1rem;
   background: #d5f4e6;
   border-radius: 4px;
+  position: relative;
+}
+/* B-51：任务卡右上角手动收起按钮 */
+.result-close {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  border: none;
+  background: transparent;
+  color: #6b7a6e;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  line-height: 1;
+}
+.result-close:hover {
+  background: rgba(0, 0, 0, 0.08);
+  color: #222;
 }
 
 .auto-prepare-tip {
