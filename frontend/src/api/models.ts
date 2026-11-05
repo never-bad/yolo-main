@@ -458,3 +458,88 @@ export const generateTrainingCharts = async (
   })
   return response.data
 }
+
+// ===== B-47 测试集评测 =====
+export interface TestEvalMetrics {
+  mAP50?: number | null
+  mAP50_95?: number | null
+  precision?: number | null
+  recall?: number | null
+  f1?: number | null
+  miss_rate?: number | null      // = 1 - recall（漏检率）
+  false_rate?: number | null     // = 1 - precision（误检率）
+  speed_ms?: number | null       // 推理延迟（inference）
+  gpu_mem_mb?: number | null     // 峰值显存
+  conf_used?: number | null
+  conf_preference?: string
+  class_ap?: Record<string, { ap?: number | null; [k: string]: any }>
+  eval_split?: string
+  error?: string | null
+}
+
+export interface TestEvalEntry {
+  model_id: string
+  display_name?: string
+  version?: string
+  status?: 'pending' | 'running' | 'done' | 'failed' | 'stale' | 'skipped' | string
+  stale?: boolean
+  metrics?: TestEvalMetrics
+  eval_config?: { imgsz?: number; conf?: number; conf_preference?: string; iou?: number; device?: string }
+  weights_sha256?: string | null
+  comparable_key?: string
+  comparable?: boolean
+  error?: string | null
+}
+
+export interface TestEvalMatrix {
+  test_dataset_id?: string | null
+  models: TestEvalEntry[]
+  classes: string[]
+  base_key?: string | null
+}
+
+export interface TestSetInfo {
+  library_root_id?: string
+  test_dataset_id?: string | null
+  test_dataset_history?: string[]
+  test_eval_preference?: string
+  image_count?: number
+  names?: string[]
+  sealed_version?: number
+  leakage_check?: { overlap_md5?: number; verdict?: string; test_images?: number; [k: string]: any }
+  evaluated_count?: number
+}
+
+export const getTestEvalMatrix = async (rootId: string, modelIds?: string[]): Promise<TestEvalMatrix> => {
+  const params: any = {}
+  if (modelIds && modelIds.length) params.model_ids = modelIds.join(',')
+  const { data } = await api.get(`/models/${rootId}/test-eval/matrix`, { params })
+  return data
+}
+
+export const getLibraryTestSet = async (rootId: string): Promise<TestSetInfo> => {
+  const { data } = await api.get(`/models/${rootId}/test-set`)
+  return data
+}
+
+export const unbindTestSet = async (rootId: string) => {
+  const { data } = await api.delete(`/models/${rootId}/test-set`)
+  return data
+}
+
+export interface TestEvalRequest {
+  focus_metrics?: string[] | null
+  extra_artifacts?: string[] | null
+  conf?: number | null
+  conf_preference?: string | null
+}
+
+export const triggerTestEval = async (modelId: string, req: TestEvalRequest = {}) => {
+  const { data } = await api.post(`/models/${modelId}/test-eval`, req)
+  return data
+}
+
+export const getTestEval = async (modelId: string): Promise<{ model_id: string; test_eval: any }> => {
+  const { data } = await api.get(`/models/${modelId}/test-eval`)
+  return data
+}

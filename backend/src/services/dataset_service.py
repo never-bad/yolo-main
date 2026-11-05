@@ -572,7 +572,7 @@ class DatasetService:
         self._bucket_state = None  # advance 期间持有的桶账本（跨 _seal_receiving_bucket 使用）
 
     async def upload_dataset(self, file: UploadFile, model_id: str = None, library_root_id: str = None,
-                             upload_id: str = None):
+                             upload_id: str = None, role: str = None):
         """上传数据集压缩包（zip / tar / tar.gz / tgz）
 
         model_id: 归属模型（1.7 模型仓库：数据挂到对应模型下）；为空则由后续采集/绑定流程归属
@@ -654,6 +654,8 @@ class DatasetService:
                 "model_id": model_id,
                 # 归属算法库（库根记录 id）：训练未显式指定库时，产出继承这个库
                 "library_root_id": library_root_id,
+                # B-47：直接上传测试集——创建即标记 role=test（跳过灌桶/自动封板，仅走准备抽取标注）
+                "role": role if role in ("train", "test") else "train",
             }
             meta_path = dataset_dir / "meta.json"
             await asyncio.to_thread(save_json_atomic, meta_path, meta)

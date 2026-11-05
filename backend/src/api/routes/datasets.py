@@ -70,6 +70,7 @@ async def upload_dataset(
     file: UploadFile = File(...),
     model_id: Optional[str] = None,
     upload_id: Optional[str] = None,
+    role: Optional[str] = None,
 ):
     """上传数据集压缩包（zip / tar / tar.gz / tgz）
 
@@ -78,10 +79,16 @@ async def upload_dataset(
               使库详情的挂载数据集列表、准备阶段的类别过滤、训练产出的库归属都按库生效
     upload_id: 前端生成的本次上传标识；登记在途产物后，取消接口可据此精确清理，
                避免「上传中断 / 请求断开」在服务端留下目录、压缩包或影子库记录。
+    role: 数据集角色。缺省 "train"（进入灌桶→封板训练流程）；"test" 表示「直接上传测试集」，
+          创建即标记 role=test，跳过灌桶/时间窗自动封板（仍走准备阶段抽取标注），
+          由前端在准备完成后调 set-as-test-set 封板为算法库的 held-out 测试集。
     """
     allowed = (".zip", ".tar", ".tar.gz", ".tgz")
     if not (file.filename or "").lower().endswith(allowed):
         raise HTTPException(400, "Only zip / tar / tar.gz / tgz files are allowed")
+
+    if role not in (None, "train", "test"):
+        raise HTTPException(400, "role 仅支持 train / test")
 
     if not model_id:
         raise HTTPException(400, "请先选择该数据集归属的算法库（没有合适的库请先新建算法库）")
@@ -89,7 +96,7 @@ async def upload_dataset(
     if not library_root_id:
         raise HTTPException(400, f"归属的算法库不存在：{model_id}")
 
-    return await dataset_service.upload_dataset(file, library_root_id, library_root_id, upload_id)
+    return await dataset_service.upload_dataset(file, library_root_id, library_root_id, upload_id, role)
 
 
 @router.post("/upload/cancel")

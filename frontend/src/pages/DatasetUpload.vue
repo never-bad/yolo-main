@@ -3,6 +3,17 @@
     <div class="card">
       <h2>上传数据集</h2>
       <div class="form-group">
+        <label>上传目的</label>
+        <div class="mode-seg">
+          <button type="button" :class="{ on: uploadMode === 'train' }" @click="uploadMode = 'train'">训练集</button>
+          <button type="button" :class="{ on: uploadMode === 'test' }" @click="uploadMode = 'test'">测试集（held-out）</button>
+        </div>
+        <small v-if="uploadMode === 'test'" class="form-hint">
+          直接上传即成为该算法库的独立测试集（跳过灌桶/训练封板），用于同库多模型公平比对；仍会校验与同库训练图是否重复（泄漏检查），命中需强制放行。
+        </small>
+        <small v-else class="form-hint">上传后进入灌桶 → 封板 → 训练流程。</small>
+      </div>
+      <div class="form-group">
         <label>选择压缩包文件（支持 .zip / .tar / .tar.gz / .tgz）</label>
         <small class="form-hint">
           内置标准化引擎：VOC(XML) / COCO(JSON) 标注自动转换 YOLO 格式；文件夹结构不统一时自动扫描重组（图片与同名标签自动配对）。
@@ -20,7 +31,7 @@
           <label for="datasetZip" class="file-btn" :disabled="uploading">选择文件</label>
           <button class="upload-btn" @click="uploadFile" :disabled="!selectedFile || uploading || !uploadLibraryId">
             <span v-if="uploading" class="loading-spinner"></span>
-            {{ uploading ? '上传中...' : '上传' }}
+            {{ uploading ? '上传中...' : (uploadMode === 'test' ? '上传为测试集' : '上传') }}
           </button>
           <!-- 上传中可随时中断；服务端会同步清理已接收的临时文件，不留残留 -->
           <button v-if="uploading" type="button" class="cancel-upload-btn" :disabled="cancellingUpload" @click="cancelUploadFlow">
@@ -60,6 +71,16 @@
           </button>
           <small v-if="preparingNew">正在自动准备数据集，准备完成后即可撤销。</small>
           <small v-else>会删除刚生成的数据集、上传的压缩包及全部关联记录，不保留任何文件。</small>
+        </div>
+        <div v-if="uploadMode === 'test'" class="testset-result">
+          <p v-if="testSetResult">✓ 已封板为算法库测试集：版本 v{{ testSetResult.sealed_version }}，共 {{ testSetResult.image_count }} 张，类别 {{ (testSetResult.names || []).join('、') }}</p>
+          <p v-if="testSetResult && testSetResult.leakage" :class="['leak-verdict', testSetResult.leakage.verdict]">
+            泄漏检查：{{ testSetResult.leakage.verdict === 'clean' ? '无重复（clean）' : ('命中 ' + testSetResult.leakage.overlap_md5 + ' 张重复图') }}
+          </p>
+          <p v-if="testSetLeak" class="leak-warn">⚠ 封板被拦截：{{ testSetLeak.detail }}</p>
+          <button v-if="testSetLeak" type="button" class="warning" :disabled="forcingTestSet" @click="forceAsTestSet">
+            {{ forcingTestSet ? '强制封板中...' : '强制放行（确认无泄漏风险）' }}
+          </button>
         </div>
       </div>
     </div>
@@ -466,7 +487,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch, onMounted, onActivated, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { uploadDataset, cancelUpload, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel, getSealThreshold, setSealThreshold } from '@/api/datasets'
+import { uploadDataset, cancelUpload, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel, getSealThreshold, setSealThreshold, setDatasetAsTestSet } from '@/api/datasets'
 import { listModels } from '@/api/models'
 import { addHardSamples, addBackgroundSamples } from '@/api/samplePool'
 import { downloadFile } from '@/utils/download'
@@ -482,6 +503,10 @@ const route = useRoute()
 const uploadLibraryId = ref('')   // 导入时必选的归属算法库（库根记录 id）
 const libraryTouched = ref(false) // 点过上传但没选库 → 显示红字提示
 const createLibraryOpen = ref(false)
+const uploadMode = ref<'train' | 'test'>('train')  // B-47：上传目的（训练集 / 测试集）
+const testSetResult = ref<any>(null)   // 直接上传测试集 → 封板结果
+const testSetLeak = ref<{ datasetId: string; detail: string } | null>(null)  // 泄漏拦截（需强制放行）
+const forcingTestSet = ref(false)
 const allModels = ref<any[]>([]) // registry 记录（算法库下拉数据源）
 const uploading = ref(false)
 const uploadPercent = ref(0)   // 上传字节进度（0~100），仅在 uploading 时显示
@@ -1223,11 +1248,13 @@ const uploadFile = async () => {
   uploadCancelled.value = false
   uploading.value = true
   uploadPercent.value = 0
+  testSetResult.value = null
+  testSetLeak.value = null
   try {
     const result = await uploadDataset(
       selectedFile.value, uploadLibraryId.value,
       (p) => { uploadPercent.value = p },
-      { uploadId: currentUploadId.value, signal: controller.signal }
+      { uploadId: currentUploadId.value, signal: controller.signal, role: uploadMode.value }
     )
     // 取消竞态：响应回来前用户已取消，不要再落结果、不要再触发自动准备
     if (uploadCancelled.value) return
@@ -1238,7 +1265,12 @@ const uploadFile = async () => {
     try {
       await prepareDst(result.dataset_id)
       if (uploadCancelled.value) return
-      showToast(`上传并准备成功！数据集已归属算法库「${libraryName(uploadLibraryId.value)}」`, 'info', 4000)
+      if (uploadMode.value === 'test') {
+        // 直接上传测试集：准备完成后自动封板为 held-out 测试集（含泄漏检查）
+        await sealTestSetAfterPrepare(result.dataset_id)
+      } else {
+        showToast(`上传并准备成功！数据集已归属算法库「${libraryName(uploadLibraryId.value)}」`, 'info', 4000)
+      }
       // 保留 uploadResult，让「撤销本次上传」在准备完成后仍然可用
       loadDatasets()
       loadUploadModels()
@@ -1261,6 +1293,36 @@ const uploadFile = async () => {
   } finally {
     uploading.value = false
     uploadAbort.value = null
+  }
+}
+
+// B-47：直接上传测试集——准备完成后自动封板为算法库 held-out 测试集（含泄漏检查）
+const sealTestSetAfterPrepare = async (datasetId: string) => {
+  try {
+    const r = await setDatasetAsTestSet(datasetId, false)
+    testSetResult.value = r
+    testSetLeak.value = null
+    showToast('已封板为算法库测试集（held-out），可用于同库模型比对', 'success', 4000)
+  } catch (error: any) {
+    const detail = error.response?.data?.detail || error.message
+    testSetLeak.value = { datasetId, detail }
+    if (!error?.__toastShown) showToast('测试集封板被拦截：' + detail, 'error', 5000)
+  }
+}
+
+// 泄漏检查命中时，用户确认无风险后强制放行
+const forceAsTestSet = async () => {
+  if (!testSetLeak.value) return
+  forcingTestSet.value = true
+  try {
+    const r = await setDatasetAsTestSet(testSetLeak.value.datasetId, true)
+    testSetResult.value = r
+    testSetLeak.value = null
+    showToast('已强制封板为算法库测试集', 'success', 4000)
+  } catch (error: any) {
+    if (!error?.__toastShown) showToast('强制封板失败: ' + (error.response?.data?.detail || error.message), 'error', 5000)
+  } finally {
+    forcingTestSet.value = false
   }
 }
 
@@ -1471,6 +1533,20 @@ onActivated(() => {
   margin-top: 0.5rem;
 }
 .result-undo small { color: #7f8c8d; }
+
+/* B-47：上传目的切换 + 测试集结果 */
+.mode-seg { display: inline-flex; border: 1px solid #d9e1ea; border-radius: 8px; overflow: hidden; margin-bottom: 0.5rem; }
+.mode-seg button { border: 0; background: #fff; padding: 0.5rem 1rem; cursor: pointer; font-size: 0.9rem; color: #4a5a6a; }
+.mode-seg button.on { background: #2c6ec5; color: #fff; font-weight: 600; }
+.mode-seg button:not(.on):hover { background: #f2f6fb; }
+
+.testset-result { margin-top: 0.75rem; padding: 0.75rem; background: #f7fbff; border: 1px solid #d6e8fb; border-radius: 8px; }
+.testset-result p { margin: 0.25rem 0; }
+.testset-result .leak-verdict.clean { color: #1f9d55; font-weight: 600; }
+.testset-result .leak-verdict.overlap { color: #e67e22; font-weight: 600; }
+.testset-result .leak-warn { color: #c0392b; font-weight: 600; }
+.testset-result .warning { background: #e67e22; color: #fff; border: 0; border-radius: 6px; padding: 0.45rem 0.9rem; cursor: pointer; margin-top: 0.5rem; }
+.testset-result .warning:disabled { opacity: 0.55; cursor: not-allowed; }
 
 .file-input {
   display: none;

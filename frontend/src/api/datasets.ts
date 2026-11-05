@@ -12,14 +12,15 @@ export interface UpdateDatasetRequest {
 export const uploadDataset = async (
   file: File, modelId: string,
   onProgress?: (percent: number) => void,
-  options?: { uploadId?: string; signal?: AbortSignal }
+  options?: { uploadId?: string; signal?: AbortSignal; role?: 'train' | 'test' }
 ) => {
   const formData = new FormData()
   formData.append('file', file)
   const { data } = await api.post('/datasets/upload', formData, {
     params: {
       model_id: modelId,
-      ...(options?.uploadId ? { upload_id: options.uploadId } : {})
+      ...(options?.uploadId ? { upload_id: options.uploadId } : {}),
+      ...(options?.role ? { role: options.role } : {})
     },
     signal: options?.signal,
     timeout: 0,
@@ -164,5 +165,18 @@ export const getSealThreshold = async (): Promise<{ seal_min_images: number; def
 
 export const setSealThreshold = async (sealMinImages: number, modelId?: string | null) => {
   const { data } = await api.put('/datasets/config/seal-threshold', { seal_min_images: sealMinImages, model_id: modelId ?? null })
+  return data
+}
+
+// B-47：把一个已标注数据集封板为所属算法库的独立测试集（held-out）。
+// force=true 用于泄漏检查命中（测试集与同库训练图 md5 重合）时强制放行。
+export const setDatasetAsTestSet = async (datasetId: string, force: boolean = false) => {
+  const { data } = await api.post(`/datasets/${datasetId}/set-as-test-set`, { force })
+  return data
+}
+
+// 测试集动态增删图片后重新封板（版本号 +1，同库旧指标标 stale）
+export const resealTestSet = async (datasetId: string) => {
+  const { data } = await api.post(`/datasets/${datasetId}/reseal-test-set`)
   return data
 }

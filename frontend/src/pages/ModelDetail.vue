@@ -406,6 +406,109 @@
         </div>
       </div>
 
+      <!-- ---------- C2. 测试集对比（B-47 P3） ---------- -->
+      <div v-else-if="activeTab === 'testeval'" class="card wk-pane">
+        <div class="wk-pane-head">
+          <h2>测试集对比</h2>
+          <button class="secondary small" :disabled="loadingTestEval" @click="loadTestEval">↻ 刷新</button>
+        </div>
+        <p class="form-hint">
+          同算法库多个模型在<strong>同一测试集</strong>上的公平比对。口径（数据集 + 封板版本 + imgsz + 置信度偏好 + 类别字典）一致才可公平对比，不一致的行会灰显并标记「不可比」。
+        </p>
+
+        <!-- 测试集管理卡 -->
+        <div class="testset-card">
+          <div class="testset-head">当前测试集</div>
+          <div v-if="testSetInfo && testSetInfo.test_dataset_id" class="testset-meta">
+            <span>数据集 {{ testSetInfo.test_dataset_id }}</span>
+            <span>封板版本 v{{ testSetInfo.sealed_version }}</span>
+            <span>{{ testSetInfo.image_count }} 张</span>
+            <span>{{ (testSetInfo.names || []).length }} 类</span>
+            <span :class="['leak', (testSetInfo.leakage_check?.verdict || 'clean')]">
+              泄漏检查：{{ testSetInfo.leakage_check?.verdict === 'clean' ? '无重复' : (testSetInfo.leakage_check?.overlap_md5 + ' 张重复') }}
+            </span>
+            <span>已评测 {{ testSetInfo.evaluated_count }} 个模型</span>
+          </div>
+          <div v-else class="empty-state">本算法库尚未设置测试集。</div>
+          <div class="testset-actions">
+            <button class="secondary small" @click="testSetPickerOpen = true">设置测试集</button>
+            <button v-if="testSetInfo && testSetInfo.test_dataset_id" class="danger small" :disabled="unbinding" @click="confirmUnbindTestSet">
+              {{ unbinding ? '解绑中...' : '解绑测试集' }}
+            </button>
+            <button class="ghost small" @click="uploadHintOpen = true">如何直接上传测试集？</button>
+          </div>
+        </div>
+
+        <!-- 比对矩阵 -->
+        <div v-if="loadingTestEval" class="loading-row"><span class="loading-spinner"></span> 加载中...</div>
+        <table v-else-if="testEvalMatrix && testEvalMatrix.models.length" class="ds-table te-table">
+          <thead>
+            <tr>
+              <th>模型</th><th>版本</th><th>状态</th>
+              <th>mAP50</th><th>mAP50:95</th><th>精确</th><th>召回</th><th>F1</th>
+              <th>漏检率</th><th>误检率</th><th>推理(ms)</th><th>显存(MB)</th><th>conf</th><th>可比</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in testEvalMatrix.models" :key="row.model_id"
+                :class="{ 'te-stale': row.status === 'stale', 'te-incomparable': !row.comparable }">
+              <td>{{ row.display_name || row.model_id }}</td>
+              <td>{{ normVer(row.version) }}</td>
+              <td><span :class="['te-status', row.status]">{{ statusLabel(row.status) }}</span></td>
+              <td :class="{ best: isBest(row, 'mAP50') }">{{ fmtMetric('mAP50', row.metrics?.mAP50) }}</td>
+              <td :class="{ best: isBest(row, 'mAP50_95') }">{{ fmtMetric('mAP50_95', row.metrics?.mAP50_95) }}</td>
+              <td>{{ fmtMetric('precision', row.metrics?.precision) }}</td>
+              <td>{{ fmtMetric('recall', row.metrics?.recall) }}</td>
+              <td :class="{ best: isBest(row, 'f1') }">{{ fmtMetric('f1', row.metrics?.f1) }}</td>
+              <td :class="{ best: isBest(row, 'miss_rate') }">{{ fmtMetric('miss_rate', row.metrics?.miss_rate) }}</td>
+              <td :class="{ best: isBest(row, 'false_rate') }">{{ fmtMetric('false_rate', row.metrics?.false_rate) }}</td>
+              <td>{{ fmtMetric('speed_ms', row.metrics?.speed_ms) }}</td>
+              <td>{{ fmtMetric('gpu_mem_mb', row.metrics?.gpu_mem_mb) }}</td>
+              <td>{{ fmtMetric('conf_used', row.metrics?.conf_used) }}</td>
+              <td>{{ row.comparable ? '✓' : '—' }}</td>
+              <td>
+                <button class="ghost small" :disabled="runningIds.has(row.model_id)" @click="runTestEvalFor(row.model_id)">
+                  {{ runningIds.has(row.model_id) ? '评测中' : '重跑' }}
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty-state">暂无可比对模型（设置测试集并训练/评测后会出现在这里）。</div>
+        <p v-if="testEvalMatrix && testEvalMatrix.base_key" class="form-hint">口径基准：{{ testEvalMatrix.base_key }}</p>
+
+        <!-- 设置测试集选择器 -->
+        <div v-if="testSetPickerOpen" class="modal-mask" @click.self="testSetPickerOpen = false">
+          <div class="modal-panel">
+            <div class="modal-head">
+              <h3>选择数据集设为测试集</h3>
+              <button class="ghost small" @click="testSetPickerOpen = false">✕</button>
+            </div>
+            <p class="form-hint">选择一个已标注数据集封板为算法库的 held-out 测试集（会做与同库训练图的泄漏检查）。也可到「上传数据集」页直接以测试集模式上传。</p>
+            <div v-if="datasetsView.length" class="te-picker">
+              <label v-for="d in datasetsView.filter((x:any) => (x.role || 'train') !== 'test')" :key="d.dataset_id" class="te-pick">
+                <input type="radio" name="testset" :value="d.dataset_id" v-model="testSetPickId" />
+                <span>{{ d.display_name || d.name || d.dataset_id }}</span>
+                <span class="te-pick-sub">{{ d.image_count }} 图 · {{ d.label_count }} 类 · {{ d.stage }}</span>
+              </label>
+            </div>
+            <div v-else class="empty-state">本库暂无数据集，请先上传或挂载。</div>
+            <div class="modal-foot">
+              <button class="primary" :disabled="!testSetPickId || settingTestSet" @click="applyTestSet">
+                {{ settingTestSet ? '封板中...' : '设为测试集' }}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="uploadHintOpen" class="modal-mask" @click.self="uploadHintOpen = false">
+          <div class="modal-panel">
+            <div class="modal-head"><h3>如何直接上传测试集？</h3><button class="ghost small" @click="uploadHintOpen = false">✕</button></div>
+            <p class="form-hint">在左侧「上传数据集」页，顶部「上传目的」选择 <strong>测试集（held-out）</strong>，选好归属算法库上传即可——系统会自动准备并封板为测试集（含泄漏检查）。无需先走训练灌桶流程。</p>
+          </div>
+        </div>
+      </div>
+
       <!-- ---------- D. 管理标签弹窗（标签字典编辑） ---------- -->
       <div v-if="labelModalOpen" class="modal-mask" @click.self="closeLabelModal">
         <div class="modal-panel">
@@ -603,7 +706,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   getModel, getModelDatasets, updateModel, exportModel,
@@ -1133,8 +1236,117 @@ const wkTabs = computed(() => [
   { key: 'datasets', label: `数据集管理 (${datasetsView.value.length})` },
   { key: 'versions', label: `模型版本 (${versions.value.length})` },
   { key: 'history', label: `训练任务历史 (${historyJobs.value.length})` },
+  { key: 'testeval', label: '测试集对比' },
   { key: 'settings', label: '设置' }
 ])
+
+// ===== B-47 测试集对比（P3） =====
+import {
+  getTestEvalMatrix, getLibraryTestSet, unbindTestSet, triggerTestEval, getTestEval,
+  type TestEvalMatrix as TeMatrix
+} from '@/api/models'
+import { setDatasetAsTestSet as setDsTestSet } from '@/api/datasets'
+const testEvalMatrix = ref<TeMatrix | null>(null)
+const testSetInfo = ref<any>(null)
+const loadingTestEval = ref(false)
+const unbinding = ref(false)
+const runningIds = ref<Set<string>>(new Set())
+const testSetPickerOpen = ref(false)
+const testSetPickId = ref('')
+const settingTestSet = ref(false)
+const uploadHintOpen = ref(false)
+
+const libraryRootId = computed(() => String(libraryRoot.value?.model_id || modelId))
+
+const loadTestEval = async () => {
+  loadingTestEval.value = true
+  try {
+    const [m, info] = await Promise.all([
+      getTestEvalMatrix(libraryRootId.value),
+      getLibraryTestSet(libraryRootId.value)
+    ])
+    testEvalMatrix.value = m
+    testSetInfo.value = info
+  } catch (e: any) {
+    if (!e?.__toastShown) showToast('测试集对比加载失败: ' + (e.response?.data?.detail || e.message), 'error')
+  } finally {
+    loadingTestEval.value = false
+  }
+}
+
+const fmtMetric = (key: string, v: any) => {
+  if (v == null) return '—'
+  if (key === 'speed_ms') return Number(v).toFixed(1)
+  if (key === 'gpu_mem_mb') return Number(v).toFixed(0)
+  if (key === 'conf_used') return Number(v).toFixed(3)
+  return (Number(v) * 100).toFixed(1) + '%'
+}
+// 可比行中逐指标最优：比率类取最大；漏检/误检取最小
+const isBest = (row: any, key: string) => {
+  const rows = (testEvalMatrix.value?.models || []).filter(r => r.comparable && r.metrics && (r.metrics as any)[key] != null)
+  if (!rows.length) return false
+  const target = (row.metrics as any)?.[key]
+  if (target == null) return false
+  const vals = rows.map(r => (r.metrics as any)[key])
+  const best = (key === 'miss_rate' || key === 'false_rate') ? Math.min(...vals) : Math.max(...vals)
+  return Number(target) === best
+}
+
+const runTestEvalFor = async (id: string) => {
+  try {
+    await triggerTestEval(id, {})
+    runningIds.value = new Set([...runningIds.value, id])
+    showToast('已加入评测队列', 'info')
+    pollTestEval(id)
+  } catch (e: any) {
+    if (!e?.__toastShown) showToast('触发失败: ' + (e.response?.data?.detail || e.message), 'error')
+  }
+}
+const pollTestEval = async (id: string) => {
+  for (let i = 0; i < 60; i++) {
+    await new Promise(r => setTimeout(r, 3000))
+    try {
+      const r = await getTestEval(id)
+      const te = r.test_eval || {}
+      if (te.status !== 'running') { await loadTestEval(); break }
+    } catch { /* 忽略中间错误，继续轮询 */ }
+  }
+  runningIds.value = new Set([...runningIds.value].filter(x => x !== id))
+}
+
+const confirmUnbindTestSet = async () => {
+  if (!(await showConfirm('确定解绑测试集吗？历史评测指标会标记为 stale，但数据仍在磁盘。'))) return
+  unbinding.value = true
+  try {
+    await unbindTestSet(libraryRootId.value)
+    showToast('已解绑测试集', 'success')
+    await loadTestEval()
+  } catch (e: any) {
+    if (!e?.__toastShown) showToast('解绑失败: ' + (e.response?.data?.detail || e.message), 'error')
+  } finally {
+    unbinding.value = false
+  }
+}
+
+const applyTestSet = async () => {
+  if (!testSetPickId.value) return
+  settingTestSet.value = true
+  try {
+    await setDsTestSet(testSetPickId.value, false)
+    testSetPickerOpen.value = false
+    testSetPickId.value = ''
+    showToast('已设为算法库测试集', 'success')
+    await loadTestEval()
+  } catch (e: any) {
+    const detail = e.response?.data?.detail || e.message
+    if (!e?.__toastShown) showToast('设置失败: ' + detail, 'error')
+  } finally {
+    settingTestSet.value = false
+  }
+}
+
+// 进入测试集对比 tab 时自动加载一次
+watch(activeTab, (t) => { if (t === 'testeval') loadTestEval() })
 
 // ===== 训练任务历史 =====
 async function loadJobs() {
@@ -1776,4 +1988,28 @@ onMounted(async () => {
 .ls-before { color: #c0392b; text-decoration: line-through; word-break: break-all; }
 .ls-after { color: #1e8449; word-break: break-all; }
 .ls-backup { margin-top: 8px; font-size: 0.75rem; color: #9aa7b6; }
+
+/* ===== B-47 测试集对比（P3） ===== */
+.testset-card { border: 1px solid #d9e1ea; border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; background: #fbfdff; }
+.testset-head { font-weight: 600; color: #2c3e50; margin-bottom: 8px; }
+.testset-meta { display: flex; flex-wrap: wrap; gap: 10px 18px; font-size: 0.83rem; color: #34495e; align-items: center; }
+.testset-meta .leak { padding: 1px 8px; border-radius: 10px; font-weight: 600; }
+.testset-meta .leak.clean { background: #e8f8ef; color: #1f9d55; }
+.testset-meta .leak.overlap { background: #fdeee0; color: #e67e22; }
+.testset-actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
+.te-table td.best { background: #eafaf0; color: #1f9d55; font-weight: 700; }
+.te-table .te-stale td { color: #95a5a6; }
+.te-table .te-incomparable { background: #f6f8fa; color: #b2bcc7; }
+.te-status { padding: 1px 8px; border-radius: 10px; font-size: 0.75rem; background: #eef2f6; color: #5a6b7b; }
+.te-status.done { background: #e8f8ef; color: #1f9d55; }
+.te-status.running { background: #eaf2fd; color: #2c6ec5; }
+.te-status.failed { background: #fdeceb; color: #c0392b; }
+.te-status.stale { background: #f0eef8; color: #8e7cc3; }
+.te-picker { display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow: auto; margin: 10px 0; }
+.te-pick { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid #e6ecf2; border-radius: 8px; }
+.te-pick-sub { color: #95a5a6; font-size: 0.78rem; }
+.modal-foot { display: flex; justify-content: flex-end; margin-top: 8px; }
+.loading-row { padding: 20px; text-align: center; color: #7f8c8d; }
+.primary { background: #2c6ec5; color: #fff; border: 0; border-radius: 6px; padding: 0.45rem 0.9rem; cursor: pointer; }
+.primary:disabled { opacity: 0.55; cursor: not-allowed; }
 </style>
