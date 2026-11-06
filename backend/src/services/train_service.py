@@ -96,8 +96,12 @@ class _RecoveredProcess:
         self._proc = psutil.Process(pid)
 
     def poll(self):
+        # psutil.Process 没有 poll()（那是 subprocess.Popen 的 API），
+        # 旧实现会在后端重启接管训练进程后抛 AttributeError，进而打挂 /train/jobs。
         try:
-            return self._proc.poll()
+            if self._proc.is_running() and self._proc.status() != psutil.STATUS_ZOMBIE:
+                return None
+            return 0
         except psutil.NoSuchProcess:
             return 0
 
@@ -1925,6 +1929,14 @@ class TrainService:
                             # g6 M5 状态机统一：崩溃 → Archived
                             job_meta["unified_status"] = "Archived"
                             save_json_atomic(job_file, job_meta)
+                        elif self._train_proc_alive(job_meta.get("pid"), job_id) is False:
+                            # 容器重建 / 进程被杀后 pid 已失效，且尚无可恢复 checkpoint：
+                            # 明确落 stopped，杜绝 status=running 的幽灵任务永远停不掉。
+                            job_meta["status"] = "stopped"
+                            job_meta["stopped_at"] = datetime.now().isoformat()
+                            job_meta["unified_status"] = "Archived"
+                            job_meta["stop_reason"] = "process_gone"
+                            save_json_atomic(job_file, job_meta)
                 
                 # 检查是否有 checkpoint 但状态不是可恢复状态
                 train_dir = self.jobs_dir / job_id / "train"
@@ -2034,6 +2046,25 @@ class TrainService:
 
         return await asyncio.to_thread(_create_zip)
 
+    @staticmethod
+    def _train_proc_alive(pid, job_id) -> bool | None:
+        """判断 job 档案里的 pid 是否仍是本任务的训练进程。
+
+        返回 None = 信息不足（无 pid），不做判定；True = 活着且 cmdline 匹配；
+        False = 进程已死或 PID 被复用成无关进程（容器重建后极常见）。
+        """
+        if not pid or not job_id:
+            return None
+        try:
+            p = psutil.Process(int(pid))
+            if not p.is_running() or p.status() == psutil.STATUS_ZOMBIE:
+                return False
+            cmdline = " ".join(p.cmdline())
+            return "train_script.py" in cmdline and job_id in cmdline
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess,
+                ValueError, TypeError):
+            return False
+
     def _recover_running_processes(self):
         """后端重启后，重新接管仍在运行但句柄已丢失的训练进程"""
         if not self.jobs_dir.exists():
@@ -2054,11 +2085,17 @@ class TrainService:
             if not pid:
                 continue
             try:
-                proc = psutil.Process(pid)
-                # 进程仍在运行 → 重新接管
-                if proc.poll() is None:
-                    self.running_processes[job_id] = _RecoveredProcess(pid)
-            except psutil.NoSuchProcess:
+                proc = psutil.Process(int(pid))
+                if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+                    continue
+                # 校验 cmdline：容器重建后 PID 极易被复用，绝不把无关进程接管成训练进程
+                try:
+                    cmdline = " ".join(proc.cmdline())
+                except psutil.Error:
+                    cmdline = ""
+                if "train_script.py" in cmdline and job_id in cmdline:
+                    self.running_processes[job_id] = _RecoveredProcess(int(pid))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, TypeError):
                 pass
 
     async def get_job(self, job_id: str):
@@ -2080,34 +2117,111 @@ class TrainService:
         return meta
     
     async def stop_job(self, job_id: str):
-        """停止训练任务"""
-        if job_id in self.running_processes:
-            process = self.running_processes[job_id]
+        """停止训练任务（兼容后端/容器重启后内存句柄丢失的幽灵 running 任务）。
+
+        旧实现只在 running_processes 里找进程，找不到就直接返回「Job not running」
+        → 容器重建后 job 档案残留 status=running，前端按钮永远停在「停止」却停不掉。
+        现在：内存句柄 → 档案 pid（校验 cmdline 防 PID 复用）→ 按 job_id 全进程扫描，
+        三层兜底杀进程树（含 dataloader worker），并且只要档案存在就把状态落 stopped。
+        """
+        job_file = self.jobs_dir / f"{job_id}.json"
+
+        def _kill_tree_by_pid(pid):
+            """按 pid 杀训练进程树；cmdline 不含 train_script.py + job_id 一律不动（防误杀）。"""
+            killed = []
+            if not job_id:
+                return killed
             try:
-                process.send_signal(signal.SIGTERM)
-                process.wait(timeout=5)
-            except:
-                process.kill()
-            
-            del self.running_processes[job_id]
-            
-            # 更新状态
-            job_file = self.jobs_dir / f"{job_id}.json"
-            
-            def _update_status():
-                if job_file.exists():
-                    job_meta = load_json(job_file)
-                    job_meta["status"] = "stopped"
-                    job_meta["stopped_at"] = datetime.now().isoformat()
-                    # g6 M5 状态机统一：手动停止 → Archived
-                    job_meta["unified_status"] = "Archived"
-                    save_json_atomic(job_file, job_meta)
-            
-            await asyncio.to_thread(_update_status)
-            
-            return {"ok": True}
-        
-        return {"ok": False, "error": "Job not running"}
+                parent = psutil.Process(int(pid))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, TypeError):
+                return killed
+            try:
+                cmdline = " ".join(parent.cmdline())
+            except psutil.Error:
+                cmdline = ""
+            if "train_script.py" not in cmdline or job_id not in cmdline:
+                return killed
+            try:
+                targets = parent.children(recursive=True) + [parent]
+            except psutil.Error:
+                targets = [parent]
+            for p in targets:
+                try:
+                    p.terminate()
+                    killed.append(p.pid)
+                except psutil.Error:
+                    pass
+            _, alive = psutil.wait_procs(targets, timeout=5)
+            for p in alive:
+                try:
+                    p.kill()
+                except psutil.Error:
+                    pass
+            return killed
+
+        def _kill_tree_by_scan():
+            """句柄与 pid 都失效时，按 job_id 扫全进程兜底。"""
+            killed = []
+            if not job_id:
+                return killed
+            for p in psutil.process_iter(["pid", "cmdline"]):
+                try:
+                    cmdline = " ".join(p.info.get("cmdline") or [])
+                    if "train_script.py" in cmdline and job_id in cmdline:
+                        p.kill()
+                        killed.append(p.pid)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    pass
+            return killed
+
+        killed = []
+        proc = self.running_processes.get(job_id)
+        if proc is not None:
+            try:
+                proc.send_signal(signal.SIGTERM)
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            self.running_processes.pop(job_id, None)
+            try:
+                pid = getattr(proc, "pid", None)
+                if pid:
+                    killed += await asyncio.to_thread(_kill_tree_by_pid, pid)
+            except Exception:
+                pass
+
+        def _read_pid():
+            if not job_file.exists():
+                return None
+            try:
+                return load_json(job_file).get("pid")
+            except Exception:
+                return None
+
+        pid = await asyncio.to_thread(_read_pid)
+        if pid:
+            killed += await asyncio.to_thread(_kill_tree_by_pid, pid)
+        killed += await asyncio.to_thread(_kill_tree_by_scan)
+
+        def _update_status():
+            if not job_file.exists():
+                return False
+            job_meta = load_json(job_file)
+            if job_meta.get("status") in (None, "", "running", "queued", "pending", "stopping"):
+                job_meta["status"] = "stopped"
+                job_meta["stopped_at"] = datetime.now().isoformat()
+                # g6 M5 状态机统一：手动停止 → Archived
+                job_meta["unified_status"] = "Archived"
+                save_json_atomic(job_file, job_meta)
+            return True
+
+        exists = await asyncio.to_thread(_update_status)
+        if not exists:
+            return {"ok": False, "error": "Job not found"}
+        return {"ok": True, "killed_pids": sorted(set(killed))}
     
     async def delete_job(self, job_id: str):
         """删除训练任务"""
