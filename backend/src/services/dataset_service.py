@@ -1186,7 +1186,9 @@ class DatasetService:
             )
         
         # 外部格式（COCO/LabelMe/VOC）导入时已直接产出 YOLO 扁平格式（images/+labels/+data.yaml），
-        # 不再转每图 JSON（那会把 YOLO 再转回 JSON，违背“只留 YOLO”）；类别号重映射已在上方完成。
+        # 不再在「txt→json」阶段转每图 JSON（那会把 YOLO 再转回 JSON，违背“只留 YOLO”）；
+        # 但为了让导入后的数据集能在平台编辑器里改框 / 抽查 / 导出，下方 else 分支会从 labels
+        # 反填每图 JSON 作为编辑器权威源（训练/封板仍以 data.yaml+labels 为准）。类别号重映射已在上方完成。
         if not external_format:
             # YOLO labels/*.txt → 每图 JSON（统一权威标注源；标注页可直接读原标注）
             # 重映射：txt class_id（源包类空间）→ 模型标签索引；只保留本模型需要的类（剔除冗余标签）
@@ -1229,6 +1231,19 @@ class DatasetService:
                     logger.exception(f"prepare {dataset_id}: txt->json import failed, labels kept")
         else:
             txt_to_json = {"converted": 0, "labels_removed": False, "class_map": None, "dropped_boxes": 0}
+            # 外部格式已直接产出 YOLO 扁平格式（labels/*.txt + data.yaml）。
+            # 但标注编辑器 / 导出 / 抽查都依赖每图 JSON 权威源，这里从 labels 反填每图 JSON，
+            # 让导入后的数据集也能在平台内改框 / 抽查 / 导出。不传 class_map：
+            # 模型绑定的类号重映射已在上方 _remap_yolo_labels 完成；未绑定的保持导入时索引。
+            if labels_dir and labels_dir.is_dir() and final_has_labels and label_count > 0:
+                try:
+                    conv = await asyncio.to_thread(self._import_labels_txt_to_json, version_dir, None)
+                    logger.info(
+                        f"prepare {dataset_id}: external labels->json backfill "
+                        f"converted={conv.get('converted')} dropped={conv.get('dropped_boxes')}"
+                    )
+                except Exception:
+                    logger.exception(f"prepare {dataset_id}: external labels->json backfill failed")
 
         # 标签字典自动生成：prepare 解析出真实类名后，归属模型的标签字典若为空
         # （动态建模型的空字典），自动用包内类名初始化；有人工维护的字典不覆盖
