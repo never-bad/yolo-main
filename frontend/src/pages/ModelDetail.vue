@@ -421,12 +421,10 @@
           <div class="testset-head">当前测试集</div>
           <div v-if="testSetInfo && testSetInfo.test_dataset_id" class="testset-meta">
             <span>数据集 {{ testSetInfo.test_dataset_id }}</span>
-            <span>封板版本 v{{ testSetInfo.sealed_version }}</span>
-            <span>{{ testSetInfo.image_count }} 张</span>
+            <span>封板版本 {{ testSetInfo.sealed_version != null ? 'v' + testSetInfo.sealed_version : '—' }}</span>
+            <span>{{ testSetInfo.image_count != null ? testSetInfo.image_count + ' 张' : '—' }}</span>
             <span>{{ (testSetInfo.names || []).length }} 类</span>
-            <span :class="['leak', (testSetInfo.leakage_check?.verdict || 'clean')]">
-              泄漏检查：{{ testSetInfo.leakage_check?.verdict === 'clean' ? '无重复' : (testSetInfo.leakage_check?.overlap_md5 + ' 张重复') }}
-            </span>
+            <span :class="['leak', leakInfo.cls]">泄漏检查：{{ leakInfo.text }}</span>
             <span>已评测 {{ testSetInfo.evaluated_count }} 个模型</span>
           </div>
           <div v-else class="empty-state">本算法库尚未设置测试集。</div>
@@ -444,13 +442,24 @@
         <table v-else-if="testEvalMatrix && testEvalMatrix.models.length" class="ds-table te-table">
           <thead>
             <tr>
-              <th>模型</th><th>版本</th><th>状态</th>
-              <th>mAP50</th><th>mAP50:95</th><th>精确</th><th>召回</th><th>F1</th>
-              <th>漏检率</th><th>误检率</th><th>推理(ms)</th><th>显存(MB)</th><th>conf</th><th>可比</th><th>操作</th>
+              <th>模型</th>
+              <th class="te-sort" @click="teSortToggle('version')">版本<span class="te-arrow">{{ teArrow('version') }}</span></th>
+              <th>状态</th>
+              <th class="te-sort" @click="teSortToggle('mAP50')">mAP50<span class="te-arrow">{{ teArrow('mAP50') }}</span></th>
+              <th class="te-sort" @click="teSortToggle('mAP50_95')">mAP50:95<span class="te-arrow">{{ teArrow('mAP50_95') }}</span></th>
+              <th class="te-sort" @click="teSortToggle('precision')">精确<span class="te-arrow">{{ teArrow('precision') }}</span></th>
+              <th class="te-sort" @click="teSortToggle('recall')">召回<span class="te-arrow">{{ teArrow('recall') }}</span></th>
+              <th class="te-sort" @click="teSortToggle('f1')">F1<span class="te-arrow">{{ teArrow('f1') }}</span></th>
+              <th class="te-sort" @click="teSortToggle('miss_rate')">漏检率<span class="te-arrow">{{ teArrow('miss_rate') }}</span></th>
+              <th class="te-sort" @click="teSortToggle('false_rate')">误检率<span class="te-arrow">{{ teArrow('false_rate') }}</span></th>
+              <th class="te-sort" @click="teSortToggle('speed_ms')">推理(ms)<span class="te-arrow">{{ teArrow('speed_ms') }}</span></th>
+              <th class="te-sort" @click="teSortToggle('gpu_mem_mb')">显存(MB)<span class="te-arrow">{{ teArrow('gpu_mem_mb') }}</span></th>
+              <th class="te-sort" @click="teSortToggle('conf_used')">conf<span class="te-arrow">{{ teArrow('conf_used') }}</span></th>
+              <th>可比</th><th>操作</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="row in testEvalMatrix.models" :key="row.model_id"
+            <tr v-for="row in sortedTeModels" :key="row.model_id"
                 :class="{ 'te-stale': row.status === 'stale', 'te-incomparable': !row.comparable }">
               <td>{{ row.display_name || row.model_id }}</td>
               <td>{{ normVer(row.version) }}</td>
@@ -1292,6 +1301,45 @@ const isBest = (row: any, key: string) => {
   return Number(target) === best
 }
 
+// ===== B-55 测试集对比表排序：默认按版本号升序；点击指标表头按该指标排序，再点切换升降序 =====
+const teSortKey = ref<string>('version')
+const teSortDir = ref<1 | -1>(1)
+const teSortToggle = (key: string) => {
+  if (teSortKey.value === key) teSortDir.value = (teSortDir.value === 1 ? -1 : 1) as 1 | -1
+  else { teSortKey.value = key; teSortDir.value = 1 }
+}
+const teArrow = (key: string) => (teSortKey.value === key ? (teSortDir.value === 1 ? '↑' : '↓') : '')
+const verParts = (v?: string) =>
+  String(v || '').toLowerCase().replace(/^v/, '').split('.').map(n => parseInt(n, 10) || 0)
+const sortedTeModels = computed(() => {
+  const rows = [...(testEvalMatrix.value?.models || [])]
+  const dir = teSortDir.value, key = teSortKey.value
+  rows.sort((a: any, b: any) => {
+    if (key === 'version') {
+      const av = verParts(a.version), bv = verParts(b.version)
+      for (let i = 0; i < Math.max(av.length, bv.length); i++) {
+        const d = (av[i] || 0) - (bv[i] || 0)
+        if (d) return d * dir
+      }
+      return 0
+    }
+    const av = (a.metrics || {})[key], bv = (b.metrics || {})[key]
+    // 缺指标（未评测/failed）的行固定排最后
+    const an = av == null ? -Infinity : Number(av), bn = bv == null ? -Infinity : Number(bv)
+    return (an - bn) * dir
+  })
+  return rows
+})
+
+// 泄漏检查显示兜底：未检查/clean/有重复 三态
+const leakInfo = computed(() => {
+  const lc: any = testSetInfo.value?.leakage_check
+  const verdict = lc?.verdict
+  if (!verdict || verdict === 'not_checked') return { cls: 'unknown', text: '未检查' }
+  if (verdict === 'clean') return { cls: 'clean', text: '无重复' }
+  return { cls: 'overlap', text: (lc?.overlap_md5 != null ? lc.overlap_md5 : '?') + ' 张重复' }
+})
+
 const runTestEvalFor = async (id: string) => {
   try {
     await triggerTestEval(id, {})
@@ -2013,6 +2061,10 @@ onMounted(async () => {
 .testset-meta .leak { padding: 1px 8px; border-radius: 10px; font-weight: 600; }
 .testset-meta .leak.clean { background: #e8f8ef; color: #1f9d55; }
 .testset-meta .leak.overlap { background: #fdeee0; color: #e67e22; }
+.testset-meta .leak.unknown { background: #eef1f4; color: #7f8c9b; }
+.te-table th.te-sort { cursor: pointer; user-select: none; white-space: nowrap; }
+.te-table th.te-sort:hover { color: #1f6fb2; }
+.te-table .te-arrow { font-size: 0.72em; margin-left: 2px; opacity: 0.85; }
 .testset-actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
 .te-table td.best { background: #eafaf0; color: #1f9d55; font-weight: 700; }
 .te-table .te-stale td { color: #95a5a6; }

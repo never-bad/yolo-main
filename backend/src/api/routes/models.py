@@ -1,3 +1,4 @@
+from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -671,6 +672,40 @@ async def get_library_test_set(root_id: str):
         raise HTTPException(500, f"读取测试集信息失败: {e}")
 
 
+_TEST_IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+
+
+def _count_test_images(ds_dir) -> int:
+    """兜底统计测试集图片数：优先 images/test，退回 images。"""
+    for sub in ("images/test", "images"):
+        d = Path(ds_dir) / sub
+        if d.is_dir():
+            return sum(1 for f in d.rglob("*")
+                       if f.is_file() and f.suffix.lower() in _TEST_IMG_EXTS)
+    return 0
+
+
+def _read_test_names(ds_dir, meta: dict = None) -> list:
+    """类别名兜底：meta.classes → data.yaml names（根目录优先，再封板副本）。"""
+    if meta and meta.get("classes"):
+        return meta["classes"]
+    try:
+        import yaml
+        candidates = [Path(ds_dir) / "data.yaml", *sorted(Path(ds_dir).rglob("data.yaml"))]
+        for cand in candidates:
+            if not cand.is_file():
+                continue
+            data = yaml.safe_load(cand.read_text(encoding="utf-8")) or {}
+            names = data.get("names")
+            if isinstance(names, dict):
+                names = [names[k] for k in sorted(names)]
+            if isinstance(names, list) and names:
+                return names
+    except Exception:  # noqa: BLE001
+        pass
+    return []
+
+
 def _get_library_test_set_impl(root_id: str) -> dict:
     root = _load_model_meta(root_id)
     if not root:
@@ -684,7 +719,9 @@ def _get_library_test_set_impl(root_id: str) -> dict:
     }
     ds_id = root.get("test_dataset_id")
     if ds_id:
-        ds_p = settings.DATASETS_DIR / ds_id / "meta.json"
+        ds_dir = settings.DATASETS_DIR / ds_id
+        ds_p = ds_dir / "meta.json"
+        m = None
         if ds_p.exists():
             try:
                 m = load_json(ds_p)
@@ -700,6 +737,16 @@ def _get_library_test_set_impl(root_id: str) -> dict:
                 })
         else:
             info["meta_error"] = f"测试集数据集目录缺失: {ds_id}"
+        # B-55 信息兜底：早期封板/换绑的数据集 meta 可能缺 test_* 字段，
+        # 从磁盘推导补全，避免前端渲染出 undefined/空白。
+        if not info.get("image_count"):
+            info["image_count"] = _count_test_images(ds_dir)
+        if not info.get("names"):
+            info["names"] = _read_test_names(ds_dir, m)
+        if info.get("sealed_version") is None and (ds_dir / "data.yaml").exists():
+            info["sealed_version"] = 1
+        if not info.get("leakage_check"):
+            info["leakage_check"] = {"verdict": "not_checked"}
         info["evaluated_count"] = len([
             mid for mid in list_library_model_ids(root_id)
             if ((_load_model_meta(mid) or {}).get("test_eval") or {}).get("status") in ("done", "failed", "stale")
