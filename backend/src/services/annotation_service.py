@@ -1105,7 +1105,7 @@ class AnnotationService:
             anns = self._load_all_image_anns(dataset_id, version)
             has_any_box = any(a.get("boxes") for a in anns.values())
             has_txt = any(
-                f.name != "classes.txt"
+                f
                 for d in labels_dirs
                 for f in d.rglob("*.txt")
             )
@@ -1149,12 +1149,10 @@ class AnnotationService:
             if legacy_file.exists():
                 save_json_atomic(legacy_file, {})
 
-            # 4) 删除派生的 YOLO txt（classes.txt 是类别表，不属于标注，保留）
+            # 4) 删除派生的 YOLO txt（派生标注，非源标注）
             removed_txt = 0
             for d in labels_dirs:
                 for f in list(d.rglob("*.txt")):
-                    if f.name == "classes.txt":
-                        continue
                     try:
                         f.unlink()
                         removed_txt += 1
@@ -1301,7 +1299,7 @@ class AnnotationService:
         """单独提取"人工修过"（reviewed=true 且有标注框）的图片 + YOLO 标签，打包成临时 zip。
 
         与 export_to_yolo 的区别：不写数据集目录，直接产出可下载的压缩包
-        （images/ + labels/ + classes.txt + data.yaml），用户在标注页挑图精修后
+        （images/ + labels/ + data.yaml），用户在标注页挑图精修后
         一键提取，无需自己去文件夹里翻。labels 为 YOLO 分割格式（轮廓点写在行尾）。
         """
         def _export_reviewed_zip_sync():
@@ -1374,7 +1372,6 @@ class AnnotationService:
                             exported += 1
                         # 类别清单与最小 data.yaml，解压后可直接喂给 ultralytics 训练
                         if classes:
-                            zipf.writestr("classes.txt", "\n".join(classes))
                             zipf.writestr(
                                 "data.yaml",
                                 yaml.dump(

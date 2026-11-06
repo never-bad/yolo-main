@@ -1013,8 +1013,8 @@ class DatasetService:
         logger.info(f"prepare {dataset_id}: extract took {t_extract - t0:.1f}s")
         
         # 「准备」= 把数据集改造成平台可用格式：
-        # 0) 外部分类格式（COCO / LabelMe / VOC）→ 统一转一图一 JSON（数据链路阶段B），
-        #    产物 images/（平铺）+ annotations/{image_id}.json + classes.txt，跳过重组
+        # 0) 外部分类格式（COCO / LabelMe / VOC）→ 直接产出 YOLO 扁平格式（数据链路阶段B），
+        #    产物 images/（平铺）+ labels/{image_id}.txt + data.yaml，跳过重组与 txt→json
         detected_classes = classes or []
         model_id_ds = str(meta.get("model_id", "") or "")
         # 归属算法库兜底：老数据只写了 model_id，这里按库根补齐 library_root_id，
@@ -1041,14 +1041,18 @@ class DatasetService:
                 )
                 if import_result["errors"]:
                     logger.warning(f"prepare {dataset_id}: import errors={len(import_result['errors'])}")
+                # 外部格式已直接产出 YOLO 扁平格式（images/+labels/+data.yaml），
+                # 包内类别即真实类别名 → 作为 detected_classes 与类别真值来源
+                detected_classes = list(import_result["classes"]) or detected_classes
+                classes_from_package = True
             else:
                 # 1) 已符合 images/{train,val,test}(+labels) 标准结构 → 保持原样
                 # 2) 其他任意目录（图片与标注同目录 / labels 子目录 / 原始无标注数据集等）
                 #    → 自动重组为 images/{train,val,test} + labels/{train,val,test} 标准结构
                 is_standard = await asyncio.to_thread(self._is_standard_structure, version_dir)
                 if not is_standard:
-                    # 重组前先从解压内容中读取类别（zip 自带的 classes.txt / data.yaml），
-                    # 供重组阶段写 classes.txt 使用（重组会清理原目录）
+                    # 重组前先从解压内容中读取类别（zip 自带的 data.yaml / coco.names），
+                    # 供重组阶段写 data.yaml 使用（重组会清理原目录）
                     if not detected_classes:
                         detected_classes = await asyncio.to_thread(self._load_classes_from_files, version_dir) or []
                         classes_from_package = True
@@ -1127,7 +1131,20 @@ class DatasetService:
                     f"保留占位名等待人工改名"
                 )
 
-        # 多模型上传自动匹配（#3）：未归属 + 包内类别可信（txt/yaml/classes.txt 来源）→
+        # 外部格式已直接产出 YOLO 扁平格式：若数据集已绑定模型且包内类别可信，
+        # 按模型标签空间重映射 labels/*.txt 的类别号（避免封板类别错位），并收敛 detected_classes
+        if external_format and classes_from_package and model_labels:
+            cmap = self._build_class_map(detected_classes, model_labels)
+            if cmap:
+                await asyncio.to_thread(self._remap_yolo_labels, version_dir / "labels", cmap)
+                detected_classes = list(model_labels)
+                await asyncio.to_thread(
+                    _save_yaml, version_dir / "data.yaml",
+                    {"nc": len(detected_classes), "names": list(detected_classes)},
+                )
+                logger.info(f"prepare {dataset_id}: external import class-remapped to model {model_id_ds}")
+
+        # 多模型上传自动匹配（#3）：未归属 + 包内类别可信（txt/yaml/data.yaml 来源）→
         # 按类名匹配已有模型（先分配后过滤：后续 class_map 只保留本模型标签空间）；
         # 匹配不到 → 保持未归属进入「未归属数据集」列表（兜底，可在模型详情页手动绑定）
         auto_match = None
@@ -1154,14 +1171,7 @@ class DatasetService:
                 )
         
         # 数据链路改造（阶段C）：prepare 不再生成 data.yaml（封板时才生成），
-        # 不再划分数据集（划分也在封板时进行）；类别写 classes.txt 供标注任务自动读取
-        if detected_classes:
-            classes_txt_path = version_dir / "classes.txt"
-            await asyncio.to_thread(
-                classes_txt_path.write_text,
-                "\n".join(detected_classes) + "\n",
-                encoding="utf-8",
-            )
+        # 不再划分数据集（划分也在封板时进行）；类别真值由 data.yaml（导入时写）+ meta.classes 承载
         
         # 标注情况：标准结构直接用 label_count，重组/外部导入后使用其返回结果
         final_has_labels = (label_count > 0) if has_labels is None else has_labels
@@ -1175,49 +1185,50 @@ class DatasetService:
                 f"files={label_validation['checked_files']} lines={label_validation['lines_checked']}"
             )
         
-        # YOLO labels/*.txt → 每图 JSON（统一权威标注源；标注页可直接读原标注）
-        # 重映射：txt class_id（源包类空间）→ 模型标签索引；只保留本模型需要的类（剔除冗余标签）
-        # 源 labels 目录保留（原始标注供追溯），每图 JSON 为平台权威源
-        txt_to_json = {"converted": 0, "labels_removed": False, "class_map": None, "dropped_boxes": 0}
-        class_filter = None
-        if labels_dir and labels_dir.is_dir() and final_has_labels and label_count > 0:
-            class_map = None
-            if classes_from_package and model_labels:
-                class_map = self._build_class_map(detected_classes, model_labels)
-                if class_map:
-                    dropped = [
-                        str(c) for i, c in enumerate(detected_classes) if i not in class_map
-                    ]
-                    class_filter = {
-                        "src_classes": [str(c) for c in detected_classes],
-                        "model_labels": list(model_labels),
-                        "kept": [str(c) for i, c in enumerate(detected_classes) if i in class_map],
-                        "dropped": dropped,
-                    }
-                    logger.info(
-                        f"prepare {dataset_id}: class filter to model {model_id_ds}: "
-                        f"kept={class_filter['kept']} dropped={class_filter['dropped']}"
-                    )
-            try:
-                txt_to_json = await asyncio.to_thread(self._import_labels_txt_to_json, version_dir, class_map)
-                txt_to_json["class_map"] = bool(class_map)
-                if txt_to_json.get("converted", 0) > 0:
-                    # 保留源 labels（不再删除）：txt 为原始标注供追溯，每图 JSON 为权威源
-                    # 有效标注以每图 JSON 为准（类过滤后可能整批无本模型有效框）
-                    json_annotated = self._count_json_annotations(version_dir)
-                    if json_annotated == 0 and txt_to_json.get("dropped_boxes", 0) > 0:
-                        logger.info(f"prepare {dataset_id}: all txt boxes dropped by class filter (model={model_id_ds})")
-                    final_has_labels = json_annotated > 0
-                    logger.info(f"prepare {dataset_id}: txt->json converted={txt_to_json['converted']}, labels kept")
-                # class_map 有效 → 数据集类别空间收敛为模型标签字典（与框索引对齐）
-                if class_map and model_labels:
-                    detected_classes = list(model_labels)
-                    classes_txt_path = version_dir / "classes.txt"
-                    await asyncio.to_thread(
-                        classes_txt_path.write_text, "\n".join(detected_classes) + "\n", encoding="utf-8"
-                    )
-            except Exception:
-                logger.exception(f"prepare {dataset_id}: txt->json import failed, labels kept")
+        # 外部格式（COCO/LabelMe/VOC）导入时已直接产出 YOLO 扁平格式（images/+labels/+data.yaml），
+        # 不再转每图 JSON（那会把 YOLO 再转回 JSON，违背“只留 YOLO”）；类别号重映射已在上方完成。
+        if not external_format:
+            # YOLO labels/*.txt → 每图 JSON（统一权威标注源；标注页可直接读原标注）
+            # 重映射：txt class_id（源包类空间）→ 模型标签索引；只保留本模型需要的类（剔除冗余标签）
+            # 源 labels 目录保留（原始标注供追溯），每图 JSON 为平台权威源
+            txt_to_json = {"converted": 0, "labels_removed": False, "class_map": None, "dropped_boxes": 0}
+            class_filter = None
+            if labels_dir and labels_dir.is_dir() and final_has_labels and label_count > 0:
+                class_map = None
+                if classes_from_package and model_labels:
+                    class_map = self._build_class_map(detected_classes, model_labels)
+                    if class_map:
+                        dropped = [
+                            str(c) for i, c in enumerate(detected_classes) if i not in class_map
+                        ]
+                        class_filter = {
+                            "src_classes": [str(c) for c in detected_classes],
+                            "model_labels": list(model_labels),
+                            "kept": [str(c) for i, c in enumerate(detected_classes) if i in class_map],
+                            "dropped": dropped,
+                        }
+                        logger.info(
+                            f"prepare {dataset_id}: class filter to model {model_id_ds}: "
+                            f"kept={class_filter['kept']} dropped={class_filter['dropped']}"
+                        )
+                try:
+                    txt_to_json = await asyncio.to_thread(self._import_labels_txt_to_json, version_dir, class_map)
+                    txt_to_json["class_map"] = bool(class_map)
+                    if txt_to_json.get("converted", 0) > 0:
+                        # 保留源 labels（不再删除）：txt 为原始标注供追溯，每图 JSON 为权威源
+                        # 有效标注以每图 JSON 为准（类过滤后可能整批无本模型有效框）
+                        json_annotated = self._count_json_annotations(version_dir)
+                        if json_annotated == 0 and txt_to_json.get("dropped_boxes", 0) > 0:
+                            logger.info(f"prepare {dataset_id}: all txt boxes dropped by class filter (model={model_id_ds})")
+                        final_has_labels = json_annotated > 0
+                        logger.info(f"prepare {dataset_id}: txt->json converted={txt_to_json['converted']}, labels kept")
+                    # class_map 有效 → 数据集类别空间收敛为模型标签字典（与框索引对齐）
+                    if class_map and model_labels:
+                        detected_classes = list(model_labels)
+                except Exception:
+                    logger.exception(f"prepare {dataset_id}: txt->json import failed, labels kept")
+        else:
+            txt_to_json = {"converted": 0, "labels_removed": False, "class_map": None, "dropped_boxes": 0}
 
         # 标签字典自动生成：prepare 解析出真实类名后，归属模型的标签字典若为空
         # （动态建模型的空字典），自动用包内类名初始化；有人工维护的字典不覆盖
@@ -1422,7 +1433,7 @@ class DatasetService:
             move_flat(im, tmp_images)
 
         if classes:
-            (staging / "classes.txt").write_text("\n".join(classes) + "\n", encoding="utf-8")
+            _save_yaml(staging / "data.yaml", {"nc": len(classes), "names": list(classes)})
 
         # 4) 清空根目录并移入整理结果（zip 原始文件保留在 uploads，可随时重新准备）
         for child in list(root_dir.iterdir()):
@@ -1714,6 +1725,34 @@ class DatasetService:
             if key and key in model_idx:
                 class_map[src_idx] = model_idx[key]
         return class_map or None
+
+    def _remap_yolo_labels(self, labels_dir: Path, class_map: dict):
+        """按 class_map（源类号→模型类号）重写 labels/*.txt 的类别号；源类号不在映射中的行删除。
+
+        用于外部格式导入且数据集已绑定模型时：让 YOLO txt 的类别号与模型标签字典顺序对齐，
+        避免封板 data.yaml 的 names 与 txt 数字索引错位（类别串号）。
+        """
+        if not labels_dir or not labels_dir.is_dir():
+            return
+        for p in labels_dir.rglob("*.txt"):
+            try:
+                out_lines = []
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if not parts:
+                            continue
+                        try:
+                            cid = int(parts[0])
+                        except ValueError:
+                            continue
+                        if cid in class_map:
+                            parts[0] = str(class_map[cid])
+                            out_lines.append(" ".join(parts))
+                        # 不在映射中的行（冗余类）直接丢弃
+                p.write_text("\n".join(out_lines), encoding="utf-8")
+            except Exception:
+                continue
 
     def _import_labels_txt_to_json(self, dataset_dir: Path, class_map: dict = None) -> dict:
         """把 YOLO labels/*.txt 标注转换为每图 JSON（一图一 JSON 为权威标注源）。
@@ -2839,14 +2878,6 @@ class DatasetService:
                 existing = meta.get("classes") or []
                 if codes and (not existing or self._is_placeholder_classes(existing)):
                     meta["classes"] = codes
-                    try:
-                        if dataset_dir.exists():
-                            (dataset_dir / "classes.txt").write_text(
-                                "\n".join(codes) + "\n", encoding="utf-8"
-                            )
-                            logger.info(f"bind {dataset_id}->{model_id}: classes.txt written: {codes}")
-                    except Exception:
-                        pass
                 
                 logger.info(f"bind {dataset_id}->{model_id}: synced {len(chinese_labels)} chinese labels")
             
@@ -3812,10 +3843,6 @@ class DatasetService:
             "bucket_index": sv,
         }
         save_json_atomic(ds_dir / "meta.json", meta)
-        try:
-            (ds_dir / "classes.txt").write_text("\n".join(names) + "\n", encoding="utf-8")
-        except Exception:
-            pass
         logger.info(
             f"bucket seal {model_id}: v{sv} -> {ds_id} images={meta['image_count']} "
             f"counts={payload.get('counts')} names={names}"

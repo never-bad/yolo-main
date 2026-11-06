@@ -1,16 +1,14 @@
-"""外部标注格式导入器：COCO / LabelMe / VOC → 统一一图一 JSON 标注。
+"""外部标注格式导入器：COCO / LabelMe / VOC → 直接产出 YOLO 扁平格式。
 
 数据链路改造（阶段B）：prepare 阶段检测到外部格式后调用，产物：
 
     datasets/{dataset_id}/images/{image_id}.jpg        # 图片平铺（封板前不划分）
-    datasets/{dataset_id}/annotations/{image_id}.json  # 一图一 JSON 标注
-    datasets/{dataset_id}/classes.txt                  # 类别（英文码，每行一个）
+    datasets/{dataset_id}/labels/{image_id}.txt        # YOLO 标签（归一化，检测/分割）
+    datasets/{dataset_id}/data.yaml                    # 类别真值（nc + names，无 path）
 
-每图 JSON 结构与 annotation_service._image_ann_path 约定完全一致：
-    {image_id, image_path, width, height, model_id, dataset_id, version,
-     boxes:[{class_id,x1,y1,x2,y2}], ai_annotated, updated_at}
-
-image_path 为相对 DATA_DIR 的路径（静态文件服务根目录），标注前端可直接取用。
+YOLO 标签即训练可用格式：检测 `class cx cy w h`，分割 `class x1 y1 x2 y2 ...`（顶点）。
+封板阶段直接读 labels/*.txt 做 train/val/test 划分，不再转回每图 JSON；
+类别真值由 data.yaml 的 names + meta.classes 承载（废弃 classes.txt）。
 """
 import json
 import shutil
@@ -20,10 +18,10 @@ from pathlib import Path
 
 from PIL import Image
 
-from src.core.settings import settings
 # 分割轮廓工具：导入外部标注包时必须保留轮廓，否则会被静默截成矩形框
-from src.services.annotation_service import clean_polygon, strip_ann_bbox
-from src.utils.json_io import load_json, save_json_atomic
+from src.services.annotation_service import clean_polygon, polygon_to_bbox, yolo_label_line
+from src.utils.json_io import load_json
+import yaml
 
 # 支持的图片后缀（与 dataset_service 保持一致）
 IMG_SUFFIX = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -54,14 +52,6 @@ def _image_dims(img_abs: Path):
     """读取图片宽高"""
     with Image.open(img_abs) as im:
         return im.size  # (width, height)
-
-
-def _rel_to_data_dir(img_abs: Path) -> str:
-    """计算图片相对 DATA_DIR 的路径（正斜杠），供静态文件服务使用"""
-    try:
-        return str(img_abs.resolve().relative_to(settings.DATA_DIR.resolve())).replace("\\", "/")
-    except ValueError:
-        return str(img_abs).replace("\\", "/")
 
 
 def _flatten_images(root: Path, images_dir: Path) -> dict:
@@ -124,34 +114,50 @@ def detect_format(root: Path) -> str:
 # ----------------------------------------------------------------------
 # 公共写盘
 # ----------------------------------------------------------------------
-def _write_ann(root: Path, image_id: str, image_abs: Path, width: int, height: int,
-               boxes: list, classes_known: bool = True) -> bool:
-    """写一张图的 JSON；无框且无已知类别时不写（保持“有 JSON=有标注”语义）
+def _write_label(root: Path, image_id: str, width: int, height: int, boxes: list) -> bool:
+    """写一张图的 YOLO 标签：labels/{image_id}.txt（归一化坐标）。
 
-    返回是否写入。boxes 已在调用方转换为 {class_id,x1,y1,x2,y2} 像素坐标。
+    检测框 → `class cx cy w h`；分割框（含 polygon）→ 归一化顶点。
+    boxes 已在调用方转换为像素坐标 {class_id,x1,y1,x2,y2} + 可选 polygon。
+    返回是否写入（无框则不写）。这是外部格式导入的“YOLO 扁平”产物，
+    封板时会直接读 labels/*.txt 划分，不再转回每图 JSON。
     """
-    if not boxes and not classes_known:
+    if not boxes:
         return False
-    data = {
-        "image_id": image_id,
-        "image_path": _rel_to_data_dir(image_abs),
-        "width": width,
-        "height": height,
-        "boxes": boxes,
-        "updated_at": datetime.now().isoformat(),
-        "ai_annotated": False,
-    }
-    # dataset_id / version / model_id 由 prepare 阶段回填
-    # 带轮廓的框只留轮廓点（与平台内标注同一存储形态：分割不存矩形）
-    save_json_atomic(root / "annotations" / f"{image_id}.json", strip_ann_bbox(data))
+    labels_dir = root / "labels"
+    labels_dir.mkdir(parents=True, exist_ok=True)
+    w = width or 1
+    h = height or 1
+    box_polys = [clean_polygon(b.get("polygon")) for b in boxes]
+    any_poly = any(box_polys)
+    lines = []
+    for b, poly in zip(boxes, box_polys):
+        if poly:
+            x1, y1, x2, y2 = polygon_to_bbox(poly)
+        else:
+            x1, y1, x2, y2 = float(b["x1"]), float(b["y1"]), float(b["x2"]), float(b["y2"])
+        cid = int(b["class_id"])
+        lines.append(yolo_label_line(cid, (x1, y1, x2, y2), poly, w, h, rect_as_poly=any_poly))
+    (labels_dir / f"{image_id}.txt").write_text("\n".join(lines), encoding="utf-8")
     return True
+
+
+def _write_data_yaml(root: Path, names: list):
+    """写数据集根目录 data.yaml（nc + names，不写 path / train/val；封板时再补划分）。
+
+    作为类别真值文件，供训练 / 导出直接读取；替代已废弃的 classes.txt。
+    """
+    (root / "data.yaml").write_text(
+        yaml.safe_dump({"nc": len(names), "names": list(names)}, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
 
 
 # ----------------------------------------------------------------------
 # COCO 导入
 # ----------------------------------------------------------------------
 def _import_coco(root: Path) -> dict:
-    """COCO 格式 → 一图一 JSON。返场统计：{images, annotated, classes, errors}"""
+    """COCO 格式 → 直接产出 YOLO 扁平格式（labels/{id}.txt + data.yaml）。返统计：{images, annotated, classes, errors}"""
     errors = []
     images_by_name = {}
     for img in _iter_images(root):
@@ -248,7 +254,7 @@ def _import_coco(root: Path) -> dict:
             errors.append(f"COCO 找不到图片: {rec['file_name']}")
             continue
         matched_images += 1
-        _write_ann(root, img_abs.stem, img_abs, rec["width"], rec["height"], rec["boxes"])
+        _write_label(root, img_abs.stem, rec["width"], rec["height"], rec["boxes"])
         annotated += 1
 
     # 安全网：识别出 COCO 源文件却一个框都没导入成功（通常是图片未匹配上 / 布局异常），
@@ -331,7 +337,7 @@ def _import_labelme(root: Path) -> dict:
             boxes.append(box)
 
         matched_images += 1
-        if _write_ann(root, img_abs.stem, img_abs, w, h, boxes, classes_known=bool(classes)):
+        if _write_label(root, img_abs.stem, w, h, boxes):
             annotated += 1
     return {"images": matched_images, "annotated": annotated, "classes": classes, "errors": errors}
 
@@ -398,7 +404,7 @@ def _import_voc(root: Path) -> dict:
             boxes.append({"class_id": classes.index(label), "x1": x1, "y1": y1, "x2": x2, "y2": y2})
 
         matched_images += 1
-        if _write_ann(root, img_abs.stem, img_abs, w, h, boxes, classes_known=bool(classes)):
+        if _write_label(root, img_abs.stem, w, h, boxes):
             annotated += 1
     return {"images": matched_images, "annotated": annotated, "classes": classes, "errors": errors}
 
@@ -408,7 +414,7 @@ def _import_voc(root: Path) -> dict:
 # ----------------------------------------------------------------------
 def import_external_annotations(root: Path, dataset_id: str, version: str,
                                 model_id: str = "") -> dict:
-    """prepare 阶段统一入口：检测格式并转换为每图 JSON。
+    """prepare 阶段统一入口：检测格式并转换为 YOLO 扁平格式（images/+labels/+data.yaml）。
 
     root = datasets/{dataset_id}/ 解压后的目录。
     返回 {format, images, annotated, classes, errors}；识别不出外部格式时返回 format=''。
@@ -428,37 +434,9 @@ def import_external_annotations(root: Path, dataset_id: str, version: str,
     # 图片平铺（先转换标注后移动图片，标注定位已完成；这里处理孤儿图片与同目录整理）
     _flatten_images(root, images_dir)
 
-    # 同步回填 dataset_id / version / model_id，并刷新 image_path（图片已被平铺移动）
-    refresh_image_paths(root, dataset_id, version, model_id)
-
-    # 类别写入 classes.txt（供 create_task 自动读取合并）
+    # 类别写入 data.yaml（nc + names，不写 path；作为类别真值文件，替代废弃的 classes.txt）
     if result["classes"]:
-        (root / "classes.txt").write_text("\n".join(result["classes"]) + "\n", encoding="utf-8")
+        _write_data_yaml(root, result["classes"])
 
     result["format"] = fmt
     return result
-
-
-def refresh_image_paths(root: Path, dataset_id: str, version: str, model_id: str = ""):
-    """图片平铺后刷新每图 JSON 的 image_path，并回填数据集归属字段"""
-    images_dir = root / "images"
-    ann_dir = root / "annotations"
-    if not ann_dir.exists():
-        return
-    for p in ann_dir.glob("*.json"):
-        try:
-            data = load_json(p)
-        except Exception:
-            continue
-        img_id = data.get("image_id", p.stem)
-        img_abs = None
-        if images_dir.exists():
-            for img in images_dir.glob(f"{img_id}.*"):
-                img_abs = img
-                break
-        if img_abs is not None:
-            data["image_path"] = _rel_to_data_dir(img_abs)
-        data["dataset_id"] = dataset_id
-        data["version"] = version
-        data["model_id"] = model_id
-        save_json_atomic(p, data)
