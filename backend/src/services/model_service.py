@@ -130,7 +130,9 @@ class ModelService:
                         continue
 
             # 1.7：先扫描数据集，按「归属算法库根记录」汇总数量与阶段分布
+            # 顺带收集类别名并集：库标签字典为空时用于封面「标签 N 类」兜底。
             ds_stats = {}
+            ds_class_union = {}
             datasets_dir = settings.DATASETS_DIR
             if datasets_dir.exists():
                 for ds_dir in datasets_dir.iterdir():
@@ -150,9 +152,61 @@ class ModelService:
                     stat["count"] += 1
                     stage = ds_meta.get("stage") or "collecting"
                     stat[stage] = stat.get(stage, 0) + 1
+                    snap = ds_meta.get("classes") or []
+                    if isinstance(snap, (list, tuple)):
+                        bucket = ds_class_union.setdefault(mid, [])
+                        for _cn in snap:
+                            _cn = str(_cn).strip()
+                            if _cn and _cn not in bucket:
+                                bucket.append(_cn)
 
             if not metas:
                 return models
+
+            def _label_rows_of(mid):
+                """只读标签字典；库内版本模型自身无字典时回退到所属库根。"""
+                if not mid:
+                    return []
+                try:
+                    dic = load_json(self.registry_dir / str(mid) / "labels_dict.json")
+                except Exception:
+                    return []
+                return dic.get("labels") or []
+
+            def _resolve_display_classes(mid, meta):
+                """封面「标签 N 类」展示口径（只在接口返回时补齐，绝不回写磁盘）。
+
+                标签真值已迁到 labels_dict.json，model.json.classes 是早期冗余字段，
+                多数库仍为空 —— 以前首页因此恒显示 0 类。优先级：
+                  model.json.classes → labels_dict.json.labels → 本库数据集快照类别并集。
+                """
+                own = meta.get("classes") or []
+                if own:
+                    return [str(c) for c in own]
+                rows = _label_rows_of(mid)
+                if not rows:
+                    rid = meta.get("library_root_id")
+                    if rid and rid != mid:
+                        rows = _label_rows_of(rid)
+                if rows:
+                    try:
+                        rows = sorted(
+                            rows,
+                            key=lambda r: r.get("index")
+                            if isinstance(r, dict) and isinstance(r.get("index"), int) else 0,
+                        )
+                    except Exception:
+                        pass
+                    names = []
+                    for i, row in enumerate(rows):
+                        if isinstance(row, dict):
+                            nm = str(row.get("english_code") or row.get("chinese_name") or "").strip()
+                        else:
+                            nm = str(row).strip()
+                        names.append(nm or f"class_{i}")
+                    return names
+                rid = meta.get("library_root_id") or mid
+                return list(ds_class_union.get(rid) or [])
 
             for model_meta in metas.values():
                 try:
@@ -167,6 +221,9 @@ class ModelService:
                     model_meta["dataset_stats"] = {
                         k: v for k, v in stat.items() if k != "count"
                     }
+                    # 封面标签类数：model.json.classes 多为历史空值 → 从标签字典/数据集快照补齐
+                    model_meta["classes"] = _resolve_display_classes(
+                        model_meta.get("model_id"), model_meta)
                     models.append(model_meta)
                 except Exception:
                     continue
