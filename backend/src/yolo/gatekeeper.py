@@ -249,6 +249,30 @@ def _evaluate_per_class(preds, gts, iou_thr, conf_scan):
     return per, mAP
 
 
+def _pick_pref_conf_from_scan(scan, preference="miss"):
+    """从 _evaluate 的 scan(conf->(prec,rec,f1)) 挑工作点 conf，按偏好偏召回/精确。
+
+    - miss(在意漏检,默认): F1 峰值带内取最低 conf → 偏召回 / 低漏检率；
+    - false(在意误检):     峰值带内取最高 conf → 偏精确 / 低误检率。
+    scan 为空时返回 None（调用方退回默认 0.25）。
+    """
+    if not scan:
+        return None
+    try:
+        confs = sorted(scan.keys())
+        f1s = [scan[c][2] for c in confs]
+        peak_f1 = max(f1s)
+        if peak_f1 <= 0:
+            return None
+        lo = peak_f1 * (1.0 - 0.02)  # 2% 容差带：F1 接近峰值的 conf 视为等价
+        band = [c for c, f in zip(confs, f1s) if f >= lo - 1e-9]
+        if not band:
+            return None
+        return max(band) if preference == "false" else min(band)
+    except Exception:
+        return None
+
+
 def _pr_at_conf(preds, gts, iou_thr, conf):
     """在给定工作点 conf 下的 P/R/F1（基于全候选框匹配）。"""
     gt_groups = defaultdict(list)
@@ -417,9 +441,12 @@ def evaluate_model_dir(weights: str, imgs_dir: str, labels_dir: str, classes: li
             mAP50_95 = 0.0
         mAP50 = round(mAP5, 4)
 
-        # ---- 工作点 conf：缺省取宏平均最优 F1 阈值 ----
-        best_confs = [per5[c]["best_conf"] for c in per5
-                      if per5[c].get("best_conf") is not None]
+        # ---- 工作点 conf：缺省取宏平均最优 F1 阈值（按偏好偏召回/精确）----
+        best_confs = []
+        for c in per5:
+            pc = _pick_pref_conf_from_scan(per5[c].get("scan"), conf_preference)
+            if pc is not None:
+                best_confs.append(pc)
         macro_best_conf = (sum(best_confs) / len(best_confs)) if best_confs else 0.25
         op_conf = conf if conf is not None else macro_best_conf
 

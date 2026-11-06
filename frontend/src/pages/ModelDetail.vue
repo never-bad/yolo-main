@@ -437,6 +437,16 @@
           </div>
         </div>
 
+        <!-- 置信度偏好开关（miss/false）：影响 P/R/F1 工作点选取，mAP 不受影响 -->
+        <div class="te-pref-bar">
+          <span class="te-pref-label">置信度偏好</span>
+          <div class="seg">
+            <button :class="['seg-btn', { active: tePref === 'miss' }]" @click="tePref = 'miss'">在意漏检</button>
+            <button :class="['seg-btn', { active: tePref === 'false' }]" @click="tePref = 'false'">在意误检</button>
+          </div>
+          <span class="form-hint">在意漏检→偏低 conf（高召回/低漏检率）；在意误检→偏高 conf（高精确/低误检率）。选后点「重跑」生效，并作为本库默认。</span>
+        </div>
+
         <!-- 比对矩阵 -->
         <div v-if="loadingTestEval" class="loading-row"><span class="loading-spinner"></span> 加载中...</div>
         <table v-else-if="testEvalMatrix && testEvalMatrix.models.length" class="ds-table te-table">
@@ -1264,6 +1274,7 @@ const testSetPickerOpen = ref(false)
 const testSetPickId = ref('')
 const settingTestSet = ref(false)
 const uploadHintOpen = ref(false)
+const tePref = ref<'miss' | 'false'>('miss')  // 置信度偏好：在意漏检(miss,默认) / 在意误检(false)
 
 const libraryRootId = computed(() => String(libraryRoot.value?.model_id || modelId))
 
@@ -1276,6 +1287,10 @@ const loadTestEval = async () => {
     ])
     testEvalMatrix.value = m
     testSetInfo.value = info
+    // 偏好与算法库根已存口径对齐（后端 test_eval_preference）
+    if (info && info.test_eval_preference) {
+      tePref.value = info.test_eval_preference === 'false' ? 'false' : 'miss'
+    }
   } catch (e: any) {
     if (!e?.__toastShown) showToast('测试集对比加载失败: ' + (e.response?.data?.detail || e.message), 'error')
   } finally {
@@ -1342,7 +1357,7 @@ const leakInfo = computed(() => {
 
 const runTestEvalFor = async (id: string) => {
   try {
-    await triggerTestEval(id, {})
+    await triggerTestEval(id, { conf_preference: tePref.value })
     runningIds.value = new Set([...runningIds.value, id])
     showToast('已加入评测队列', 'info')
     pollTestEval(id)
@@ -2069,6 +2084,12 @@ onMounted(async () => {
 .te-table td.best { background: #eafaf0; color: #1f9d55; font-weight: 700; }
 .te-table .te-stale td { color: #95a5a6; }
 .te-table .te-incomparable { background: #f6f8fa; color: #b2bcc7; }
+.te-pref-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 12px 0 4px; }
+.te-pref-label { font-weight: 600; color: #2c3e50; }
+.seg { display: inline-flex; border: 1px solid #cdd6df; border-radius: 7px; overflow: hidden; }
+.seg-btn { border: 0; background: #fff; color: #4a5a6a; padding: 6px 14px; cursor: pointer; font-size: 13px; }
+.seg-btn + .seg-btn { border-left: 1px solid #cdd6df; }
+.seg-btn.active { background: #1f6fb2; color: #fff; font-weight: 600; }
 .te-status { padding: 1px 8px; border-radius: 10px; font-size: 0.75rem; background: #eef2f6; color: #5a6b7b; }
 .te-status.done { background: #e8f8ef; color: #1f9d55; }
 .te-status.running { background: #eaf2fd; color: #2c6ec5; }

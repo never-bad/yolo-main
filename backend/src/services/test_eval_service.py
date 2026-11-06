@@ -129,6 +129,18 @@ def run_test_eval(model_id: str, force: bool = False, focus_metrics=None,
         return {"ok": False, "error": "无法解析类别字典（空类别）"}
 
     conf_preference = _resolve_conf_preference(meta, library_root_id, conf_preference)
+    # 把本次偏好落盘到算法库根，作为默认偏好：手动重跑与后台循环（后者不传 conf_preference，
+    # 只靠 root.test_eval_preference）都沿用同一口径，避免手动选 false、循环又用 miss 的不一致。
+    try:
+        if library_root_id and library_root_id != model_id:
+            rp = settings.REGISTRY_DIR / library_root_id / "model.json"
+            if rp.exists():
+                rmeta = load_json(rp)
+                if rmeta.get("test_eval_preference") != conf_preference:
+                    rmeta["test_eval_preference"] = conf_preference
+                    save_json_atomic(rp, rmeta)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("persist test_eval_preference failed: %s", e)
     imgsz = _resolve_imgsz(meta)
 
     # 写 running 状态（防止并发重复触发）
