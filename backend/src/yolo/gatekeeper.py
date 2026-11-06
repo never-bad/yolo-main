@@ -15,6 +15,11 @@
 """
 from pathlib import Path
 
+import glob
+import os
+import time
+from collections import defaultdict
+
 
 # 防偏科阈值：单类 AP 相对跌幅超过该比例即判定"灾难性遗忘/退化"
 # 全部类别统一校验（用户无需也不可配置）；类上原本无输出（old_ap≈0）的类别不参与比较
@@ -23,6 +28,9 @@ CLASS_REGRESSION_RATIO = 0.05
 # M7 守门员增强（P5 拍板）：晋升 Margin —— 仅当 new_mAP > historical_best_mAP + Margin 才放行，
 # 避免"持平即晋升"的噪声抖动；0.5% 为训练模块规范口径。
 MARGIN = 0.005
+
+# 测试集评测（predict 版）置信度扫描点：用于 AP 的 PR 曲线与"最优 F1 阈值"扫描。
+CONF_SCAN = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 # ---- Loss 稳定性校验（M7 / 2.1）----
 # 从 results.csv 的 box_loss + val/box_loss 序列判断训练是否震荡/发散：
@@ -121,6 +129,333 @@ def _pick_eval_split(data_yaml: str) -> str:
     except Exception:
         pass
     return split
+
+
+# --------------------------------------------------------------------------- #
+# predict 版评测（B-54 引入）：直接 model.predict 逐图推理 + 自算 mAP/P/R/F1，
+# 不依赖 data.yaml 的 train/val 键，用于仅含 test 的封板测试集。
+# 返回字段与 evaluate_model 完全对齐，前端/matrix 无需改动。
+# --------------------------------------------------------------------------- #
+def _box_iou(boxA, boxB):
+    """两个 [x1,y1,x2,y2] 框的 IoU。"""
+    xA = max(boxA[0], boxB[0]); yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2]); yB = min(boxA[3], boxB[3])
+    interW = max(0.0, xB - xA); interH = max(0.0, yB - yA)
+    inter = interW * interH
+    areaA = max(0.0, (boxA[2] - boxA[0]) * (boxA[3] - boxA[1]))
+    areaB = max(0.0, (boxB[2] - boxB[0]) * (boxB[3] - boxB[1]))
+    union = areaA + areaB - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _compute_ap(recall, precision):
+    """COCO 风格全点插值 AP（PR 曲线下面积）。"""
+    if not recall:
+        return 0.0
+    mrec = [0.0] + list(recall) + [1.0]
+    mpre = [0.0] + list(precision) + [0.0]
+    for i in range(len(mpre) - 2, -1, -1):
+        mpre[i] = max(mpre[i], mpre[i + 1])
+    ap = 0.0
+    for i in range(1, len(mrec)):
+        ap += (mrec[i] - mrec[i - 1]) * mpre[i]
+    return ap
+
+
+def _evaluate(preds, gts, iou_thr, conf_scan):
+    """对单个类别计算 AP / conf 扫描 / 最优 F1 阈值。
+
+    preds: [{'img','cls','conf','box':[x1,y1,x2,y2]}]
+    gts:   [{'img','cls','box':[x1,y1,x2,y2]}]
+    """
+    gt_groups = defaultdict(list)
+    for gi, g in enumerate(gts):
+        gt_groups[(g['img'], g['cls'])].append(gi)
+
+    order = sorted(range(len(preds)), key=lambda i: preds[i]['conf'], reverse=True)
+    matched = defaultdict(set)
+    tp = [0] * len(preds); fp = [0] * len(preds)
+    for idx in order:
+        p = preds[idx]
+        gis = gt_groups.get((p['img'], p['cls']), [])
+        best_iou = 0.0; best_gi = -1
+        for gi in gis:
+            if gi in matched[(p['img'], p['cls'])]:
+                continue
+            iou = _box_iou(p['box'], gts[gi]['box'])
+            if iou > best_iou:
+                best_iou = iou; best_gi = gi
+        if best_gi >= 0 and best_iou >= iou_thr:
+            matched[(p['img'], p['cls'])].add(best_gi)
+            tp[idx] = 1
+        else:
+            fp[idx] = 1
+
+    total_gt = len(gts)
+    cum_tp = cum_fp = 0
+    P_list = []; R_list = []
+    for idx in order:
+        cum_tp += tp[idx]; cum_fp += fp[idx]
+        prec = cum_tp / (cum_tp + cum_fp) if (cum_tp + cum_fp) > 0 else 0.0
+        rec = cum_tp / total_gt if total_gt > 0 else 0.0
+        P_list.append(prec); R_list.append(rec)
+    ap = _compute_ap(R_list, P_list)
+
+    scan = {}
+    for c in conf_scan:
+        cut = len(order)
+        for k, idx in enumerate(order):
+            if preds[idx]['conf'] < c:
+                cut = k; break
+        if cut == 0:
+            scan[c] = (0.0, 0.0, 0.0)
+        else:
+            ctp = sum(tp[order[k]] for k in range(cut))
+            cfp = sum(fp[order[k]] for k in range(cut))
+            prec = ctp / (ctp + cfp) if (ctp + cfp) > 0 else 0.0
+            rec = ctp / total_gt if total_gt > 0 else 0.0
+            f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+            scan[c] = (round(prec, 4), round(rec, 4), round(f1, 4))
+
+    best_f1 = -1.0; best_conf = 0.0; best_pr = None
+    for k in range(len(order)):
+        ctp = sum(tp[order[j]] for j in range(k + 1))
+        cfp = sum(fp[order[j]] for j in range(k + 1))
+        prec = ctp / (ctp + cfp) if (ctp + cfp) > 0 else 0.0
+        rec = ctp / total_gt if total_gt > 0 else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+        if f1 > best_f1:
+            best_f1 = f1; best_conf = preds[order[k]]['conf']; best_pr = (prec, rec)
+
+    return {
+        "ap": ap, "scan": scan, "best_f1": best_f1, "best_conf": best_conf,
+        "best_precision": (best_pr[0] if best_pr else None),
+        "best_recall": (best_pr[1] if best_pr else None),
+    }
+
+
+def _evaluate_per_class(preds, gts, iou_thr, conf_scan):
+    """逐类别评估并返回 (per_class_results, mAP)。"""
+    classes = sorted(set([p['cls'] for p in preds]) | set([g['cls'] for g in gts]))
+    per = {}
+    aps = []
+    for c in classes:
+        p_c = [p for p in preds if p['cls'] == c]
+        g_c = [g for g in gts if g['cls'] == c]
+        res = _evaluate(p_c, g_c, iou_thr, conf_scan)
+        per[c] = res
+        aps.append(res['ap'])
+    mAP = sum(aps) / len(aps) if aps else 0.0
+    return per, mAP
+
+
+def _pr_at_conf(preds, gts, iou_thr, conf):
+    """在给定工作点 conf 下的 P/R/F1（基于全候选框匹配）。"""
+    gt_groups = defaultdict(list)
+    for gi, g in enumerate(gts):
+        gt_groups[(g['img'], g['cls'])].append(gi)
+    order = sorted(range(len(preds)), key=lambda i: preds[i]['conf'], reverse=True)
+    matched = defaultdict(set)
+    tp = [0] * len(preds); fp = [0] * len(preds)
+    for idx in order:
+        p = preds[idx]
+        gis = gt_groups.get((p['img'], p['cls']), [])
+        best_iou = 0.0; best_gi = -1
+        for gi in gis:
+            if gi in matched[(p['img'], p['cls'])]:
+                continue
+            iou = _box_iou(p['box'], gts[gi]['box'])
+            if iou > best_iou:
+                best_iou = iou; best_gi = gi
+        if best_gi >= 0 and best_iou >= iou_thr:
+            matched[(p['img'], p['cls'])].add(best_gi)
+            tp[idx] = 1
+        else:
+            fp[idx] = 1
+    total_gt = len(gts)
+    ctp = sum(tp[order[k]] for k in range(len(order)) if preds[order[k]]['conf'] >= conf)
+    cfp = sum(fp[order[k]] for k in range(len(order)) if preds[order[k]]['conf'] >= conf)
+    prec = ctp / (ctp + cfp) if (ctp + cfp) > 0 else 0.0
+    rec = ctp / total_gt if total_gt > 0 else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    return prec, rec, f1
+
+
+def _empty_eval(split: str, conf, conf_preference, err) -> dict:
+    """evaluate_model / evaluate_model_dir 统一错误/缺数据返回骨架。"""
+    return {
+        "mAP50": None, "mAP50_95": None, "precision": None, "recall": None,
+        "f1": None, "miss_rate": None, "false_rate": None,
+        "mask_mAP50": None, "mask_mAP50_95": None,
+        "speed_ms": None, "speed_breakdown": None, "gpu_mem_mb": None,
+        "class_ap": {}, "eval_split": split,
+        "conf_used": conf if conf is not None else 0.001,
+        "conf_preference": conf_preference, "error": err,
+    }
+
+
+def evaluate_model_dir(weights: str, imgs_dir: str, labels_dir: str, classes: list,
+                       conf: float = None, conf_preference: str = "miss",
+                       imgsz: int = 640, iou: float = 0.7,
+                       device: str = "cuda:0") -> dict:
+    """predict 版评测：直接推理指定图片目录 + 解析同目录 YOLO 标签算 mAP/P/R/F1。
+
+    与 evaluate_model 返回字段完全一致（mAP50/mAP50_95/precision/recall/f1/
+    miss_rate/false_rate/speed_ms/gpu_mem_mb/class_ap/eval_split/conf_used/
+    conf_preference/error/mask_*），前端与测试集矩阵接口无需改动。
+
+    不要求 data.yaml 含 train/val 键——封板测试集（仅 test 键）也能评。
+
+    Args:
+        imgs_dir:   测试图片目录（如 .../images/test）
+        labels_dir: YOLO 格式标签目录（如 .../labels/test），按 base 同名 .txt 配对
+        classes:    类别名列表（按 0 基 id 对应标签 class id）
+        conf:       工作点置信度；None 时取"宏平均最优 F1 阈值"
+        conf_preference / imgsz / iou / device：评测超参
+    """
+    from ultralytics import YOLO
+
+    IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+    names_norm = _normalize_classes(classes)
+
+    def find_images(d):
+        files = []
+        for ext in IMG_EXTS:
+            files += glob.glob(os.path.join(d, "*" + ext))
+            files += glob.glob(os.path.join(d, "**", "*" + ext), recursive=True)
+        return sorted(set(files))
+
+    def parse_labels(label_dir, per_img):
+        gts = []
+        for base, info in per_img.items():
+            lp = os.path.join(label_dir, base + ".txt")
+            if not os.path.exists(lp):
+                continue
+            h, w = info["shape"]
+            with open(lp, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 5:
+                        continue
+                    try:
+                        cid = int(float(parts[0]))
+                        cx, cy, ww, hh = map(float, parts[1:5])
+                    except ValueError:
+                        continue
+                    if names_norm and cid >= len(names_norm):
+                        continue
+                    x1 = (cx - ww / 2) * w; y1 = (cy - hh / 2) * h
+                    x2 = (cx + ww / 2) * w; y2 = (cy + hh / 2) * h
+                    gts.append({"img": base, "cls": cid, "box": [x1, y1, x2, y2]})
+        return gts
+
+    try:
+        model = YOLO(_resolve_weights(weights))
+        try:
+            if hasattr(model.model, "set_classes") and classes:
+                model.set_classes(classes)
+        except Exception:
+            pass
+
+        gpu0 = None
+        try:
+            import torch
+            if "cuda" in (device or "") and torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
+
+        image_files = find_images(imgs_dir)
+        if not image_files:
+            return _empty_eval("test", conf, conf_preference, f"测试集图片目录为空: {imgs_dir}")
+
+        per_img = {}
+        preds = []
+        times = []
+        for f in image_files:
+            base = os.path.splitext(os.path.basename(f))[0]
+            t0 = time.perf_counter()
+            results = model.predict(source=f, conf=1e-4, iou=iou,
+                                    imgsz=imgsz, device=device, verbose=False)
+            dt = time.perf_counter() - t0
+            times.append(dt)
+            r = results[0]
+            if r.boxes is not None and len(r.boxes) > 0:
+                xyxy = r.boxes.xyxy.cpu().numpy()
+                c = r.boxes.conf.cpu().numpy()
+                cl = r.boxes.cls.cpu().numpy()
+                for i in range(len(xyxy)):
+                    preds.append({
+                        "img": base, "cls": int(cl[i]),
+                        "conf": float(c[i]),
+                        "box": [float(x) for x in xyxy[i]],
+                    })
+            per_img[base] = {"shape": tuple(r.orig_shape)}
+
+        gts = (parse_labels(labels_dir, per_img)
+               if labels_dir and os.path.isdir(labels_dir) else [])
+        has_gt = bool(gts)
+
+        # ---- AP@0.5 与 AP@0.5:0.95（与 ultralytics 口径一致）----
+        per5, mAP5 = _evaluate_per_class(preds, gts, 0.5, CONF_SCAN)
+        iou_grid = [round(0.5 + 0.05 * i, 2) for i in range(10)]
+        ap5095_per_class = {}
+        for iou_t in iou_grid:
+            per_t, _ = _evaluate_per_class(preds, gts, iou_t, CONF_SCAN)
+            for c, res in per_t.items():
+                ap5095_per_class.setdefault(c, []).append(res["ap"])
+        if ap5095_per_class:
+            class_ap = {
+                names_norm[c]: round(sum(ap5095_per_class[c]) / len(ap5095_per_class[c]), 4)
+                for c in ap5095_per_class
+            }
+            mAP50_95 = round(
+                sum(sum(v) / len(v) for v in ap5095_per_class.values())
+                / len(ap5095_per_class), 4)
+        else:
+            class_ap = {}
+            mAP50_95 = 0.0
+        mAP50 = round(mAP5, 4)
+
+        # ---- 工作点 conf：缺省取宏平均最优 F1 阈值 ----
+        best_confs = [per5[c]["best_conf"] for c in per5
+                      if per5[c].get("best_conf") is not None]
+        macro_best_conf = (sum(best_confs) / len(best_confs)) if best_confs else 0.25
+        op_conf = conf if conf is not None else macro_best_conf
+
+        if has_gt:
+            p, r, f1 = _pr_at_conf(preds, gts, iou, op_conf)
+        else:
+            p = r = f1 = None
+
+        mean_t = sum(times) / len(times) if times else 0.0
+        try:
+            import torch
+            if "cuda" in (device or "") and torch.cuda.is_available():
+                gpu0 = round(torch.cuda.max_memory_allocated() / (1024 * 1024), 1)
+        except Exception:
+            pass
+
+        return {
+            "mAP50": mAP50 if has_gt else None,
+            "mAP50_95": mAP50_95 if has_gt else None,
+            "precision": round(p, 4) if p is not None else None,
+            "recall": round(r, 4) if r is not None else None,
+            "f1": round(f1, 4) if f1 is not None else None,
+            "miss_rate": round(1 - r, 4) if r is not None else None,
+            "false_rate": round(1 - p, 4) if p is not None else None,
+            "mask_mAP50": None, "mask_mAP50_95": None,
+            "speed_ms": round(mean_t * 1000, 2),
+            "speed_breakdown": None,
+            "gpu_mem_mb": gpu0,
+            "class_ap": class_ap,
+            "eval_split": "test",
+            "conf_used": op_conf,
+            "conf_preference": conf_preference,
+            "error": None,
+        }
+    except Exception as e:
+        return _empty_eval("test", conf, conf_preference, str(e))
 
 
 def evaluate_model(weights: str, data_yaml: str, classes: list,

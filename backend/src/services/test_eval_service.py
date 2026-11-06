@@ -22,7 +22,7 @@ from src.core.lifecycle import record_error, record_heartbeat
 from src.core.settings import settings
 from src.utils.class_labels import model_class_names, resolve_library_root_id
 from src.utils.json_io import load_json, save_json_atomic
-from src.yolo.gatekeeper import evaluate_model
+from src.yolo.gatekeeper import evaluate_model_dir
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +111,15 @@ def run_test_eval(model_id: str, force: bool = False, focus_metrics=None,
     data_yaml = settings.DATASETS_DIR / test_dataset_id / "data.yaml"
     if not data_yaml.exists():
         return {"ok": False, "error": f"测试集未封板（缺 data.yaml）: {test_dataset_id}"}
+    # 评测走 predict 版（evaluate_model_dir），直接喂 images/test + labels/test，
+    # 不依赖 data.yaml 的 train/val 键（封板测试集仅含 test 键，ultralytics val 会报错）。
+    ds_dir = settings.DATASETS_DIR / test_dataset_id
+    imgs_test = ds_dir / "images" / "test"
+    labels_test = ds_dir / "labels" / "test"
+    if not imgs_test.exists():
+        imgs_test = ds_dir / "images"
+    if not labels_test.exists():
+        labels_test = ds_dir / "labels"
     weights = meta.get("weights_path")
     if not weights or not Path(weights).exists():
         return {"ok": False, "error": f"模型权重不存在: {weights}"}
@@ -134,8 +143,8 @@ def run_test_eval(model_id: str, force: bool = False, focus_metrics=None,
     _write_test_eval(model_id, te)
 
     try:
-        result = evaluate_model(
-            weights, str(data_yaml), classes,
+        result = evaluate_model_dir(
+            weights, str(imgs_test), str(labels_test), classes,
             conf=conf, conf_preference=conf_preference,
             imgsz=imgsz, iou=0.7, device="cuda:0",
         )
