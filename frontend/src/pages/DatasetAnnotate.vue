@@ -555,7 +555,8 @@
             </select>
           </div>
           <p class="hint" v-if="!trainedVersions.length">
-            目前还没有能用于预标注的模型：<b>需要先在这个算法库里训练完成一次</b>（训练产出权重后才会出现在这里）。
+            目前还没有能用于预标注的模型：<b>需要先在这个算法库里训练完成一次</b>（训练产出权重后才会出现在这里）。<br />
+            下拉只列出<b>本算法库</b>自己训练的模型；其他库的模型因类别字典对不上会一个框都标不出来，已隐藏。
           </p>
           <p class="hint" v-else>
             用法：人工先标一小批 → 训练出第一版 → 回来勾上它批量预标剩下的图 → 人只删错的、补漏的。<br />
@@ -729,7 +730,8 @@ const trainedVersionLabel = (v: any) => {
   // 主标识用模型管理页的重命名：version（如 v1）和 model_id 对人毫无辨识度，
   // 多个库都叫 v1 时根本挑不出该用哪个权重。没改过名才退回 version / model_id。
   const name = v.display_name || v.version || v.model_id
-  const scope = v.same_library ? '本库' : '其他库·类别可能对不上'
+  // B-60：下拉只返回本库版本，不再出现跨库项（跨库类别字典不一致会静默 0 框）
+  const scope = '本库'
   const task = v.task === 'segment' ? '分割' : v.task === 'detect' ? '检测' : (v.task || '未知')
   const cls = (v.classes && v.classes.length) ? `${v.classes.length}类` : '未知类别'
   // 跨库时补上所属算法库；未归库的模型库名等于自身名字，不重复显示

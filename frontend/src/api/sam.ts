@@ -16,7 +16,7 @@ export const getSamModels = async () => {
   return data
 }
 
-// 「本库已训模型」预标注引擎可选的版本（优先返回当前标注任务所属算法库训练出的版本）
+// 「本库已训模型」预标注引擎可选的版本（B-60：只返回当前标注任务所属算法库训练出的版本）
 export const getSamTrainedVersions = async (taskId?: string) => {
   const { data } = await api.get('/sam/trained-versions', { params: taskId ? { task_id: taskId } : {} })
   return data

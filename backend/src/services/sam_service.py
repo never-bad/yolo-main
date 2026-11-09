@@ -517,15 +517,16 @@ class SAMService:
             return "", ""
 
     def list_trained_versions(self, task_id: str = "") -> dict:
-        """可用来预标注的已训模型版本清单（只列真实有权重 best.pt 的版本）。
+        """可用来预标注的已训模型版本清单（只列本算法库自己训练、且有 best.pt 的版本）。
 
-        默认只给当前算法库自己的版本——同库的类别体系与标注任务一致，画出来的框才对得上。
-        本库一个都没有时（新库还没训过），把其他库的版本也带出来并标记 same_library=False，
-        前端会注明"类别可能对不上"，方便先用现成模型把链路跑通。
+        B-60：只返回本库版本。跨库模型的类别字典与当前标注任务不一致，
+        _trained_class_map 会映射为空 → _detect_trained 直接返回 []（静默 0 个框），
+        列在下拉里只会让用户以为模型坏了。other_library_count 仅供排障统计。
         """
         _, owner_model = self._task_dataset_model(task_id) if task_id else ("", "")
         root = self._library_root_of(owner_model) if owner_model else ""
-        mine, others = [], []
+        mine = []
+        other_count = 0
         registry = settings.REGISTRY_DIR
         # 库根 id → 库名，缓存避免每个版本都重读一次 model.json
         lib_names: dict = {}
@@ -549,7 +550,14 @@ class SAMService:
                 if meta.get("empty"):
                     continue
                 lroot = self._library_root_of(mid)
-                item = {
+                if not (bool(root) and lroot == root):
+                    other_count += 1
+                    continue  # 跨库版本不进下拉（类别对不上，选了也一个框都不出）
+                try:
+                    size_mb = round(weights.stat().st_size / 1e6, 1)
+                except OSError:
+                    continue  # 权重在扫描期间被删/悬空，跳过，别拖挂整个下拉
+                mine.append({
                     "model_id": mid,
                     # 模型管理页的重命名必须出现在这里：用户在管理页起的名字
                     # （如「积水分割v1（139张精修·服务器训练）」）是唯一可读的标识，
@@ -564,13 +572,16 @@ class SAMService:
                     "created_at": meta.get("created_at") or "",
                     "imgsz": meta.get("imgsz"),
                     "weights_name": weights.name,
-                    "size_mb": round(weights.stat().st_size / 1e6, 1),
-                    "same_library": bool(root) and lroot == root,
-                }
-                (mine if item["same_library"] else others).append(item)
+                    "size_mb": size_mb,
+                    "same_library": True,
+                })
         mine.sort(key=lambda x: x.get("created_at") or "", reverse=True)
-        others.sort(key=lambda x: x.get("created_at") or "", reverse=True)
-        return {"library_root_id": root, "versions": mine + others, "same_library_count": len(mine)}
+        return {
+            "library_root_id": root,
+            "versions": mine,
+            "same_library_count": len(mine),
+            "other_library_count": other_count,
+        }
 
     def _resolve_gd_model_name(self, model_name: str) -> str:
         """本地优先解析 GroundingDINO 模型：若已下载到 SAM_MODELS_DIR/<名称> 则用本地路径，避免联网"""
