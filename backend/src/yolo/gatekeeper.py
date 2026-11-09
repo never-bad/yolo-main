@@ -192,10 +192,20 @@ def _evaluate(preds, gts, iou_thr, conf_scan):
             fp[idx] = 1
 
     total_gt = len(gts)
+    n = len(order)
+    # 前缀和：tp/fp 累计值在 PR 曲线、conf 扫描、最优 F1 里被反复用到。
+    # 旧实现在 best_f1 循环里对每个 k 都 sum(range(k+1))，复杂度 O(n^2)；
+    # predict 用 conf=1e-4 把候选框全捞出来，几百张图的测试集轻松几万框，
+    # 单类就是十几亿次 Python 操作，再 ×11 个 IoU 档 → 评测卡在 CPU 里
+    # 几十分钟不出结果（此时 GPU 早已空闲，界面永远停在 running）。
+    # 这里一次遍历建前缀和，后面全部 O(1) 取用，结果逐位等价、口径不变。
+    pref_tp = [0] * (n + 1)
+    pref_fp = [0] * (n + 1)
     cum_tp = cum_fp = 0
     P_list = []; R_list = []
-    for idx in order:
+    for k, idx in enumerate(order):
         cum_tp += tp[idx]; cum_fp += fp[idx]
+        pref_tp[k + 1] = cum_tp; pref_fp[k + 1] = cum_fp
         prec = cum_tp / (cum_tp + cum_fp) if (cum_tp + cum_fp) > 0 else 0.0
         rec = cum_tp / total_gt if total_gt > 0 else 0.0
         P_list.append(prec); R_list.append(rec)
@@ -210,17 +220,15 @@ def _evaluate(preds, gts, iou_thr, conf_scan):
         if cut == 0:
             scan[c] = (0.0, 0.0, 0.0)
         else:
-            ctp = sum(tp[order[k]] for k in range(cut))
-            cfp = sum(fp[order[k]] for k in range(cut))
+            ctp = pref_tp[cut]; cfp = pref_fp[cut]
             prec = ctp / (ctp + cfp) if (ctp + cfp) > 0 else 0.0
             rec = ctp / total_gt if total_gt > 0 else 0.0
             f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
             scan[c] = (round(prec, 4), round(rec, 4), round(f1, 4))
 
     best_f1 = -1.0; best_conf = 0.0; best_pr = None
-    for k in range(len(order)):
-        ctp = sum(tp[order[j]] for j in range(k + 1))
-        cfp = sum(fp[order[j]] for j in range(k + 1))
+    for k in range(n):
+        ctp = pref_tp[k + 1]; cfp = pref_fp[k + 1]
         prec = ctp / (ctp + cfp) if (ctp + cfp) > 0 else 0.0
         rec = ctp / total_gt if total_gt > 0 else 0.0
         f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0

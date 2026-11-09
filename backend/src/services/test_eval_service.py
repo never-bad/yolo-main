@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 MAX_CONCURRENT_TEST_EVAL = 1  # 串行，避免与训练抢 GPU
 TEST_EVAL_POLL_SECONDS = 60
+# running 超过该秒数仍没有结果 → 视为「容器重建/进程被杀」留下的幽灵，重置为 pending 重跑。
+# 优化后单模型评测通常是秒级~2 分钟，10 分钟阈值不会误杀正常任务。
+TEST_EVAL_STALE_SECONDS = 600
 
 
 # --------------------------------------------------------------------------- #
@@ -228,6 +231,53 @@ def _stale_library_test_evals(library_root_id: str, new_version: int) -> None:
 # --------------------------------------------------------------------------- #
 # 后台循环
 # --------------------------------------------------------------------------- #
+def _reset_stale_running(max_age: float = TEST_EVAL_STALE_SECONDS) -> list:
+    """把「卡在 running 但进程早就没了」的幽灵评测重置为 pending。
+
+    compose 重建容器 / 后端崩溃会杀掉正在跑的评测子进程，但 model.json 的
+    test_eval.status 仍是 running；后台循环只接管 pending，于是界面永远转圈。
+    run_test_eval 没有中间进度写盘，无法区分「真在算」和「进程已死」，
+    故用保守的超时阈值（正常评测远小于它）兜底。
+    """
+    reset = []
+    if not settings.REGISTRY_DIR.exists():
+        return reset
+    now = time.time()
+    for d in settings.REGISTRY_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        mf = d / "model.json"
+        if not mf.exists():
+            continue
+        try:
+            te = (load_json(mf) or {}).get("test_eval") or {}
+        except Exception:
+            continue
+        if te.get("status") != "running":
+            continue
+        started = te.get("started_at")
+        if not started:
+            # 正常 run_test_eval 写 running 必带 started_at；缺字段无法判断年龄，
+            # 保守跳过（否则 now - 0 会被算成「几十亿秒前」而误重置）。
+            continue
+        try:
+            age = now - float(started)
+        except (TypeError, ValueError):
+            continue
+        if age <= max_age:
+            continue
+        te.update({
+            "status": "pending", "error": None, "requested_at": now,
+            "resume_reason": "stale_running_after_restart",
+        })
+        try:
+            _write_test_eval(d.name, te)
+            reset.append(d.name)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("reset stale test_eval failed for %s: %s", d.name, e)
+    return reset
+
+
 def _iter_pending_models() -> list:
     out = []
     if not settings.REGISTRY_DIR.exists():
@@ -285,6 +335,9 @@ async def test_eval_loop(poll_seconds: int | None = None):
             if running_train and running_train > 0:
                 await asyncio.sleep(poll)
                 continue
+            # 容器重建后残留的 running 幽灵先复位，否则永远等不到结果
+            for mid in _reset_stale_running():
+                logger.info("test_eval: reset stale running -> pending: %s", mid)
             for model_id in _iter_pending_models():
                 try:
                     # 评测是 CPU/GPU 阻塞任务（ultralytics val 可能耗时数分钟），
