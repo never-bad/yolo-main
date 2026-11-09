@@ -106,8 +106,16 @@ async def update_config(request: ConfigRequest):
 
 @router.get("/models")
 async def list_models():
-    """列出可用的检测模型（.pt 文件）"""
-    return sam_service.list_models()
+    """列出可用的检测模型（.pt 文件）。
+
+    模型列表是非关键路径：单个坏文件/权限异常不该让标注页「模型设置」弹窗
+    整体打不开，降级返回空列表并把堆栈打进日志供排障。
+    """
+    try:
+        return sam_service.list_models()
+    except Exception:
+        traceback.print_exc()
+        return []
 
 
 @router.post("/models")

@@ -301,9 +301,17 @@ class SAMService:
             if not d.exists():
                 continue
             for f in d.glob("*.pt"):
+                # 悬空符号链接（目标 .pt 随镜像/卷变更消失）glob 仍能匹配到，
+                # 但 stat() 会抛 FileNotFoundError；旧实现让整个 /sam/models 直接 500
+                # （标注页点「模型」按钮时并发三个 GET 之一，弹窗因此打不开）。
+                # 单个坏文件跳过即可，不能拖挂整个模型列表。
+                try:
+                    size_mb = round(f.stat().st_size / 1e6, 1)
+                except OSError:
+                    continue
                 found.setdefault(f.name, {
                     "name": f.name,
-                    "size_mb": round(f.stat().st_size / 1e6, 1),
+                    "size_mb": size_mb,
                     "path": str(f),
                 })
         return sorted(found.values(), key=lambda x: x["name"])
