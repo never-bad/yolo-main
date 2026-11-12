@@ -479,7 +479,25 @@ def main():
                         help="迁移来源描述（如 model_xxx [yolov5s]），写入 [Migration] 日志与模型血缘")
     parser.add_argument("--migration-lr0-degraded", action="store_true",
                         help="lr0 已由后端自动降 10 倍（仅 [Migration] 日志标注）")
-    
+    # 数据增强策略（可选，缺省则由 ultralytics 使用默认值；仅非 resume 时透传）
+    parser.add_argument("--mosaic", type=float, default=None, help="Mosaic 增强概率 (0~1)")
+    parser.add_argument("--mixup", type=float, default=None, help="MixUp 增强概率 (0~1)")
+    parser.add_argument("--copy-paste", type=float, default=None, help="Copy-Paste 增强概率 (0~1)")
+    parser.add_argument("--flipud", type=float, default=None, help="垂直翻转概率 (0~1)")
+    parser.add_argument("--fliplr", type=float, default=None, help="水平翻转概率 (0~1)")
+    parser.add_argument("--hsv-h", type=float, default=None, help="HSV 色相增强幅度 (0~1)")
+    parser.add_argument("--hsv-s", type=float, default=None, help="HSV 饱和度增强幅度 (0~1)")
+    parser.add_argument("--hsv-v", type=float, default=None, help="HSV 明度增强幅度 (0~1)")
+    parser.add_argument("--degrees", type=float, default=None, help="旋转角度 (+/- 度)")
+    parser.add_argument("--translate", type=float, default=None, help="平移比例 (0~1)")
+    parser.add_argument("--scale", type=float, default=None, help="缩放比例 (0~1)")
+    parser.add_argument("--shear", type=float, default=None, help="剪切角度 (+/- 度)")
+    parser.add_argument("--perspective", type=float, default=None, help="透视畸变比例 (0~0.001)")
+    parser.add_argument("--erasing", type=float, default=None, help="随机擦除概率 (0~0.9)")
+    parser.add_argument("--crop-fraction", type=float, default=None, help="随机裁剪比例 (0~1)")
+    parser.add_argument("--close-mosaic", type=int, default=None, help="最后 N 轮关闭 Mosaic (0=从不)")
+    parser.add_argument("--auto-augment", type=str, default=None, help="自动增强策略 (如 randaugment)")
+
     args = parser.parse_args()
 
     # 断点续训时 --model 指向本任务的 last.pt（只用于 YOLO 恢复 epoch/优化器状态），
@@ -652,9 +670,28 @@ def main():
                 ("optimizer", args.optimizer),
                 ("weight_decay", args.weight_decay),
                 ("patience", args.patience),
+                # 数据增强策略
+                ("mosaic", args.mosaic),
+                ("mixup", args.mixup),
+                ("copy_paste", args.copy_paste),
+                ("flipud", args.flipud),
+                ("fliplr", args.fliplr),
+                ("hsv_h", args.hsv_h),
+                ("hsv_s", args.hsv_s),
+                ("hsv_v", args.hsv_v),
+                ("degrees", args.degrees),
+                ("translate", args.translate),
+                ("scale", args.scale),
+                ("shear", args.shear),
+                ("perspective", args.perspective),
+                ("erasing", args.erasing),
+                ("crop_fraction", args.crop_fraction),
+                ("close_mosaic", args.close_mosaic),
+                ("auto_augment", args.auto_augment),
             ]
             for key, val in advanced:
-                # patience=0 / weight_decay=0 是合法值（禁用早停/无衰减），不能跳过
+                # patience=0 / weight_decay=0 / close_mosaic=0 / 各增强概率=0.0 都是合法值
+                # （禁用早停 / 无衰减 / 不关闭 Mosaic / 关闭某增强），不能因「假值」跳过
                 if val is not None:
                     train_kwargs[key] = val
         

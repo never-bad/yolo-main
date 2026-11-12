@@ -37,6 +37,24 @@ class TrainJobRequest(BaseModel):
     # 算法库归属：从算法库详情页「发起训练」时带入该库的根记录 id，
     # 使训练产出（新版本）自动落在这个库下；缺省则由后端继承基座模型的库归属
     library_root_id: Optional[str] = None
+    # 数据增强策略（可选，缺省则由 ultralytics 使用默认值）
+    mosaic: Optional[float] = None
+    mixup: Optional[float] = None
+    copy_paste: Optional[float] = None
+    flipud: Optional[float] = None
+    fliplr: Optional[float] = None
+    hsv_h: Optional[float] = None
+    hsv_s: Optional[float] = None
+    hsv_v: Optional[float] = None
+    degrees: Optional[float] = None
+    translate: Optional[float] = None
+    scale: Optional[float] = None
+    shear: Optional[float] = None
+    perspective: Optional[float] = None
+    erasing: Optional[float] = None
+    crop_fraction: Optional[float] = None
+    close_mosaic: Optional[int] = None
+    auto_augment: Optional[str] = None
 
 @router.get("/gpus")
 async def list_gpus():
@@ -87,7 +105,28 @@ async def create_train_job(request: TrainJobRequest):
             background_sample_ratio=request.background_sample_ratio,
             migration_target_model=request.migration_target_model,
             recall_enabled=request.recall_enabled,
-            library_root_id=request.library_root_id
+            library_root_id=request.library_root_id,
+            augment={
+                k: v for k, v in {
+                    "mosaic": request.mosaic,
+                    "mixup": request.mixup,
+                    "copy_paste": request.copy_paste,
+                    "flipud": request.flipud,
+                    "fliplr": request.fliplr,
+                    "hsv_h": request.hsv_h,
+                    "hsv_s": request.hsv_s,
+                    "hsv_v": request.hsv_v,
+                    "degrees": request.degrees,
+                    "translate": request.translate,
+                    "scale": request.scale,
+                    "shear": request.shear,
+                    "perspective": request.perspective,
+                    "erasing": request.erasing,
+                    "crop_fraction": request.crop_fraction,
+                    "close_mosaic": request.close_mosaic,
+                    "auto_augment": request.auto_augment,
+                }.items() if v is not None
+            }
         )
         return result
     except ValueError as e:

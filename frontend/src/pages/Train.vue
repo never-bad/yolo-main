@@ -297,6 +297,97 @@
           <input v-model.number="trainForm.patience" type="number" min="0" :disabled="training" />
           <small>验证指标连续 N 轮不涨则停止（0 = 关闭）</small>
         </div>
+        <!-- B-65 数据增强策略：仅 L3 高级模式暴露；留空不传，沿用 ultralytics 默认值 -->
+        <div class="augment-block" style="margin-top: 14px;">
+          <div style="font-weight: 600; margin-bottom: 8px;">数据增强策略（留空 = 沿用 ultralytics 默认）</div>
+          <div class="grid adv-grid" style="grid-template-columns: repeat(4, 1fr);">
+            <div class="form-group">
+              <label>Mosaic 概率</label>
+              <input v-model.number="trainForm.mosaic" type="number" step="0.1" min="0" max="1" placeholder="1.0" :disabled="training" />
+              <small>多图拼接增强 (0~1)</small>
+            </div>
+            <div class="form-group">
+              <label>MixUp 概率</label>
+              <input v-model.number="trainForm.mixup" type="number" step="0.1" min="0" max="1" placeholder="0.0" :disabled="training" />
+              <small>图像混合增强 (0~1)</small>
+            </div>
+            <div class="form-group">
+              <label>Copy-Paste 概率</label>
+              <input v-model.number="trainForm.copy_paste" type="number" step="0.1" min="0" max="1" placeholder="0.0" :disabled="training" />
+              <small>实例复制粘贴 (0~1)</small>
+            </div>
+            <div class="form-group">
+              <label>垂直翻转 flipud</label>
+              <input v-model.number="trainForm.flipud" type="number" step="0.1" min="0" max="1" placeholder="0.0" :disabled="training" />
+              <small>上下翻转概率 (0~1)</small>
+            </div>
+            <div class="form-group">
+              <label>水平翻转 fliplr</label>
+              <input v-model.number="trainForm.fliplr" type="number" step="0.1" min="0" max="1" placeholder="0.5" :disabled="training" />
+              <small>左右翻转概率 (0~1)</small>
+            </div>
+            <div class="form-group">
+              <label>HSV 色相 hsv_h</label>
+              <input v-model.number="trainForm.hsv_h" type="number" step="0.001" min="0" max="1" placeholder="0.015" :disabled="training" />
+              <small>色相抖动幅度</small>
+            </div>
+            <div class="form-group">
+              <label>HSV 饱和度 hsv_s</label>
+              <input v-model.number="trainForm.hsv_s" type="number" step="0.1" min="0" max="1" placeholder="0.7" :disabled="training" />
+              <small>饱和度抖动幅度</small>
+            </div>
+            <div class="form-group">
+              <label>HSV 明度 hsv_v</label>
+              <input v-model.number="trainForm.hsv_v" type="number" step="0.1" min="0" max="1" placeholder="0.4" :disabled="training" />
+              <small>明度抖动幅度</small>
+            </div>
+            <div class="form-group">
+              <label>旋转角度 degrees</label>
+              <input v-model.number="trainForm.degrees" type="number" step="1" min="0" max="45" placeholder="0.0" :disabled="training" />
+              <small>随机旋转 ±度</small>
+            </div>
+            <div class="form-group">
+              <label>平移 translate</label>
+              <input v-model.number="trainForm.translate" type="number" step="0.05" min="0" max="1" placeholder="0.1" :disabled="training" />
+              <small>随机平移比例</small>
+            </div>
+            <div class="form-group">
+              <label>缩放 scale</label>
+              <input v-model.number="trainForm.scale" type="number" step="0.05" min="0" max="1" placeholder="0.5" :disabled="training" />
+              <small>随机缩放比例</small>
+            </div>
+            <div class="form-group">
+              <label>剪切 shear</label>
+              <input v-model.number="trainForm.shear" type="number" step="0.5" min="0" max="10" placeholder="0.0" :disabled="training" />
+              <small>随机剪切 ±度</small>
+            </div>
+            <div class="form-group">
+              <label>透视 perspective</label>
+              <input v-model.number="trainForm.perspective" type="number" step="0.0001" min="0" max="0.001" placeholder="0.0" :disabled="training" />
+              <small>透视畸变比例</small>
+            </div>
+            <div class="form-group">
+              <label>随机擦除 erasing</label>
+              <input v-model.number="trainForm.erasing" type="number" step="0.1" min="0" max="0.9" placeholder="0.4" :disabled="training" />
+              <small>随机擦除概率</small>
+            </div>
+            <div class="form-group">
+              <label>随机裁剪 crop_fraction</label>
+              <input v-model.number="trainForm.crop_fraction" type="number" step="0.05" min="0" max="1" placeholder="0.0" :disabled="training" />
+              <small>随机裁剪比例</small>
+            </div>
+            <div class="form-group">
+              <label>收尾关 Mosaic</label>
+              <input v-model.number="trainForm.close_mosaic" type="number" step="1" min="0" placeholder="10" :disabled="training" />
+              <small>最后 N 轮关 Mosaic (0=不关)</small>
+            </div>
+            <div class="form-group">
+              <label>自动增强策略</label>
+              <input v-model="trainForm.auto_augment" type="text" placeholder="randaugment" :disabled="training" />
+              <small>留空=关闭 (检测一般用不到)</small>
+            </div>
+          </div>
+        </div>
       </div>
       <div class="adv-enhance">
         <div class="form-group">
@@ -1523,7 +1614,9 @@ const retrainJob = async (job: any) => {
       gpu_index: job.gpu_index ?? undefined,
       // 多选聚合已下线：重跑只使用主数据集（job.dataset_ids 不再透传）
       // 重跑保持原任务的算法库归属（产出仍落在同一个库下）
-      library_root_id: job.library_root_id || undefined
+      library_root_id: job.library_root_id || undefined,
+      // B-65 数据增强策略：复用原任务的增强配置（job.augment 由后端档案回传）
+      ...(job.augment && typeof job.augment === 'object' ? job.augment : {})
     }
     const result = await createTrainJob(params)
     restoreScroll(prevScrollY)

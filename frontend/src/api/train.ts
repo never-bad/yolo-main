@@ -27,6 +27,24 @@ export interface TrainJobRequest {
   recall_enabled?: boolean        // 回忆集混训：增量训练时混入同业务旧数据防遗忘（默认 true）
   // 算法库归属：从算法库详情页发起训练时带上该库 id，训练产出（新版本）会归到这个库下
   library_root_id?: string
+  // 数据增强策略（可选，缺省则由 ultralytics 使用默认值；与后端 --xxx 一一对应）
+  mosaic?: number
+  mixup?: number
+  copy_paste?: number
+  flipud?: number
+  fliplr?: number
+  hsv_h?: number
+  hsv_s?: number
+  hsv_v?: number
+  degrees?: number
+  translate?: number
+  scale?: number
+  shear?: number
+  perspective?: number
+  erasing?: number
+  crop_fraction?: number
+  close_mosaic?: number
+  auto_augment?: string
 }
 
 export interface GpuInfo {

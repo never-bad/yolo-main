@@ -1129,7 +1129,7 @@ class TrainService:
                          dataset_ids: list = None, aggregate_incomplete: bool = False,
                          hard_sample_ratio: float = 0.1, background_sample_ratio: float = 0.05,
                          migration_target_model: str = None, recall_enabled: bool = True,
-                         library_root_id: str = None):
+                         library_root_id: str = None, augment: dict = None):
         """创建训练任务（支持高级训练参数与训练节点选择、业务/算法类型隔离）
 
         阶段1.3（训练任务聚合）：支持多数据集聚合训练。
@@ -1399,6 +1399,8 @@ class TrainService:
             "architecture_override": architecture_override,
             "library_root_id": library_root_id,   # 产出模型归属的算法库（继承基座；None=独立模型）
             "original_model_path": actual_model_path,  # 保存原始模型路径，用于恢复
+            # 数据增强策略：用户显式配置才非空；写入档案便于「重新训练」复用
+            "augment": augment or {},
             "epochs": epochs,
             "imgsz": imgsz,
             "batch": batch,
@@ -1433,7 +1435,8 @@ class TrainService:
                 f"{migration['source_model_id']} [{migration['source_architecture']}]" if migration else None,
                 bool(migration and migration.get("lr0_degraded")),
                 library_root_id,
-                base_model_id
+                base_model_id,
+                augment
             )
         except Exception as e:
             try:
@@ -1748,7 +1751,8 @@ class TrainService:
                        migration_lr0_degraded: bool = False,
                        library_root_id: str = None,
                        base_model_id: str = None,
-                       lineage_base_model: str = None):
+                       lineage_base_model: str = None,
+                       augment: dict = None):
         """启动训练进程（同步方法，在线程中调用）
 
         2.4 迁移训练参数（训练模块规范 §3.2.2）：
@@ -1824,6 +1828,11 @@ class TrainService:
             # 训练节点：指定 GPU（多卡环境）
             if gpu_index is not None:
                 cmd += ["--gpu", str(gpu_index)]
+            # 数据增强策略：用户显式配置才透传（键名下划线转连字符匹配 train_script 的 --xxx）
+            for a_key, a_val in (augment or {}).items():
+                if a_val is None:
+                    continue
+                cmd += [f"--{a_key.replace('_', '-')}", str(a_val)]
         
         # 如果是恢复训练，追加日志而不是覆盖
         mode = "a" if resume else "w"
