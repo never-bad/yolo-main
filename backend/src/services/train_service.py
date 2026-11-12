@@ -1825,9 +1825,12 @@ class TrainService:
                 cmd += ["--weight-decay", str(weight_decay)]
             if patience is not None:
                 cmd += ["--patience", str(patience)]
-            # 训练节点：指定 GPU（多卡环境）
+            # 训练节点：指定 GPU（多卡环境）。
+            # 真正的物理卡隔离在启动 env 的 CUDA_VISIBLE_DEVICES 完成：
+            # 隔离后容器内只可见那一张卡，torch 逻辑序号恒为 0，故脚本侧固定传 0，
+            # 避免「用户选 GPU1 却落到 cuda:0=物理GPU0」的序号错乱（B-16 同类 OOM）。
             if gpu_index is not None:
-                cmd += ["--gpu", str(gpu_index)]
+                cmd += ["--gpu", "0"]
             # 数据增强策略：用户显式配置才透传（键名下划线转连字符匹配 train_script 的 --xxx）
             for a_key, a_val in (augment or {}).items():
                 if a_val is None:
@@ -1842,6 +1845,10 @@ class TrainService:
             # 设置环境变量确保 Python 进程输出 UTF-8 编码
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
+            # 物理卡隔离（B-16 修复核心）：把用户选的 gpu_index 设为唯一可见卡，
+            # 配合上面 --gpu 0，彻底消除 torch cuda:N 序号与物理卡号错乱导致的选卡失败/OOM。
+            if gpu_index is not None:
+                env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
             
             process = subprocess.Popen(
                 cmd,
