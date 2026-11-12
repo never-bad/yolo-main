@@ -283,9 +283,13 @@ def _extract_zip(zip_path: Path, extract_to: Path):
         
         for member in file_list:
             try:
+                # Windows 压缩包常用反斜杠作分隔符（如 images\a.jpg），
+                # 归一化到正斜杠后再用于路径构建与安全判定；
+                # zip_ref.getinfo/open 仍用原始 member（zipfile 以原 arcname 为键）。
+                norm = zip_guard.normalize_member(member)
                 # 安全地处理路径（防止路径遍历攻击）——收口到 utils.zip_guard（S-01/S-02）
-                member_path = Path(member)
-                if not zip_guard.is_safe_member(member):
+                member_path = Path(norm)
+                if not zip_guard.is_safe_member(norm):
                     logger.warning(f"Skipping unsafe path: {member}")
                     continue
                 
@@ -296,7 +300,7 @@ def _extract_zip(zip_path: Path, extract_to: Path):
                 # 确保使用长路径格式
                 target_str = _ensure_long_path(target_str)
                 
-                # 获取文件信息
+                # 获取文件信息（用原始成员名，zipfile 以原 arcname 索引）
                 info = zip_ref.getinfo(member)
                 
                 # 如果是目录

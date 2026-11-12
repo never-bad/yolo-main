@@ -53,6 +53,21 @@ def is_safe_member(member: str) -> bool:
     return True
 
 
+def normalize_member(member: str) -> str:
+    """将成员名中的 Windows 反斜杠统一为正斜杠。
+
+    Python 的 zipfile 不会自动转换成员名里的 `\\`，而 Windows 压缩工具
+    常用 `\\` 作为分隔符（如 ``images\\fire_0001.jpg``）。在 Linux 上解压时
+    `\\` 不是路径分隔符，会导致目录树建不起来、文件以带 `\\` 的平铺文件名
+    写出，进而破坏标准结构识别与 annotations 配对（labels 被静默清空）。
+
+    归一化到 `/` 即可让目录树正确还原；顺带提升安全性——
+    ``images\\..\\etc\\x`` 归一化后变成 ``images/../etc/x``，会被
+    :func:`is_safe_member` 正确判为含 ``..`` 而拒绝（Zip Slip 防护更稳）。
+    """
+    return member.replace("\\", "/")
+
+
 def check_zip_bomb(zf: zipfile.ZipFile) -> None:
     """按中央目录声明的 file_size 预检解压后总体积与压缩比。
 
