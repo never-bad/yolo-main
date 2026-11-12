@@ -1,1 +1,0 @@
-function r(t){const n=String((t==null?void 0:t.display_name)||"").trim(),i=String((t==null?void 0:t.filename)||"").trim();return n&&!n.startsWith("ds_")?n:i?i.replace(/\.[^.]+$/,""):n||String((t==null?void 0:t.dataset_id)||"")}export{r as d};
