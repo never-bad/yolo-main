@@ -298,7 +298,7 @@
           <small>验证指标连续 N 轮不涨则停止（0 = 关闭）</small>
         </div>
         <!-- B-65 数据增强策略：仅 L3 高级模式暴露；留空不传，沿用 ultralytics 默认值 -->
-        <div class="augment-block" style="margin-top: 14px;">
+        <div class="augment-block" style="grid-column: 1 / -1; margin-top: 14px;">
           <div style="font-weight: 600; margin-bottom: 8px;">数据增强策略（留空 = 沿用 ultralytics 默认）</div>
           <div class="grid adv-grid" style="grid-template-columns: repeat(4, 1fr);">
             <div class="form-group">
