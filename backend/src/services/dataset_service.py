@@ -3890,6 +3890,19 @@ class DatasetService:
             "is_bucket_snapshot": True,
             "bucket_index": sv,
         }
+        # 桶封板快照输出到独立 ds_dir，_build_training_artifacts 只写
+        # images/{train,val,test} + labels/{train,val,test} + data.yaml；每图 JSON
+        # 只存在于临时 work 目录（finally 里已删）。缺 annotations/*.json 时标注页、
+        # 抽查、导出都读不到框，表现为「有 labels 标注文件却只有图片」。
+        # 仅在目标目录确实没有每图 JSON 时反填，绝不覆盖人工微调过的框。
+        ann_out = ds_dir / "annotations"
+        if not ann_out.exists() or not any(ann_out.glob("*.json")):
+            try:
+                conv = self._import_labels_txt_to_json(ds_dir, None)
+                logger.info(f"bucket seal {ds_id}: txt->json {conv}")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"bucket seal {ds_id}: txt->json failed: {e}")
+
         save_json_atomic(ds_dir / "meta.json", meta)
         logger.info(
             f"bucket seal {model_id}: v{sv} -> {ds_id} images={meta['image_count']} "
