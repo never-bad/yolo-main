@@ -322,46 +322,6 @@
               <small>上下翻转概率 (0~1)</small>
             </div>
             <div class="form-group">
-              <label>水平翻转 fliplr</label>
-              <input v-model.number="trainForm.fliplr" type="number" step="0.1" min="0" max="1" placeholder="0.5" :disabled="training" />
-              <small>左右翻转概率 (0~1)</small>
-            </div>
-            <div class="form-group">
-              <label>HSV 色相 hsv_h</label>
-              <input v-model.number="trainForm.hsv_h" type="number" step="0.001" min="0" max="1" placeholder="0.015" :disabled="training" />
-              <small>色相抖动幅度</small>
-            </div>
-            <div class="form-group">
-              <label>HSV 饱和度 hsv_s</label>
-              <input v-model.number="trainForm.hsv_s" type="number" step="0.1" min="0" max="1" placeholder="0.7" :disabled="training" />
-              <small>饱和度抖动幅度</small>
-            </div>
-            <div class="form-group">
-              <label>HSV 明度 hsv_v</label>
-              <input v-model.number="trainForm.hsv_v" type="number" step="0.1" min="0" max="1" placeholder="0.4" :disabled="training" />
-              <small>明度抖动幅度</small>
-            </div>
-            <div class="form-group">
-              <label>旋转角度 degrees</label>
-              <input v-model.number="trainForm.degrees" type="number" step="1" min="0" max="45" placeholder="0.0" :disabled="training" />
-              <small>随机旋转 ±度</small>
-            </div>
-            <div class="form-group">
-              <label>平移 translate</label>
-              <input v-model.number="trainForm.translate" type="number" step="0.05" min="0" max="1" placeholder="0.1" :disabled="training" />
-              <small>随机平移比例</small>
-            </div>
-            <div class="form-group">
-              <label>缩放 scale</label>
-              <input v-model.number="trainForm.scale" type="number" step="0.05" min="0" max="1" placeholder="0.5" :disabled="training" />
-              <small>随机缩放比例</small>
-            </div>
-            <div class="form-group">
-              <label>剪切 shear</label>
-              <input v-model.number="trainForm.shear" type="number" step="0.5" min="0" max="10" placeholder="0.0" :disabled="training" />
-              <small>随机剪切 ±度</small>
-            </div>
-            <div class="form-group">
               <label>透视 perspective</label>
               <input v-model.number="trainForm.perspective" type="number" step="0.0001" min="0" max="0.001" placeholder="0.0" :disabled="training" />
               <small>透视畸变比例</small>
