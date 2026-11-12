@@ -1009,7 +1009,8 @@ const submitClassAlignment = async () => {
   const decisions: Array<{ src_index: number; target_id: number | null }> = []
   for (const i of (a.unresolved || [])) {
     const v = alignChoices[i]
-    if (!v) {
+    // 目标类下标可为 0（数字 0 是 falsy），不能用 !v 判断未选
+    if (v === undefined || v === null || v === '') {
       showToast(`请先为「${a.source_classes?.[i] ?? '第 ' + i + ' 类'}」选择对应标签，或选择「忽略该类」`, 'info', 4000)
       return
     }
