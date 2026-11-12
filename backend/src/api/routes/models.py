@@ -4,7 +4,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
 from src.services.model_service import ModelService
-from src.services.dataset_service import DatasetService
+from src.services.dataset_service import DatasetService, AlignmentConfirmRequired
 from src.services.test_eval_service import (
     run_test_eval, get_test_eval_matrix, list_library_model_ids,
     _load_model_meta, _stale_library_test_evals,
@@ -420,6 +420,9 @@ async def delete_model(model_id: str, action: str = "", target_model_id: str = "
             for d in attached:
                 try:
                     await ds_service.bind_model(d["dataset_id"], target_root, target_root, force=force)
+                except AlignmentConfirmRequired as e:
+                    # 删除库转移归属途中出现类别对齐需确认：报 409 带报告，由前端引导用户逐类确认
+                    raise HTTPException(409, str(e.report))
                 except ValueError as e:
                     raise HTTPException(400, str(e))
         else:

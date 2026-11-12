@@ -721,6 +721,15 @@
         </div>
       </div>
     </template>
+
+    <!-- 改库拦截：类别对齐待确认弹窗 -->
+    <ClassAlignConfirmDialog
+      v-model:visible="alignConfirmOpen"
+      :dataset-id="alignPending?.datasetId || ''"
+      :report="alignPending?.report"
+      :target-model-id="alignPending?.target || null"
+      @confirmed="onAlignConfirmed"
+    />
   </div>
 </template>
 
@@ -739,6 +748,7 @@ import {
   uploadDataset, prepareDataset
 } from '@/api/datasets'
 import { listTrainJobs } from '@/api/train'
+import ClassAlignConfirmDialog from '@/components/ClassAlignConfirmDialog.vue'
 import { deleteModelWithGuard, showConfirm, showPrompt } from '@/composables/useDialog'
 import { showToast } from '@/utils/toast'
 
@@ -1085,8 +1095,22 @@ async function bindCurrent(d: any) {
     await bindDatasetModel(d.dataset_id, modelId, force)
     await refresh()
   } catch (e: any) {
+    // 拦截式：换库触发类别对齐待确认 → 409 带报告，弹框让用户逐类确认后再发（带 decisions）
+    if (e?.response?.status === 409 && e?.response?.data?.status === 'needs_confirm') {
+      alignPending.value = { datasetId: d.dataset_id, target: modelId, report: e.response.data }
+      alignConfirmOpen.value = true
+      return
+    }
     if (!e?.__toastShown) showToast('挂载失败：' + (e?.response?.data?.detail || e?.message), 'error', 4000)
   }
+}
+
+// 改库拦截：类别对齐待确认弹窗（拦截式，不静默换库）
+const alignConfirmOpen = ref(false)
+const alignPending = ref<{ datasetId: string; target: string; report: any } | null>(null)
+function onAlignConfirmed() {
+  alignPending.value = null
+  refresh()
 }
 
 async function revalidate(d: ModelDataset) {

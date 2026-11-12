@@ -463,6 +463,15 @@
       </div>
     </div>
 
+    <!-- 改库拦截：类别对齐待确认弹窗 -->
+    <ClassAlignConfirmDialog
+      v-model:visible="alignConfirmOpen"
+      :dataset-id="alignPending?.datasetId || ''"
+      :report="alignPending?.report"
+      :target-model-id="alignPending?.target || null"
+      @confirmed="onAlignConfirmed"
+    />
+
     <!-- 封板/灌桶数量门槛设置弹窗 -->
     <div v-if="thresholdOpen" class="modal-mask" @click.self="thresholdOpen = false">
       <div class="modal threshold-modal">
@@ -524,6 +533,7 @@ import { showConfirm, showPrompt } from '@/composables/useDialog'
 import { showToast } from '@/utils/toast'
 import FolderTree from '@/components/FolderTree.vue'
 import LibraryCreateModal from '@/components/LibraryCreateModal.vue'
+import ClassAlignConfirmDialog from '@/components/ClassAlignConfirmDialog.vue'
 
 const selectedFile = ref<File | null>(null)
 const router = useRouter()
@@ -763,6 +773,10 @@ const bindLibraryId = ref('')
 const bindError = ref('')
 const binding = ref(false)
 
+// 改库触发类别对齐 needs_confirm：拦截后弹确认框（拦截式，不静默换库）
+const alignConfirmOpen = ref(false)
+const alignPending = ref<{ datasetId: string; target: string; report: any } | null>(null)
+
 function openBindDialog(dataset: any) {
   bindDialog.value = dataset
   bindLibraryId.value = datasetLibraryId(dataset)
@@ -779,10 +793,27 @@ async function submitBind() {
     loadDatasets()
     loadUploadModels()
   } catch (e: any) {
+    // 拦截式：换库触发类别对齐待确认 → 409 带报告，弹框让用户逐类确认后再发（带 decisions）
+    if (e?.response?.status === 409 && e?.response?.data?.status === 'needs_confirm') {
+      alignPending.value = {
+        datasetId: bindDialog.value.dataset_id,
+        target: bindLibraryId.value,
+        report: e.response.data,
+      }
+      alignConfirmOpen.value = true
+      return
+    }
     bindError.value = '保存失败: ' + (e.response?.data?.detail || e.message)
   } finally {
     binding.value = false
   }
+}
+
+function onAlignConfirmed() {
+  alignPending.value = null
+  bindDialog.value = null
+  loadDatasets()
+  loadUploadModels()
 }
 
 // 从图片相对路径提取 stem（文件名去扩展名），供后端匹配图片与标注

@@ -35,6 +35,15 @@ from src.services.annotation_service import (
 
 logger = logging.getLogger(__name__)
 
+
+class AlignmentConfirmRequired(Exception):
+    """改算法库归属时，数据集类别对新库标签字典为 needs_confirm，需人工确认后才放行。
+
+    .report 即 class_alignment 报告（含 pairs / canonical_names / summary），
+    供路由转 409 让前端弹出逐类确认框；此时归属尚未切换。
+    """
+
+
 # 桶灌流程互斥：防止并发请求重复灌桶/封板（模块级：多个服务实例共享同一把锁）
 _BUCKET_LOCK = threading.Lock()
 
@@ -2244,33 +2253,16 @@ class DatasetService:
         meta = await asyncio.to_thread(load_json, meta_path)
         return await asyncio.to_thread(self._bind_conflict_sync, dataset_dir, meta, model_id)
 
-    def confirm_class_alignment(self, dataset_id: str, decisions: list) -> dict:
-        """人工确认导入类别映射（B-64 导入闸门）。
+    def _validate_alignment_decisions(self, alignment: dict, decisions: list) -> dict:
+        """校验人工确认决策，返回 {src_index(int): target_id(int|None)}。
 
-        decisions: [{"src_index": int, "target_id": int | null}, ...]
-          target_id = 库标签字典下标；null / -1 表示忽略该源类（相关框会被丢弃）。
-        所有 unresolved 的源类都必须给出决定，否则拒绝，绝不替用户猜。
-        确认后同步重写 labels/*.txt、每图 JSON、data.yaml 与 meta，
-        并把报告置为 confirmed —— 之后封板/训练/展示只消费这张落盘的映射表。
+        复用自 confirm_class_alignment 与换库拦截（B-64b 派生），两处语义一致：
+        未确认的 unresolved 类必须全部给出决定，null/-1 表示忽略该类。
         """
-        ds_dir = self.datasets_dir / dataset_id
-        mp = ds_dir / "meta.json"
-        if not mp.exists():
-            raise ValueError(f"数据集不存在: {dataset_id}")
-        meta = load_json(mp)
-        align = meta.get("class_alignment") or {}
-        status = align.get("status")
-        if status in ("aligned", "confirmed"):
-            return {"ok": True, "dataset_id": dataset_id, "status": status,
-                    "message": "类别已对齐，无需重复确认"}
-        if status == "no_model" or not align:
-            raise ValueError("该数据集没有可确认的类别对齐报告（尚未准备，或归属库字典为空）")
-
-        source = [str(c) for c in (align.get("source_classes") or [])]
-        canonical = [str(c) for c in (align.get("canonical_names") or [])]
+        source = [str(c) for c in (alignment.get("source_classes") or [])]
+        canonical = [str(c) for c in (alignment.get("canonical_names") or [])]
         if not canonical:
             raise ValueError("归属算法库的标签字典为空，无法确认类别映射")
-
         decided = {}
         for d in decisions or []:
             if not isinstance(d, dict):
@@ -2290,8 +2282,7 @@ class DatasetService:
             if not (0 <= ti < len(canonical)):
                 raise ValueError(f"第 {i} 类的目标序号 {ti} 超出库标签字典范围")
             decided[i] = ti
-
-        unresolved = [int(i) for i in (align.get("unresolved") or [])]
+        unresolved = [int(i) for i in (alignment.get("unresolved") or [])]
         missing = [i for i in unresolved if i not in decided]
         if missing:
             names = "、".join(
@@ -2300,19 +2291,27 @@ class DatasetService:
             raise ValueError(
                 f"还有类别未确认：{names}。请为每个类别选择对应标签，或明确选择「忽略该类」。"
             )
+        return decided
 
+    def _remap_alignment_files(self, ds_dir: Path, align: dict, decided: dict,
+                               canonical: list) -> tuple:
+        """按已确认决策重写 labels/*.txt、每图 JSON、data.yaml。
+
+        返回 (cmap, touched, dropped)。decided: {src_index(int): target_id(int|None)}。
+        canonical: 落盘用的库标签字典英文名清单（上传闸门用 align.canonical_names，
+        换库拦截用新库 model_class_names）。
+        """
+        source = [str(c) for c in (align.get("source_classes") or [])]
         cmap = {int(k): int(v) for k, v in (align.get("class_map") or {}).items()}
         for i, t in decided.items():
             if t is None:
                 cmap.pop(i, None)
             else:
                 cmap[i] = t
-
         # 1) YOLO labels：重写类号；用户选择忽略的类，其标签行直接丢弃
         labels_dir = ds_dir / "labels"
         if labels_dir.is_dir():
             self._remap_yolo_labels(labels_dir, cmap)
-
         # 2) 每图 JSON（编辑器/抽查/导出的权威源）：同步 class_id 与 english_code
         touched = dropped = 0
         ann_dir = ds_dir / "annotations"
@@ -2351,11 +2350,37 @@ class DatasetService:
                     doc["boxes"] = out
                     save_json_atomic(p, doc)
                     touched += 1
-
         # 3) data.yaml 的 names 收敛到库字典（类别真值）
         if (ds_dir / "data.yaml").exists():
             _save_yaml(ds_dir / "data.yaml",
                        {"nc": len(canonical), "names": list(canonical)})
+        return cmap, touched, dropped
+
+    def confirm_class_alignment(self, dataset_id: str, decisions: list) -> dict:
+        """人工确认导入类别映射（B-64 导入闸门）。
+
+        decisions: [{"src_index": int, "target_id": int | null}, ...]
+          target_id = 库标签字典下标；null / -1 表示忽略该源类（相关框会被丢弃）。
+        所有 unresolved 的源类都必须给出决定，否则拒绝，绝不替用户猜。
+        确认后同步重写 labels/*.txt、每图 JSON、data.yaml 与 meta，
+        并把报告置为 confirmed —— 之后封板/训练/展示只消费这张落盘的映射表。
+        """
+        ds_dir = self.datasets_dir / dataset_id
+        mp = ds_dir / "meta.json"
+        if not mp.exists():
+            raise ValueError(f"数据集不存在: {dataset_id}")
+        meta = load_json(mp)
+        align = meta.get("class_alignment") or {}
+        status = align.get("status")
+        if status in ("aligned", "confirmed"):
+            return {"ok": True, "dataset_id": dataset_id, "status": status,
+                    "message": "类别已对齐，无需重复确认"}
+        if status == "no_model" or not align:
+            raise ValueError("该数据集没有可确认的类别对齐报告（尚未准备，或归属库字典为空）")
+
+        decided = self._validate_alignment_decisions(align, decisions)
+        canonical = [str(c) for c in (align.get("canonical_names") or [])]
+        cmap, touched, dropped = self._remap_alignment_files(ds_dir, align, decided, canonical)
 
         # 4) 报告与 meta 落盘
         for pair in align.get("pairs") or []:
@@ -3030,15 +3055,19 @@ class DatasetService:
         return result
 
     async def bind_model(self, dataset_id: str, model_id: str, library_root_id: str = None,
-                         force: bool = False):
+                         force: bool = False, alignment_decisions: list = None):
         """绑定数据集到模型（1.7 模型仓库：数据归属模型，合并/采集复用）
 
         library_root_id: 归属算法库根记录 id（解绑时传 None 一并清空）；
                          由调用方按 model_id 反查，保证「库详情—挂载数据集」与训练继承一致。
         force: 换库时已知「类别序号对不上」仍坚持挂载（默认 False：有冲突直接拒绝）。
+        alignment_decisions: 换库触发类别对齐 needs_confirm 时，人工确认决策
+            [{"src_index": int, "target_id": int | null}, ...]；传了则按新库重写文件并落盘、
+            再继续正常换库；不传且 needs_confirm → 抛 AlignmentConfirmRequired（拦截，不换库）。
 
-        绑定成功后数据集全部图片自动流入模型消息队列（阶段D），
-        队列达到阈值或定时后自动打包进入标注页。
+        换库前按「新库标签字典」重算别名对齐：needs_confirm 必须人工确认才放行（拦截式，
+        不静默兜底），aligned/no_model 则更新报告后直接换库。对齐结论依赖归属库，故换库是
+        陈旧「已对齐」结论失效的唯一时机，必须在此重新核对。
         """
         dataset_dir = self.datasets_dir / dataset_id
         meta_path = dataset_dir / "meta.json"
@@ -3058,11 +3087,72 @@ class DatasetService:
                         + (report.get("summary") or "")
                         + "\n确认后请勾选强制挂载，或先到目标算法库把标签顺序调整一致。"
                     )
+                # B-64b 派生：换库时按「新库」重算别名对齐；needs_confirm 则拦截，
+                # 必须先人工确认（拦截式，不静默兜底）。
+                new_root = library_root_id or model_id
+                try:
+                    alignment = class_alignment(meta_now.get("classes") or [],
+                                                 model_id=new_root)
+                except Exception:
+                    alignment = {"status": "no_model",
+                                 "source_classes": meta_now.get("classes") or [],
+                                 "canonical_names": [], "pairs": [], "class_map": {},
+                                 "unresolved": [],
+                                 "summary": "类别对齐报告生成失败，请检查新库标签字典。"}
+                if alignment.get("status") == "needs_confirm":
+                    if not alignment_decisions:
+                        # 拦截：存待确认报告 + 标记，抛异常让前端弹确认框；不动归属
+                        meta_now["class_alignment"] = alignment
+                        meta_now["class_map"] = None
+                        meta_now["_pending_library_change"] = {
+                            "model_id": model_id,
+                            "library_root_id": library_root_id,
+                        }
+                        save_json_atomic(meta_path, meta_now)
+                        raise AlignmentConfirmRequired(alignment)
+                    # 带 decisions：按新库重写文件 + 落盘后，继续走下面的正常换库流程
+                    decided = self._validate_alignment_decisions(
+                        alignment, alignment_decisions)
+                    canonical = model_class_names(new_root)
+                    cmap, touched, dropped = self._remap_alignment_files(
+                        dataset_dir, alignment, decided, canonical)
+                    for pair in alignment.get("pairs") or []:
+                        i = pair.get("src_index")
+                        if i in decided:
+                            t = decided[i]
+                            pair["class_id"] = t
+                            pair["canonical"] = canonical[t] if t is not None else None
+                            pair["status"] = "confirmed_ignored" if t is None else "confirmed"
+                            pair["candidates"] = [t] if t is not None else []
+                    alignment.update({
+                        "status": "confirmed",
+                        "class_map": {str(k): v for k, v in cmap.items()},
+                        "unresolved": [],
+                        "confirmed_at": datetime.now().isoformat(),
+                        "decisions": {str(k): v for k, v in decided.items()},
+                        "summary": f"换库类别映射已人工确认：{len(cmap)} 个类别对齐到新库标签字典"
+                                   + (f"，{dropped} 个框按「忽略该类」丢弃" if dropped else ""),
+                    })
+                    meta_now["class_alignment"] = alignment
+                    meta_now["class_map"] = alignment["class_map"]
+                    meta_now["classes"] = list(canonical)
+                    meta_now.pop("_pending_library_change", None)
+                    save_json_atomic(meta_path, meta_now)
+                    logger.info(
+                        f"bind {dataset_id}->{model_id}: alignment confirmed on library "
+                        f"change (touched={touched}, dropped={dropped})")
+                elif alignment.get("status") == "aligned":
+                    meta_now["class_alignment"] = alignment
+                    meta_now["class_map"] = alignment.get("class_map")
+                else:  # no_model
+                    meta_now["class_alignment"] = alignment
+                    meta_now["class_map"] = None
 
         def _bind_sync():
             meta = load_json(meta_path)
             meta["model_id"] = model_id
             meta["library_root_id"] = library_root_id
+            meta.pop("_pending_library_change", None)
             
             # 读取模型标签字典（包含中文别名和描述）；解绑时 model_id 为空，跳过
             labels_dict = None

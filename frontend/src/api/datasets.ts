@@ -120,8 +120,18 @@ export const checkDatasetBind = async (datasetId: string, modelId: string): Prom
 }
 
 // 1.7 模型仓库：绑定/解绑数据集到模型（model_id 传 null 表示解绑；force 用于确认串号风险后放行）
-export const bindDatasetModel = async (datasetId: string, modelId: string | null, force = false) => {
-  const { data } = await api.put(`/datasets/${datasetId}/model`, { model_id: modelId, force })
+// alignmentDecisions：换库触发类别对齐 needs_confirm 时，人工确认决策 [{"src_index","target_id"}]
+export const bindDatasetModel = async (
+  datasetId: string,
+  modelId: string | null,
+  force = false,
+  alignmentDecisions: Array<{ src_index: number; target_id: number | null }> | null = null
+) => {
+  const { data } = await api.put(`/datasets/${datasetId}/model`, {
+    model_id: modelId,
+    force,
+    alignment_decisions: alignmentDecisions ?? undefined,
+  })
   return data
 }
 

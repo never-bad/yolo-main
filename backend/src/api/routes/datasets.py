@@ -1,9 +1,9 @@
 import asyncio
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
-from typing import Optional, Dict
-from src.services.dataset_service import DatasetService
+from typing import Optional, Dict, List
+from src.services.dataset_service import DatasetService, AlignmentConfirmRequired
 from src.services.model_service import ModelService
 from src.core.settings import settings
 
@@ -26,6 +26,7 @@ class SealRequest(BaseModel):
 class BindModelRequest(BaseModel):
     model_id: Optional[str] = None  # 归属模型；None 表示解除归属
     force: bool = False             # 类别序号对不上时仍强制挂载（前端确认弹窗后才传 True）
+    alignment_decisions: Optional[List[dict]] = None  # 换库触发类别对齐 needs_confirm 时的人工确认决策
 
 class MergeRequest(BaseModel):
     dataset_ids: list[str]          # 至少 2 个待合并的数据集 id
@@ -75,7 +76,12 @@ async def bind_dataset_model(dataset_id: str, request: BindModelRequest):
     if request.model_id and not root_id:
         raise HTTPException(400, f"归属的算法库不存在：{request.model_id}")
     try:
-        result = await dataset_service.bind_model(dataset_id, root_id, root_id, request.force)
+        result = await dataset_service.bind_model(
+            dataset_id, root_id, root_id, request.force, request.alignment_decisions
+        )
+    except AlignmentConfirmRequired as e:
+        # 换库触发类别对齐 needs_confirm：409 返回报告，前端弹确认框后重发带 decisions 的请求
+        return JSONResponse(status_code=409, content=e.report)
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"dataset_id": dataset_id, "model_id": result.get("model_id")}
