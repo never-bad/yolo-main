@@ -3347,18 +3347,51 @@ class DatasetService:
                     continue
 
             def _fix_path_refs(obj):
+                """把指向旧数据集目录的相对路径改成新目录，返回是否发生修改。
+
+                加 '/' 边界，避免误伤同前缀的其它数据集（如 ds_x 与 ds_x2）。
+                """
+                changed = False
                 if isinstance(obj, dict):
                     for k, v in obj.items():
-                        if isinstance(v, str) and v.startswith(old_prefix):
+                        if isinstance(v, str) and (v == old_prefix or v.startswith(old_prefix + "/")):
                             obj[k] = new_prefix + v[len(old_prefix):]
+                            changed = True
                         elif isinstance(v, (dict, list)):
-                            _fix_path_refs(v)
+                            if _fix_path_refs(v):
+                                changed = True
                 elif isinstance(obj, list):
                     for it in obj:
-                        _fix_path_refs(it)
+                        if _fix_path_refs(it):
+                            changed = True
+                return changed
 
-            _fix_path_refs(meta)
-            save_json_atomic(mp, meta)
+            if _fix_path_refs(meta):
+                save_json_atomic(mp, meta)
+
+            # 6) 每图标注 JSON 与标注任务 items 的 image_path 跟随。
+            #    前端按 /prod-api/static/{image_path} 取图；漏迁移会让封板更名后的
+            #    数据集全部图片 404（表现为「数据集打不开图片」）。
+            ann_dir = new_dir / "annotations"
+            if ann_dir.exists():
+                for af in ann_dir.glob("*.json"):
+                    try:
+                        doc = load_json(af)
+                        if _fix_path_refs(doc):
+                            save_json_atomic(af, doc)
+                    except Exception:  # noqa: BLE001
+                        continue
+            if settings.ANNOTATIONS_DIR.exists():
+                for tdir in settings.ANNOTATIONS_DIR.iterdir():
+                    tf = tdir / "task.json"
+                    if tdir.name.startswith(".") or not tf.is_file():
+                        continue
+                    try:
+                        tm = load_json(tf)
+                        if _fix_path_refs(tm):
+                            save_json_atomic(tf, tm)
+                    except Exception:  # noqa: BLE001
+                        continue
         except Exception as e:  # noqa: BLE001
             logger.warning(f"rename {old_id}: path refs update failed: {e}")
 
