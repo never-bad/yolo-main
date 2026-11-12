@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -30,6 +31,24 @@ class MergeRequest(BaseModel):
     dataset_ids: list[str]          # 至少 2 个待合并的数据集 id
     library_root_id: Optional[str] = None  # 归属算法库（缺省取第一个源的归属库）
     display_name: Optional[str] = None    # 合并后数据集命名（缺省 merged_<时间>）
+
+class ClassAlignmentRequest(BaseModel):
+    # [{"src_index": 0, "target_id": 1}]；target_id=null/-1 表示忽略该源类
+    decisions: list[dict]
+
+@router.post("/{dataset_id}/confirm-class-alignment")
+async def confirm_class_alignment(dataset_id: str, request: ClassAlignmentRequest):
+    """B-64 导入闸门：人工确认「包内类名 → 本库标签字典」的对应关系。
+
+    确认后同步重写 labels/*.txt、每图 JSON、data.yaml 与 meta.class_map，
+    把报告置为 confirmed；未确认的数据集会在封板时被 label_guard 明确拒绝。
+    """
+    try:
+        return await asyncio.to_thread(
+            dataset_service.confirm_class_alignment, dataset_id, request.decisions
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 @router.get("/{dataset_id}/bind-check")
 async def check_dataset_bind(dataset_id: str, model_id: str = Query(...)):

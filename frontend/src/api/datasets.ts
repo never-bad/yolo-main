@@ -48,6 +48,16 @@ export const prepareDataset = async (datasetId: string, splitRatio?: any, classe
   return data
 }
 
+/** B-64 导入闸门：人工确认「包内类名 → 本库标签字典」的映射。
+ *  decisions: [{ src_index, target_id }]；target_id=null 表示忽略该源类。 */
+export const confirmClassAlignment = async (
+  datasetId: string,
+  decisions: Array<{ src_index: number; target_id: number | null }>
+) => {
+  const { data } = await api.post(`/datasets/${datasetId}/confirm-class-alignment`, { decisions })
+  return data
+}
+
 export const listDatasets = async () => {
   const { data } = await api.get('/datasets')
   return data

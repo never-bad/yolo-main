@@ -150,6 +150,7 @@
               {{ dsTitle(dataset) }}
               <span v-if="bucketBadge(dataset).text" :class="'badge ' + bucketBadge(dataset).cls">{{ bucketBadge(dataset).text }}</span>
               <span v-if="validationBadge(dataset).text" :class="'badge ' + validationBadge(dataset).cls" :title="validationBadge(dataset).tip">{{ validationBadge(dataset).text }}</span>
+              <span v-if="alignmentBadge(dataset).text" :class="'badge ' + alignmentBadge(dataset).cls" :title="alignmentBadge(dataset).tip">{{ alignmentBadge(dataset).text }}</span>
             </h3>
             <div class="dataset-actions">
               <button 
@@ -336,6 +337,32 @@
               <span v-for="(c, i) in (viewerDetail?.classes || viewingDataset.classes)" :key="i" class="class-tag">{{ c }}</span>
             </span>
           </div>
+          <!-- B-64 类别对齐闸门：未确认时封板会被明确拒绝，这里提供逐类确认入口 -->
+          <div v-if="viewerDetail?.class_alignment" class="align-card" :class="'align-' + viewerDetail.class_alignment.status">
+            <div class="align-head">
+              <span class="align-title">类别对齐</span>
+              <span :class="'align-status ' + viewerDetail.class_alignment.status">{{ alignStatusText(viewerDetail.class_alignment.status) }}</span>
+            </div>
+            <p class="align-summary">{{ viewerDetail.class_alignment.summary }}</p>
+            <div v-if="viewerDetail.class_alignment.status === 'needs_confirm'" class="align-rows">
+              <div class="align-row" v-for="p in (viewerDetail.class_alignment.pairs || [])" :key="p.src_index">
+                <span class="align-src">{{ p.src_name }} <small>第 {{ p.src_index }} 类</small></span>
+                <span class="align-arrow">→</span>
+                <select v-model="alignChoices[p.src_index]" class="align-select">
+                  <option value="">请选择…</option>
+                  <option v-for="(nm, i) in (viewerDetail.class_alignment.canonical_names || [])" :key="i" :value="i">{{ nm }}（第 {{ i }} 类）</option>
+                  <option value="__ignore__">忽略该类（丢弃这些框）</option>
+                </select>
+                <span v-if="p.status === 'ambiguous'" class="align-warn">有歧义，候选 {{ (p.candidates || []).join(', ') }}</span>
+              </div>
+              <div class="align-actions">
+                <button class="primary" :disabled="alignSubmitting" @click="submitClassAlignment">
+                  {{ alignSubmitting ? '处理中…' : '确认映射' }}
+                </button>
+                <span class="align-hint">确认后会同步改写标签、每图标注与 data.yaml；未确认不能封板/训练</span>
+              </div>
+            </div>
+          </div>
           <div class="viewer-description" v-if="viewerDetail?.description || viewingDataset.description">
             {{ viewerDetail?.description || viewingDataset.description }}
           </div>
@@ -488,7 +515,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch, onMounted, onActivated, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { uploadDataset, cancelUpload, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel, getSealThreshold, setSealThreshold, setDatasetAsTestSet } from '@/api/datasets'
+import { uploadDataset, cancelUpload, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel, getSealThreshold, setSealThreshold, setDatasetAsTestSet, confirmClassAlignment } from '@/api/datasets'
 import { listModels } from '@/api/models'
 import { addHardSamples, addBackgroundSamples } from '@/api/samplePool'
 import { downloadFile } from '@/utils/download'
@@ -820,6 +847,7 @@ const viewDataset = async (dataset: any) => {
   viewerImages.value = []
   viewerDetail.value = null
   poolSelected.value = {}  // 打开新数据集时清空勾选
+  Object.keys(alignChoices).forEach(k => delete alignChoices[Number(k)])  // 清空上次类别选择
   try {
     const result = await getDataset(dataset.dataset_id)
     viewerDetail.value = result
@@ -957,6 +985,48 @@ const validationBadge = (d: any) => {
     errs.length > 5 ? `…另有 ${errs.length - 5} 条错误` : ''
   ].filter(Boolean).join('\n')
   return { text: `校验✗ ${v.invalid_lines ?? 0} 行`, cls: 'badge-invalid', tip }
+}
+
+// B-64 类别对齐闸门：卡片徽标 + 详情弹窗里逐类人工确认（零新增组件库依赖）
+const alignChoices = reactive<Record<number, string>>({})
+const alignSubmitting = ref(false)
+const alignStatusText = (s: string) => ({
+  aligned: '已对齐', needs_confirm: '待确认', confirmed: '已人工确认', no_model: '无标签字典'
+} as Record<string, string>)[s] || s
+
+const alignmentBadge = (d: any) => {
+  const a = d?.class_alignment
+  if (a?.status === 'needs_confirm') {
+    return { text: '类别待确认', cls: 'badge-align-warn', tip: a.summary || '类别与库标签字典未对齐' }
+  }
+  return { text: '', cls: '', tip: '' }
+}
+
+const submitClassAlignment = async () => {
+  const a = viewerDetail.value?.class_alignment
+  const dsId = viewingDataset.value?.dataset_id
+  if (!a || !dsId || a.status !== 'needs_confirm') return
+  const decisions: Array<{ src_index: number; target_id: number | null }> = []
+  for (const i of (a.unresolved || [])) {
+    const v = alignChoices[i]
+    if (!v) {
+      showToast(`请先为「${a.source_classes?.[i] ?? '第 ' + i + ' 类'}」选择对应标签，或选择「忽略该类」`, 'info', 4000)
+      return
+    }
+    decisions.push({ src_index: Number(i), target_id: v === '__ignore__' ? null : Number(v) })
+  }
+  alignSubmitting.value = true
+  try {
+    const res = await confirmClassAlignment(dsId, decisions)
+    showToast(res.summary || '类别映射已确认', 'success', 4000)
+    viewerDetail.value = await getDataset(dsId)
+    Object.keys(alignChoices).forEach(k => delete alignChoices[Number(k)])
+    await loadDatasets(true)
+  } catch (e: any) {
+    showToast('确认失败: ' + (e.response?.data?.detail || e.message), 'error', 5000)
+  } finally {
+    alignSubmitting.value = false
+  }
 }
 
 // 桶进度条（每个模型一行：已封板版本 + 接收桶已灌/该库生效门槛）
@@ -2035,6 +2105,27 @@ button {
 }
 
 /* 图片预览弹窗 */
+/* B-64 类别对齐闸门 */
+.badge-align-warn { background: #fff3d6; color: #8a5a00; border: 1px solid #f0c36d; }
+.align-card { margin: 14px 0; padding: 12px 14px; border: 1px solid #d9dee5; border-radius: 8px; background: #f8fafc; }
+.align-card.align-needs_confirm { border-color: #f0c36d; background: #fffbf2; }
+.align-card.align-aligned, .align-card.align-confirmed { border-color: #a8dcc4; background: #f4fbf7; }
+.align-head { display: flex; align-items: center; gap: 10px; }
+.align-title { font-weight: 500; font-size: 13px; }
+.align-status { font-size: 12px; padding: 1px 8px; border-radius: 10px; background: #eef1f5; color: #5b6472; }
+.align-status.needs_confirm { background: #fde8c4; color: #8a5a00; }
+.align-status.aligned, .align-status.confirmed { background: #d8f2e4; color: #177245; }
+.align-summary { margin: 8px 0 10px; font-size: 12px; color: #55606e; line-height: 1.6; }
+.align-rows { display: flex; flex-direction: column; gap: 8px; }
+.align-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.align-src { min-width: 150px; }
+.align-src small { color: #9099a5; margin-left: 4px; }
+.align-arrow { color: #98a2ae; }
+.align-select { padding: 4px 8px; border: 1px solid #cfd6df; border-radius: 6px; background: #fff; font-size: 13px; min-width: 190px; }
+.align-warn { color: #b26a00; font-size: 12px; }
+.align-actions { display: flex; align-items: center; gap: 10px; margin-top: 6px; flex-wrap: wrap; }
+.align-hint { font-size: 12px; color: #8a94a1; }
+
 .viewer-mask {
   position: fixed;
   inset: 0;

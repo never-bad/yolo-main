@@ -22,7 +22,10 @@ from src.core.lifecycle import record_error, record_heartbeat
 from src.core.settings import settings, seal_threshold_for
 from src.utils.fs_tree import build_tree
 from src.utils.class_labels import model_class_names, merge_classes_with_model, resolve_library_root_id
-from src.utils.class_labels import is_placeholder_classes as _is_placeholder_names
+from src.utils.class_labels import (
+    is_placeholder_classes as _is_placeholder_names,
+    class_alignment, resolve_class, build_alias_index, read_label_rows, norm_class_name,
+)
 from src.utils import zip_guard
 from src.utils.json_io import load_json, save_json_atomic
 from src.services.annotation_importers import import_external_annotations
@@ -1131,10 +1134,14 @@ class DatasetService:
                     f"保留占位名等待人工改名"
                 )
 
+        # B-64：记录「包内源类名」快照。后面一旦按库字典重映射成功，
+        # detected_classes 会被收敛成库标签，届时就没有原始名字可供对齐报告展示了。
+        raw_src_classes = [str(c) for c in detected_classes]
+
         # 外部格式已直接产出 YOLO 扁平格式：若数据集已绑定模型且包内类别可信，
         # 按模型标签空间重映射 labels/*.txt 的类别号（避免封板类别错位），并收敛 detected_classes
         if external_format and classes_from_package and model_labels:
-            cmap = self._build_class_map(detected_classes, model_labels)
+            cmap = self._build_class_map(detected_classes, model_labels, model_id_ds)
             if cmap:
                 await asyncio.to_thread(self._remap_yolo_labels, version_dir / "labels", cmap)
                 detected_classes = list(model_labels)
@@ -1189,6 +1196,9 @@ class DatasetService:
         # 不再在「txt→json」阶段转每图 JSON（那会把 YOLO 再转回 JSON，违背“只留 YOLO”）；
         # 但为了让导入后的数据集能在平台编辑器里改框 / 抽查 / 导出，下方 else 分支会从 labels
         # 反填每图 JSON 作为编辑器权威源（训练/封板仍以 data.yaml+labels 为准）。类别号重映射已在上方完成。
+        # B-64：class_filter 会被写进 meta，但此前只在下面非外部分支赋值，
+        # 外部格式导入（COCO/LabelMe/VOC）走到 meta.update 会 NameError。先统一初始化。
+        class_filter = None
         if not external_format:
             # YOLO labels/*.txt → 每图 JSON（统一权威标注源；标注页可直接读原标注）
             # 重映射：txt class_id（源包类空间）→ 模型标签索引；只保留本模型需要的类（剔除冗余标签）
@@ -1198,7 +1208,7 @@ class DatasetService:
             if labels_dir and labels_dir.is_dir() and final_has_labels and label_count > 0:
                 class_map = None
                 if classes_from_package and model_labels:
-                    class_map = self._build_class_map(detected_classes, model_labels)
+                    class_map = self._build_class_map(detected_classes, model_labels, model_id_ds)
                     if class_map:
                         dropped = [
                             str(c) for i, c in enumerate(detected_classes) if i not in class_map
@@ -1264,6 +1274,22 @@ class DatasetService:
             except Exception as e:
                 logger.warning(f"prepare {dataset_id}: auto-init model labels failed: {e}")
 
+        # B-64 类别契约：用「包内原始类名」对库标签字典出一份对齐报告并落盘。
+        # needs_confirm 时绝不静默跳过：meta.classes 保留原类名（不再被展示层覆盖成库名），
+        # 封板会在 label_guard 处明确拒绝，前端在数据集详情里提供确认入口。
+        try:
+            alignment = class_alignment(
+                raw_src_classes, model_id=model_id_ds,
+                canonical_names=model_labels or None,
+            )
+        except Exception:
+            logger.exception(f"prepare {dataset_id}: class alignment report failed")
+            alignment = {"status": "no_model", "source_classes": raw_src_classes,
+                         "canonical_names": [], "pairs": [], "class_map": {},
+                         "unresolved": [], "summary": "类别对齐报告生成失败，请检查标签字典。"}
+        if alignment.get("status") == "needs_confirm":
+            logger.warning(f"prepare {dataset_id}: {alignment.get('summary')}")
+
         # 更新元数据（prepare 完成 → 进入标注阶段：边采边标）
         meta.update({
             "status": "prepared",
@@ -1275,6 +1301,8 @@ class DatasetService:
             "split_ratio": split_ratio,  # 封板划分时复用（封板请求未指定时）
             "classes": detected_classes,
             "class_filter": class_filter,  # 按模型剔除的冗余类记录（None=未过滤）
+            "class_alignment": alignment,  # B-64 类别契约报告（aligned / needs_confirm / no_model）
+            "class_map": alignment.get("class_map") if alignment.get("status") == "aligned" else None,
             "label_validation": label_validation,
             "txt_to_json": txt_to_json,
             "model_auto_match": auto_match,  # 多模型上传自动匹配记录（None=未匹配）
@@ -1602,7 +1630,12 @@ class DatasetService:
           不需要重新准备数据集，也不回写存量快照（按 index 合并、绝不截断）。
         - 历史数据 prepare 时可能因未读到类别文件而生成了 class_0/class_1 等占位名，
           若目录中存在真实类别文件（classes.txt / coco.names / names.txt）则按行回填。
+        - B-64：类别报告为 needs_confirm 时**不得**用库字典覆盖展示，
+          否则界面会把 Fall-Detected 伪装成 fall，用户误以为已对齐（磁盘其实没改）。
         """
+        align = meta.get("class_alignment") or {}
+        if align.get("status") == "needs_confirm":
+            return meta.get("classes") or []
         classes = meta.get("classes") or []
         live = merge_classes_with_model(classes, model_class_names(meta.get("model_id") or ""))
         if live != classes:
@@ -1722,24 +1755,27 @@ class DatasetService:
                 })
         return annotated
 
-    def _build_class_map(self, src_classes: list, model_labels: list) -> dict:
-        """构建 txt class_id 重映射表：源包类名 → 目标模型标签索引。
+    def _build_class_map(self, src_classes: list, model_labels: list,
+                         model_id: str = "") -> dict:
+        """构建 txt class_id 重映射表：源包类名 → 目标算法库标签索引。
 
-        只保留目标模型需要的类（模型标签字典英文码），其余剔除（冗余标签过滤）。
-        返回 {源index: 模型index}；双方任一为空 / 无交集时返回 None（保持原始 index）。
+        B-64：判定统一交给 class_labels.class_alignment（单一类别契约），
+        不再各自写一套 lower 精确匹配。别名（中文名/描述/ai_prompt_en）与
+        归一化命中都算对齐；**只要有一个类别存在歧义或认不出，就返回 None**，
+        绝不做「部分重映射」——那会让整批框静默挂到错误的类上。
         """
         if not src_classes or not model_labels:
             return None
-        model_idx = {
-            str(n).strip().lower(): i for i, n in enumerate(model_labels)
-            if str(n).strip()
-        }
-        class_map = {}
-        for src_idx, name in enumerate(src_classes):
-            key = str(name).strip().lower()
-            if key and key in model_idx:
-                class_map[src_idx] = model_idx[key]
-        return class_map or None
+        try:
+            report = class_alignment(
+                src_classes, model_id=model_id, canonical_names=model_labels
+            )
+        except Exception:
+            logger.exception("class alignment failed, keep original class ids")
+            return None
+        if report.get("status") != "aligned":
+            return None
+        return {int(k): int(v) for k, v in (report.get("class_map") or {}).items()}
 
     def _remap_yolo_labels(self, labels_dir: Path, class_map: dict):
         """按 class_map（源类号→模型类号）重写 labels/*.txt 的类别号；源类号不在映射中的行删除。
@@ -1888,38 +1924,40 @@ class DatasetService:
 
     @staticmethod
     def _norm_cls(name: str) -> str:
-        """归一化类别名用于比对（小写 + 去所有分隔符），traffic-scene == trafficscene"""
-        return re.sub(r"[^0-9a-z]+", "", str(name or "").strip().lower())
+        """归一化类别名用于比对（B-64 起委托给唯一的 norm_class_name）。"""
+        return norm_class_name(name)
 
     def _auto_match_model(self, classes: list) -> Optional[str]:
-        """多模型上传自动匹配（#3）：包内类别 → 与已有模型标签字典比对。
+        """多模型上传自动匹配（#3）：包内类别 → 与已有算法库标签字典比对。
 
-        - 包内所有类被某模型完全覆盖 → 立即命中（最精确）
-        - 全部未覆盖时取覆盖率最高者，仅当覆盖率 >= 0.6 才绑定（保守，避免错绑）
-        - 匹配不到返回 None → 数据集保持未归属（兜底，后续手动绑定）
+        B-64：覆盖率改用统一的 resolve_class（含别名与归一化），
+        与 prepare 的类号映射、预标注的类别对齐同一口径；阈值 0.6 保持保守。
         """
         if not classes or not settings.REGISTRY_DIR.exists():
             return None
-        base = {self._norm_cls(c) for c in classes if str(c).strip()}
+        base = list(dict.fromkeys(
+            str(c).strip() for c in classes if str(c).strip()
+        ))
         if not base:
             return None
         best, best_model_id = 0.0, None
         for model_dir in settings.REGISTRY_DIR.iterdir():
-            if not model_dir.is_dir():
-                continue
-            mf = model_dir / "model.json"
-            if not mf.exists():
+            if not model_dir.is_dir() or not (model_dir / "model.json").exists():
                 continue
             try:
                 labels = self._labels_from_model(model_dir.name)
             except Exception:
                 continue
-            label_set = {self._norm_cls(c) for c in labels if str(c).strip()}
-            if not label_set:
-                continue  # 无标签空间（含刚建好还没配标签的算法库）不参与自动匹配
-            # 判据只看标签字典是否为空，不要按 empty 跳过：empty 的语义是
-            # 「算法库占位记录」，而库根恰恰是数据集应当归属的对象（见 library_root_id）。
-            cover = len(base & label_set) / len(base)
+            if not labels:
+                continue  # 无标签空间（含刚建好还没配标签的库）不参与自动匹配
+            idx, names = build_alias_index(read_label_rows(model_dir.name), labels)
+            if not names:
+                continue
+            hit = sum(
+                1 for c in base
+                if resolve_class(c, idx, names)["class_id"] is not None
+            )
+            cover = hit / len(base)
             if cover >= 1.0:
                 return model_dir.name  # 完全覆盖：立即命中
             if cover > best:
@@ -1936,7 +1974,12 @@ class DatasetService:
         - 字典比数据集快照短时不截断，尾部沿用 meta.classes
           （截断会让已落盘的 class_id 越界）。
         - 字典全是占位名（未配真名）时不覆盖数据集里的真实类名。
+        - B-64：类别报告为 needs_confirm 时**不得**用库字典按 index 覆盖，
+          否则封板 data.yaml 会把未对齐的源类名伪装成库名，训练语义依旧是错的。
         """
+        align = meta.get("class_alignment") or {}
+        if align.get("status") == "needs_confirm":
+            return meta.get("classes") or []
         names = model_class_names(meta.get("model_id") or "")
         if not names or _is_placeholder_names(names):
             return meta.get("classes") or []
@@ -2197,6 +2240,148 @@ class DatasetService:
         meta = await asyncio.to_thread(load_json, meta_path)
         return await asyncio.to_thread(self._bind_conflict_sync, dataset_dir, meta, model_id)
 
+    def confirm_class_alignment(self, dataset_id: str, decisions: list) -> dict:
+        """人工确认导入类别映射（B-64 导入闸门）。
+
+        decisions: [{"src_index": int, "target_id": int | null}, ...]
+          target_id = 库标签字典下标；null / -1 表示忽略该源类（相关框会被丢弃）。
+        所有 unresolved 的源类都必须给出决定，否则拒绝，绝不替用户猜。
+        确认后同步重写 labels/*.txt、每图 JSON、data.yaml 与 meta，
+        并把报告置为 confirmed —— 之后封板/训练/展示只消费这张落盘的映射表。
+        """
+        ds_dir = self.datasets_dir / dataset_id
+        mp = ds_dir / "meta.json"
+        if not mp.exists():
+            raise ValueError(f"数据集不存在: {dataset_id}")
+        meta = load_json(mp)
+        align = meta.get("class_alignment") or {}
+        status = align.get("status")
+        if status in ("aligned", "confirmed"):
+            return {"ok": True, "dataset_id": dataset_id, "status": status,
+                    "message": "类别已对齐，无需重复确认"}
+        if status == "no_model" or not align:
+            raise ValueError("该数据集没有可确认的类别对齐报告（尚未准备，或归属库字典为空）")
+
+        source = [str(c) for c in (align.get("source_classes") or [])]
+        canonical = [str(c) for c in (align.get("canonical_names") or [])]
+        if not canonical:
+            raise ValueError("归属算法库的标签字典为空，无法确认类别映射")
+
+        decided = {}
+        for d in decisions or []:
+            if not isinstance(d, dict):
+                continue
+            try:
+                i = int(d.get("src_index"))
+            except (TypeError, ValueError):
+                continue
+            t = d.get("target_id")
+            if t is None or t == "" or t == -1:
+                decided[i] = None  # 忽略该源类
+                continue
+            try:
+                ti = int(t)
+            except (TypeError, ValueError):
+                raise ValueError(f"第 {i} 类的目标序号无效: {t}")
+            if not (0 <= ti < len(canonical)):
+                raise ValueError(f"第 {i} 类的目标序号 {ti} 超出库标签字典范围")
+            decided[i] = ti
+
+        unresolved = [int(i) for i in (align.get("unresolved") or [])]
+        missing = [i for i in unresolved if i not in decided]
+        if missing:
+            names = "、".join(
+                f"{source[i] if i < len(source) else i}（第 {i} 类）" for i in missing
+            )
+            raise ValueError(
+                f"还有类别未确认：{names}。请为每个类别选择对应标签，或明确选择「忽略该类」。"
+            )
+
+        cmap = {int(k): int(v) for k, v in (align.get("class_map") or {}).items()}
+        for i, t in decided.items():
+            if t is None:
+                cmap.pop(i, None)
+            else:
+                cmap[i] = t
+
+        # 1) YOLO labels：重写类号；用户选择忽略的类，其标签行直接丢弃
+        labels_dir = ds_dir / "labels"
+        if labels_dir.is_dir():
+            self._remap_yolo_labels(labels_dir, cmap)
+
+        # 2) 每图 JSON（编辑器/抽查/导出的权威源）：同步 class_id 与 english_code
+        touched = dropped = 0
+        ann_dir = ds_dir / "annotations"
+        if ann_dir.is_dir():
+            for p in ann_dir.glob("*.json"):
+                try:
+                    doc = load_json(p)
+                except Exception:
+                    continue
+                boxes = doc.get("boxes") or []
+                if not boxes:
+                    continue
+                out, changed = [], False
+                for b in boxes:
+                    cid = b.get("class_id")
+                    if isinstance(cid, int) or (isinstance(cid, str) and str(cid).isdigit()):
+                        key = int(cid)
+                    else:
+                        nm = str(cid or "").strip().lower()
+                        key = next((i for i, s in enumerate(source)
+                                    if str(s).strip().lower() == nm), None)
+                    if key is None or key not in cmap:
+                        dropped += 1
+                        changed = True
+                        continue
+                    nb = dict(b)
+                    nb["class_id"] = cmap[key]
+                    nb["english_code"] = canonical[cmap[key]]
+                    for fld in ("class_name", "label", "name"):
+                        if isinstance(nb.get(fld), str):
+                            nb[fld] = canonical[cmap[key]]
+                    out.append(nb)
+                    if nb != b:
+                        changed = True
+                if changed:
+                    doc["boxes"] = out
+                    save_json_atomic(p, doc)
+                    touched += 1
+
+        # 3) data.yaml 的 names 收敛到库字典（类别真值）
+        if (ds_dir / "data.yaml").exists():
+            _save_yaml(ds_dir / "data.yaml",
+                       {"nc": len(canonical), "names": list(canonical)})
+
+        # 4) 报告与 meta 落盘
+        for pair in align.get("pairs") or []:
+            i = pair.get("src_index")
+            if i in decided:
+                t = decided[i]
+                pair["class_id"] = t
+                pair["canonical"] = canonical[t] if t is not None else None
+                pair["status"] = "confirmed_ignored" if t is None else "confirmed"
+                pair["candidates"] = [t] if t is not None else []
+        align.update({
+            "status": "confirmed",
+            "class_map": {str(k): v for k, v in cmap.items()},
+            "unresolved": [],
+            "confirmed_at": datetime.now().isoformat(),
+            "decisions": {str(k): v for k, v in decided.items()},
+            "summary": f"类别映射已人工确认：{len(cmap)} 个类别对齐到本库标签字典"
+                       + (f"，{dropped} 个框按「忽略该类」丢弃" if dropped else ""),
+        })
+        meta["class_alignment"] = align
+        meta["class_map"] = align["class_map"]
+        meta["classes"] = list(canonical)
+        save_json_atomic(mp, meta)
+        return {
+            "ok": True, "dataset_id": dataset_id, "status": "confirmed",
+            "class_map": align["class_map"], "canonical_names": canonical,
+            "json_files_updated": touched, "boxes_dropped": dropped,
+            "summary": align["summary"],
+        }
+
     def _build_training_artifacts(self, dataset_dir: Path, meta: dict, split_ratio: dict,
                                   out_dir: Path = None, label_guard: bool = False) -> dict:
         """封板一次性产出：划分 train/val/test + 每图 JSON → YOLO txt + 生成 data.yaml（数据链路阶段E）
@@ -2304,6 +2489,23 @@ class DatasetService:
         # 封板兜底校验：txt 里的类别号直接沿用标注 JSON 的 class_id（标注当时的顺序写死的），
         # 若该数据集被换挂到「有同名类别但序号不同」的算法库，这里不拦就会静默串号。
         if label_guard:
+            # B-64 导入闸门：类别没确认就封板，等于把「系统替你猜」写进训练数据。
+            # 这里明确拒绝，并把待确认的类名和库内可选标签一并返回，方便前端引导。
+            _align = meta.get("class_alignment") or {}
+            if _align.get("status") == "needs_confirm":
+                _todo = [
+                    f"{p.get('src_name')}（第 {p.get('src_index')} 类）"
+                    for p in (_align.get("pairs") or [])
+                    if p.get("class_id") is None
+                ]
+                raise ValueError(
+                    "封板中止：数据集类别尚未与归属算法库的标签字典对齐，"
+                    "直接封板会把框标成错误的类。\n"
+                    f"待确认：{'、'.join(_todo[:8]) or '见类别对齐报告'}"
+                    f"{'…' if len(_todo) > 8 else ''}\n"
+                    f"库内标签：{_align.get('canonical_names') or []}\n"
+                    "请到「上传数据集」页打开该数据集详情，确认每个类别的对应关系后再封板。"
+                )
             _triples = [
                 (b.get("class_id"), b.get("english_code") or "", rec["image_id"])
                 for rec in annotated for b in (rec.get("boxes") or [])

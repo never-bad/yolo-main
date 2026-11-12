@@ -458,34 +458,36 @@ class SAMService:
         key = (self._trained_id, tuple(classes or ()))
         if self._trained_map is not None and self._trained_map_key == key:
             return self._trained_map
-        by_code = {}
-        for i, c in enumerate(classes or []):
-            by_code[str(c).strip().lower()] = i
-        # 标签字典允许同一个任务里英文码与模型训练时的叫法不同：用中文名再兜一层
-        by_alias = {}
+        # B-64：类别判定统一走 class_labels 的单一契约，与 prepare 的类号映射、
+        # 自动归属使用同一套别名 + 归一化规则（此前这里另写了一套 by_code/by_alias）。
+        from src.utils.class_labels import build_alias_index, resolve_class
+        canonical = [str(c).strip() for c in (classes or [])]
+        rows = []
         for lab in self._dict_labels(cfg) or []:
-            idx = lab.get("index")
-            if not isinstance(idx, int) or idx < 0 or idx >= len(classes or []):
+            i = lab.get("index")
+            if not isinstance(i, int) or i < 0 or i >= len(canonical):
                 continue
-            # ai_prompt_en 排最后兜底：它是"给大模型/SAM 用的英文提示词"，
-            # 常与训练产出的类名一致（如字典 english_code=diedao 但模型 classes=fall），
-            # 优先级必须低于英文码与中文名，避免反过来抢走正确对齐。
-            for alias in (lab.get("english_code"), lab.get("chinese_name"), lab.get("chinese_desc"), lab.get("ai_prompt_en")):
-                a = str(alias or "").strip().lower()
-                if a:
-                    by_alias.setdefault(a, idx)
+            rows.append({
+                "index": i,
+                "english_code": canonical[i],  # 任务类别名即规范名，下标即 YOLO 类号
+                "chinese_name": lab.get("chinese_name"),
+                "chinese_desc": lab.get("chinese_desc"),
+                "ai_prompt_en": lab.get("ai_prompt_en"),
+                # 库字典里的英文码也当别名：库改名后旧权重仍能对齐
+                "aliases": [lab.get("english_code")],
+            })
+        idx_map, names_map = build_alias_index(rows, canonical)
         mapping = {}
         for mid, name in enumerate(self._trained_names(model)):
-            n = name.strip().lower()
-            idx = by_code.get(n)
-            if idx is None:
-                idx = by_alias.get(n)
-            if idx is None:
+            r = resolve_class(name, idx_map, names_map)
+            cid = r["class_id"]
+            if cid is None:
                 # 名字里带序号前缀（如 "0 helmet"）时再试一次去前缀匹配
-                tail = n.split(" ", 1)[-1].strip() if " " in n else ""
-                idx = by_code.get(tail) or by_alias.get(tail)
-            if idx is not None:
-                mapping[mid] = idx
+                tail = str(name).split(" ", 1)[-1].strip() if " " in str(name) else ""
+                if tail:
+                    cid = resolve_class(tail, idx_map, names_map)["class_id"]
+            if cid is not None:
+                mapping[mid] = cid
         self._trained_map = mapping
         self._trained_map_key = key
         print(
