@@ -273,7 +273,10 @@
               <span v-if="auditBatchProgress.audit.errors" class="a-reject">({{ auditBatchProgress.audit.errors }} 次失败)</span>
             </div>
             <div v-if="auditBatchProgress?.failed_images" class="audit-batch-line">
-              <span class="a-reject">⚠ {{ auditBatchProgress.failed_images }} 张跳过（读取/写入失败）</span>
+              <span class="a-reject">⚠ {{ auditBatchProgress.failed_images }} 张审核异常被跳过（非「无框」）</span>
+              <span v-if="auditBatchProgress?.last_error" class="audit-last-error" :title="auditBatchProgress.last_error">
+                最后错误：{{ auditBatchProgress.last_error }}
+              </span>
             </div>
             <button class="danger small" @click="stopAuditBatch" :disabled="!auditBatchRunning">停止</button>
           </div>
@@ -5161,6 +5164,7 @@ canvas {
 .audit-batch-line { margin-top: 6px; font-size: 12px; color: #666; line-height: 1.5; word-break: break-all; }
 .audit-batch-line .a-keep, .audit-batch-line .a-modify, .audit-batch-line .a-reject,
 .audit-batch-line .a-split, .audit-batch-line .a-missed { padding: 0 4px; border-radius: 3px; margin: 0 2px; }
+.audit-last-error { display: block; margin-top: 3px; font-size: 11px; color: #c0392b; max-height: 34px; overflow: hidden; text-overflow: ellipsis; }
 /* 批量审核按钮（蓝色，区别于预标注蓝绿） */
 .audit-batch-btn { background: #1c64f2; }
 .audit-batch-btn:hover:not(:disabled) { background: #1552d6; }

@@ -3112,6 +3112,7 @@ class SAMService:
             "skipped_candidates": bt.skipped_candidates,
             "current_image": bt.current_image,
             "error": bt.error,
+            "last_error": getattr(bt, "last_error", None),
             "preload_warnings": bt.preload_warnings,
             "failed_images": bt.failed_images,
             "summary": bt.result_summary,
@@ -3177,16 +3178,21 @@ class SAMService:
             try:
                 existing = await self.annotation_service.get_image_annotation(bt.task_id, image_id)
                 boxes = (existing or {}).get("boxes") or []
-                # 与 audit_image 一致：只审有矩形框或轮廓点的框
-                valid = [b for b in boxes if b.get("x1") is not None or b.get("polygon")]
-                if not valid:
+                # 只审有矩形框或轮廓点的框；记录其在原 boxes 中的下标，供审核结论写回对齐
+                valid_idx = [i for i, b in enumerate(boxes)
+                             if b.get("x1") is not None or b.get("polygon")]
+                if not valid_idx:
                     bt.done += 1
                     return
-                # 临时分配 box_id 以便和审核返回对齐（落盘不需要 box_id）
-                dets = [{"box_id": i, "class_id": b.get("class_id"),
-                         "bbox": [b.get("x1"), b.get("y1"), b.get("x2"), b.get("y2")],
-                         "score": b.get("score") or b.get("confidence")}
-                        for i, b in enumerate(valid)]
+                # 关键：qwen_audit_detections 内部按 b["x1"]/["y1"]/["x2"]/["y2"] 取坐标
+                # （见本文件 L2111），必须传「保留原始字段」的框字典，不能重构成
+                # {"bbox": [...]}，否则每张图都会 KeyError('x1') 被计入 failed_images。
+                # 这里用浅拷贝并只补 box_id（送审序号 = valid_idx 的下标 j）。
+                dets = []
+                for j, orig_i in enumerate(valid_idx):
+                    nb = dict(boxes[orig_i])
+                    nb["box_id"] = j
+                    dets.append(nb)
                 async with sem:
                     audit, msg = await asyncio.to_thread(
                         self.qwen_audit_detections, img_abs, dets, ld, cfg, classes
@@ -3197,20 +3203,19 @@ class SAMService:
                     return
                 st = audit.get("stats") or {}
                 bt.audit_checked += 1
-                bt.audit_boxes += len(valid)
+                bt.audit_boxes += len(valid_idx)
                 for k in ("keep", "modify", "reject", "split", "missed"):
                     bt.audit_summary[k] = bt.audit_summary.get(k, 0) + (st.get(k) or 0)
-                # 审核结论映射回原框（按临时 box_id）
+                # 审核结论按 box_id(=有效框序号 j) 映射回原 boxes 下标 orig_i，
+                # 保证被过滤掉的无效框仍原样保留、且不错位。
                 rmap = {r.get("box_id"): r for r in (audit.get("box_reviews") or [])}
-                saved = []
-                for i, b in enumerate(boxes):
-                    nb = dict(b)
-                    r = rmap.get(i)
+                saved = [dict(b) for b in boxes]
+                for j, orig_i in enumerate(valid_idx):
+                    r = rmap.get(j)
                     if r:
-                        nb["audit"] = {k: r.get(k) for k in
-                                       ("action", "kind", "reason", "tags", "suggested_class_id")
-                                       if r.get(k) is not None}
-                    saved.append(nb)
+                        saved[orig_i]["audit"] = {k: r.get(k) for k in
+                                                  ("action", "kind", "reason", "tags", "suggested_class_id")
+                                                  if r.get(k) is not None}
                 # box 级 audit 经 save_annotation 落盘（保留现有字段 + 边界检查 + shadow）
                 await self.annotation_service.save_annotation(
                     bt.task_id, image_id, saved,
