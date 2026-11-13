@@ -143,6 +143,23 @@
                 :class="{ active: imageFilter === 'unannotated' }"
                 @click="setFilter('unannotated')"
               >未标注（{{ counts.unannotated }}）</div>
+              <!-- 审核结果：按最严重一类筛，点一类只列该类，方便挨个人工二审 -->
+              <div class="filter-menu-group">
+                <div class="filter-menu-item group-header label-only">审核结果（批量审核后可用）</div>
+                <div
+                  v-for="k in AUDIT_FILTER_KEYS"
+                  :key="k"
+                  class="filter-menu-item sub"
+                  :class="{ active: imageFilter === k }"
+                  @click="setFilter(k)"
+                  :title="'只显示「' + filterLabels[k] + '」的图片，按顺序逐张查阅'"
+                >↳ {{ filterLabels[k] }}（{{ counts[k] }}）</div>
+                <div
+                  class="filter-menu-item sub audit-refresh"
+                  @click="refreshAuditClassify(); filterOpen = false"
+                  title="批量审核进行中/结束后，手动刷新分类结果"
+                >↳ ⟳ 刷新审核结果</div>
+              </div>
             </div>
           </div>
         </div>
@@ -165,6 +182,13 @@
               <span v-else-if="item.sample_type === 'background'" class="img-badge bg" title="空白样本（负样本）：无目标框">空</span>
               <span v-if="item.annotated" class="img-badge ok" title="已有标注">✓</span>
               <span v-if="item.ai_annotated" class="img-badge ai" title="AI 预标注，建议人工审核">AI</span>
+              <!-- 审核结论徽标：与筛选下拉同源，颜色按严重度 -->
+              <span
+                v-if="auditTypeByImage[item.image_id]"
+                class="img-badge audit"
+                :class="'at-' + auditTypeByImage[item.image_id]"
+                :title="AUDIT_TYPE_LABELS[auditTypeByImage[item.image_id]] + '（批量审核结论，仅供参考，请人工复核）'"
+              >{{ AUDIT_TYPE_SHORT[auditTypeByImage[item.image_id]] }}</span>
             </span>
           </div>
           <div v-if="visibleItems.length === 0" class="empty-filter">
@@ -1639,6 +1663,12 @@ const auditBatchPercent = computed(() => {
 const auditClassifyData = ref<any>(null)
 const auditClassifyOpen = ref(false)
 const auditClassifyTab = ref<'type' | 'action'>('type')
+// 图片列表联动：image_id → 该图的 primary_type（只归最严重一类），用于徽标 + 筛选
+const auditTypeByImage = ref<Record<string, string>>({})
+const AUDIT_TYPE_SHORT: Record<string, string> = {
+  label_error: '标错', missing: '漏标', merged: '粘连',
+  imprecise: '不精准', compliance: '合规', clean: '通过'
+}
 const AUDIT_TYPE_LABELS: Record<string, string> = {
   label_error: '标签错误', missing: '漏标', merged: '粘连',
   imprecise: '框不精准', compliance: '合规风险', clean: '无问题'
@@ -1676,10 +1706,14 @@ const classifyItemTip = (s: any) => {
 
 // ===== 图片列表分类过滤（级联下拉菜单） =====
 // poly_* 三档按"轮廓质量"分：修过（人工复核）/ 待修（AI 歪稿）/ 还没轮廓，方便挑图精修
-type FilterKey = 'all' | 'annotated' | 'ai' | 'manual' | 'unannotated' | 'poly_refined' | 'poly_draft' | 'poly_none'
+// 审核结果 6 类筛选：按最严重一类归集，与后端 classify 的 buckets_by_type 同源
+type AuditFilterKey = 'audit_label_error' | 'audit_missing' | 'audit_merged' | 'audit_imprecise' | 'audit_compliance' | 'audit_clean'
+type FilterKey = 'all' | 'annotated' | 'ai' | 'manual' | 'unannotated' | 'poly_refined' | 'poly_draft' | 'poly_none' | AuditFilterKey
+const AUDIT_FILTER_KEYS: AuditFilterKey[] = ['audit_label_error', 'audit_missing', 'audit_merged', 'audit_imprecise', 'audit_compliance', 'audit_clean']
+const auditTypeOfFilter = (k: AuditFilterKey) => k.slice(6)  // 去掉 'audit_' 前缀
 const imageFilter = ref<FilterKey>('all')
 const filterOpen = ref(false)
-const counts = computed(() => {
+const counts = computed<Record<string, number>>(() => {
   const total = items.value.length
   const annotated = items.value.filter(i => i.annotated).length
   const ai = items.value.filter(i => i.ai_annotated).length
@@ -1689,7 +1723,16 @@ const counts = computed(() => {
   const poly_draft = items.value.filter(i => i.has_polygon && !i.reviewed).length
   const poly_none = items.value.filter(i => !i.has_polygon).length
   const reviewed = items.value.filter(i => i.reviewed).length
-  return { total, annotated, ai, manual, unannotated, poly_refined, poly_draft, poly_none, reviewed }
+  const auditCounts: Record<string, number> = {}
+  for (const k of AUDIT_FILTER_KEYS) auditCounts[k] = 0
+  for (const i of items.value) {
+    const t = auditTypeByImage.value[i.image_id]
+    if (t) {
+      const k = 'audit_' + t
+      if (k in auditCounts) auditCounts[k]++
+    }
+  }
+  return { total, annotated, ai, manual, unannotated, poly_refined, poly_draft, poly_none, reviewed, ...auditCounts }
 })
 const filterLabels: Record<string, string> = {
   all: '全部',
@@ -1700,6 +1743,12 @@ const filterLabels: Record<string, string> = {
   poly_refined: '轮廓·已修过',
   poly_draft: '轮廓·待修正',
   poly_none: '轮廓·还没有',
+  audit_label_error: '审核·标签错误',
+  audit_missing: '审核·漏标',
+  audit_merged: '审核·粘连',
+  audit_imprecise: '审核·框不精准',
+  audit_compliance: '审核·合规风险',
+  audit_clean: '审核·无问题',
 }
 const currentFilterLabel = computed(() => {
   const label = filterLabels[imageFilter.value] || '全部'
@@ -1711,7 +1760,12 @@ const setFilter = (val: FilterKey) => {
   filterOpen.value = false
 }
 const filteredItems = computed(() => {
-  switch (imageFilter.value) {
+  const f = imageFilter.value
+  if (f.startsWith('audit_')) {
+    const t = auditTypeOfFilter(f as AuditFilterKey)
+    return items.value.filter(i => auditTypeByImage.value[i.image_id] === t)
+  }
+  switch (f) {
     case 'annotated': return items.value.filter(i => i.annotated)
     case 'ai': return items.value.filter(i => i.ai_annotated)
     case 'manual': return items.value.filter(i => i.annotated && !i.ai_annotated)
@@ -1917,6 +1971,8 @@ const loadTaskItems = async () => {
     if (items.value.length > 0) {
       selectImage(0)
     }
+    // 异步拉审核分类（约 2s），不阻塞列表渲染；完成后徽标与筛选自动出现
+    refreshAuditClassify()
   } catch (error: any) {
     if (!error?.__toastShown) showToast('加载失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
   } finally {
@@ -3921,12 +3977,13 @@ const pollAuditBatch = async () => {
     if (errs > 0) msg += `（${errs} 张失败）`
     showToast(msg, 'info', 6000)
     await loadTaskItems()
-    openAuditClassify()  // 自动拉分类清单
+    refreshAuditClassify()  // 刷新列表徽标 + 筛选计数（不再自动弹窗，避免打断挨个查阅）
   } else if (res.status === 'cancelled') {
     auditBatchId.value = null
     saveAnnotateState()
     showToast(`批量审核已取消，已审 ${res.done || 0} 张图`, 'info', 4000)
     await loadTaskItems()
+    refreshAuditClassify()
   } else if (res.status === 'error') {
     auditBatchId.value = null
     saveAnnotateState()
@@ -3959,6 +4016,25 @@ const stopAuditBatch = async () => {
   }
 }
 
+// 静默拉取审核分类并构建 image_id → primary_type 映射（供图片列表徽标/筛选使用）。
+// 异步、失败静默：分类接口要扫描上万张标注，不能阻塞标注页主流程。
+const refreshAuditClassify = async () => {
+  if (!currentTask.value) return
+  try {
+    const res = await listAuditClassify(currentTask.value)
+    auditClassifyData.value = res
+    const map: Record<string, string> = {}
+    for (const [key, arr] of Object.entries(res?.buckets_by_type || {})) {
+      for (const s of (arr as any[]) || []) {
+        if (s?.image_id) map[s.image_id] = key
+      }
+    }
+    auditTypeByImage.value = map
+  } catch (e) {
+    // 静默：接口未就绪/任务无审核结论时不影响标注
+  }
+}
+
 // 审核结果分类归集（双维度）：拉取并打开分类弹窗
 const openAuditClassify = async () => {
   if (!currentTask.value) return
@@ -3966,6 +4042,13 @@ const openAuditClassify = async () => {
   try {
     const res = await listAuditClassify(currentTask.value)
     auditClassifyData.value = res
+    const map: Record<string, string> = {}
+    for (const [key, arr] of Object.entries(res?.buckets_by_type || {})) {
+      for (const s of (arr as any[]) || []) {
+        if (s?.image_id) map[s.image_id] = key
+      }
+    }
+    auditTypeByImage.value = map
     if (!res?.audited_images) {
       showToast('该任务还没有批量审核结论，请先跑「批量审核」', 'info', 4000)
     }
@@ -4814,6 +4897,16 @@ onUnmounted(() => {
   color: #7f8c8d;
   background: rgba(127, 140, 141, 0.15);
 }
+
+/* 批量审核结论徽标：颜色按严重度（红=需改标签/删框，橙=漏标粘连，黄=不精准，紫=合规，绿=通过） */
+.img-badge.audit { font-size: 0.66rem; padding: 0.2rem 0.3rem; letter-spacing: -0.3px; }
+.img-badge.audit.at-label_error { color: #fff; background: #c0392b; }
+.img-badge.audit.at-missing     { color: #fff; background: #e67e22; }
+.img-badge.audit.at-merged      { color: #fff; background: #d35400; }
+.img-badge.audit.at-imprecise   { color: #7d5a00; background: #f5d76e; }
+.img-badge.audit.at-compliance  { color: #fff; background: #8e44ad; }
+.img-badge.audit.at-clean       { color: #1e8449; background: rgba(46, 204, 113, 0.18); }
+.filter-menu-item.audit-refresh { color: #2980b9; font-style: italic; }
 
 .sample-type-group {
   display: inline-flex;

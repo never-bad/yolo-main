@@ -139,33 +139,42 @@ class BatchTask:
 # 不使用 .format 而用 .replace，避免下方 JSON 示例里的花括号被误解析。
 DEFAULT_AUDIT_PROMPT = (
     "# Role\n"
-    "你是资深的工业视觉数据审核专家。请对当前图片及 AI 预标注的边界框进行严苛的二次审核。\n\n"
+    "你是资深的工业视觉数据审核专家，对当前图片及已标注框做**保守、克制**的二次审核。\n"
+    "核心原则：**只报告有充分把握的问题；不确定就判 keep。宁可漏报，不可错报。**\n\n"
     "# Context\n"
     "- 目标类别定义（含审核标准）：\n{labels_text}\n"
-    "- 预标注结果：{dets_text}\n"
+    "- 已有标注框：{dets_text}\n"
     "（JSON 格式：box_id 唯一标识每个框，{bbox_hint}，class_id 对应上面的类别序号）\n\n"
-    "# Audit Dimensions（审核维度）\n"
-    "请严格执行以下检查：\n"
-    "1. 语义准确性：框内物体是否与类别定义（desc）严格匹配？输出 keep / modify / reject。\n"
-    "2. 标签错误检测：框内物体是否被错误分类？若发现标签错误，输出 reject 并给出 suggested_class（建议的正确类别序号）。\n"
-    "3. 漏标排查：仔细扫描全图，是否还有符合类别定义的目标没有被框出来？输出到 missed_targets，{bbox_hint}。\n"
-    "4. 粘连框检测：是否有框内包含两个或多个独立目标？输出到 merged_boxes，action=split 或 reject。\n"
-    "5. 边界质量：框是否过大、过小或未贴合边缘？过大/过小输出 modify。\n"
-    "6. 业务合规：目标是否存在违规行为（如未戴安全帽、未穿反光衣）？在对应框的 tags 中加入 #compliance_issue。\n\n"
-    "# Output Format\n"
-    "仅返回标准 JSON，不要包含任何解释：\n"
+    "# 判定规则（严格遵守）\n"
+    "1. keep：框内物体与类别定义一致且框贴合 → action=keep。\n"
+    "2. modify：框过大/过小/未贴合边缘，但框内**确实是目标类别** → action=modify。\n"
+    "   **框质量问题一律用 modify，禁止用 reject。**\n"
+    "3. reject：**仅限**框内物体完全不是目标类别（例如类别是「摔倒」但框内是设备、动物、空白背景）。\n"
+    "   reason 必须写明「框内实际是什么」；理由说「符合定义/确实是该目标」时禁止判 reject。\n"
+    "4. 标签错误 label_errors：**仅当类别清单有 2 个及以上类别、且能给出确实不同的 suggested_class 时**才输出。\n"
+    "   类别清单只有一个类别时，label_errors 必须是空数组（不存在改成别的类的可能）。\n"
+    "5. 漏标 missed_targets：**只报告清晰可辨、完整可见、与已有框不重叠、且你能给出可靠 bbox 的目标**。\n"
+    "   禁止把已有框的一部分、遮挡残影、背景纹理、模糊人影、同一目标的重复部位当作漏标。\n"
+    "   没有把握就不报；每张图最多报 2 个。\n"
+    "6. 粘连 merged_boxes：仅在**一个框内确实包含两个及以上完整独立目标**时输出。\n"
+    "7. 业务合规 #compliance_issue：**仅当类别定义里明确要求检查合规/违规行为（如未戴安全帽、未穿反光衣）时**才添加。\n"
+    "   类别定义只是描述目标外观或姿态（如「人员摔倒」）时，**一律不要输出该标签**。\n\n"
+    "# 输出要求\n"
+    "- reason 必须写明判定依据（你看到了什么），并标注把握程度：高 / 中 / 低。\n"
+    "  reason 与 action 必须逻辑一致，不得自相矛盾。\n"
+    "- 仅返回标准 JSON，不要包含任何解释文字：\n"
     "{\n"
     "  \"missed_targets\": [\n"
-    "    {\"class_id\": 序号, \"bbox\": [x1, y1, x2, y2], \"reason\": \"漏标原因（限20字）\"}\n"
+    "    {\"class_id\": 序号, \"bbox\": [x1, y1, x2, y2], \"reason\": \"依据+把握（限30字）\"}\n"
     "  ],\n"
     "  \"merged_boxes\": [\n"
-    "    {\"box_id\": 1, \"action\": \"split | reject\", \"reason\": \"包含两个独立目标（限20字）\"}\n"
+    "    {\"box_id\": 1, \"action\": \"split | reject\", \"reason\": \"依据+把握（限30字）\"}\n"
     "  ],\n"
     "  \"label_errors\": [\n"
-    "    {\"box_id\": 3, \"suggested_class\": 正确类别序号, \"reason\": \"框内实际为XXX而非当前标签（限20字）\"}\n"
+    "    {\"box_id\": 3, \"suggested_class\": 正确类别序号, \"reason\": \"依据+把握（限30字）\"}\n"
     "  ],\n"
     "  \"box_reviews\": [\n"
-    "    {\"box_id\": 2, \"action\": \"keep | modify | reject\", \"reason\": \"审核理由（限20字）\", \"tags\": [\"#occluded\", \"#blur\"]}\n"
+    "    {\"box_id\": 2, \"action\": \"keep | modify | reject\", \"reason\": \"依据+把握（限30字）\", \"tags\": [\"#occluded\", \"#blur\"]}\n"
     "  ]\n"
     "}\n"
 )
@@ -2201,6 +2210,22 @@ class SAMService:
             return None
 
         ids = {d["box_id"] for d in audit_dets}
+        # 合规标签硬闸门：只有类别法典明确写了合规/违规判定要求时才允许
+        # #compliance_issue。像「人员摔倒」这种纯外观/姿态描述，模型无权
+        # 把「有人摔倒」当成违规贴标签（实测曾产生 21.7% 的噪音桶）。
+        desc_all = " ".join(
+            f"{l.get('chinese_name') or ''} {l.get('chinese_desc') or ''}"
+            for l in (labels or []) if isinstance(l, dict)
+        )
+        compliance_required = any(
+            k in desc_all for k in ("合规", "违规", "违章", "未戴", "未穿", "安全帽", "反光衣")
+        )
+        # 原框的真实类别，用于校验「建议类别」是否真的构成标签错误
+        orig_cls = {d["box_id"]: d.get("class_id") for d in audit_dets}
+        # 单类别数据集（如只有 fall）不存在「改成别的类」的可能，
+        # 此时模型输出的 label_errors 全是噪音（实测 41 张里大量理由为
+        # 「人员摔倒，符合定义」却被判 reject），整段跳过。
+        single_class = len(classes) <= 1
         box_reviews: List[dict] = []
         # ① box_reviews：逐框审核
         for r in (data.get("box_reviews") or []):
@@ -2210,16 +2235,23 @@ class SAMService:
                 continue
             if bid not in ids:
                 continue
+            tags = [str(t) for t in (r.get("tags") or []) if str(t).strip()]
+            if not compliance_required:
+                tags = [t for t in tags if not t.lower().startswith("#compliance")]
             box_reviews.append({
                 "box_id": bid,
                 "action": (str(r.get("action") or "keep").lower() if str(r.get("action") or "").strip() else "keep"),
                 "kind": "review",
                 "reason": (str(r.get("reason") or ""))[:50],
-                "tags": [str(t) for t in (r.get("tags") or []) if str(t).strip()],
+                "tags": tags,
                 "suggested_class_id": None,
             })
-        # ② label_errors：标签错误 → 补录/更新 reject + 建议类别
+        # ② label_errors：仅在「多类别 且 建议类别确实不同于原类别」时成立。
+        # 旧版无条件把该框改成 reject/label_error 且沿用 box_reviews 的 reason，
+        # 导致「理由：人员摔倒，符合定义 / 动作：删除」这种自相矛盾结论。
         for r in (data.get("label_errors") or []):
+            if single_class:
+                break
             try:
                 bid = int(r.get("box_id"))
             except (TypeError, ValueError):
@@ -2227,19 +2259,23 @@ class SAMService:
             if bid not in ids:
                 continue
             sug = cls_to_id(r.get("suggested_class"))
+            cur = orig_cls.get(bid)
+            # 建议类别无效、或与当前类别相同 → 不构成标签错误，丢弃该条
+            if sug is None or (cur is not None and sug == cur):
+                continue
+            reason = (str(r.get("reason") or ""))[:50]
             found = next((b for b in box_reviews if b["box_id"] == bid), None)
             if found is None:
                 box_reviews.append({
                     "box_id": bid, "action": "reject", "kind": "label_error",
-                    "reason": (str(r.get("reason") or ""))[:50], "tags": [],
-                    "suggested_class_id": sug,
+                    "reason": reason, "tags": [], "suggested_class_id": sug,
                 })
             else:
                 found["kind"] = "label_error"
                 found["action"] = "reject"
                 found["suggested_class_id"] = sug
-                if not found["reason"]:
-                    found["reason"] = (str(r.get("reason") or ""))[:50]
+                # 用 label_errors 自己的 reason 覆盖，避免与 reject 动作的语义冲突
+                found["reason"] = reason or found["reason"]
         # ③ merged_boxes：粘连框 → 补录/更新 split/reject
         for r in (data.get("merged_boxes") or []):
             try:
@@ -2278,6 +2314,20 @@ class SAMService:
                 "class_id": cid, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "reason": (str(mt.get("reason") or ""))[:50],
             })
+        # ⑤ 一致性兜底：理由明确表示「符合/正确」却判 reject 的自相矛盾结论，
+        # 降级为 keep 并打 #needs_review，避免模型一句话把正确的框判成删除。
+        # 只在肯定表述且不含否定词时触发（「非摔倒」「未摔倒」等合理 reject 不受影响）。
+        POSITIVE = ("符合定义", "符合", "确实", "正确", "无误", "属于该类别")
+        NEGATIVE = ("非", "不是", "未", "无", "不", "并非", "错误", "误标", "无关")
+        for b in box_reviews:
+            if b["action"] != "reject":
+                continue
+            reason = b.get("reason") or ""
+            if any(p in reason for p in POSITIVE) and not any(n in reason for n in NEGATIVE):
+                b["action"] = "keep"
+                b["kind"] = "review"
+                b["suggested_class_id"] = None
+                b["tags"] = list(dict.fromkeys((b.get("tags") or []) + ["#needs_review"]))
         stats = {"keep": 0, "modify": 0, "reject": 0, "split": 0, "missed": len(missed)}
         for b in box_reviews:
             stats[b["action"]] = stats.get(b["action"], 0) + 1
@@ -3217,6 +3267,10 @@ class SAMService:
                 except (FileNotFoundError, OSError):
                     ann = dict(existing or {})  # 兼容集中式 legacy 标注
                 ann_boxes = ann.get("boxes") or []
+                # 重跑前清掉该图所有框的旧审核结论：模型可能不再对某些框输出
+                # box_reviews，若不清会残留上一轮的假 label_error / 合规 tag。
+                ann_boxes = [{k: v for k, v in dict(b).items() if k != "audit"}
+                             for b in ann_boxes]
                 rmap = {r.get("box_id"): r for r in (audit.get("box_reviews") or [])}
                 for j, orig_i in enumerate(valid_idx):
                     r = rmap.get(j)
