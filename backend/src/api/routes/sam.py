@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 import traceback
 from src.services.sam_service import SAMService
+from src.services.dup_service import dup_service
 
 router = APIRouter(prefix="/sam", tags=["sam"])
 sam_service = SAMService()
@@ -296,3 +297,37 @@ async def audit_classify(task_id: str):
         raise HTTPException(404, str(e))
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+class DupScanRequest(BaseModel):
+    task_id: str
+    threshold: int = 6   # dHash Hamming 距离阈值，1~20；越小越严格（6 抓缩放/压缩级近重复）
+
+
+@router.post("/duplicates/scan/start")
+async def duplicates_scan_start(request: DupScanRequest):
+    """启动全库重复图扫描（M3：MD5 精确 + dHash 感知哈希，结论写回 audit_meta.duplicate）"""
+    try:
+        return await dup_service.start_scan(request.task_id, request.threshold)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.get("/duplicates/scan/status")
+async def duplicates_scan_status(batch_id: str):
+    """查询重复图扫描进度"""
+    result = dup_service.get_status(batch_id)
+    if not result:
+        raise HTTPException(404, "Dup scan task not found")
+    return result
+
+
+@router.post("/duplicates/scan/stop")
+async def duplicates_scan_stop(batch_id: str):
+    """取消重复图扫描"""
+    result = dup_service.stop_scan(batch_id)
+    if not result:
+        raise HTTPException(404, "Dup scan task not found")
+    return result

@@ -228,6 +228,11 @@
           <button class="ai-btn" @click="openAuditClassify" :disabled="!items.length" title="按问题类型 / 建议动作双维度列出需人工二审的图片">
             审核结果分类
           </button>
+          <!-- M3 重复图扫描：MD5+dHash 感知哈希全库查重，不调千问、纯 CPU 数十秒 -->
+          <button class="ai-btn batch-btn dup-scan-btn" @click="runDupScan" :disabled="dupScanRunning || !items.length" title="全库重复图检测（MD5 精确 + dHash 感知哈希）：找相同图/近重复图（缩放、压缩、调色），结论写回每图 JSON，审核筛选里出现「重复图片」分组。纯 CPU，1 万张约 1~2 分钟，不调千问">
+            <span v-if="dupScanRunning" class="loading-spinner"></span>
+            {{ dupScanRunning ? '重复图扫描中...' : '重复图扫描' }}
+          </button>
           <!-- 一级入口：选哪个 AI 模型（原来藏在 ⋯更多 → 标注模型设置，不好找） -->
           <button class="ai-btn model-btn" @click="openModelCfg"
             :title="'当前 AI 识别模型：' + detectorLabel + '\n点击可选择/切换模型（支持多个引擎同时检测）'">
@@ -303,6 +308,19 @@
               </span>
             </div>
             <button class="danger small" @click="stopAuditBatch" :disabled="!auditBatchRunning">停止</button>
+          </div>
+          <!-- M3 重复图扫描进度（独立于批量审核，走 /sam/duplicates/scan/* 端点） -->
+          <div v-if="dupScanId" class="batch-progress audit-batch-progress">
+            <span>重复图扫描: {{ dupScanProgress?.done || 0 }}/{{ dupScanProgress?.total || 0 }}（{{ dupPhaseLabel }}）</span>
+            <div class="progress-bar">
+              <div class="progress-fill" :style="{ width: dupScanPercent + '%' }"></div>
+            </div>
+            <div v-if="dupScanProgress?.status === 'done' && dupScanProgress?.result_summary" class="audit-batch-line">
+              重复组 {{ dupScanProgress.result_summary.groups }} 个 · 重复图 {{ dupScanProgress.result_summary.duplicate_images }} 张
+              <span v-if="dupScanProgress.result_summary.skipped_no_ann">（{{ dupScanProgress.result_summary.skipped_no_ann }} 张无标注未写回）</span>
+              <span v-if="dupScanProgress.result_summary.failed_images" class="a-reject">（{{ dupScanProgress.result_summary.failed_images }} 张坏图跳过）</span>
+            </div>
+            <button class="danger small" @click="stopDupScanTask" :disabled="!dupScanRunning">停止</button>
           </div>
         </div>
         <div class="canvas-container" @mousedown="startDrawing" @mousemove="drawing" @mouseup="endDrawing" @wheel="onWheel" @mouseleave="onCanvasLeave" @contextmenu="onCanvasContextMenu">
@@ -801,7 +819,7 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import type { BBox } from '@/api/annotations'
 import { createAnnotationTask, findAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotations, exportReviewedZip, clearAiAnnotations, clearAllAnnotations, cleanTaskOverlaps, importYoloLabels, deleteTaskImage } from '@/api/annotations'
-import { autoLabelImage, interactiveLabelImage, pointLabelImage, erasePolygonRegion, startBatchLabel, getBatchProgress, stopBatchLabel, auditBatchStart, listAuditClassify, getSamConfig, updateSamConfig, getSamModels, getSamTrainedVersions, auditImage, listAuditIssues } from '@/api/sam'
+import { autoLabelImage, interactiveLabelImage, pointLabelImage, erasePolygonRegion, startBatchLabel, getBatchProgress, stopBatchLabel, auditBatchStart, listAuditClassify, dupScanStart, getDupScanStatus, stopDupScan, getSamConfig, updateSamConfig, getSamModels, getSamTrainedVersions, auditImage, listAuditIssues } from '@/api/sam'
 import { listDatasets, approveDatasetReview } from '@/api/datasets'
 import { showConfirm, showPrompt, showAlert } from '@/composables/useDialog'
 import { downloadFile } from '@/utils/download'
@@ -1659,6 +1677,20 @@ const auditBatchPercent = computed(() => {
   return Math.round((auditBatchProgress.value.done / auditBatchProgress.value.total) * 100)
 })
 
+// ===== M3 重复图扫描（MD5+dHash 感知哈希，独立于千问批量审核）=====
+const dupScanId = ref<string | null>(null)
+const dupScanProgress = ref<any>(null)
+const dupScanTimer = ref<any>(null)
+const dupScanRunning = computed(() =>
+  !!dupScanProgress.value && ['running', 'pending'].includes(dupScanProgress.value.status)
+)
+const dupScanPercent = computed(() => {
+  if (!dupScanProgress.value || !dupScanProgress.value.total) return 0
+  return Math.round((dupScanProgress.value.done / dupScanProgress.value.total) * 100)
+})
+const DUP_PHASE_LABELS: Record<string, string> = { hash: '算哈希', cluster: '聚类', writeback: '写回' }
+const dupPhaseLabel = computed(() => DUP_PHASE_LABELS[dupScanProgress.value?.phase] || '进行中')
+
 // 审核分类归集（双维度：问题类型 / 建议动作）
 const auditClassifyData = ref<any>(null)
 const auditClassifyOpen = ref(false)
@@ -1666,12 +1698,12 @@ const auditClassifyTab = ref<'type' | 'action'>('type')
 // 图片列表联动：image_id → 该图的 primary_type（只归最严重一类），用于徽标 + 筛选
 const auditTypeByImage = ref<Record<string, string>>({})
 const AUDIT_TYPE_SHORT: Record<string, string> = {
-  label_error: '标错', missing: '漏标', merged: '粘连',
-  imprecise: '不精准', compliance: '合规', clean: '通过'
+  label_error: '标错', missing: '漏标', duplicate: '重复',
+  merged: '粘连', imprecise: '不精准', compliance: '合规', clean: '通过'
 }
 const AUDIT_TYPE_LABELS: Record<string, string> = {
-  label_error: '标签错误', missing: '漏标', merged: '粘连',
-  imprecise: '框不精准', compliance: '合规风险', clean: '无问题'
+  label_error: '标签错误', missing: '漏标', duplicate: '重复图片',
+  merged: '粘连', imprecise: '框不精准', compliance: '合规风险', clean: '无问题'
 }
 const AUDIT_ACTION_LABELS: Record<string, string> = {
   relabel: '建议重标', delete: '建议删除', split: '建议拆分',
@@ -1706,10 +1738,11 @@ const classifyItemTip = (s: any) => {
 
 // ===== 图片列表分类过滤（级联下拉菜单） =====
 // poly_* 三档按"轮廓质量"分：修过（人工复核）/ 待修（AI 歪稿）/ 还没轮廓，方便挑图精修
-// 审核结果 6 类筛选：按最严重一类归集，与后端 classify 的 buckets_by_type 同源
-type AuditFilterKey = 'audit_label_error' | 'audit_missing' | 'audit_merged' | 'audit_imprecise' | 'audit_compliance' | 'audit_clean'
+// 审核结果 7 类筛选：按最严重一类归集，与后端 classify 的 buckets_by_type 同源
+// （duplicate 由 M3 重复图扫描写入 audit_meta.duplicate，与批量审核共用这套筛选）
+type AuditFilterKey = 'audit_label_error' | 'audit_missing' | 'audit_duplicate' | 'audit_merged' | 'audit_imprecise' | 'audit_compliance' | 'audit_clean'
 type FilterKey = 'all' | 'annotated' | 'ai' | 'manual' | 'unannotated' | 'poly_refined' | 'poly_draft' | 'poly_none' | AuditFilterKey
-const AUDIT_FILTER_KEYS: AuditFilterKey[] = ['audit_label_error', 'audit_missing', 'audit_merged', 'audit_imprecise', 'audit_compliance', 'audit_clean']
+const AUDIT_FILTER_KEYS: AuditFilterKey[] = ['audit_label_error', 'audit_missing', 'audit_duplicate', 'audit_merged', 'audit_imprecise', 'audit_compliance', 'audit_clean']
 const auditTypeOfFilter = (k: AuditFilterKey) => k.slice(6)  // 去掉 'audit_' 前缀
 const imageFilter = ref<FilterKey>('all')
 const filterOpen = ref(false)
@@ -1745,6 +1778,7 @@ const filterLabels: Record<string, string> = {
   poly_none: '轮廓·还没有',
   audit_label_error: '审核·标签错误',
   audit_missing: '审核·漏标',
+  audit_duplicate: '审核·重复图片',
   audit_merged: '审核·粘连',
   audit_imprecise: '审核·框不精准',
   audit_compliance: '审核·合规风险',
@@ -1989,6 +2023,7 @@ const saveAnnotateState = () => {
       index: currentIndex.value,
       batchId: batchId.value,  // 恢复批量预标注轮询
       auditBatchId: auditBatchId.value,  // 恢复批量审核轮询
+      dupScanId: dupScanId.value,  // 恢复重复图扫描轮询
     }))
   } catch (e) {
     console.error('保存标注状态失败:', e)
@@ -2085,6 +2120,12 @@ const restoreAnnotateState = async () => {
     auditBatchId.value = saved.auditBatchId
     auditBatchProgress.value = { status: 'running', total: 1, done: 0, current_image: '' }
     pollAuditBatch()
+  }
+  // 恢复重复图扫描轮询（dup_ 前缀的独立 batch_id，走 /sam/duplicates/scan/*）
+  if (saved.dupScanId) {
+    dupScanId.value = saved.dupScanId
+    dupScanProgress.value = { status: 'running', total: 1, done: 0, phase: 'hash' }
+    pollDupScan()
   }
   currentTask.value = saved.taskId
   if (!currentTask.value) return
@@ -4016,6 +4057,93 @@ const stopAuditBatch = async () => {
   }
 }
 
+// ===== M3 重复图扫描：MD5 精确 + dHash 感知哈希全库查重（不调千问，纯 CPU）=====
+const runDupScan = async () => {
+  if (!currentTask.value) return
+  if (!(await showConfirm(
+    `确认对 ${items.value.length} 张图片执行重复图扫描？\n` +
+    '· MD5 精确 + dHash 感知哈希：找相同图与近重复图（缩放/压缩/轻微调色）\n' +
+    '· 结论写回每图 JSON（audit_meta.duplicate），审核筛选出现「重复图片」分组\n' +
+    '· 纯 CPU 不调千问，1 万张约 1~2 分钟，可中途停止'
+  ))) return
+  try {
+    const result = await dupScanStart(currentTask.value, 6)
+    dupScanId.value = result.batch_id
+    dupScanProgress.value = { status: 'running', total: result.total, done: 0, phase: 'hash' }
+    pollDupScan()
+  } catch (e: any) {
+    if (!e?.__toastShown) showToast('启动重复图扫描失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
+  }
+}
+
+const pollDupScan = async () => {
+  if (!dupScanId.value) return
+  let res: any
+  try {
+    res = await getDupScanStatus(dupScanId.value)
+  } catch (e: any) {
+    if (e?.response?.status === 404) {
+      // 任务在后端已不存在（重启丢内存态）：已写回的结论不丢，提示后收尾
+      dupScanId.value = null
+      dupScanProgress.value = null
+      saveAnnotateState()
+      showToast('重复图扫描任务已中断（可能因后端重启），已写回的结论已保存。', 'info', 4000)
+      refreshAuditClassify()
+      return
+    }
+    dupScanTimer.value = setTimeout(pollDupScan, 2000)
+    return
+  }
+  if (!res) {
+    dupScanTimer.value = setTimeout(pollDupScan, 2000)
+    return
+  }
+  dupScanProgress.value = res
+  if (res.status === 'done') {
+    dupScanId.value = null
+    saveAnnotateState()
+    const s = res.result_summary || {}
+    let msg = `重复图扫描完成：${s.groups || 0} 个重复组 / ${s.duplicate_images || 0} 张重复图`
+    if (s.skipped_no_ann) msg += `（${s.skipped_no_ann} 张无标注未写回）`
+    if (s.failed_images) msg += `（${s.failed_images} 张坏图跳过）`
+    showToast(msg, 'info', 6000)
+    refreshAuditClassify()  // 刷新筛选计数，「审核·重复图片」分组出现
+  } else if (res.status === 'cancelled') {
+    dupScanId.value = null
+    saveAnnotateState()
+    showToast('重复图扫描已取消，已完成部分的结论已保存', 'info', 4000)
+    refreshAuditClassify()
+  } else if (res.status === 'error') {
+    dupScanId.value = null
+    saveAnnotateState()
+    showToast('重复图扫描出错: ' + (res.error || '未知错误'), 'error', 4000)
+  } else {
+    saveAnnotateState()
+    dupScanTimer.value = setTimeout(pollDupScan, 1500)
+  }
+}
+
+const stopDupScanTask = async () => {
+  if (!dupScanId.value) return
+  try {
+    await stopDupScan(dupScanId.value)
+    dupScanId.value = null
+    dupScanProgress.value = null
+    saveAnnotateState()
+    showToast('重复图扫描已取消，已完成部分的结论已保存', 'info', 4000)
+    refreshAuditClassify()
+  } catch (e: any) {
+    if (e.response?.status === 404) {
+      dupScanId.value = null
+      dupScanProgress.value = null
+      saveAnnotateState()
+      showToast('重复图扫描任务已不存在（可能已重启）', 'info', 4000)
+      return
+    }
+    if (!e?.__toastShown) showToast('停止失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
+  }
+}
+
 // 静默拉取审核分类并构建 image_id → primary_type 映射（供图片列表徽标/筛选使用）。
 // 异步、失败静默：分类接口要扫描上万张标注，不能阻塞标注页主流程。
 const refreshAuditClassify = async () => {
@@ -4071,6 +4199,9 @@ onUnmounted(() => {
   }
   if (auditBatchTimer.value) {
     clearTimeout(auditBatchTimer.value)
+  }
+  if (dupScanTimer.value) {
+    clearTimeout(dupScanTimer.value)
   }
 })
 

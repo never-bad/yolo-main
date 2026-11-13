@@ -3360,17 +3360,19 @@ class SAMService:
         """扫描任务全部图片的审核结论，按问题类型 / 建议动作双维度分类归集。
 
         复用每图 JSON 的 box.audit（action/kind/tags/suggested_class_id）与图级
-        audit_meta.missed_targets。每图只归入「最严重一个类型 / 一个动作」桶（不重叠），
-        但返回明细 details 列出该图全部问题，便于点开复核。严重度：
-        标签错误/漏标(高) > 粘连/框不精准(中) > 合规(中) > 无问题。
+        audit_meta.missed_targets / audit_meta.duplicate。每图只归入「最严重一个类型 /
+        一个动作」桶（不重叠），但返回明细 details 列出该图全部问题，便于点开复核。
+        严重度：标签错误/漏标(高) > 重复图片(高，整图该删) > 粘连/框不精准(中) > 合规(中) > 无问题。
+        duplicate 由 dup_service（M3 重复图扫描）写入，与千问审核相互独立：
+        只被查重扫过、没被 L2 审过的图也会单独归入 duplicate 桶。
         """
         task_meta = await self._load_task_meta(task_id)
         if not task_meta:
             raise ValueError("Task not found")
         dataset_id, version = self.annotation_service._task_to_ds(task_meta)
         items = task_meta.get("items", [])
-        SEV_TYPE = {"label_error": 0, "missing": 1, "merged": 2, "imprecise": 3,
-                    "compliance": 4, "clean": 5}
+        SEV_TYPE = {"label_error": 0, "missing": 1, "duplicate": 2, "merged": 3,
+                    "imprecise": 4, "compliance": 5, "clean": 6}
         SEV_ACTION = {"relabel": 0, "delete": 1, "split": 2, "add": 2,
                       "adjust": 3, "review_only": 5}
 
@@ -3435,7 +3437,23 @@ class SAMService:
                             "bbox": [m.get("x1"), m.get("y1"), m.get("x2"), m.get("y2")],
                             "reason": m.get("reason"),
                         })
-                if has_audit or missed:
+                # M3 重复图：dup_service 写在图级 audit_meta.duplicate，与框级审核独立
+                dup = meta.get("duplicate") or {}
+                dup_in_img = bool(dup and (dup.get("group_size") or 0) >= 2)
+                if dup_in_img:
+                    types_in_img.add("duplicate")
+                    actions_in_img.add("review_only")
+                    for s in (dup.get("similar") or []):
+                        details.append({
+                            "type": "duplicate", "action": "review_only",
+                            "group_id": dup.get("group_id"),
+                            "similar_image_id": s.get("image_id"),
+                            "distance": s.get("distance"),
+                            "exact": s.get("exact"),
+                            "reason": "与图片 %s 互为重复组（组内 %s 张）" % (
+                                s.get("image_id"), dup.get("group_size")),
+                        })
+                if has_audit or missed or dup_in_img:
                     audited += 1
                 if not types_in_img:
                     # 有审核标记但全 keep 无漏标无 tag → 无问题；完全没审过则跳过不计

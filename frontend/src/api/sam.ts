@@ -145,3 +145,23 @@ export const listAuditClassify = async (taskId: string) => {
   const { data } = await api.get('/sam/audit/classify', { params: { task_id: taskId } })
   return data
 }
+
+// M3 重复图检测：MD5 精确 + dHash 感知哈希全库查重，结论写回 audit_meta.duplicate
+// 分类接口会归入 duplicate 桶，筛选下拉自动出现「审核·重复图片」分组
+export const dupScanStart = async (taskId: string, threshold = 6) => {
+  const { data } = await api.post('/sam/duplicates/scan/start', {
+    task_id: taskId,
+    threshold
+  })
+  return data
+}
+
+export const getDupScanStatus = async (batchId: string) => {
+  const { data } = await api.get('/sam/duplicates/scan/status', { params: { batch_id: batchId } })
+  return data
+}
+
+export const stopDupScan = async (batchId: string) => {
+  const { data } = await api.post('/sam/duplicates/scan/stop', null, { params: { batch_id: batchId } })
+  return data
+}
