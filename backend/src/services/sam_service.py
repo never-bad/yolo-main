@@ -3206,37 +3206,36 @@ class SAMService:
                 bt.audit_boxes += len(valid_idx)
                 for k in ("keep", "modify", "reject", "split", "missed"):
                     bt.audit_summary[k] = bt.audit_summary.get(k, 0) + (st.get(k) or 0)
-                # 审核结论按 box_id(=有效框序号 j) 映射回原 boxes 下标 orig_i，
-                # 保证被过滤掉的无效框仍原样保留、且不错位。
+                # 审核结论只注入 audit 字段，绝不改写框坐标，也不重新规范化标注。
+                # 直接对每图 JSON 做一次原子写（与单图审核 audit_image 落盘范式一致），
+                # 绕开 save_annotation 的 P1-1 边界校验：历史标注里存在 x1=-0.02
+                # 这类浮点级越界框，走 save_annotation 会被整图拒绝，导致审核结论
+                # 写不回并计入 failed_images（审核本身其实成功了）。
+                ann_path = settings.DATASETS_DIR / ds_id / "annotations" / f"{image_id}.json"
+                try:
+                    ann = load_json(ann_path) or {}
+                except (FileNotFoundError, OSError):
+                    ann = dict(existing or {})  # 兼容集中式 legacy 标注
+                ann_boxes = ann.get("boxes") or []
                 rmap = {r.get("box_id"): r for r in (audit.get("box_reviews") or [])}
-                saved = [dict(b) for b in boxes]
                 for j, orig_i in enumerate(valid_idx):
                     r = rmap.get(j)
-                    if r:
-                        saved[orig_i]["audit"] = {k: r.get(k) for k in
-                                                  ("action", "kind", "reason", "tags", "suggested_class_id")
-                                                  if r.get(k) is not None}
-                # box 级 audit 经 save_annotation 落盘（保留现有字段 + 边界检查 + shadow）
-                await self.annotation_service.save_annotation(
-                    bt.task_id, image_id, saved,
-                    ai_annotated=(existing or {}).get("ai_annotated", False),
-                )
-                # 图级 audit_meta（漏标建议框 + 统计 + 时间 + 模型），save_annotation 不处理顶层字段，单独原子写
-                meta = {
+                    if r and orig_i < len(ann_boxes):
+                        nb = dict(ann_boxes[orig_i])
+                        nb["audit"] = {k: r.get(k) for k in
+                                       ("action", "kind", "reason", "tags", "suggested_class_id")
+                                       if r.get(k) is not None}
+                        ann_boxes[orig_i] = nb
+                ann["boxes"] = ann_boxes
+                ann["audit_meta"] = {
                     "missed_targets": audit.get("missed_targets") or [],
                     "stats": st,
                     "audited_at": datetime.now().isoformat(),
                     "model": cfg.get("qwen_model"),
                     "schema": 1,
                 }
-                try:
-                    ann_path = settings.DATASETS_DIR / ds_id / "annotations" / f"{image_id}.json"
-                    if ann_path.exists():
-                        ann = load_json(ann_path) or {}
-                        ann["audit_meta"] = meta
-                        save_json_atomic(ann_path, ann)
-                except Exception as e:
-                    print(f"批量审核写 audit_meta 失败 {image_id}: {e}")
+                # 审核写回不动框坐标、可重复生成，无需 .bak（1 万张图避免成倍备份文件）
+                save_json_atomic(ann_path, ann, backup=False)
                 bt.done += 1
             except Exception as e:
                 print(f"批量审核跳过图片 {image_id}: {e}")

@@ -3325,8 +3325,10 @@ const openModelCfg = async () => {
     modelCfg.value.iou = typeof cfg.iou === 'number' ? cfg.iou : 0.4
     // 分割形态两个开关直接读自 samConfig（与工具条同源），弹窗里改勾选即时反映到工具条
     samConfig.value = cfg
-    // 千问是否启用 = 上方「检测引擎」里有没有勾千问 VL（原本还要再勾一次开关，容易漏）
-    modelCfg.value.qwen_enabled = dets.includes('qwen_vl')
+    // 千问是否启用：保留后端现值（可能由接口/批量审核链路开启），或引擎里勾了千问 VL。
+    // 不能只按 detectors 推导——否则用户在弹窗点保存会把 curl 写入的 qwen_enabled:true
+    // 冲成 false，导致批量审核直接报「千问未启用」。
+    modelCfg.value.qwen_enabled = !!cfg.qwen_enabled || dets.includes('qwen_vl')
     modelCfg.value.qwen_backend = cfg.qwen_backend || 'ollama'
     modelCfg.value.qwen_endpoint = cfg.qwen_endpoint || 'http://localhost:11434'
     modelCfg.value.qwen_model = cfg.qwen_model || 'qwen3-vl:4b-instruct'
@@ -3352,6 +3354,26 @@ const closeModelCfg = async () => {
   try { samConfig.value = await getSamConfig() } catch { /* 回读失败不影响关闭 */ }
 }
 
+// 数字输入框清空会得到 ''，直接 POST 会被 Pydantic 判 422。
+// 统一转 Number；空串/null/NaN 回退默认值，保证配置接口永远收到合法数字。
+const numOr = (v: any, fallback: number): number => {
+  if (v === '' || v === null || v === undefined) return fallback
+  const n = Number(v)
+  return Number.isFinite(n) ? n : fallback
+}
+// 把 FastAPI 422 的 detail 数组转成可读文本（旧版直接拼对象 → [object Object]）
+const errText = (e: any): string => {
+  const d = e?.response?.data?.detail
+  if (Array.isArray(d)) {
+    return d.map((x: any) => {
+      const loc = Array.isArray(x?.loc) ? x.loc.slice(1).join('.') : ''
+      return `${loc ? loc + ': ' : ''}${x?.msg || JSON.stringify(x)}`
+    }).join('；')
+  }
+  if (d && typeof d === 'object') return JSON.stringify(d)
+  return String(d || e?.message || '未知错误')
+}
+
 const saveModelCfg = async () => {
   try {
     if (!modelCfg.value.detectors.length) {
@@ -3368,23 +3390,26 @@ const saveModelCfg = async () => {
       detector: modelCfg.value.detectors[0],   // 兼容旧字段（批量兜底重试等仍引用）
       detector_weights: modelCfg.value.detector_weights,
       trained_model_id: modelCfg.value.trained_model_id || '',
-      conf: modelCfg.value.conf,
-      iou: modelCfg.value.iou,
+      // 数字输入框被清空会得到 ''，Pydantic 无法把 '' 转 int/float → 422。
+      // 统一 Number() 强转 + 空值/NaN 回退默认，避免弹窗保存报 [object Object]。
+      conf: numOr(modelCfg.value.conf, 0.25),
+      iou: numOr(modelCfg.value.iou, 0.4),
       // 分割轮廓开关：单图 AI 与批量各一个（关掉即只出方框，不跑 SAM 所以更快）
       // 取自 samConfig（与工具条同一份数据），不会把工具条刚切好的形态覆盖回去
       sam_enabled: samEnabledModel.value,
       batch_sam_enabled: batchSamModel.value,
-      // 勾了引擎即启用千问，未勾引擎自然关闭（与弹窗里显示的勾选框一致）
-      qwen_enabled: modelCfg.value.detectors.includes('qwen_vl'),
+      // 保留后端现值 OR 引擎勾选：批量 L2 审核依赖 qwen_enabled，但不要求
+      // 把千问挂成检测引擎，故不能因「没勾 qwen_vl」就把开关关掉。
+      qwen_enabled: !!modelCfg.value.qwen_enabled || modelCfg.value.detectors.includes('qwen_vl'),
       qwen_backend: modelCfg.value.qwen_backend,
       qwen_endpoint: modelCfg.value.qwen_endpoint,
       qwen_model: modelCfg.value.qwen_model,
       qwen_api_key: modelCfg.value.qwen_api_key,
-      qwen_timeout: modelCfg.value.qwen_timeout,
+      qwen_timeout: numOr(modelCfg.value.qwen_timeout, 90),
       qwen_mock: !!modelCfg.value.qwen_mock,
       qwen_keep_alive: modelCfg.value.qwen_keep_alive,
-      qwen_num_parallel: modelCfg.value.qwen_num_parallel,
-      qwen_image_max_side: modelCfg.value.qwen_image_max_side,
+      qwen_num_parallel: numOr(modelCfg.value.qwen_num_parallel, 1),
+      qwen_image_max_side: numOr(modelCfg.value.qwen_image_max_side, 1024),
       qwen_verify_enabled: !!modelCfg.value.qwen_verify_enabled,
       qwen_audit_enabled: !!modelCfg.value.qwen_audit_enabled,
       qwen_audit_batch: !!modelCfg.value.qwen_audit_batch,
@@ -3397,7 +3422,7 @@ const saveModelCfg = async () => {
     showModelCfg.value = false
     showToast('AI 标注模型配置已保存并生效', 'success')
   } catch (e: any) {
-    if (!e?.__toastShown) showToast('保存 AI 标注配置失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
+    if (!e?.__toastShown) showToast('保存 AI 标注配置失败: ' + errText(e), 'error', 5000)
   }
 }
 
