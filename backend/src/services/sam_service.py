@@ -2297,6 +2297,30 @@ class SAMService:
                 if act in ("split", "reject"):
                     found["action"] = act
         # ④ missed_targets：漏标补框
+        # 实测发现模型经常把「已经框好的目标」再当成漏标报一遍：40 条抽样里
+        # 50% 与已有框 IoU=1.00，理由还写着「框内人员躺地，符合摔倒定义」。
+        # 两道闸门：与已有框高度重叠 → 丢弃；理由自相矛盾/在描述已框内容 → 丢弃。
+        def _iou(a, b):
+            ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+            ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+            if ix2 <= ix1 or iy2 <= iy1:
+                return 0.0
+            inter = (ix2 - ix1) * (iy2 - iy1)
+            union = ((a[2] - a[0]) * (a[3] - a[1])
+                     + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+            return inter / union if union > 0 else 0.0
+
+        existing_bboxes = []
+        for d in audit_dets:
+            e = d.get("bbox")
+            if isinstance(e, (list, tuple)) and len(e) == 4:
+                try:
+                    existing_bboxes.append([float(v) for v in e])
+                except (TypeError, ValueError):
+                    pass
+        # 这些措辞说明模型在描述「不是目标」或「框内已框住的内容」，不是漏标
+        MISSED_NEG = ("非摔倒", "未摔倒", "不是摔倒", "并非摔倒", "与类别不符",
+                      "站立", "弯腰", "坐姿", "坐着", "无目标")
         missed = []
         for mt in (data.get("missed_targets") or []):
             cid = cls_to_id(mt.get("class_id") if "class_id" in mt else mt.get("class"))
@@ -2307,12 +2331,21 @@ class SAMService:
                 x1, y1, x2, y2 = (float(v) for v in bb)
             except (TypeError, ValueError):
                 continue
+            reason_m = (str(mt.get("reason") or ""))[:50]
+            # 闸门1：与任一已有框 IoU>=0.5 → 就是同一个目标，不算漏标
+            cand = [x1, y1, x2, y2]
+            if any(_iou(cand, e) >= 0.5 for e in existing_bboxes):
+                continue
+            # 闸门2：理由自相矛盾，或在描述已有框里的内容
+            if (any(n in reason_m for n in MISSED_NEG)
+                    or reason_m.lstrip().startswith("框内")):
+                continue
             # 模型空间坐标 → 原图像素（与送审框的换算互逆；含 0~1000 归一化 / 缩放像素两种约定）
             if img_abs is not None:
                 x1, y1, x2, y2 = self._qwen_model_to_orig((x1, y1, x2, y2), img_abs, cfg or {})
             missed.append({
                 "class_id": cid, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                "reason": (str(mt.get("reason") or ""))[:50],
+                "reason": reason_m,
             })
         # ⑤ 一致性兜底：理由明确表示「符合/正确」却判 reject 的自相矛盾结论，
         # 降级为 keep 并打 #needs_review，避免模型一句话把正确的框判成删除。
