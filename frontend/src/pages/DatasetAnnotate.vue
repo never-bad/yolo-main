@@ -195,6 +195,15 @@
             <span v-if="batchRunning" class="loading-spinner"></span>
             {{ batchRunning ? '批量预标注中...' : '批量预标注' }}
           </button>
+          <!-- 批量 L2 审核：只审已有标注框，不改框本身，结论写回每图 JSON 供人工二审 -->
+          <button class="ai-btn batch-btn audit-batch-btn" @click="runAuditBatch" :disabled="auditBatchRunning || !items.length" title="对任务内全部已标注图片并发跑千问 L2 语义二审（漏标/粘连/标签错误/框质量/合规），结论写回每图 JSON 供人工二审">
+            <span v-if="auditBatchRunning" class="loading-spinner"></span>
+            {{ auditBatchRunning ? '批量审核中...' : '批量审核' }}
+          </button>
+          <!-- 审核结果分类：按问题类型 / 建议动作双维度列出需人工二审的图片 -->
+          <button class="ai-btn" @click="openAuditClassify" :disabled="!items.length" title="按问题类型 / 建议动作双维度列出需人工二审的图片">
+            审核结果分类
+          </button>
           <!-- 一级入口：选哪个 AI 模型（原来藏在 ⋯更多 → 标注模型设置，不好找） -->
           <button class="ai-btn model-btn" @click="openModelCfg"
             :title="'当前 AI 识别模型：' + detectorLabel + '\n点击可选择/切换模型（支持多个引擎同时检测）'">
@@ -247,6 +256,26 @@
               <span v-if="batchProgress.audit.errors" class="a-reject">({{ batchProgress.audit.errors }} 次失败)</span>
             </div>
             <button class="danger small" @click="stopBatch" :disabled="!batchRunning">停止</button>
+          </div>
+          <!-- 批量 L2 审核进度（与预标注进度独立，共用 /sam/batch/{id} 端点） -->
+          <div v-if="auditBatchId" class="batch-progress audit-batch-progress">
+            <span>批量审核: {{ auditBatchProgress?.done || 0 }}/{{ auditBatchProgress?.total || 0 }}</span>
+            <div class="progress-bar">
+              <div class="progress-fill" :style="{ width: auditBatchPercent + '%' }"></div>
+            </div>
+            <div v-if="auditBatchProgress?.audit" class="audit-batch-line">
+              已审 {{ auditBatchProgress.audit.checked }} 图/{{ auditBatchProgress.audit.boxes }} 框
+              · <span class="a-keep">✓{{ auditBatchProgress.audit.stats.keep }}</span>
+              <span class="a-modify">~{{ auditBatchProgress.audit.stats.modify }}</span>
+              <span class="a-reject">✗{{ auditBatchProgress.audit.stats.reject }}</span>
+              <span class="a-split">⧉{{ auditBatchProgress.audit.stats.split }}</span>
+              <span class="a-missed">漏{{ auditBatchProgress.audit.stats.missed }}</span>
+              <span v-if="auditBatchProgress.audit.errors" class="a-reject">({{ auditBatchProgress.audit.errors }} 次失败)</span>
+            </div>
+            <div v-if="auditBatchProgress?.failed_images" class="audit-batch-line">
+              <span class="a-reject">⚠ {{ auditBatchProgress.failed_images }} 张跳过（读取/写入失败）</span>
+            </div>
+            <button class="danger small" @click="stopAuditBatch" :disabled="!auditBatchRunning">停止</button>
           </div>
         </div>
         <div class="canvas-container" @mousedown="startDrawing" @mousemove="drawing" @mouseup="endDrawing" @wheel="onWheel" @mouseleave="onCanvasLeave" @contextmenu="onCanvasContextMenu">
@@ -420,6 +449,41 @@
                 </span>
               </li>
             </ul>
+          </div>
+        </div>
+        <!-- 批量审核分类归集：双维度（问题类型 / 建议动作）列出需人工二审的图片 -->
+        <div v-if="auditClassifyOpen" class="issue-mask" @click.self="auditClassifyOpen = false">
+          <div class="issue-dialog classify-dialog">
+            <div class="issue-dialog-head">
+              <strong>审核结果分类</strong>
+              <span class="issue-hint">
+                共 {{ auditClassifyData?.total_images || 0 }} 张 · 已审 {{ auditClassifyData?.audited_images || 0 }} 张
+              </span>
+              <div class="seg-tabs">
+                <button class="seg-btn" :class="{ active: auditClassifyTab === 'type' }" @click="auditClassifyTab = 'type'">按问题类型</button>
+                <button class="seg-btn" :class="{ active: auditClassifyTab === 'action' }" @click="auditClassifyTab = 'action'">按建议动作</button>
+              </div>
+              <button class="small" @click="openAuditClassify" :disabled="!currentTask">刷新</button>
+              <button class="small" @click="auditClassifyOpen = false">关闭</button>
+            </div>
+            <div v-if="!auditClassifyData?.audited_images" class="issue-empty">该任务还没有批量审核结论，请先跑「批量审核」。</div>
+            <div v-else class="classify-body">
+              <div v-for="b in classifyBucketsArr" :key="b.key" class="classify-group">
+                <div class="classify-group-head" :class="'cg-' + b.key">
+                  <span class="cg-label">{{ b.label }}</span>
+                  <span class="cg-count">{{ b.items.length }}</span>
+                </div>
+                <ul class="classify-list">
+                  <li v-for="s in b.items" :key="s.image_id" @click="gotoClassifyImage(s.image_id)" :title="classifyItemTip(s)">
+                    <span class="issue-img">{{ s.image_id }}</span>
+                    <span class="classify-meta">
+                      <span class="cg-tag">{{ AUDIT_TYPE_LABELS[s.primary_type] }}</span>
+                      <span class="cg-tag cg-action">{{ AUDIT_ACTION_LABELS[s.primary_action] }}</span>
+                    </span>
+                  </li>
+                </ul>
+              </div>
+            </div>
           </div>
         </div>
         <div class="box-list">
@@ -626,6 +690,12 @@
           <input type="checkbox" v-model="modelCfg.qwen_mock" />
           <span>模拟框模式（本地联调，不调用真实模型）</span>
         </label>
+        <div class="row" style="flex-direction:column;align-items:stretch;gap:4px;margin-top:8px">
+          <span>千问 L2 审核提示词模板 <em class="dim">（留空用内置默认；可用占位符 {labels_text} 类别定义、{dets_text} 预标注框JSON、{bbox_hint} 坐标说明）</em></span>
+          <textarea v-model="modelCfg.qwen_audit_prompt_template" rows="9" class="w-input"
+            style="font-family:monospace;font-size:12px;white-space:pre;resize:vertical"
+            placeholder="留空使用内置审核提示词（6 维度：语义/标签错误/漏标/粘连/边界/合规）"></textarea>
+        </div>
         <!-- 速度开关：实测 qwen3-vl:4b 上"检测"约 0.45s、"L2 审核"约 1.35s，
              审核比检测还贵，所以单独给开关；批量里审核只进统计，默认不做。 -->
         <span class="cfg-title" style="display:block;margin-top:10px">准确性</span>
@@ -704,7 +774,7 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import type { BBox } from '@/api/annotations'
 import { createAnnotationTask, findAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotations, exportReviewedZip, clearAiAnnotations, clearAllAnnotations, cleanTaskOverlaps, importYoloLabels, deleteTaskImage } from '@/api/annotations'
-import { autoLabelImage, interactiveLabelImage, pointLabelImage, erasePolygonRegion, startBatchLabel, getBatchProgress, stopBatchLabel, getSamConfig, updateSamConfig, getSamModels, getSamTrainedVersions, auditImage, listAuditIssues } from '@/api/sam'
+import { autoLabelImage, interactiveLabelImage, pointLabelImage, erasePolygonRegion, startBatchLabel, getBatchProgress, stopBatchLabel, auditBatchStart, listAuditClassify, getSamConfig, updateSamConfig, getSamModels, getSamTrainedVersions, auditImage, listAuditIssues } from '@/api/sam'
 import { listDatasets, approveDatasetReview } from '@/api/datasets'
 import { showConfirm, showPrompt, showAlert } from '@/composables/useDialog'
 import { downloadFile } from '@/utils/download'
@@ -757,6 +827,7 @@ const modelCfg = ref<any>({
   qwen_verify_enabled: true,
   qwen_audit_enabled: true,
   qwen_audit_batch: false,
+  qwen_audit_prompt_template: '',
 })
 // 自动保存（防抖）
 const autoSaveTimer = ref<any>(null)
@@ -1549,6 +1620,57 @@ const batchPercent = computed(() => {
   return Math.round((batchProgress.value.done / batchProgress.value.total) * 100)
 })
 
+// ===== 批量 L2 审核（审已有标注，结论写回每图 JSON，双维度分类供人工二审）=====
+const auditBatchId = ref<string | null>(null)
+const auditBatchProgress = ref<any>(null)
+const auditBatchTimer = ref<any>(null)
+const auditBatchRunning = computed(() =>
+  !!auditBatchProgress.value && ['running', 'pending'].includes(auditBatchProgress.value.status)
+)
+const auditBatchPercent = computed(() => {
+  if (!auditBatchProgress.value || !auditBatchProgress.value.total) return 0
+  return Math.round((auditBatchProgress.value.done / auditBatchProgress.value.total) * 100)
+})
+
+// 审核分类归集（双维度：问题类型 / 建议动作）
+const auditClassifyData = ref<any>(null)
+const auditClassifyOpen = ref(false)
+const auditClassifyTab = ref<'type' | 'action'>('type')
+const AUDIT_TYPE_LABELS: Record<string, string> = {
+  label_error: '标签错误', missing: '漏标', merged: '粘连',
+  imprecise: '框不精准', compliance: '合规风险', clean: '无问题'
+}
+const AUDIT_ACTION_LABELS: Record<string, string> = {
+  relabel: '建议重标', delete: '建议删除', split: '建议拆分',
+  add: '建议补标', adjust: '建议修正', review_only: '仅复核'
+}
+// 按当前维度把 buckets 字典转成有序数组（后端 dict 已按严重度顺序排列）
+const classifyBucketsArr = computed(() => {
+  const d = auditClassifyData.value
+  if (!d) return []
+  const isType = auditClassifyTab.value === 'type'
+  const buckets = isType ? d.buckets_by_type : d.buckets_by_action
+  const labels = isType ? AUDIT_TYPE_LABELS : AUDIT_ACTION_LABELS
+  return Object.keys(buckets).map((k) => ({
+    key: k,
+    label: labels[k] || k,
+    items: buckets[k] || []
+  }))
+})
+// 列表项悬浮提示：把该图全部问题明细拼成多行文本
+const classifyItemTip = (s: any) => {
+  const parts: string[] = []
+  for (const det of (s.details || [])) {
+    if (det.type === 'missing') {
+      parts.push(`漏标(${classes.value[det.class_id] ?? det.class_id})` + (det.reason ? '：' + det.reason : ''))
+    } else {
+      const t = AUDIT_TYPE_LABELS[det.type] || det.type
+      parts.push(t + (det.reason ? '：' + det.reason : ''))
+    }
+  }
+  return parts.join('\n') || '无问题'
+}
+
 // ===== 图片列表分类过滤（级联下拉菜单） =====
 // poly_* 三档按"轮廓质量"分：修过（人工复核）/ 待修（AI 歪稿）/ 还没轮廓，方便挑图精修
 type FilterKey = 'all' | 'annotated' | 'ai' | 'manual' | 'unannotated' | 'poly_refined' | 'poly_draft' | 'poly_none'
@@ -1807,6 +1929,7 @@ const saveAnnotateState = () => {
       imageId: currentImage.value?.image_id || null,
       index: currentIndex.value,
       batchId: batchId.value,  // 恢复批量预标注轮询
+      auditBatchId: auditBatchId.value,  // 恢复批量审核轮询
     }))
   } catch (e) {
     console.error('保存标注状态失败:', e)
@@ -1897,6 +2020,12 @@ const restoreAnnotateState = async () => {
     batchId.value = saved.batchId
     batchProgress.value = { status: 'running', total: 1, done: 0, boxes_written: 0, current_image: '' }
     pollBatch()
+  }
+  // 同样恢复批量审核轮询（audit_ 前缀的独立 batch_id，复用 /sam/batch/{id}）
+  if (saved.auditBatchId) {
+    auditBatchId.value = saved.auditBatchId
+    auditBatchProgress.value = { status: 'running', total: 1, done: 0, current_image: '' }
+    pollAuditBatch()
   }
   currentTask.value = saved.taskId
   if (!currentTask.value) return
@@ -3207,6 +3336,7 @@ const openModelCfg = async () => {
     modelCfg.value.qwen_verify_enabled = cfg.qwen_verify_enabled !== false
     modelCfg.value.qwen_audit_enabled = cfg.qwen_audit_enabled !== false
     modelCfg.value.qwen_audit_batch = cfg.qwen_audit_batch === true
+    modelCfg.value.qwen_audit_prompt_template = cfg.qwen_audit_prompt_template || ''
     showModelCfg.value = true
   } catch (e: any) {
     if (!e?.__toastShown) showToast('读取 AI 标注配置失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
@@ -3255,6 +3385,7 @@ const saveModelCfg = async () => {
       qwen_verify_enabled: !!modelCfg.value.qwen_verify_enabled,
       qwen_audit_enabled: !!modelCfg.value.qwen_audit_enabled,
       qwen_audit_batch: !!modelCfg.value.qwen_audit_batch,
+      qwen_audit_prompt_template: modelCfg.value.qwen_audit_prompt_template || '',
     })
     // 同步页面阈值并刷新本地配置
     aiConf.value = modelCfg.value.conf
@@ -3711,9 +3842,124 @@ const stopBatch = async () => {
   }
 }
 
+// ===== 批量 L2 审核（审已有标注，结论写回每图 JSON，双维度分类供人工二审）=====
+const runAuditBatch = async () => {
+  if (!currentTask.value) return
+  if (!(await showConfirm(
+    `确认对 ${items.value.length} 张图片执行批量 L2 审核？\n` +
+    '· 只对已有标注框做语义二审（漏标/粘连/标签错误/框质量/合规），不改框本身\n' +
+    '· 结论写回每图 JSON（框级 box.audit + 图级 audit_meta），供你人工二审\n' +
+    '· 默认 16 路并发；1 万张约 30 分~2 小时（取决于 vLLM 吞吐）\n' +
+    '· 中途可「停止」，已完成图片的审核结论已落盘，可继续'
+  ))) return
+  try {
+    const result = await auditBatchStart(currentTask.value, 16)
+    auditBatchId.value = result.batch_id
+    auditBatchProgress.value = { status: 'running', total: result.total, done: 0, current_image: '' }
+    pollAuditBatch()
+  } catch (e: any) {
+    if (!e?.__toastShown) showToast('启动批量审核失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
+  }
+}
+
+const pollAuditBatch = async () => {
+  if (!auditBatchId.value) return
+  let res: any
+  try {
+    res = await getBatchProgress(auditBatchId.value)  // 复用 /sam/batch/{id}
+  } catch {
+    auditBatchTimer.value = setTimeout(pollAuditBatch, 2000)
+    return
+  }
+  if (!res) {
+    // 批量审核任务不存在（例如后端重启导致内存任务丢失），已写回的审核结论已保存，不丢数据
+    auditBatchId.value = null
+    auditBatchProgress.value = null
+    saveAnnotateState()
+    showToast('批量审核任务已中断（可能因后端重启），已完成图片的审核结论已保存。', 'info', 4000)
+    await loadTaskItems()
+    return
+  }
+  auditBatchProgress.value = res
+  if (res.status === 'done') {
+    auditBatchId.value = null
+    saveAnnotateState()
+    const st = res.audit?.stats || {}
+    const checked = res.audit?.checked ?? res.result_summary?.checked ?? 0
+    const boxes = res.audit?.boxes ?? res.result_summary?.boxes ?? 0
+    const errs = res.audit?.errors ?? res.result_summary?.errors ?? 0
+    let msg = `批量审核完成！共审 ${checked} 张图 / ${boxes} 框`
+    msg += `\n通过 ${st.keep || 0} · 待修正 ${st.modify || 0} · 建议删除 ${st.reject || 0} · 粘连 ${st.split || 0} · 漏标 ${st.missed || 0}`
+    if (errs > 0) msg += `（${errs} 张失败）`
+    showToast(msg, 'info', 6000)
+    await loadTaskItems()
+    openAuditClassify()  // 自动拉分类清单
+  } else if (res.status === 'cancelled') {
+    auditBatchId.value = null
+    saveAnnotateState()
+    showToast(`批量审核已取消，已审 ${res.done || 0} 张图`, 'info', 4000)
+    await loadTaskItems()
+  } else if (res.status === 'error') {
+    auditBatchId.value = null
+    saveAnnotateState()
+    showToast('批量审核出错: ' + (res.error || '未知错误'), 'error', 4000)
+  } else {
+    saveAnnotateState()
+    auditBatchTimer.value = setTimeout(pollAuditBatch, 1500)
+  }
+}
+
+const stopAuditBatch = async () => {
+  if (!auditBatchId.value) return
+  try {
+    await stopBatchLabel(auditBatchId.value)
+    const done = auditBatchProgress.value?.done || 0
+    auditBatchId.value = null
+    auditBatchProgress.value = null
+    saveAnnotateState()
+    showToast(`批量审核已取消，已审 ${done} 张图`, 'info', 4000)
+    await loadTaskItems()
+  } catch (e: any) {
+    if (e.response?.status === 404) {
+      auditBatchId.value = null
+      auditBatchProgress.value = null
+      saveAnnotateState()
+      showToast('审核任务已不存在（可能已重启），已停止', 'info', 4000)
+      return
+    }
+    if (!e?.__toastShown) showToast('停止失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
+  }
+}
+
+// 审核结果分类归集（双维度）：拉取并打开分类弹窗
+const openAuditClassify = async () => {
+  if (!currentTask.value) return
+  auditClassifyOpen.value = true
+  try {
+    const res = await listAuditClassify(currentTask.value)
+    auditClassifyData.value = res
+    if (!res?.audited_images) {
+      showToast('该任务还没有批量审核结论，请先跑「批量审核」', 'info', 4000)
+    }
+  } catch (e: any) {
+    if (!e?.__toastShown) showToast('获取审核分类失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
+  }
+}
+
+// 从分类清单跳转到指定图片
+const gotoClassifyImage = (imageId: string) => {
+  const idx = items.value.findIndex((it: any) => it.image_id === imageId)
+  if (idx < 0) return
+  auditClassifyOpen.value = false
+  selectImage(idx)
+}
+
 onUnmounted(() => {
   if (batchTimer.value) {
     clearTimeout(batchTimer.value)
+  }
+  if (auditBatchTimer.value) {
+    clearTimeout(auditBatchTimer.value)
   }
 })
 
@@ -4915,6 +5161,28 @@ canvas {
 .audit-batch-line { margin-top: 6px; font-size: 12px; color: #666; line-height: 1.5; word-break: break-all; }
 .audit-batch-line .a-keep, .audit-batch-line .a-modify, .audit-batch-line .a-reject,
 .audit-batch-line .a-split, .audit-batch-line .a-missed { padding: 0 4px; border-radius: 3px; margin: 0 2px; }
+/* 批量审核按钮（蓝色，区别于预标注蓝绿） */
+.audit-batch-btn { background: #1c64f2; }
+.audit-batch-btn:hover:not(:disabled) { background: #1552d6; }
+.audit-batch-progress { border-left: 3px solid #1c64f2; }
+/* 双维度分类弹窗 */
+.classify-dialog { width: 720px; max-width: 92vw; }
+.seg-tabs { display: inline-flex; gap: 4px; }
+.classify-body { max-height: 60vh; overflow: auto; padding: 0 4px; }
+.classify-group { margin-bottom: 10px; }
+.classify-group-head { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-radius: 6px; font-weight: 600; font-size: 13px; }
+.classify-group-head .cg-count { margin-left: auto; color: #555; font-size: 12px; background: rgba(0,0,0,.06); padding: 1px 8px; border-radius: 10px; }
+.cg-label_error, .cg-relabel, .cg-delete { background: #fde8e8; color: #c81e1e; }
+.cg-missing, .cg-imprecise, .cg-add, .cg-adjust { background: #fef3c7; color: #b45309; }
+.cg-merged, .cg-split { background: #fef9c3; color: #854d0e; }
+.cg-compliance { background: #ede9fe; color: #6d28d9; }
+.cg-clean, .cg-review_only { background: #e7f6ec; color: #15803d; }
+.classify-list { list-style: none; margin: 4px 0 0; padding: 0 0 0 8px; }
+.classify-list li { display: flex; align-items: center; gap: 10px; padding: 4px 8px; border-radius: 5px; cursor: pointer; font-size: 13px; }
+.classify-list li:hover { background: #eef3ff; }
+.classify-meta { display: inline-flex; gap: 6px; margin-left: auto; }
+.cg-tag { font-size: 12px; padding: 1px 7px; border-radius: 4px; background: #f1f5f9; color: #475569; }
+.cg-tag.cg-action { background: #eef2ff; color: #4338ca; }
 .issue-mask { position: fixed; inset: 0; background: rgba(0, 0, 0, .45); z-index: 1000; display: flex; align-items: center; justify-content: center; }
 .issue-dialog { background: #fff; border-radius: 10px; width: 580px; max-width: 92vw; max-height: 76vh; display: flex; flex-direction: column; box-shadow: 0 8px 30px rgba(0, 0, 0, .25); padding: 14px 16px; }
 .issue-dialog-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 14px; }

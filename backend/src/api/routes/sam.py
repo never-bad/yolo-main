@@ -39,6 +39,7 @@ class ConfigRequest(BaseModel):
     qwen_audit_batch: Optional[bool] = None     # 批量预标注是否也做 L2 审核（默认关）
     qwen_verify_enabled: Optional[bool] = None  # 框级二次校验（反幻觉：候选框裁剪复问，回答否则丢弃）
     qwen_verify_margin: Optional[float] = None  # 校验裁剪的四周外扩比例（默认 0.35）
+    qwen_audit_prompt_template: Optional[str] = None  # 千问 L2 审核系统提示词模板（留空用内置默认）
 
 
 class AutoLabelRequest(BaseModel):
@@ -54,6 +55,11 @@ class BatchStartRequest(BaseModel):
     classes: List[str]
     conf: Optional[float] = None
     prompts: Optional[List[str]] = None  # 与 classes 一一对应的英文提示词
+
+
+class AuditBatchRequest(BaseModel):
+    task_id: str
+    concurrency: Optional[int] = 16  # 并发路数（默认 16，后端封顶 32）
 
 
 class InteractiveLabelRequest(BaseModel):
@@ -268,3 +274,25 @@ async def batch_stop(batch_id: str):
     if not result:
         raise HTTPException(404, "Batch task not found")
     return result
+
+
+@router.post("/audit/batch/start")
+async def audit_batch_start(request: AuditBatchRequest):
+    """启动异步批量 L2 审核（审任务内全部已标注图片，结论写回每图 JSON）"""
+    try:
+        return await sam_service.batch_audit(request.task_id, request.concurrency or 16)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.get("/audit/classify")
+async def audit_classify(task_id: str):
+    """扫描任务全部图片的审核结论，按问题类型 / 建议动作双维度分类归集（供人工二审）"""
+    try:
+        return await sam_service.classify_audit(task_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, str(e))

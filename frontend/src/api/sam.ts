@@ -129,3 +129,19 @@ export const stopBatchLabel = async (batchId: string) => {
   const { data } = await api.post(`/sam/batch/${batchId}/stop`)
   return data
 }
+
+// 批量 L2 审核：对任务内全部已标注图片并发跑千问语义二审，结论写回每图 JSON
+// 进度/停止复用 getBatchProgress / stopBatchLabel（同一 batch_id 与 /sam/batch/{id} 端点）
+export const auditBatchStart = async (taskId: string, concurrency?: number) => {
+  const { data } = await api.post('/sam/audit/batch/start', {
+    task_id: taskId,
+    concurrency: concurrency ?? 16
+  })
+  return data
+}
+
+// 审核结果分类归集：扫描任务全部图片的审核结论，按问题类型 / 建议动作双维度列出需人工二审的图片
+export const listAuditClassify = async (taskId: string) => {
+  const { data } = await api.get('/sam/audit/classify', { params: { task_id: taskId } })
+  return data
+}

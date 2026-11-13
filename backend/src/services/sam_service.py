@@ -93,6 +93,9 @@ DEFAULT_CONFIG = {
     # 单框约 0.3~0.6s）。关闭后误检只能靠人工删除。
     "qwen_verify_enabled": True,
     "qwen_verify_margin": 0.35,      # 裁剪时四周外扩比例（相对框宽高），给足上下文又不引入干扰
+    # 千问 L2 审核系统提示词模板（留空用内置默认）。占位符：
+    # {labels_text}=类别定义(含chinese_desc) {dets_text}=预标注框JSON {bbox_hint}=坐标说明
+    "qwen_audit_prompt_template": "",
 }
 class BatchTask:
     """内存中的批量预标注任务状态"""
@@ -129,6 +132,43 @@ class BatchTask:
         self.failed_images = 0
         self.last_error: Optional[str] = None
         self.audit_summary = {"keep": 0, "modify": 0, "reject": 0, "split": 0, "missed": 0}
+
+
+# 千问 L2 审核内置默认系统提示词（用户未在「AI 标注模型设置」配置模板时使用）。
+# 占位符 {labels_text}{dets_text}{bbox_hint} 由 _render_audit_prompt 运行时注入；
+# 不使用 .format 而用 .replace，避免下方 JSON 示例里的花括号被误解析。
+DEFAULT_AUDIT_PROMPT = (
+    "# Role\n"
+    "你是资深的工业视觉数据审核专家。请对当前图片及 AI 预标注的边界框进行严苛的二次审核。\n\n"
+    "# Context\n"
+    "- 目标类别定义（含审核标准）：\n{labels_text}\n"
+    "- 预标注结果：{dets_text}\n"
+    "（JSON 格式：box_id 唯一标识每个框，{bbox_hint}，class_id 对应上面的类别序号）\n\n"
+    "# Audit Dimensions（审核维度）\n"
+    "请严格执行以下检查：\n"
+    "1. 语义准确性：框内物体是否与类别定义（desc）严格匹配？输出 keep / modify / reject。\n"
+    "2. 标签错误检测：框内物体是否被错误分类？若发现标签错误，输出 reject 并给出 suggested_class（建议的正确类别序号）。\n"
+    "3. 漏标排查：仔细扫描全图，是否还有符合类别定义的目标没有被框出来？输出到 missed_targets，{bbox_hint}。\n"
+    "4. 粘连框检测：是否有框内包含两个或多个独立目标？输出到 merged_boxes，action=split 或 reject。\n"
+    "5. 边界质量：框是否过大、过小或未贴合边缘？过大/过小输出 modify。\n"
+    "6. 业务合规：目标是否存在违规行为（如未戴安全帽、未穿反光衣）？在对应框的 tags 中加入 #compliance_issue。\n\n"
+    "# Output Format\n"
+    "仅返回标准 JSON，不要包含任何解释：\n"
+    "{\n"
+    "  \"missed_targets\": [\n"
+    "    {\"class_id\": 序号, \"bbox\": [x1, y1, x2, y2], \"reason\": \"漏标原因（限20字）\"}\n"
+    "  ],\n"
+    "  \"merged_boxes\": [\n"
+    "    {\"box_id\": 1, \"action\": \"split | reject\", \"reason\": \"包含两个独立目标（限20字）\"}\n"
+    "  ],\n"
+    "  \"label_errors\": [\n"
+    "    {\"box_id\": 3, \"suggested_class\": 正确类别序号, \"reason\": \"框内实际为XXX而非当前标签（限20字）\"}\n"
+    "  ],\n"
+    "  \"box_reviews\": [\n"
+    "    {\"box_id\": 2, \"action\": \"keep | modify | reject\", \"reason\": \"审核理由（限20字）\", \"tags\": [\"#occluded\", \"#blur\"]}\n"
+    "  ]\n"
+    "}\n"
+)
 
 
 class SAMService:
@@ -2096,44 +2136,34 @@ class SAMService:
             bbox_hint = "bbox 为 0~1000 归一化坐标 [x1,y1,x2,y2]（相对图片宽高的千分比）"
         else:
             bbox_hint = "bbox 为图片像素坐标 [x1,y1,x2,y2]"
-        sys_msg = (
-            "# Role\n"
-            "你是资深的工业视觉数据审核专家。请对当前图片及 AI 预标注的边界框进行严苛的二次审核。\n\n"
-            "# Context\n"
-            f"- 目标类别定义（含审核标准）：\n{labels_text}\n"
-            f"- 预标注结果：{dets_text}\n"
-            f"（JSON 格式：box_id 唯一标识每个框，{bbox_hint}，class_id 对应上面的类别序号）\n\n"
-            "# Audit Dimensions（审核维度）\n"
-            "请严格执行以下检查：\n"
-            "1. 语义准确性：框内物体是否与类别定义（desc）严格匹配？输出 keep / modify / reject。\n"
-            "2. 标签错误检测：框内物体是否被错误分类？若发现标签错误，输出 reject 并给出 suggested_class（建议的正确类别序号）。\n"
-            f"3. 漏标排查：仔细扫描全图，是否还有符合类别定义的目标没有被框出来？输出到 missed_targets，{bbox_hint}。\n"
-            "4. 粘连框检测：是否有框内包含两个或多个独立目标？输出到 merged_boxes，action=split 或 reject。\n"
-            "5. 边界质量：框是否过大、过小或未贴合边缘？过大/过小输出 modify。\n"
-            "6. 业务合规：目标是否存在违规行为（如未戴安全帽、未穿反光衣）？在对应框的 tags 中加入 #compliance_issue。\n\n"
-            "# Output Format\n"
-            "仅返回标准 JSON，不要包含任何解释：\n"
-            "{\n"
-            "  \"missed_targets\": [\n"
-            "    {\"class_id\": 序号, \"bbox\": [x1, y1, x2, y2], \"reason\": \"漏标原因（限20字）\"}\n"
-            "  ],\n"
-            "  \"merged_boxes\": [\n"
-            "    {\"box_id\": 1, \"action\": \"split | reject\", \"reason\": \"包含两个独立目标（限20字）\"}\n"
-            "  ],\n"
-            "  \"label_errors\": [\n"
-            "    {\"box_id\": 3, \"suggested_class\": 正确类别序号, \"reason\": \"框内实际为XXX而非当前标签（限20字）\"}\n"
-            "  ],\n"
-            "  \"box_reviews\": [\n"
-            "    {\"box_id\": 2, \"action\": \"keep | modify | reject\", \"reason\": \"审核理由（限20字）\", \"tags\": [\"#occluded\", \"#blur\"]}\n"
-            "  ]\n"
-            "}"
-        )
+        # 审核系统提示词：用户自定义模板优先（占位符 {labels_text}/{dets_text}/{bbox_hint}），未配置回退内置默认
+        sys_msg = self._render_audit_prompt(cfg, labels_text, dets_text, bbox_hint)
         user_msg = f"类别定义：\n{labels_text}\n\n预标注框：\n{dets_text}\n请审核这张图片。"
         content = self._qwen_image_chat(cfg, sys_msg, user_msg, img_abs)
         if not content:
             return None, "千问审核推理失败（无输出）"
         return self._parse_qwen_audit(content, audit_dets, labels, classes,
                                       img_abs=img_abs, cfg=cfg), ""
+
+    def _render_audit_prompt(self, cfg, labels_text, dets_text, bbox_hint):
+        """渲染千问 L2 审核系统提示词。
+        优先用「AI 标注模型设置」里用户自定义的模板（占位符 {labels_text}/{dets_text}/{bbox_hint}），
+        未配置或渲染异常时回退内置 DEFAULT_AUDIT_PROMPT。"""
+        tpl = (cfg or {}).get("qwen_audit_prompt_template") or ""
+        tpl = (tpl or "").strip()
+        if not tpl:
+            tpl = DEFAULT_AUDIT_PROMPT
+        try:
+            return (tpl
+                    .replace("{labels_text}", labels_text or "")
+                    .replace("{dets_text}", dets_text or "")
+                    .replace("{bbox_hint}", bbox_hint or ""))
+        except Exception as e:
+            print(f"qwen: 审核提示词模板渲染失败，回退内置默认模板: {e}")
+            return (DEFAULT_AUDIT_PROMPT
+                    .replace("{labels_text}", labels_text or "")
+                    .replace("{dets_text}", dets_text or "")
+                    .replace("{bbox_hint}", bbox_hint or ""))
 
     def _parse_qwen_audit(self, content: str, audit_dets: list, labels: list, classes: list,
                           img_abs=None, cfg: dict = None) -> dict:
@@ -3099,6 +3129,258 @@ class SAMService:
             return None
         bt.cancelled = True
         return {"ok": True, "status": bt.status}
+
+    # ------------------------------------------------------------------
+    # 批量 L2 审核（审「已有标注」，结果写回每图 JSON，供人工分批二审）
+    # ------------------------------------------------------------------
+    async def batch_audit(self, task_id: str, concurrency: int = 16) -> dict:
+        """启动异步批量审核：对任务内全部已标注图片并发跑千问 L2 审核并把结论写回。
+
+        与 batch_auto_label（预标注）不同：本方法不调用检测引擎、不加 _lock 串行化
+        （审核接口 audit_image 本身无锁，实测 vLLM 并发 batching 有效），用 Semaphore
+        控制并发路数（默认 16，上限 32）。复用 BatchTask 状态机 / 取消 / 进度展示。
+        """
+        task_meta = await self._load_task_meta(task_id)
+        if not task_meta:
+            raise ValueError("Task not found")
+        items = task_meta.get("items", [])
+        batch_id = f"audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        bt = BatchTask(batch_id, task_id, self._task_classes(task_id), 0.0)
+        bt.total = len(items)
+        self.batch_tasks[batch_id] = bt
+        asyncio.create_task(self._run_audit_batch(batch_id, items, max(1, min(concurrency, 32))))
+        return {"batch_id": batch_id, "total": bt.total}
+
+    async def _run_audit_batch(self, batch_id: str, items: list, concurrency: int) -> None:
+        bt = self.batch_tasks[batch_id]
+        cfg = self._read_config()
+        if not cfg.get("qwen_enabled", False):
+            bt.status = "error"
+            bt.error = "千问未启用：请先在「AI 标注模型设置」开启并配置 vLLM 端点"
+            return
+        ld = self._task_labels_desc(bt.task_id)
+        if ld:
+            cfg = dict(cfg)
+            cfg["qwen_labels_desc"] = ld
+        classes = bt.classes
+        sem = asyncio.Semaphore(concurrency)
+        # 任务→数据集映射（ann 路径用），循环内只换 image_id
+        tm = await self._load_task_meta(bt.task_id) or {}
+        ds_id, _ver = self.annotation_service._task_to_ds(tm)
+
+        async def _audit_one(item):
+            if bt.cancelled:
+                return
+            image_id = item["image_id"]
+            bt.current_image = image_id
+            img_abs = settings.DATA_DIR / item["image_path"]
+            try:
+                existing = await self.annotation_service.get_image_annotation(bt.task_id, image_id)
+                boxes = (existing or {}).get("boxes") or []
+                # 与 audit_image 一致：只审有矩形框或轮廓点的框
+                valid = [b for b in boxes if b.get("x1") is not None or b.get("polygon")]
+                if not valid:
+                    bt.done += 1
+                    return
+                # 临时分配 box_id 以便和审核返回对齐（落盘不需要 box_id）
+                dets = [{"box_id": i, "class_id": b.get("class_id"),
+                         "bbox": [b.get("x1"), b.get("y1"), b.get("x2"), b.get("y2")],
+                         "score": b.get("score") or b.get("confidence")}
+                        for i, b in enumerate(valid)]
+                async with sem:
+                    audit, msg = await asyncio.to_thread(
+                        self.qwen_audit_detections, img_abs, dets, ld, cfg, classes
+                    )
+                if not audit or not audit.get("ok"):
+                    bt.audit_errors += 1
+                    bt.done += 1
+                    return
+                st = audit.get("stats") or {}
+                bt.audit_checked += 1
+                bt.audit_boxes += len(valid)
+                for k in ("keep", "modify", "reject", "split", "missed"):
+                    bt.audit_summary[k] = bt.audit_summary.get(k, 0) + (st.get(k) or 0)
+                # 审核结论映射回原框（按临时 box_id）
+                rmap = {r.get("box_id"): r for r in (audit.get("box_reviews") or [])}
+                saved = []
+                for i, b in enumerate(boxes):
+                    nb = dict(b)
+                    r = rmap.get(i)
+                    if r:
+                        nb["audit"] = {k: r.get(k) for k in
+                                       ("action", "kind", "reason", "tags", "suggested_class_id")
+                                       if r.get(k) is not None}
+                    saved.append(nb)
+                # box 级 audit 经 save_annotation 落盘（保留现有字段 + 边界检查 + shadow）
+                await self.annotation_service.save_annotation(
+                    bt.task_id, image_id, saved,
+                    ai_annotated=(existing or {}).get("ai_annotated", False),
+                )
+                # 图级 audit_meta（漏标建议框 + 统计 + 时间 + 模型），save_annotation 不处理顶层字段，单独原子写
+                meta = {
+                    "missed_targets": audit.get("missed_targets") or [],
+                    "stats": st,
+                    "audited_at": datetime.now().isoformat(),
+                    "model": cfg.get("qwen_model"),
+                    "schema": 1,
+                }
+                try:
+                    ann_path = settings.DATASETS_DIR / ds_id / "annotations" / f"{image_id}.json"
+                    if ann_path.exists():
+                        ann = load_json(ann_path) or {}
+                        ann["audit_meta"] = meta
+                        save_json_atomic(ann_path, ann)
+                except Exception as e:
+                    print(f"批量审核写 audit_meta 失败 {image_id}: {e}")
+                bt.done += 1
+            except Exception as e:
+                print(f"批量审核跳过图片 {image_id}: {e}")
+                bt.failed_images += 1
+                bt.last_error = str(e)
+                bt.done += 1
+
+        try:
+            # 切片并发：每批 concurrency*4 起任务，避免一次性创建上万协程占用过多线程
+            chunk = max(concurrency * 4, 32)
+            for i in range(0, len(items), chunk):
+                if bt.cancelled:
+                    break
+                batch = items[i:i + chunk]
+                await asyncio.gather(*[_audit_one(it) for it in batch])
+            if bt.cancelled:
+                bt.status = "cancelled"
+            elif bt.failed_images >= bt.total and bt.total > 0:
+                bt.status = "error"
+                bt.error = bt.last_error or "全部图片审核失败"
+            else:
+                bt.status = "done"
+                bt.result_summary = {
+                    "checked": bt.audit_checked, "boxes": bt.audit_boxes,
+                    "errors": bt.audit_errors, "stats": bt.audit_summary,
+                }
+        except Exception as e:
+            bt.status = "error"
+            bt.error = str(e)
+
+    # ------------------------------------------------------------------
+    # 审核结果分类归集（双维度：问题类型 / 建议动作，每图只归最严重一类）
+    # ------------------------------------------------------------------
+    async def classify_audit(self, task_id: str) -> dict:
+        """扫描任务全部图片的审核结论，按问题类型 / 建议动作双维度分类归集。
+
+        复用每图 JSON 的 box.audit（action/kind/tags/suggested_class_id）与图级
+        audit_meta.missed_targets。每图只归入「最严重一个类型 / 一个动作」桶（不重叠），
+        但返回明细 details 列出该图全部问题，便于点开复核。严重度：
+        标签错误/漏标(高) > 粘连/框不精准(中) > 合规(中) > 无问题。
+        """
+        task_meta = await self._load_task_meta(task_id)
+        if not task_meta:
+            raise ValueError("Task not found")
+        dataset_id, version = self.annotation_service._task_to_ds(task_meta)
+        items = task_meta.get("items", [])
+        SEV_TYPE = {"label_error": 0, "missing": 1, "merged": 2, "imprecise": 3,
+                    "compliance": 4, "clean": 5}
+        SEV_ACTION = {"relabel": 0, "delete": 1, "split": 2, "add": 2,
+                      "adjust": 3, "review_only": 5}
+
+        def _scan():
+            buckets_by_type = {k: [] for k in SEV_TYPE}
+            buckets_by_action = {k: [] for k in SEV_ACTION}
+            dist_by_type = {k: 0 for k in SEV_TYPE}
+            dist_by_action = {k: 0 for k in SEV_ACTION}
+            audited = 0
+            for it in items:
+                image_id = it.get("image_id")
+                ann = self.annotation_service._load_image_ann(dataset_id, version, image_id)
+                if not ann:
+                    continue
+                boxes = ann.get("boxes") or []
+                meta = ann.get("audit_meta") or {}
+                missed = meta.get("missed_targets") or []
+                types_in_img, actions_in_img, details, has_audit = set(), set(), [], False
+                for b in boxes:
+                    au = b.get("audit") or {}
+                    if not au:
+                        continue
+                    has_audit = True
+                    action = au.get("action")
+                    kind = au.get("kind")
+                    tags = au.get("tags") or []
+                    if kind == "label_error":
+                        t = "label_error"
+                    elif kind == "merged":
+                        t = "merged"
+                    elif action in ("modify", "reject"):
+                        t = "imprecise"
+                    else:
+                        t = None
+                    compliance = any(str(tg).startswith("#compliance") for tg in tags)
+                    if compliance and t is None:
+                        t = "compliance"
+                    if t:
+                        types_in_img.add(t)
+                        details.append({
+                            "box_id": b.get("box_id"), "type": t, "action": action,
+                            "kind": kind, "reason": au.get("reason"), "tags": tags,
+                            "suggested_class_id": au.get("suggested_class_id"),
+                        })
+                    if kind == "label_error":
+                        actions_in_img.add("relabel")
+                    elif action == "reject":
+                        actions_in_img.add("delete")
+                    elif action == "modify":
+                        actions_in_img.add("adjust")
+                    elif kind == "merged" or action == "split":
+                        actions_in_img.add("split")
+                    if compliance:
+                        actions_in_img.add("review_only")
+                if missed:
+                    types_in_img.add("missing")
+                    actions_in_img.add("add")
+                    for m in missed:
+                        details.append({
+                            "type": "missing", "action": "add",
+                            "class_id": m.get("class_id"),
+                            "bbox": [m.get("x1"), m.get("y1"), m.get("x2"), m.get("y2")],
+                            "reason": m.get("reason"),
+                        })
+                if has_audit or missed:
+                    audited += 1
+                if not types_in_img:
+                    # 有审核标记但全 keep 无漏标无 tag → 无问题；完全没审过则跳过不计
+                    if has_audit:
+                        types_in_img.add("clean")
+                        actions_in_img.add("review_only")
+                    else:
+                        continue
+                primary_type = min(types_in_img, key=lambda x: SEV_TYPE[x])
+                primary_action = (min(actions_in_img, key=lambda x: SEV_ACTION[x])
+                                 if actions_in_img else "review_only")
+                summary = {
+                    "image_id": image_id,
+                    "image_path": it.get("image_path"),
+                    "width": it.get("width"), "height": it.get("height"),
+                    "primary_type": primary_type, "primary_action": primary_action,
+                    "types": sorted(types_in_img, key=lambda x: SEV_TYPE[x]),
+                    "actions": sorted(actions_in_img, key=lambda x: SEV_ACTION[x]),
+                    "details": details,
+                    "audited_at": meta.get("audited_at"),
+                }
+                buckets_by_type[primary_type].append(summary)
+                buckets_by_action[primary_action].append(summary)
+                dist_by_type[primary_type] += 1
+                dist_by_action[primary_action] += 1
+            return {
+                "task_id": task_id,
+                "total_images": len(items),
+                "audited_images": audited,
+                "dist_by_type": dict(dist_by_type),
+                "dist_by_action": dict(dist_by_action),
+                "buckets_by_type": buckets_by_type,
+                "buckets_by_action": buckets_by_action,
+            }
+
+        return await asyncio.to_thread(_scan)
 
     # ------------------------------------------------------------------
     # 内部辅助
