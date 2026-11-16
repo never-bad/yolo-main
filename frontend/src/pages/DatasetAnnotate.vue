@@ -2257,7 +2257,13 @@ const loadExistingAnnotation = async () => {
         x2: box.x2,
         y2: box.y2,
         // 分割轮廓必须回填，否则重新打开图片时分割标注只剩矩形（顶点也就无从微调）
-        ...(box.polygon && box.polygon.length >= 3 ? { polygon: box.polygon as number[][] } : {})
+        ...(box.polygon && box.polygon.length >= 3 ? { polygon: box.polygon as number[][] } : {}),
+        // 这三个字段必须原样带回：保存是「整体覆盖写」，不回填就等于
+        // 一改框就把大模型审核结论（audit）、置信度、来源全清掉，
+        // 该图也会从「问题图」队列里静默消失。
+        ...(box.confidence != null ? { confidence: box.confidence } : {}),
+        ...(box.source ? { source: box.source } : {}),
+        ...(box.audit ? { audit: box.audit } : {})
       }))
       // 以服务端为准重新拉画布，避免"框坐标在但看不见"
       redrawCanvas()
