@@ -3366,17 +3366,52 @@ const deleteCurrentImage = async () => {
   if (!currentTask.value || !currentImage.value) return
   deletingImage.value = true
   try {
-    const res = await deleteTaskImage(currentTask.value, currentImage.value.image_id)
-    const removedId = res.image_id
-    const idx = items.value.findIndex(it => it.image_id === removedId)
+    // 落点按「可见集合」（类别筛选 ∩ 文件名搜索）算，不能用全量 items 下标：
+    // 旧实现记录全量下标 idx，删完 items 整体前移一位，同一 idx 落到的是另一张图，
+    // 而那张往往被当前筛选挡掉 → 表现为「删完跳到类别以外的图」。
+    // 删除后 visibleItems 里原位置上的就是同一类别里的下一张，正是用户期望的落点。
+    const pos = visibleIdx.value
+    const wasVisible = pos >= 0
+    const prevId = currentImage.value.image_id
+    // 这张图马上要被删掉，画布上的未保存改动不该再回写：
+    // 否则 selectImage 里的 persistAnnotation 会 POST 到已删除的图片（404
+    // 或留下指向已删图片的孤立标注文件）。改动本身也随图片一起作废。
+    const wasDirty = dirty.value
+    dirty.value = false
+    clearTimeout(autoSaveTimer.value)
+
+    let res: any
+    try {
+      res = await deleteTaskImage(currentTask.value, prevId)
+    } catch (e) {
+      // 删除没成功，图片还在：把未保存状态交还给自动保存，别把用户刚改的框丢了
+      if (wasDirty) markDirty()
+      throw e
+    }
+    const removedId = res?.image_id || prevId
+    const fallbackIdx = items.value.findIndex(it => it.image_id === removedId)
     items.value = items.value.filter(it => it.image_id !== removedId)
+
+    const list = visibleItems.value   // items 已被替换，这里读到的是删除后重算的集合
     if (items.value.length === 0) {
       currentImage.value = null
       currentBoxes.value = []
       currentSampleType.value = ''
       redrawCanvas()
+    } else if (wasVisible && list.length) {
+      // 停在原位置（删除后该位置即原下一张）；删的是最后一张则退到新的最后一张
+      selectImageByItem(list[Math.min(pos, list.length - 1)])
+    } else if (wasVisible) {
+      // 当前这类筛选已经删空：不要硬塞一张类别外的图进来（画布与列表会自相矛盾），
+      // 清空画布，让列表显示「该筛选条件下没有图片」
+      currentImage.value = null
+      currentBoxes.value = []
+      currentSampleType.value = ''
+      redrawCanvas()
+      showToast(`「${currentFilterLabel.value}」已无图片：${removedId} 是最后一张`, 'info', 4000)
     } else {
-      selectImage(Math.min(Math.max(idx, 0), items.value.length - 1))
+      // 当前图本就被筛选挡住（如搜索命中）：按全量下标就近落位
+      selectImage(Math.min(Math.max(fallbackIdx, 0), items.value.length - 1))
     }
     saveAnnotateState()
     showToast(`已删除图片 ${removedId}，当前图片总数：${res.image_count}`, 'success')
