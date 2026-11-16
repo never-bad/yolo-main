@@ -216,7 +216,7 @@
               :style="{ width: Math.max(2, posInput.length) + 1 + 'ch' }"
               inputmode="numeric"
               autocomplete="off"
-              @keydown.enter.prevent="commitPosJump"
+              @keydown.enter.prevent="commitPosJump(true)"
               @keydown.esc.prevent="cancelPosJump"
               @blur="onPosBlur"
             />
@@ -4453,24 +4453,41 @@ const cancelPosJump = () => {
 // 失焦也算提交（输完号直接点画布/别处就跳过去），但没改动过就不动，避免误触发
 const onPosBlur = () => {
   if (posInput.value.trim() === posJumpBase.trim()) cancelPosJump()
-  else commitPosJump()
+  else commitPosJump(false)
 }
 
-const commitPosJump = () => {
+// keepOnError=true（回车触发）：越界时留在输入框里并把内容选中，
+// 用户可以接着改数字，不必重新点开一次；失焦触发时则正常退出编辑态。
+const commitPosJump = (keepOnError = false) => {
   if (!posEditing.value) return
   const n = visibleItems.value.length
   const raw = posInput.value.trim()
-  // 允许留空直接回车 = 放弃；非数字、越界一律按边界夹取，不弹错打断操作
-  const parsed = parseInt(raw, 10)
+  // 清空后回车/失焦 = 放弃跳转，不提示（用户就是想退出来）
+  if (!raw || n === 0) { cancelPosJump(); return }
+  const parsed = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN   // 拒绝 "12abc" 这类半截数字
+  const outOfRange = Number.isNaN(parsed) || parsed < 1 || parsed > n
+  if (outOfRange) {
+    // 越界不跳：夹到边界等于替用户做决定，还可能连当前图都丢了；
+    // 保持画面不动、只说明合法范围，让用户自己改一个数。
+    showToast(
+      Number.isNaN(parsed)
+        ? '请输入数字序号（只能填正整数）'
+        : `序号超出范围：当前筛选共 ${n} 张，请输入 1 ~ ${n}`,
+      'info', 3500
+    )
+    if (keepOnError) {
+      // 留在输入框并选中内容，接着改数字即可，不必重新点开
+      nextTick(() => { posInputRef.value?.focus(); posInputRef.value?.select() })
+      return
+    }
+    cancelPosJump()
+    return
+  }
   posEditing.value = false
   posInput.value = ''
-  if (!raw || Number.isNaN(parsed) || n === 0) return
-  const target = Math.min(Math.max(parsed, 1), n) - 1
+  const target = parsed - 1
   if (target === visibleIdx.value) return
   selectImageByItem(visibleItems.value[target])
-  if (parsed < 1 || parsed > n) {
-    showToast(`序号超出范围（1 ~ ${n}），已跳到第 ${target + 1} 张`, 'info', 3000)
-  }
 }
 
 const handleKeydown = (e: KeyboardEvent) => {
