@@ -389,11 +389,11 @@
 
     <div class="card">
       <h2>训练任务列表</h2>
-      <button @click="loadJobs" :disabled="loadingJobs" class="secondary">
+      <button @click="loadJobs()" :disabled="loadingJobs" class="secondary">
         <span v-if="loadingJobs" class="loading-spinner"></span>
         {{ loadingJobs ? '加载中...' : '刷新' }}
       </button>
-      <div v-if="loadingJobs" class="loading-state">
+      <div v-if="loadingJobs && !jobs.length" class="loading-state">
         <span class="loading-spinner large"></span>
         <span>加载任务列表...</span>
       </div>
@@ -609,10 +609,14 @@ import { dsTitle } from '@/utils/dsDisplay'
 import { subscribeLogsSSE, pollLogsTail, getLogLines } from '@/api/logs'
 import FolderTree from '@/components/FolderTree.vue'
 import { useLogStore } from '@/store/logs'
+import { useTrainStore } from '@/store/train'
 import { showAlert, showConfirm } from '@/composables/useDialog'
 import { showToast } from '@/utils/toast'
 
 const logStore = useLogStore()
+// 训练任务与进度提到 store：退出页面再进来时先画上次的结果，
+// 不再整页骨架屏 + 进度条归零（数据源仍是服务器，多设备看到的是一致的）
+const trainStore = useTrainStore()
 
 const trainForm = ref<TrainJobRequest>({
   dataset_id: '',
@@ -1388,7 +1392,6 @@ const training = ref(false)
 // 训练前准备权重（镜像下载缓存）的进行中标记，用于按钮提示
 const preparingWeight = ref(false)
 const currentJobId = ref<string | null>(null)
-const jobs = ref<any[]>([])
 // UX-7 任务卡标题 = 数据集名 · 模型文件名（basename）；job_id 改由下方元信息行首段「任务id:」展示，灰小字副标题已去掉
 const jobTitle = (job: any) => {
   const ds = datasets.value.find((d: any) => d.dataset_id === job.dataset_id)
@@ -1398,8 +1401,11 @@ const jobTitle = (job: any) => {
 let eventSource: EventSource | null = null
 let pollInterval: any = null
 
-// 每个任务的独立进度（key: job_id）
-const jobProgress = ref<Record<string, { current: number; total: number; percent: number; has: boolean; lossLine: string; lastActivity: number }>>({})
+// 任务列表与逐任务进度都存在 pinia（store/train.ts），组件卸载后仍保留：
+// 切到别的页面再回来，列表和进度条立刻可见，不会被清空重来。
+// 这里只是把 store 的响应式状态引进来用，模板不用改。
+const jobs = computed(() => trainStore.jobs)
+const jobProgress = computed(() => trainStore.jobProgress)
 // 每个任务独立的轮询定时器
 const jobPollers = new Map<string, any>()
 // 每个任务独立的日志偏移量
@@ -1660,6 +1666,7 @@ const deleteJobItem = async (jobId: string) => {
   try {
     stopJobPolling(jobId)
     await deleteTrainJob(jobId)
+    trainStore.dropProgress(jobId)   // 任务没了，进度快照也清掉，免得 store 里越积越多
     showToast('删除成功!', 'success')
     restoreScroll(prevScrollY)
     loadJobs()
@@ -1750,14 +1757,14 @@ const updateJobProgress = (jobId: string, lines: string[]) => {
       }
     }
   }
-  jobProgress.value[jobId] = {
+  trainStore.setProgress(jobId, {
     current: cur,
     total,
     percent: total > 0 ? Math.min(100, Math.round((cur / total) * 100)) : 0,
     has: total > 0,
     lossLine,
     lastActivity: Date.now()
-  }
+  })
 }
 
 // B-17：/logs/tail 的 offset 是字节偏移，必须做安全整数防御。
@@ -2131,11 +2138,13 @@ watch(
   { deep: true }
 )
 
-const loadJobs = async () => {
-  loadingJobs.value = true
+const loadJobs = async (silent = false) => {
+  // silent=true（从别的页面切回来）：不显示骨架屏，先画 store 里的旧列表，
+  // 让刷新在背后完成，避免整页「加载任务列表...」闪一下
+  if (!silent) loadingJobs.value = true
   try {
     const result = await listTrainJobs()
-    jobs.value = result.jobs
+    trainStore.setJobs(result.jobs)
     startAllJobPolling()
     // 同步刷新模型列表，保证任务卡的守门员状态徽章/报告最新
     loadModels()
@@ -2147,7 +2156,9 @@ const loadJobs = async () => {
 }
 
 onMounted(async () => {
-  loadJobs()
+  // 之前来过本页（store 里有旧任务列表）→ 静默刷新：直接画上次的列表和进度，
+  // 后台再向服务器拉一遍最新状态。首次进入才显示骨架屏。
+  loadJobs(trainStore.loadedOnce)
   loadModels()
   // 算法库详情页「发起训练」跳转：记住归属库，产出自动成为该库的新版本
   const libQ = route.query.library_root_id

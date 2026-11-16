@@ -61,6 +61,14 @@ EXCLUDE_KEYWORDS = ("_result", "_predict", "_detect")
 _LIST_CACHE_LOCK = threading.Lock()
 _LIST_CACHE = {"sig": None, "result": None, "ts": 0.0}
 
+# advance_buckets 节流：灌桶是幂等操作，前端每次进数据集页都会调用，
+# 但几十秒内重复执行没有意义 —— 它要扫全部包、改 meta、同步影子库，
+# 而且会把 meta/buckets 的 mtime 刷新掉，反过来让上面 _LIST_CACHE 的签名失效
+# （表现为「缓存做了却永远命中不了，每次切回数据集页都全量重扫」）。
+_ADVANCE_LOCK = threading.Lock()
+_ADVANCE_STATE = {"ts": 0.0, "result": None}
+_ADVANCE_MIN_INTERVAL = 30.0   # 秒；此窗口内重复调用直接返回上次结果
+
 # ===== 上传在途注册表（「取消上传」用，杜绝半成品文件遗留）=====
 # 前端每次上传生成 upload_id 随请求带入；服务端在生成 dataset_id 后立刻登记产物路径。
 # 取消接口按 upload_id 就能精确删除「数据集目录 + 原始压缩包 + PG 影子库记录」，
@@ -4367,10 +4375,22 @@ class DatasetService:
         return {"poured": poured_events, "sealed": sealed_events, "skipped": skipped,
                 "pending_review": pending_review}
 
-    async def advance_buckets(self) -> dict:
+    async def advance_buckets(self, force: bool = False) -> dict:
         """按模型滚动灌桶（幂等）：A 包「标完 + 审核通过」后灌桶，满 settings.SEAL_MIN_IMAGES 自动封板出成品数据集。
         供前端在数据集页加载 / 标注完成返回时调用。
+
+        节流：_ADVANCE_MIN_INTERVAL 秒内的重复调用直接返回上次结果（force=True 跳过）。
+        灌桶本身幂等，短时间内重跑既没用，又会把 meta.json / buckets.json 的 mtime
+        刷新掉、令 list_datasets 的签名缓存失效 —— 那才是「切回数据集页要转圈」的主因。
+        真正需要立刻生效的场景（审核通过、封板、撤回）走各自的接口，不受此节流影响。
         """
+        now = time.time()
+        with _ADVANCE_LOCK:
+            if (not force and _ADVANCE_STATE["result"] is not None
+                    and now - _ADVANCE_STATE["ts"] < _ADVANCE_MIN_INTERVAL):
+                logger.info("advance_buckets: throttled (%.0fs since last run)", now - _ADVANCE_STATE["ts"])
+                return _ADVANCE_STATE["result"]
+
         def _locked():
             with _BUCKET_LOCK:
                 return self._advance_buckets_sync()
@@ -4380,6 +4400,9 @@ class DatasetService:
         from src.db import shadow
         await shadow.sync_buckets()
         await shadow.refresh_all_datasets()
+        with _ADVANCE_LOCK:
+            _ADVANCE_STATE["ts"] = time.time()
+            _ADVANCE_STATE["result"] = events
         return events
 
     def _purge_library_buckets_sync(self, root_id: str) -> int:
@@ -4506,7 +4529,9 @@ class DatasetService:
         while True:
             record_heartbeat("bucket_poll")
             try:
-                res = await self.advance_buckets()
+                # force=True：后台定时任务按自己的节奏跑，不被前端的节流窗口挡掉
+                # （否则用户刚好在页面上刷新时，这一轮轮询会被判定为 throttled 而跳过）
+                res = await self.advance_buckets(force=True)
                 if res.get("poured") or res.get("sealed"):
                     logger.info(
                         f"bucket poll: poured={len(res['poured'])} "

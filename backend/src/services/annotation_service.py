@@ -5,6 +5,8 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
+import time
 import zipfile
 from pathlib import Path
 from datetime import datetime
@@ -15,6 +17,24 @@ from src.utils import zip_guard
 from src.utils.json_io import load_json, save_json_atomic
 
 logger = logging.getLogger(__name__)
+
+# ===== 每图标注全量读取的签名缓存 =====
+# get_task_items 每次进标注页都要读整个 annotations/ 目录（万张图 = 万次 open+json.loads，
+# 实测 2~5s），而进页面的频率远高于标注变动的频率。
+#
+# 缓存键 = (数据集, version) 目录的「目录项签名」：
+#   · 目录自身的 mtime_ns（新增/删除/重命名文件必变）
+#   · 文件总数 + 最新的 3 个 mtime_ns + 文件名哈希
+# 目录 mtime 只覆盖「增删」，覆盖不到「改内容」（改 JSON 不动目录 mtime），
+# 因此额外取最新的几个文件 mtime —— 单机写入必然把被改文件的 mtime 顶到最新，
+# 只要它进入 Top3 就能捕获。TTL 兜底极端并发写（多个文件同时被改到同一纳秒级）。
+#
+# 关键：这是**服务器级共享缓存**，不是单设备缓存。签名随磁盘变化，A 电脑标完图后
+# 目录里必然多出/更新文件，B 电脑刷新即命中新签名重新读，不会看到陈旧数据。
+_ANN_CACHE_LOCK = threading.Lock()
+_ANN_CACHE: dict = {}          # (dataset_id, version) -> {"sig": str, "data": dict, "ts": float}
+_ANN_CACHE_TTL = 3.0           # 秒；兜底用，主要靠签名
+_ANN_CACHE_MAX_KEYS = 8        # 只缓存最近用过的几个数据集，避免内存无界增长
 
 
 def live_classes(snapshot_classes: list, model_id: str) -> list:
@@ -299,27 +319,99 @@ class AnnotationService:
         p = self._image_ann_path(dataset_id, version, image_id)
         p.parent.mkdir(parents=True, exist_ok=True)
         save_json_atomic(p, strip_ann_bbox(data))
+        # 写后就失效：签名虽然能靠 mtime 捕获，但同一毫秒内多次写会撞，
+        # 这里显式清掉最稳妥，也避免写路径自己读到旧缓存
+        self._invalidate_ann_cache(dataset_id)
 
     def _delete_image_ann(self, dataset_id: str, version: str, image_id: str):
         p = self._image_ann_path(dataset_id, version, image_id)
         try:
             p.unlink()
+            self._invalidate_ann_cache(dataset_id)
         except OSError:
             pass
 
+    @staticmethod
+    def _ann_dir_signature(ann_dir: Path) -> str:
+        """annotations/ 目录的轻量签名：文件数 + 全部 mtime 之和/最大值 + 目录 mtime。
+
+        不做全量 json.loads，只对目录做一次 scandir（目录项 stat 由 scandir 顺带给出），
+        实测万文件约 18ms，相比全量读取的 2~5s 可忽略。
+
+        为什么用「mtime 之和」而不是只看最新几个文件：批量审核/查重会连续写上千个
+        文件，若只取 Top3，可能在批次中途把签名固定住、之后改动的文件挤不进 Top3
+        而漏检。求和后任一文件被改写都会让和变化，没有盲区；代价只是几次大整数加法。
+        取不到签名时返回空串，调用方据此跳过缓存（宁可慢也不出错）。
+        """
+        try:
+            import hashlib
+            st = ann_dir.stat()
+            count = 0
+            mtime_sum = 0
+            mtime_max = 0
+            for e in os.scandir(ann_dir):
+                if not e.name.endswith(".json"):
+                    continue
+                try:
+                    m = e.stat().st_mtime_ns
+                except OSError:
+                    continue
+                count += 1
+                mtime_sum += m
+                if m > mtime_max:
+                    mtime_max = m
+            raw = f"{count}|{mtime_sum}|{mtime_max}|{st.st_mtime_ns}|{st.st_size}"
+            return hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()
+        except OSError:
+            return ""
+
+    def _invalidate_ann_cache(self, dataset_id: str | None = None) -> None:
+        """标注缓存失效。写路径（保存/删除/清空/导入）改动后调用，
+        保证下一次读取一定重新读盘，而不是等签名或 TTL 自然过期。"""
+        with _ANN_CACHE_LOCK:
+            if dataset_id is None:
+                _ANN_CACHE.clear()
+            else:
+                for k in [k for k in _ANN_CACHE if k[0] == dataset_id]:
+                    _ANN_CACHE.pop(k, None)
+
     def _load_all_image_anns(self, dataset_id: str, version: str) -> dict:
-        """读取数据集下所有每图 JSON 标注（缺失/损坏按空处理）"""
+        """读取数据集下所有每图 JSON 标注（缺失/损坏按空处理）。
+
+        带签名缓存：进标注页时万张图的全量 json.loads 是主要卡顿来源，
+        磁盘无变化时直接复用上次结果。返回值一律给**浅拷贝**，
+        因为部分调用方（如导出）会对结果做 setdefault 等原地修改。
+        """
         ann_dir = self.datasets_dir / dataset_id / "annotations"
-        out = {}
         if not ann_dir.exists():
-            return out
+            return {}
+
+        key = (dataset_id, version)
+        sig = self._ann_dir_signature(ann_dir)
+
+        if sig:
+            with _ANN_CACHE_LOCK:
+                hit = _ANN_CACHE.get(key)
+                if (hit and hit["sig"] == sig
+                        and time.time() - hit["ts"] < _ANN_CACHE_TTL):
+                    return dict(hit["data"])
+
+        out = {}
         for p in ann_dir.glob("*.json"):
             try:
                 data = ann_with_bbox(load_json(p))
                 out[data.get("image_id", p.stem)] = data
             except Exception:
                 continue
-        return out
+
+        if sig:
+            with _ANN_CACHE_LOCK:
+                # 只保留最近若干个数据集，避免长期运行后内存无界增长
+                if len(_ANN_CACHE) >= _ANN_CACHE_MAX_KEYS and key not in _ANN_CACHE:
+                    oldest = min(_ANN_CACHE.items(), key=lambda kv: kv[1]["ts"])[0]
+                    _ANN_CACHE.pop(oldest, None)
+                _ANN_CACHE[key] = {"sig": sig, "data": out, "ts": time.time()}
+        return dict(out)
 
     def _task_to_ds(self, task_meta: dict) -> tuple:
         return task_meta.get("dataset_id", ""), task_meta.get("version", "v1")
