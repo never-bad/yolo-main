@@ -200,7 +200,31 @@
           </div>
         </div>
         <!-- 翻页用画布两侧的 ‹ › 或键盘 ←/→，这里只留一个游标，表示当前图在筛选/搜索结果里的位置 -->
-        <div class="nav-pos">{{ visibleIdx >= 0 ? `第 ${visibleIdx + 1} / ${visibleItems.length} 张` : '当前无匹配图片' }}</div>
+        <!-- 游标可点击：输入序号直接跳到第 N 张（千张级任务里比连点 → 快得多） -->
+        <div
+          class="nav-pos"
+          :class="{ editing: posEditing, jumpable: !!visibleItems.length }"
+          :title="visibleItems.length ? '点击输入序号，直接跳到第 N 张' : ''"
+          @click="startPosJump"
+        >
+          <template v-if="posEditing">
+            <span class="pos-text">第</span>
+            <input
+              ref="posInputRef"
+              v-model="posInput"
+              class="nav-pos-input"
+              :style="{ width: Math.max(2, posInput.length) + 1 + 'ch' }"
+              inputmode="numeric"
+              autocomplete="off"
+              @keydown.enter.prevent="commitPosJump"
+              @keydown.esc.prevent="cancelPosJump"
+              @blur="onPosBlur"
+            />
+            <span class="pos-text">/ {{ visibleItems.length }} 张</span>
+          </template>
+          <span v-else-if="visibleIdx >= 0">第 {{ visibleIdx + 1 }} / {{ visibleItems.length }} 张</span>
+          <span v-else>{{ visibleItems.length ? '当前无匹配图片（点此跳转）' : '当前无匹配图片' }}</span>
+        </div>
       </div>
 
       <div class="canvas-area">
@@ -4402,6 +4426,53 @@ const nextImage = () => {
   if (p >= 0 && p < visibleItems.value.length - 1) selectImageByItem(visibleItems.value[p + 1])
 }
 
+// ===== 游标跳转：点「第 N / M 张」输入序号直达 =====
+// 千张级任务里靠 ← / → 挪几十张太慢，直接输入序号最省事。
+// 序号口径与游标一致：可见集合（类别筛选 ∩ 文件名搜索）里的第 N 张，从 1 开始。
+const posEditing = ref(false)
+const posInput = ref('')
+const posInputRef = ref<HTMLInputElement | null>(null)
+let posJumpBase = ''   // 进入编辑时的原值，用于判断「有没有真的改过」
+
+const startPosJump = async () => {
+  if (!visibleItems.value.length || posEditing.value) return
+  // 当前图被筛掉时游标是 -1，从 1 开始输入更符合直觉
+  posInput.value = visibleIdx.value >= 0 ? String(visibleIdx.value + 1) : ''
+  posJumpBase = posInput.value
+  posEditing.value = true
+  await nextTick()
+  posInputRef.value?.focus()
+  posInputRef.value?.select()
+}
+
+const cancelPosJump = () => {
+  posEditing.value = false
+  posInput.value = ''
+}
+
+// 失焦也算提交（输完号直接点画布/别处就跳过去），但没改动过就不动，避免误触发
+const onPosBlur = () => {
+  if (posInput.value.trim() === posJumpBase.trim()) cancelPosJump()
+  else commitPosJump()
+}
+
+const commitPosJump = () => {
+  if (!posEditing.value) return
+  const n = visibleItems.value.length
+  const raw = posInput.value.trim()
+  // 允许留空直接回车 = 放弃；非数字、越界一律按边界夹取，不弹错打断操作
+  const parsed = parseInt(raw, 10)
+  posEditing.value = false
+  posInput.value = ''
+  if (!raw || Number.isNaN(parsed) || n === 0) return
+  const target = Math.min(Math.max(parsed, 1), n) - 1
+  if (target === visibleIdx.value) return
+  selectImageByItem(visibleItems.value[target])
+  if (parsed < 1 || parsed > n) {
+    showToast(`序号超出范围（1 ~ ${n}），已跳到第 ${target + 1} 张`, 'info', 3000)
+  }
+}
+
 const handleKeydown = (e: KeyboardEvent) => {
   const tag = (e.target as HTMLElement)?.tagName
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
@@ -4904,6 +4975,40 @@ onUnmounted(() => {
   font-size: 0.78rem;
   color: #7f8c8d;
   font-variant-numeric: tabular-nums;
+}
+
+/* 游标可点击跳转：默认只做轻微提示，避免抢列表的视觉重心 */
+.nav-pos.jumpable {
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background 0.15s, color 0.15s;
+}
+.nav-pos.jumpable:hover {
+  background: #eef3f8;
+  color: #2c3e50;
+}
+.nav-pos.editing {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+  color: #2c3e50;
+}
+.nav-pos .pos-text {
+  white-space: nowrap;
+}
+.nav-pos-input {
+  padding: 0.1rem 0.3rem;
+  border: 1px solid #3498db;
+  border-radius: 3px;
+  font-size: 0.78rem;
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  color: #2c3e50;
+  background: #fff;
+  outline: none;
+  min-width: 2.5ch;
 }
 
 .image-filter {
