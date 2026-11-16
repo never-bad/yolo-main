@@ -857,6 +857,15 @@ const loadingDatasets = ref(false)
 const creatingTask = ref(false)
 const loadingItems = ref(false)
 const savingAnnotation = ref(false)
+// 保存请求串行链：早先这里是「有请求在飞就直接 return」，而切图路径会 await 它，
+// 结果拿到 false 后照样清空画布，新画的框被静默丢弃 —— 就是「切走再切回来框没了」。
+// 现在所有保存请求排成一条链依次执行，调用方 await 到的一定是「自己那次改动已落盘」。
+let saveChain: Promise<any> = Promise.resolve()
+// 在途保存计数：>0 时按钮保持「保存中」，全部落地才关
+let pendingSaves = 0
+// 画布内容的修改代数。每次 markDirty +1，保存时带上快照代数：
+// 落地时代数没变才能清 dirty（变了说明期间又改过，dirty 必须留着）
+let dirtyVersion = 0
 const deletingImage = ref(false)
 // 右侧面板"⋯ 更多"（全局/批量操作）菜单开关
 const moreOpen = ref(false)
@@ -2226,28 +2235,41 @@ const selectImage = async (index: number) => {
 // 加载已有标注
 const loadExistingAnnotation = async () => {
   if (!currentTask.value || !currentImage.value) return
-  
+  // 记下这次是为哪张图发的请求：快速连翻时响应会乱序回来，
+  // 不校验就会把上一张的框画到当前图上（表现为「框变了/框没了」）
+  const imageId = currentImage.value.image_id
+  const taskId = currentTask.value
   loadingAnnotation.value = true
   try {
-    const result = await getImageAnnotation(currentTask.value, currentImage.value.image_id)
+    const result = await getImageAnnotation(taskId, imageId)
+    // 期间用户已经切到别的图：这份结果直接丢弃
+    if (currentImage.value?.image_id !== imageId) return
     if (result) {
       currentSampleType.value = result.sample_type || ''
       // 回读"人工复核过"标记：之前修过的图再打开仍算已修，不会被筛回"待修正"
       manualTouched.value = !!result.reviewed
-      if (result.boxes && result.boxes.length > 0) {
-        currentBoxes.value = result.boxes.map((box: any) => ({
-          class_id: box.class_id,
-          x1: box.x1,
-          y1: box.y1,
-          x2: box.x2,
-          y2: box.y2,
-          // 分割轮廓必须回填，否则重新打开图片时分割标注只剩矩形（顶点也就无从微调）
-          ...(box.polygon && box.polygon.length >= 3 ? { polygon: box.polygon as number[][] } : {})
-        }))
-      }
+      // 无条件赋值：图确实是「无框」状态时也要显式清空，
+      // 不能只在有框时才写（否则上一次的框会残留在画布上）
+      currentBoxes.value = (result.boxes || []).map((box: any) => ({
+        class_id: box.class_id,
+        x1: box.x1,
+        y1: box.y1,
+        x2: box.x2,
+        y2: box.y2,
+        // 分割轮廓必须回填，否则重新打开图片时分割标注只剩矩形（顶点也就无从微调）
+        ...(box.polygon && box.polygon.length >= 3 ? { polygon: box.polygon as number[][] } : {})
+      }))
+      // 以服务端为准重新拉画布，避免"框坐标在但看不见"
+      redrawCanvas()
     }
   } catch (error: any) {
     console.error('加载标注失败:', error)
+    // 以前这里只打 console：请求超时/失败时画布是空的，用户会以为标注丢了，
+    // 随手再画一遍就把服务端数据覆盖成半个框。必须让用户看见。
+    if (!error?.__toastShown) {
+      showToast('加载该图标注失败，画布可能不完整，请刷新后再修改: '
+        + (error.response?.data?.detail || error.message), 'error', 6000)
+    }
   } finally {
     loadingAnnotation.value = false
   }
@@ -4265,40 +4287,66 @@ onUnmounted(() => {
 })
 
 // 保存标注（silent=true 用于自动保存，不弹提示打扰）
-const persistAnnotation = async (silent = false): Promise<boolean> => {
-  if (!currentTask.value || !currentImage.value) return false
-  if (savingAnnotation.value) return false
+// 三个必须守住的点（都是「切走再切回来框没了」的成因）：
+//  1) 在飞时不能直接放弃，否则调用方以为存好了，随后 currentBoxes 被清空 → 新框永久丢失；
+//  2) 发请求前要把 image_id / 画布框 / 代数 全部快照，await 期间用户可能已经切图；
+//  3) 回写列表状态必须按 image_id 定位，不能用 currentIndex（那时候早就是另一张图了）。
+// 快照必须在「排队那一刻」取，不能在 await 之后取 —— 所以把真正干活的部分包成闭包，
+// 交给 saveChain 串行执行，闭包里用的全是入队时的值。
+const persistAnnotation = (silent = false): Promise<boolean> => {
+  if (!currentTask.value || !currentImage.value) return Promise.resolve(false)
+  // ↓ 入队即快照，此后用户切图/改画布都不影响这次要落盘的内容
+  const taskId = currentTask.value
+  const imageId = currentImage.value.image_id
+  const imgRef = currentImage.value
+  const boxes = currentBoxes.value.map((b: any) => ({ ...b }))
+  const aiFlag = currentImageHasAi.value || !!imgRef.ai_annotated
+  const manualType = currentSampleType.value || undefined
+  const touched = manualTouched.value
+  const ver = dirtyVersion
+  pendingSaves += 1
   savingAnnotation.value = true
-  try {
-    const aiFlag = currentImageHasAi.value || !!currentImage.value.ai_annotated
-    // 人工保存：显式样本类型时附带 manual 判据（人工确认），未选择时留空由后端自动判定
-    const manualType = currentSampleType.value || undefined
-    // 人工框标 source=manual（AI 框保存 source=ai_x），后端据此识别"人工补框→困难样本"
-    // audit 落盘（供"问题图片检索"），box_id 是预标注临时索引不落盘
-    const payloadBoxes = currentBoxes.value.map((b: any) => {
-      const { box_id, ...rest } = b
-      return rest.source ? rest : { ...rest, source: 'manual' }
-    })
-    await saveAnn(currentTask.value, currentImage.value.image_id, payloadBoxes, aiFlag, manualType, manualType ? 'manual' : undefined, manualTouched.value)
-    items.value[currentIndex.value].annotated = true
-    if (aiFlag) {
-      items.value[currentIndex.value].ai_annotated = true
+
+  const job = saveChain.then(async (): Promise<boolean> => {
+    // 前一次保存失败也要继续往下跑（catch 过），不能因为一条链断了就永久罢工
+    try {
+      // 人工框标 source=manual（AI 框保存 source=ai_x），后端据此识别"人工补框→困难样本"
+      // audit 落盘（供"问题图片检索"），box_id 是预标注临时索引不落盘
+      const payloadBoxes = boxes.map((b: any) => {
+        const { box_id, ...rest } = b
+        return rest.source ? rest : { ...rest, source: 'manual' }
+      })
+      await saveAnn(taskId, imageId, payloadBoxes, aiFlag, manualType, manualType ? 'manual' : undefined, touched)
+      // 列表状态按 image_id 回写（await 后 currentIndex 可能已指向别的图）
+      const row = items.value.find((it: any) => it.image_id === imageId)
+      if (row) {
+        row.annotated = true
+        if (aiFlag) row.ai_annotated = true
+        if (manualType) row.sample_type = manualType
+        // 即时刷新"轮廓质量"筛选所需的本地标记（免得重进页面才更新列表）
+        row.reviewed = row.reviewed || touched
+        row.has_polygon = payloadBoxes.some((b: any) => (b.polygon?.length || 0) >= 3)
+      }
+      // 只有「代数没变 + 还停在这张图上」才能清 dirty：代数变了说明期间又改过，
+      // 用户切走了则 dirty 属于新图（selectImage 刚置的 false），都不能碰
+      if (dirtyVersion === ver && currentImage.value?.image_id === imageId) dirty.value = false
+      if (!silent) showToast('保存成功!', 'success')
+      return true
+    } catch (error: any) {
+      // 自动保存失败也必须吭声：以前静默吞掉，用户以为存上了，切图后照样丢框
+      if (!error?.__toastShown) {
+        showToast('保存失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
+      }
+      return false
     }
-    if (manualType) {
-      items.value[currentIndex.value].sample_type = manualType
-    }
-    // 即时刷新"轮廓质量"筛选所需的本地标记（免得重进页面才更新列表）
-    items.value[currentIndex.value].reviewed = items.value[currentIndex.value].reviewed || manualTouched.value
-    items.value[currentIndex.value].has_polygon = currentBoxes.value.some((b: any) => (b.polygon?.length || 0) >= 3)
-    dirty.value = false
-    if (!silent) showToast('保存成功!', 'success')
-    return true
-  } catch (error: any) {
-    if (!silent && !error?.__toastShown) showToast('保存失败: ' + (error.response?.data?.detail || error.message), 'error', 4000)
-    return false
-  } finally {
-    savingAnnotation.value = false
-  }
+  })
+  // 链本身要吞掉异常，但调用方仍然拿到 false
+  saveChain = job.catch(() => false)
+  job.finally(() => {
+    pendingSaves = Math.max(0, pendingSaves - 1)
+    if (pendingSaves === 0) savingAnnotation.value = false
+  }).catch(() => {})
+  return job
 }
 
 const saveAnnotation = () => persistAnnotation(false)
@@ -4306,6 +4354,7 @@ const saveAnnotation = () => persistAnnotation(false)
 // 标记脏状态并防抖自动保存（所有编辑操作经 pushUndo 触发）
 const markDirty = () => {
   dirty.value = true
+  dirtyVersion += 1
   clearTimeout(autoSaveTimer.value)
   autoSaveTimer.value = setTimeout(() => persistAnnotation(true), 1500)
 }
