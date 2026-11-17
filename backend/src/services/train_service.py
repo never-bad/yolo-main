@@ -357,6 +357,9 @@ class TrainService:
             "optimizer": optimizer,
             "weight_decay": weight_decay,
             "patience": patience,
+            # 数据加载进程数推荐：容器 shm 已给 24G，多进程可行；
+            # 图少时进程多了反而调度开销占主导，所以按规模给档。
+            "workers": self._suggest_workers(image_count),
         }
 
         # ---------- 4. 说明文案（L2 展示黄金公式推导） ----------
@@ -383,6 +386,27 @@ class TrainService:
             "level": "L2",
             "reason": reason,
         }
+
+    @staticmethod
+    def _suggest_workers(image_count: int) -> int:
+        """按数据集规模推荐 DataLoader 进程数。
+
+        依据：单进程时 GPU 会在每个 batch 后等 CPU decode 图片，
+        实测 1.3 万张 / batch12 的场景下每 iter 0.94s（正常应 0.1s 级）。
+        进程数不是越多越好 —— 图少时调度与 IPC 开销会反超收益，
+        且每个 worker 都要占一份内存，所以按规模分档。
+        """
+        try:
+            n = int(image_count or 0)
+        except Exception:
+            n = 0
+        if n < 500:
+            return 2
+        if n < 3000:
+            return 4
+        if n < 10000:
+            return 6
+        return 8
 
     def _resolve_dataset_yaml(self, dataset_id: str, version: str = "v1") -> Path:
         """定位数据集训练用 data.yaml：
@@ -1126,6 +1150,7 @@ class TrainService:
                          lr0: float = None, optimizer: str = None,
                          weight_decay: float = None, patience: int = None,
                          gpu_index: int = None, business: str = None,
+                         workers: int = None,
                          dataset_ids: list = None, aggregate_incomplete: bool = False,
                          hard_sample_ratio: float = 0.1, background_sample_ratio: float = 0.05,
                          migration_target_model: str = None, recall_enabled: bool = True,
@@ -1409,6 +1434,7 @@ class TrainService:
             "weight_decay": weight_decay,
             "patience": patience,
             "gpu_index": gpu_index,
+            "workers": workers,
             "business": business,
             "baseline_model_id": baseline_model_id,   # 守门员对比基准（上一代同业务生产模型）
             # 2.4 跨代迁移训练信息（非迁移任务为 None；前端/守门员报告/模型血缘据此标记）
@@ -1427,16 +1453,35 @@ class TrainService:
         # 启动失败（如 Popen 异常）则清理任务文件并回滚，避免留下"训练中"残留
         try:
             await asyncio.to_thread(
-                self._start_training, job_id, actual_data_yaml, actual_model_path, epochs, imgsz, batch, False,
-                lr0, optimizer, weight_decay, patience, gpu_index,
-                business, baseline_path, baseline_model_id,
+                self._start_training,
+                job_id=job_id,
+                data_yaml=actual_data_yaml,
+                model_name=actual_model_path,
+                epochs=epochs, imgsz=imgsz, batch=batch,
+                resume=False,
+                lr0=lr0, optimizer=optimizer,
+                weight_decay=weight_decay, patience=patience,
+                gpu_index=gpu_index,
+                business=business,
+                baseline_path=baseline_path,
+                baseline_model_id=baseline_model_id,
                 # 2.4 迁移训练：目标架构 + 迁移来源 + lr0 是否自动降级
-                migration.get("target_model") if migration else None,
-                f"{migration['source_model_id']} [{migration['source_architecture']}]" if migration else None,
-                bool(migration and migration.get("lr0_degraded")),
-                library_root_id,
-                base_model_id,
-                augment
+                migration_target=migration.get("target_model") if migration else None,
+                migration_source=(
+                    f"{migration['source_model_id']} [{migration['source_architecture']}]"
+                    if migration else None
+                ),
+                migration_lr0_degraded=bool(migration and migration.get("lr0_degraded")),
+                library_root_id=library_root_id,
+                base_model_id=base_model_id,
+                # 血缘基座：新建任务时基座就是本次传入的原始权重（微调时 actual_model_path
+                # 已是基座 .pt，与 job_meta["original_model_path"] 同源）。
+                # 注意：这一位原来是 augment —— 位置错位导致 augment 从未真正生效，
+                # 同时把 dict 当 lineage_base_model 传给脚本（`if lineage_base_model`
+                # 为真 → 拼出 "--lineage-base-model {'mosaic': ...}" 的脏参数）。
+                lineage_base_model=actual_model_path,
+                augment=augment,
+                workers=workers,
             )
         except Exception as e:
             try:
@@ -1752,7 +1797,8 @@ class TrainService:
                        library_root_id: str = None,
                        base_model_id: str = None,
                        lineage_base_model: str = None,
-                       augment: dict = None):
+                       augment: dict = None,
+                       workers: int = None):
         """启动训练进程（同步方法，在线程中调用）
 
         2.4 迁移训练参数（训练模块规范 §3.2.2）：
@@ -1831,6 +1877,10 @@ class TrainService:
             # 避免「用户选 GPU1 却落到 cuda:0=物理GPU0」的序号错乱（B-16 同类 OOM）。
             if gpu_index is not None:
                 cmd += ["--gpu", "0"]
+            # 数据加载进程数：用户显式指定才透传（缺省交给脚本按环境自动判断，
+            # 容器内 auto 会落 0 = 单进程，GPU 会等 CPU 读图）
+            if workers is not None:
+                cmd += ["--workers", str(int(workers))]
             # 数据增强策略：用户显式配置才透传（键名下划线转连字符匹配 train_script 的 --xxx）
             for a_key, a_val in (augment or {}).items():
                 if a_val is None:
@@ -2439,31 +2489,40 @@ class TrainService:
         need_mig = (not use_resume) and resume_mig.get("enabled")
         await asyncio.to_thread(
             self._start_training,
-            job_id, 
-            data_yaml, 
-            model_to_use,
-            job_meta["epochs"],
-            job_meta["imgsz"],
-            job_meta["batch"],
-            use_resume,
-            job_meta.get("lr0"),
-            job_meta.get("optimizer"),
-            job_meta.get("weight_decay"),
-            job_meta.get("patience"),
-            job_meta.get("gpu_index"),
-            resume_business,
-            resume_baseline_path,
-            resume_baseline_id,
-            resume_mig.get("target_model") if need_mig else None,
-            f"{resume_mig.get('source_model_id')} [{resume_mig.get('source_architecture')}]"
-            if need_mig else None,
-            bool(resume_mig.get("lr0_degraded")),
-            job_meta.get("library_root_id"),
+            job_id=job_id,
+            data_yaml=data_yaml,
+            model_name=model_to_use,
+            epochs=job_meta["epochs"],
+            imgsz=job_meta["imgsz"],
+            batch=job_meta["batch"],
+            resume=use_resume,
+            lr0=job_meta.get("lr0"),
+            optimizer=job_meta.get("optimizer"),
+            weight_decay=job_meta.get("weight_decay"),
+            patience=job_meta.get("patience"),
+            gpu_index=job_meta.get("gpu_index"),
+            business=resume_business,
+            baseline_path=resume_baseline_path,
+            baseline_model_id=resume_baseline_id,
+            migration_target=resume_mig.get("target_model") if need_mig else None,
+            migration_source=(
+                f"{resume_mig.get('source_model_id')} [{resume_mig.get('source_architecture')}]"
+                if need_mig else None
+            ),
+            migration_lr0_degraded=bool(resume_mig.get("lr0_degraded")),
+            library_root_id=job_meta.get("library_root_id"),
             # 修复：续训原来漏传 base_model_id，导致产出模型的 parent_model_id
             # 退化成守门员基线（血缘链断裂）。job_meta 里本来就存着，补上即可
-            job_meta.get("base_model_id"),
+            base_model_id=job_meta.get("base_model_id"),
             # 血缘基座沿用最初的原始权重；--model 传的是 last.pt，只用于恢复训练
-            job_meta.get("original_model_path") or job_meta.get("model_name")
+            lineage_base_model=(
+                job_meta.get("original_model_path") or job_meta.get("model_name")
+            ),
+            # 续训沿用原任务的数据增强配置（checkpoint 会恢复 ultralytics 大部分
+            # 训练超参，但这里显式传以保持与首次训练一致）
+            augment=job_meta.get("augment"),
+            # 数据加载进程数：续训沿用原任务的设置
+            workers=job_meta.get("workers"),
         )
         
         return {"job_id": job_id, "status": "running", "message": "Training resumed from checkpoint"}

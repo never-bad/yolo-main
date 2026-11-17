@@ -639,8 +639,25 @@ def main():
         # 数据加载进程数：容器/Docker/Windows 使用单进程（workers=0）最稳，
         # 避免多进程 DataLoader 在 fork + CUDA + 共享内存环境下的 [Errno 22] / 卡死 / 崩溃
         if args.workers is not None:
-            workers = args.workers
+            workers = max(0, int(args.workers))
             print(f"[{datetime.now().isoformat()}] 数据加载进程数: workers={workers}（由用户指定）")
+            if workers > 0:
+                # 进程数不能超过 CPU 核数，超了只会互相争抢、上下文切换变多
+                try:
+                    _cpu = os.cpu_count() or 4
+                    if workers > _cpu:
+                        print(f"[{datetime.now().isoformat()}] [WARN] workers={workers} 超过 CPU 核数 {_cpu}，按 {_cpu} 执行")
+                        workers = _cpu
+                except Exception:
+                    pass
+                # 说明：这里不强行 set_start_method('spawn')。
+                # ultralytics 的 Dataset 是纯 CPU 的（PIL/OpenCV decode + 几何增强），
+                # DataLoader worker 里不碰 CUDA，默认 fork 是安全的，且比 spawn 快得多
+                # （spawn 每个 epoch 都要重新 import torch）。
+                # 真遇到 "Cannot re-initialize CUDA in forked subprocess" 时，
+                # 把 workers 调回 0 即可，不需要改代码。
+                print(f"[{datetime.now().isoformat()}] DataLoader 多进程预取已启用"
+                      f"（共享内存已配 24G，若报 Errno 22 / 卡死请把 workers 调回 0）")
         elif os.name == 'nt' or os.path.exists('/.dockerenv') or (Path(__file__).resolve().parent.parent.parent / 'app').exists():
             workers = 0
             print(f"[{datetime.now().isoformat()}] 数据加载进程数: workers=0（容器/单进程模式，最稳定）")

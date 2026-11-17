@@ -18,6 +18,9 @@ export interface TrainJobRequest {
   weight_decay?: number // 权重衰减
   patience?: number     // 早停轮数（0 = 关闭）
   gpu_index?: number | null // 训练节点：指定 GPU 索引（null/undefined = 自动）
+  // 数据加载进程数（Dataloader workers）。undefined = 自动（容器内会落 0）。
+  // 0 = 单进程最稳但慢（GPU 等数据）；4~8 = 多进程预取，通常快数倍。
+  workers?: number | null
   // 训练增强（1.5/1.6）：样本池抽样 + 回忆集混训
   hard_sample_ratio?: number      // 困难样本库按比例抽样并入训练（0=关闭，默认 0.1）
   background_sample_ratio?: number // 空白样本库抽样（负样本，默认 0.05）

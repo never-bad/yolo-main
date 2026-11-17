@@ -27,6 +27,11 @@ class TrainJobRequest(BaseModel):
     weight_decay: Optional[float] = None # 权重衰减
     patience: Optional[int] = None       # 早停轮数（0 = 关闭）
     gpu_index: Optional[int] = None      # 训练节点：指定 GPU 索引（多卡环境；缺省自动）
+    # 数据加载进程数（Dataloader workers）。缺省 None = 由脚本按环境自动决定
+    # （容器内 auto 会走 0，因为 fork+CUDA+共享内存容易 [Errno 22]）。
+    # 用户显式指定则以此为准：0=单进程（最稳，但 GPU 会等数据），
+    # 4~8=多进程预取（快数倍，前提是容器 shm 够大）。
+    workers: Optional[int] = None
     # 阶段1.5/1.6（训练增强）：回忆集混训 + 样本池抽样并入（缺省开启，池为空时自动跳过）
     hard_sample_ratio: float = 0.1       # 困难样本库抽样比例（针对 base_model_id）
     background_sample_ratio: float = 0.05  # 空白负样本库抽样比例
@@ -99,6 +104,7 @@ async def create_train_job(request: TrainJobRequest):
             weight_decay=request.weight_decay,
             patience=request.patience,
             gpu_index=request.gpu_index,
+            workers=request.workers,
             dataset_ids=request.dataset_ids,
             aggregate_incomplete=request.aggregate_incomplete,
             hard_sample_ratio=request.hard_sample_ratio,

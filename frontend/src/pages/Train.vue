@@ -297,6 +297,26 @@
           <input v-model.number="trainForm.patience" type="number" min="0" :disabled="training" />
           <small>验证指标连续 N 轮不涨则停止（0 = 关闭）</small>
         </div>
+        <!-- 数据加载进程数：默认 0（容器内最稳），但 GPU 会一直等 CPU 读图，
+             大几千张图时慢到 8 倍。这里放出来让用户按机器情况自己调。 -->
+        <div class="form-group">
+          <label>
+            数据加载进程 workers
+            <span
+              class="hint-dot"
+              title="Dataloader 进程数。0=单进程（容器里最稳，但 GPU 常常在等数据）；4~8=多进程预取，dataset 大时能快数倍。改这个不影响模型精度，只影响速度。"
+            >?</span>
+          </label>
+          <select v-model.number="trainForm.workers" :disabled="training">
+            <option :value="null">自动（容器内 = 0）</option>
+            <option :value="0">0 — 单进程（最稳）</option>
+            <option :value="2">2 进程</option>
+            <option :value="4">4 进程（推荐）</option>
+            <option :value="6">6 进程</option>
+            <option :value="8">8 进程（最快）</option>
+          </select>
+          <small :class="{ 'warn-text': workersSpeedHint.warn }">{{ workersSpeedHint.text }}</small>
+        </div>
         <!-- B-65 数据增强策略：仅 L3 高级模式暴露；留空不传，沿用 ultralytics 默认值 -->
         <div class="augment-block" style="grid-column: 1 / -1; margin-top: 14px;">
           <div style="font-weight: 600; margin-bottom: 8px;">数据增强策略（留空 = 沿用 ultralytics 默认）</div>
@@ -404,7 +424,7 @@
             <span class="job-pill" :class="'jp-' + jobPillKey(job.status)">{{ jobStatusText(job.status) }}</span>
           </div>
           <p>任务id: {{ job.job_id }}&nbsp;|&nbsp;模型: {{ (job.model_name || '').split(/[\\/]/).pop() }}&nbsp;|&nbsp;{{ job.epochs }} 轮&nbsp;|&nbsp;Img {{ job.imgsz }}&nbsp;|&nbsp;Batch {{ job.batch }}</p>
-          <p>节点: {{ job.gpu_index != null && job.gpu_index !== undefined ? 'GPU ' + job.gpu_index : '自动选择' }}&nbsp;|&nbsp;启动: {{ new Date(job.created_at).toLocaleString() }}&nbsp;|&nbsp;训练时长: {{ jobDuration(job) }}</p>
+          <p>节点: {{ job.gpu_index != null && job.gpu_index !== undefined ? 'GPU ' + job.gpu_index : '自动选择' }}&nbsp;|&nbsp;启动: {{ new Date(job.created_at).toLocaleString() }}&nbsp;|&nbsp;训练时长: {{ jobDuration(job) }}<template v-if="job.workers != null">&nbsp;|&nbsp;加载进程: {{ job.workers }}</template></p>
           <p class="job-badges">
             <span v-if="job.gpu_abnormal" class="gpu-abnormal-badge" title="GPU 利用率持续过低，系统自动停止训练">⚠️ GPU 异常熔断</span>
             <span v-if="job.early_stopped" class="early-stop-badge" title="模型已收敛，系统自动提前停止训练以节省资源">✓ 已完成（早停）</span>
@@ -628,6 +648,7 @@ const trainForm = ref<TrainJobRequest>({
   base_model_id: undefined,
   business: 'general',
   gpu_index: null,  // null = 自动选择 GPU
+  workers: null,    // null = 自动（容器内为 0）；手动可设 0/2/4/6/8
   // 1.5/1.6 训练增强：样本池抽样 + 回忆集混训
   hard_sample_ratio: 0,   // 困难样本抽样默认关闭（0），用户按需开启
   background_sample_ratio: 0.05,
@@ -810,10 +831,46 @@ function fmtDuration(sec: number): string {
   if (s >= 60) return `约 ${Math.round(s / 60)} 分钟`
   return `约 ${s} 秒`
 }
-// Workers：YOLO 数据加载工作进程数（后端未直接返回，按图片规模推导）
+// Workers：用户是否手动改过。改过之后不再被自动推荐覆盖
+// （否则切一次数据集 / 换个模型就把手动调的值冲掉，用户会以为没生效）
+const workersTouched = ref(false)
+watch(() => trainForm.value.workers, (v) => {
+  // 推荐逻辑写入时也会触发；用 suggestParamsRes 是否在填充来区分太脆弱，
+  // 改为：只有当值不是当前推荐值时才认定是用户手动改的
+  const rec = suggestParamsRes.value?.workers
+  if (v !== null && v !== undefined && v !== rec) workersTouched.value = true
+})
+
+// Workers：YOLO 数据加载工作进程数
+// 注意：这只是「自动」档位下前端给用户看的说明值，真正的执行值由后端/脚本决定
+// （容器内 auto → 0）。用户显式选了就以选择为准，见 workersSpeedHint。
 const workersValue = computed(() => {
+  if (trainForm.value.workers !== null && trainForm.value.workers !== undefined) {
+    return String(trainForm.value.workers)
+  }
   const cnt = resourceEstimate.value.imageCount
-  return Math.min(8, Math.max(2, Math.floor(cnt / 256) || 2))
+  return String(Math.min(8, Math.max(2, Math.floor(cnt / 256) || 2)))
+})
+
+// 选 workers 时给一句人话解释代价，避免用户瞎选
+const workersSpeedHint = computed(() => {
+  const w = trainForm.value.workers
+  const cnt = resourceEstimate.value.imageCount
+  if (w === null || w === undefined) {
+    return { text: '自动 = 容器内使用单进程（最稳），图片多时会明显变慢', warn: false }
+  }
+  if (w === 0) {
+    return {
+      text: cnt > 2000
+        ? `单进程：${cnt} 张图会比较慢，GPU 大部分时间在等 CPU 读图，建议调到 4`
+        : '单进程：最稳，容器环境不易崩溃',
+      warn: cnt > 2000
+    }
+  }
+  return {
+    text: `多进程预取：通常快 ${Math.min(8, Math.round(w / 0.9))} 倍以上；不影响精度，只影响速度`,
+    warn: false
+  }
 })
 
 // ===== 预训练权重开关（§3.2.1 从零训练 / §3.2.2 跨代迁移入口二） =====
@@ -1115,6 +1172,11 @@ const fetchSuggest = async () => {
       trainForm.value.optimizer = p.optimizer
       trainForm.value.weight_decay = p.weight_decay
       trainForm.value.patience = p.patience
+      // 数据加载进程数：用户手动选过就尊重他的选择，否则跟随推荐
+      // （切数据集 / 换模型都会重新推荐，无脑覆盖会把手动调过的值冲掉）
+      if (!workersTouched.value && p.workers !== undefined && p.workers !== null) {
+        trainForm.value.workers = p.workers
+      }
       suggestReason.value = res.reason || ''
       // 2.2：黄金参数 L2 只读展示（CPU/不可用时为 null）
       suggestGolden.value = res.golden || null
@@ -1578,6 +1640,8 @@ const retrainJob = async (job: any) => {
       weight_decay: job.weight_decay ?? undefined,
       patience: job.patience ?? undefined,
       gpu_index: job.gpu_index ?? undefined,
+      // 重跑沿用原任务的数据加载进程数（旧任务可能没这个字段 → undefined = 自动）
+      workers: job.workers ?? undefined,
       // 多选聚合已下线：重跑只使用主数据集（job.dataset_ids 不再透传）
       // 重跑保持原任务的算法库归属（产出仍落在同一个库下）
       library_root_id: job.library_root_id || undefined,
@@ -2320,6 +2384,35 @@ onUnmounted(() => {
   margin-top: 0.25rem;
   color: #8593a6;
   line-height: 1.4;
+}
+
+/* 当前选择有明显代价时把说明变红，避免用户忽略 */
+.form-group small.warn-text {
+  color: #d97706;
+  font-weight: 500;
+}
+
+/* 参数旁的问号提示点：鼠标悬停出原生 tooltip，不引入额外组件 */
+.hint-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-left: 4px;
+  border-radius: 50%;
+  background: #e6ebf2;
+  color: #6b7a8d;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: help;
+  vertical-align: middle;
+  user-select: none;
+}
+
+.hint-dot:hover {
+  background: #2563eb;
+  color: #fff;
 }
 
 .check-line {
