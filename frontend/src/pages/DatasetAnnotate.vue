@@ -1730,6 +1730,8 @@ const auditClassifyOpen = ref(false)
 const auditClassifyTab = ref<'type' | 'action'>('type')
 // 图片列表联动：image_id → 该图的 primary_type（只归最严重一类），用于徽标 + 筛选
 const auditTypeByImage = ref<Record<string, string>>({})
+// image_id → 重复组编号（来自 classify 明细里的 duplicate.group_id），用于「审核·重复图片」筛选按组相邻排列
+const dupGroupByImage = ref<Record<string, string>>({})
 const AUDIT_TYPE_SHORT: Record<string, string> = {
   label_error: '标错', missing: '漏标', duplicate: '重复',
   merged: '粘连', imprecise: '不精准', compliance: '合规', clean: '通过'
@@ -1826,11 +1828,64 @@ const setFilter = (val: FilterKey) => {
   imageFilter.value = val
   filterOpen.value = false
 }
+// 从 classify 结果一次性构建两张映射表：
+//  - image_id → primary_type（徽标/筛选计数）
+//  - image_id → 重复组 group_id（duplicate 明细里带，供重复图片按组相邻排列）
+// 明细里每条 duplicate 都带 group_id 与 similar_image_id；一张图可能有多条，任取其一即可。
+const applyAuditClassify = (res: any) => {
+  auditClassifyData.value = res
+  const typeMap: Record<string, string> = {}
+  const groupMap: Record<string, string> = {}
+  for (const [type, arr] of Object.entries(res?.buckets_by_type || {})) {
+    for (const s of (arr as any[]) || []) {
+      if (!s?.image_id) continue
+      typeMap[s.image_id] = type
+      // 从全量明细收集组号：一张图可能同时有多个问题，duplicate 明细未必在 duplicate 桶里
+      const det = (s.details || []).find((x: any) => x?.type === 'duplicate' && x.group_id)
+      if (det?.group_id) groupMap[s.image_id] = det.group_id
+    }
+  }
+  auditTypeByImage.value = typeMap
+  dupGroupByImage.value = groupMap
+}
+
+// 重复图片按「相似组」相邻排列：同一 group_id 的图挨在一起，组内按 image_id 升序
+// （代表图最小、排最前），组间按各组代表图升序；没有组号的图保持原有相对顺序、排末尾。
+// group_id 来自 classify 明细，需刷新审核分类后才有；没数据时返回原顺序，不报错。
+const sortByDupGroup = (list: any[]) => {
+  const groupOf = dupGroupByImage.value
+  if (!groupOf || !Object.keys(groupOf).length) return list
+  const members: Record<string, string[]> = {}   // group_id -> 组内 image_id 升序
+  const gidOf = new Map<string, string>()        // image_id -> group_id
+  for (const it of list) {
+    const id = String(it.image_id)
+    const gid = groupOf[id]
+    if (!gid) continue
+    gidOf.set(id, gid)
+    ;(members[gid] = members[gid] || []).push(id)
+  }
+  for (const ids of Object.values(members)) ids.sort()
+  const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
+  // 组间顺序按各组代表图（最小 image_id）升序，稳定可复现
+  const order = Object.keys(members).sort((x, y) => cmp(members[x][0], members[y][0]))
+  const rank = new Map(order.map((g, i) => [g, i]))
+  return list.slice().sort((a, b) => {
+    const ia = String(a.image_id), ib = String(b.image_id)
+    const ga = gidOf.get(ia), gb = gidOf.get(ib)
+    if (!ga && !gb) return 0            // 都无组：保持相对顺序
+    if (!ga) return 1                   // 无组的排末尾
+    if (!gb) return -1
+    if (ga !== gb) return rank.get(ga)! - rank.get(gb)!
+    return cmp(ia, ib)                  // 同组：代表图在前
+  })
+}
 const filteredItems = computed(() => {
   const f = imageFilter.value
   if (f.startsWith('audit_')) {
     const t = auditTypeOfFilter(f as AuditFilterKey)
-    return items.value.filter(i => auditTypeByImage.value[i.image_id] === t)
+    const matched = items.value.filter(i => auditTypeByImage.value[i.image_id] === t)
+    // 重复图片：按重复组相邻排列，方便一组一组核对（其余类型保持原顺序）
+    return t === 'duplicate' ? sortByDupGroup(matched) : matched
   }
   switch (f) {
     case 'annotated': return items.value.filter(i => i.annotated)
@@ -4237,14 +4292,7 @@ const refreshAuditClassify = async () => {
   if (!currentTask.value) return
   try {
     const res = await listAuditClassify(currentTask.value)
-    auditClassifyData.value = res
-    const map: Record<string, string> = {}
-    for (const [key, arr] of Object.entries(res?.buckets_by_type || {})) {
-      for (const s of (arr as any[]) || []) {
-        if (s?.image_id) map[s.image_id] = key
-      }
-    }
-    auditTypeByImage.value = map
+    applyAuditClassify(res)
   } catch (e) {
     // 静默：接口未就绪/任务无审核结论时不影响标注
   }
@@ -4256,14 +4304,7 @@ const openAuditClassify = async () => {
   auditClassifyOpen.value = true
   try {
     const res = await listAuditClassify(currentTask.value)
-    auditClassifyData.value = res
-    const map: Record<string, string> = {}
-    for (const [key, arr] of Object.entries(res?.buckets_by_type || {})) {
-      for (const s of (arr as any[]) || []) {
-        if (s?.image_id) map[s.image_id] = key
-      }
-    }
-    auditTypeByImage.value = map
+    applyAuditClassify(res)
     if (!res?.audited_images) {
       showToast('该任务还没有批量审核结论，请先跑「批量审核」', 'info', 4000)
     }
