@@ -94,12 +94,16 @@
       </button>
       <div v-if="bucketNotice" class="bucket-notice" @click="dismissBucketNotice" title="点击关闭">{{ bucketNotice }}<span class="bucket-notice-close">✕</span></div>
       <button v-else-if="bucketNoticeDismissed && bucketNoticeLast" class="bucket-notice-restore" @click="restoreBucketNotice" title="恢复最近一次灌桶/封板提示">↻ 恢复上次提示</button>
-      <div class="bucket-progress">
+      <div class="bucket-progress" :class="{ 'is-collapsed': bucketCollapsed }">
         <div class="bucket-progress-title">
-          <span>桶进度（每桶满 <b>{{ sealMinImages }}</b> 张自动封板{{ perModelOverrideCount ? `，${perModelOverrideCount} 个库单独设置` : '' }}，标完的 A 包自动灌入）</span>
+          <span class="bucket-progress-heading">
+            <button class="bucket-collapse-btn" @click="toggleBucketCollapsed" :title="bucketCollapsed ? '展开桶进度' : '收起桶进度'" :aria-expanded="!bucketCollapsed">{{ bucketCollapsed ? '▸' : '▾' }}</button>
+            <span class="bucket-progress-label">桶进度（每桶满 <b>{{ sealMinImages }}</b> 张自动封板{{ perModelOverrideCount ? `，${perModelOverrideCount} 个库单独设置` : '' }}，标完的 A 包自动灌入）</span>
+            <span v-if="bucketCollapsed && bucketBars.length" class="bucket-collapsed-summary">共 {{ bucketBars.length }} 个库</span>
+          </span>
           <button class="threshold-gear" @click="openThresholdModal" title="修改封板/灌桶数量门槛">⚙ 门槛设置</button>
         </div>
-        <template v-if="bucketBars.length">
+        <template v-if="bucketBars.length && !bucketCollapsed">
           <div v-for="bar in bucketBars" :key="bar.model_id" class="bucket-model">
           <span class="bucket-model-tag">{{ modelName(bar.model_id) }}</span>
           <span v-if="bar.cap && bar.cap !== sealMinImages" class="bucket-own-th" :title="'该库单独门槛 ' + bar.cap + ' 张（全局默认 ' + sealMinImages + '）'">单独{{ bar.cap }}</span>
@@ -674,6 +678,13 @@ watch(bucketNotice, (v) => {
 })
 const dismissBucketNotice = () => { bucketNotice.value = ''; bucketNoticeDismissed.value = true; localStorage.setItem(BN_KEY, '1') }
 const restoreBucketNotice = () => { bucketNotice.value = bucketNoticeLast.value; bucketNoticeDismissed.value = false; localStorage.removeItem(BN_KEY) }
+// 桶进度面板折叠状态持久化：切到别的页面再回来（组件重建）也不重置，避免每次展开一长列
+const BK_COLLAPSED_KEY = 'bucket_progress_collapsed'
+const bucketCollapsed = ref(localStorage.getItem(BK_COLLAPSED_KEY) === '1')
+const toggleBucketCollapsed = () => {
+  bucketCollapsed.value = !bucketCollapsed.value
+  localStorage.setItem(BK_COLLAPSED_KEY, bucketCollapsed.value ? '1' : '0')
+}
 const loading = ref(false)
 const preparingIds = ref(new Set<string>())  // B-49：正在自动准备的数据集 id 集合（上传口释放后可多个并发准备）
 const isPreparing = (dsId: string) => preparingIds.value.has(dsId)
@@ -1976,6 +1987,8 @@ onActivated(() => {
   border: 1px solid #e2e8f0;
   border-radius: 6px;
 }
+.bucket-progress.is-collapsed { padding-bottom: 0.55rem; }
+.bucket-progress.is-collapsed .bucket-progress-title { margin-bottom: 0; }
 .bucket-progress-title {
   font-size: 0.8rem;
   color: #5a6a7a;
@@ -1986,6 +1999,32 @@ onActivated(() => {
   justify-content: space-between;
   gap: 0.6rem;
   flex-wrap: wrap;
+}
+/* 桶进度折叠：标题左侧 箭头 + 文案 + 折叠时摘要 */
+.bucket-progress-heading { display: inline-flex; align-items: center; gap: 0.4rem; min-width: 0; }
+.bucket-collapse-btn {
+  border: 1px solid #cbd5e1;
+  background: #fff;
+  color: #5a6a7a;
+  border-radius: 4px;
+  width: 1.35rem;
+  height: 1.35rem;
+  line-height: 1;
+  padding: 0;
+  font-size: 0.85rem;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.bucket-collapse-btn:hover { background: rgba(26, 115, 232, 0.08); border-color: #1a73e8; color: #1a73e8; }
+.bucket-progress-label { min-width: 0; }
+.bucket-collapsed-summary {
+  color: #1a73e8;
+  background: rgba(26, 115, 232, 0.08);
+  border-radius: 10px;
+  padding: 0.05rem 0.5rem;
+  font-size: 0.72rem;
+  font-weight: 500;
+  white-space: nowrap;
 }
 .threshold-gear {
   border: 1px solid #cbd5e1;
