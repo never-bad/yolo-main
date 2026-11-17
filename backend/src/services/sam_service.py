@@ -93,6 +93,12 @@ DEFAULT_CONFIG = {
     # 单框约 0.3~0.6s）。关闭后误检只能靠人工删除。
     "qwen_verify_enabled": True,
     "qwen_verify_margin": 0.35,      # 裁剪时四周外扩比例（相对框宽高），给足上下文又不引入干扰
+    # L2 审核前把待审框画到「发送给模型的那份图」上（带 #编号），原图文件不动。
+    # 旧版只发无框原图，框仅以 JSON 坐标数字给出 → 模型要凭 0~1000 归一化坐标心算
+    # 「第 2 个框圈的是哪块像素」，小模型（qwen3-vl:4b）极易串框：整图判断对（画面里
+    # 确实有摔倒的人），但框级对应错（框住摔倒者却写「框内为骑行人员，非摔倒」）。
+    # 画上图后模型直接「看图对框」，不再做空间心算。关掉可回退旧行为做 A/B 对比。
+    "qwen_audit_draw_boxes": True,
     # 千问 L2 审核系统提示词模板（留空用内置默认）。占位符：
     # {labels_text}=类别定义(含chinese_desc) {dets_text}=预标注框JSON {bbox_hint}=坐标说明
     "qwen_audit_prompt_template": "",
@@ -1975,6 +1981,84 @@ class SAMService:
             return ""
         return self._qwen_chat_raw(cfg, sys_msg, user_msg, b64, img_abs)
 
+    # 画框配色（按 class_id 取模）：高饱和、彼此可辨，避免与常见目标颜色混淆
+    _AUDIT_DRAW_COLORS = [
+        (255, 45, 45), (0, 176, 255), (255, 214, 0), (0, 220, 120),
+        (255, 0, 200), (255, 128, 0), (140, 90, 255), (0, 230, 230),
+    ]
+
+    def _qwen_audit_render_b64(self, cfg: dict, img_abs: Path, audit_dets: list) -> str:
+        """把待审框画到「发送给模型的图片副本」上（带 #box_id 编号）→ base64 JPEG。
+
+        为什么要画：旧版审核只发无框原图，框仅以 JSON 坐标数字给出，模型必须凭
+        归一化坐标心算「第 N 个框对应画面哪一块」。小模型在这一步经常串框——整图
+        语义判断是对的，但把结论安到了错误的框上。画上图后模型直接看图对框。
+
+        实现要点：
+        - 缩放规则与 _qwen_encode_b64 完全一致（同一 max_side），保证「模型看到的图」
+          与「我方换算坐标用的尺寸」一致；不进整图缓存（每张图的框不同，命中率≈0）。
+        - 坐标换算复用已验证的 _qwen_model_to_orig（模型空间→原图像素），再乘缩放比
+          落到副本像素上；不另写一套坐标逻辑，避免 norm1000/pixel 两种约定各错一次。
+        - 原图文件绝不改动，只在内存副本上绘制。
+        - 任何异常都向上抛，由调用方回退到无框原图（fail-open，不因画框失败丢审核）。
+        """
+        import base64, io
+        from PIL import Image as PILImage, ImageDraw
+        max_side = int(cfg.get("qwen_image_max_side") or 1024)
+        quality = int(cfg.get("qwen_jpeg_quality") or 88)
+        image = PILImage.open(img_abs).convert("RGB")
+        ow, oh = image.size
+        if max(ow, oh) > max_side and max(ow, oh) > 0:
+            down = max_side / max(ow, oh)
+            image = image.resize((max(1, int(ow * down)), max(1, int(oh * down))))
+        else:
+            down = 1.0
+        w, h = image.size
+        draw = ImageDraw.Draw(image)
+        # 线宽/字号随图尺寸自适应：小图别糊成一团，大图别细得看不见
+        lw = max(2, int(round(min(w, h) / 320)))
+        fs = max(11, int(round(min(w, h) / 42)))
+        try:
+            from PIL import ImageFont
+            font = ImageFont.load_default(size=fs)   # Pillow ≥10.1 支持指定字号
+        except Exception:
+            font = None
+        for d in (audit_dets or []):
+            bb = d.get("bbox")
+            if not bb or len(bb) != 4:
+                continue
+            try:
+                ob = self._qwen_model_to_orig(bb, img_abs, cfg)
+            except Exception:
+                continue
+            x1 = max(0, min(w - 1, int(round(float(ob[0]) * down))))
+            y1 = max(0, min(h - 1, int(round(float(ob[1]) * down))))
+            x2 = max(x1 + 1, min(w, int(round(float(ob[2]) * down))))
+            y2 = max(y1 + 1, min(h, int(round(float(ob[3]) * down))))
+            try:
+                ci = int(d.get("class_id") or 0)
+            except Exception:
+                ci = 0
+            color = self._AUDIT_DRAW_COLORS[ci % len(self._AUDIT_DRAW_COLORS)]
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=lw)
+            label = f"#{d.get('box_id')}"
+            if font is not None:
+                tb = draw.textbbox((0, 0), label, font=font)
+                tw, th = tb[2] - tb[0], tb[3] - tb[1]
+            else:
+                tw, th = len(label) * 6, 11
+            pad = 2
+            # 编号标签默认贴在框左上角外侧；顶部空间不够就贴到框内，避免被裁掉
+            ly = y1 - th - pad * 2
+            if ly < 0:
+                ly = y1
+            lx = min(max(0, x1), max(0, w - tw - pad * 2))
+            draw.rectangle([lx, ly, lx + tw + pad * 2, ly + th + pad * 2], fill=color)
+            draw.text((lx + pad, ly + pad), label, fill=(0, 0, 0), font=font)
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=quality)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
     def _qwen_chat_raw(self, cfg: dict, sys_msg: str, user_msg: str, b64: str,
                        img_abs=None) -> str:
         """真正发 HTTP 的一层：_qwen_image_chat（整图）与框级校验（裁剪小图）共用。"""
@@ -2154,8 +2238,29 @@ class SAMService:
             bbox_hint = "bbox 为图片像素坐标 [x1,y1,x2,y2]"
         # 审核系统提示词：用户自定义模板优先（占位符 {labels_text}/{dets_text}/{bbox_hint}），未配置回退内置默认
         sys_msg = self._render_audit_prompt(cfg, labels_text, dets_text, bbox_hint)
-        user_msg = f"类别定义：\n{labels_text}\n\n预标注框：\n{dets_text}\n请审核这张图片。"
-        content = self._qwen_image_chat(cfg, sys_msg, user_msg, img_abs)
+        # 默认把待审框画到发送副本上（带 #编号），让模型「看图对框」而不是靠坐标心算。
+        # 画框失败（坏图/PIL 异常）一律回退无框原图，绝不因为画框而丢掉整次审核。
+        drawn = False
+        if cfg.get("qwen_audit_draw_boxes", True):
+            try:
+                b64 = self._qwen_audit_render_b64(cfg, img_abs, audit_dets)
+                drawn = bool(b64)
+            except Exception as e:
+                print(f"qwen audit: 画框副本生成失败，回退无框原图 {img_abs}: {e}")
+        if drawn:
+            sys_msg += ("\n\n# 图片说明（重要）\n"
+                        "发送给你的这张图上**已经画出了全部待审框**，每个框左上角有形如 #0、#1 的编号标签，"
+                        "与上面 JSON 里的 box_id 一一对应，框线颜色按类别区分。\n"
+                        "请**直接看编号框圈住的画面内容**来判定该框，不要凭坐标推算位置，"
+                        "也不要把某个框的结论写到另一个编号上。\n"
+                        "这些框线与编号是我方叠加的辅助标记，**不是画面里的真实物体**："
+                        "不要把它们当作目标、遮挡物或漏标目标；漏标只报框线之外真实存在的目标。")
+            user_msg = (f"类别定义：\n{labels_text}\n\n预标注框（编号与图上 #标签对应）：\n{dets_text}\n"
+                        f"请逐个查看图上 #编号 框内的实际内容，审核这张图片。")
+            content = self._qwen_chat_raw(cfg, sys_msg, user_msg, b64, img_abs)
+        else:
+            user_msg = f"类别定义：\n{labels_text}\n\n预标注框：\n{dets_text}\n请审核这张图片。"
+            content = self._qwen_image_chat(cfg, sys_msg, user_msg, img_abs)
         if not content:
             return None, "千问审核推理失败（无输出）"
         return self._parse_qwen_audit(content, audit_dets, labels, classes,

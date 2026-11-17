@@ -40,6 +40,7 @@ class ConfigRequest(BaseModel):
     qwen_audit_batch: Optional[bool] = None     # 批量预标注是否也做 L2 审核（默认关）
     qwen_verify_enabled: Optional[bool] = None  # 框级二次校验（反幻觉：候选框裁剪复问，回答否则丢弃）
     qwen_verify_margin: Optional[float] = None  # 校验裁剪的四周外扩比例（默认 0.35）
+    qwen_audit_draw_boxes: Optional[bool] = None  # L2 审核前把待审框画到发送副本上（带编号，默认开）
     qwen_audit_prompt_template: Optional[str] = None  # 千问 L2 审核系统提示词模板（留空用内置默认）
 
 

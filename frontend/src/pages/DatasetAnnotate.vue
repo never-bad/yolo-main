@@ -788,6 +788,11 @@
           <span>框级二次校验（防乱标）
             <em class="dim">（每个候选框裁剪小图再问一次模型"是不是"，回答否则丢弃；每框约 +0.3~0.6s，强烈建议开着）</em></span>
         </label>
+        <label class="row">
+          <input type="checkbox" v-model="modelCfg.qwen_audit_draw_boxes" />
+          <span>审核时把待审框画在发给模型的图上
+            <em class="dim">（带 #编号，模型直接看图对框；关掉则只发无框原图+坐标数字，小模型容易把结论安到错的框上。原图文件不改动）</em></span>
+        </label>
         <span class="cfg-title" style="display:block;margin-top:10px">速度</span>
         <label class="row">
           <input type="checkbox" v-model="modelCfg.qwen_audit_enabled" />
@@ -921,6 +926,7 @@ const modelCfg = ref<any>({
   qwen_num_parallel: 1,
   qwen_image_max_side: 1024,
   qwen_verify_enabled: true,
+  qwen_audit_draw_boxes: true,
   qwen_audit_enabled: true,
   qwen_audit_batch: false,
   qwen_audit_prompt_template: '',
@@ -3649,6 +3655,7 @@ const openModelCfg = async () => {
     modelCfg.value.qwen_num_parallel = typeof cfg.qwen_num_parallel === 'number' ? cfg.qwen_num_parallel : 1
     modelCfg.value.qwen_image_max_side = typeof cfg.qwen_image_max_side === 'number' ? cfg.qwen_image_max_side : 1024
     modelCfg.value.qwen_verify_enabled = cfg.qwen_verify_enabled !== false
+    modelCfg.value.qwen_audit_draw_boxes = cfg.qwen_audit_draw_boxes !== false
     modelCfg.value.qwen_audit_enabled = cfg.qwen_audit_enabled !== false
     modelCfg.value.qwen_audit_batch = cfg.qwen_audit_batch === true
     modelCfg.value.qwen_audit_prompt_template = cfg.qwen_audit_prompt_template || ''
@@ -3721,6 +3728,7 @@ const saveModelCfg = async () => {
       qwen_num_parallel: numOr(modelCfg.value.qwen_num_parallel, 1),
       qwen_image_max_side: numOr(modelCfg.value.qwen_image_max_side, 1024),
       qwen_verify_enabled: !!modelCfg.value.qwen_verify_enabled,
+      qwen_audit_draw_boxes: !!modelCfg.value.qwen_audit_draw_boxes,
       qwen_audit_enabled: !!modelCfg.value.qwen_audit_enabled,
       qwen_audit_batch: !!modelCfg.value.qwen_audit_batch,
       qwen_audit_prompt_template: modelCfg.value.qwen_audit_prompt_template || '',
