@@ -840,7 +840,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, onActivated, onDeactivated, nextTick, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import type { BBox } from '@/api/annotations'
 import { createAnnotationTask, findAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotations, exportReviewedZip, clearAiAnnotations, clearAllAnnotations, cleanTaskOverlaps, importYoloLabels, deleteTaskImage } from '@/api/annotations'
 import { autoLabelImage, interactiveLabelImage, pointLabelImage, erasePolygonRegion, startBatchLabel, getBatchProgress, stopBatchLabel, auditBatchStart, listAuditClassify, dupScanStart, getDupScanStatus, stopDupScan, getSamConfig, updateSamConfig, getSamModels, getSamTrainedVersions, auditImage, listAuditIssues } from '@/api/sam'
@@ -852,6 +853,9 @@ import { dsTitle } from '@/utils/dsDisplay'
 import { suggestModelLabels, adoptSuggestedLabels } from '@/api/models'
 
 const newTask = ref({ datasetId: '', version: 'v1' })
+// 缓存态下从数据集页跳来的待进入数据集（由 watch route.query.dataset_id 写入、onActivated 消费）
+let _annotatePendingDatasetId: string | null = null
+const route = useRoute()
 const datasets = ref<any[]>([])
 const loadingDatasets = ref(false)
 const creatingTask = ref(false)
@@ -4721,12 +4725,47 @@ const handleDocClick = () => {
 onMounted(() => {
   loadDatasets()
   loadSamConfigAndModels()
+  bindWindowListeners()
+  handleUrlEntry()
+  restoreAnnotateState()
+})
+
+const bindWindowListeners = () => {
   window.addEventListener('keydown', handleKeydown)
   window.addEventListener('keyup', handleKeyup)
   window.addEventListener('resize', fitView)
   document.addEventListener('click', handleDocClick)
-  handleUrlEntry()
-  restoreAnnotateState()
+}
+const unbindWindowListeners = () => {
+  window.removeEventListener('keydown', handleKeydown)
+  window.removeEventListener('keyup', handleKeyup)
+  window.removeEventListener('resize', fitView)
+  document.removeEventListener('click', handleDocClick)
+}
+
+// keep-alive 缓存后，切走组件不销毁，但全局键盘监听必须摘掉：
+// 否则在训练/数据集页敲 S、C、G、方向键会误触标注页的快捷键（改到看不见的画布上）。
+// 切回时重新挂上监听，并处理"从数据集页点『去标注』带 dataset_id 跳过来"的情形——
+// 缓存后 onMounted 不再触发，handleUrlEntry 必须在这里补跑，否则切不了数据集。
+onActivated(async () => {
+  bindWindowListeners()
+  // 组件一直活着，重新量一次画布尺寸（切走期间窗口可能变过）
+  await nextTick()
+  fitView()
+  if (_annotatePendingDatasetId) {
+    const dsId = _annotatePendingDatasetId
+    _annotatePendingDatasetId = null
+    await enterDataset(dsId)
+  }
+})
+
+// 切走：摘掉全局监听、清掉在途的抠图队列（免得往已隐藏的画布上写）
+onDeactivated(() => {
+  unbindWindowListeners()
+  cutoutGone = true
+  cutoutQueue.value = []
+  if (dirty.value) persistAnnotation(true)
+  saveAnnotateState()
 })
 
 // 雪球闭环（1.8）：?dataset_id=xxx 直达 —— 优先复用该数据集已有标注任务，
@@ -4735,6 +4774,12 @@ const handleUrlEntry = async () => {
   const params = new URLSearchParams(window.location.search)
   const dsId = params.get('dataset_id')
   if (!dsId) return
+  // 首次挂载走这里；组件已被缓存时（再次从数据集页点"去标注"）走下面 watch
+  await enterDataset(dsId)
+}
+
+// 直接进入某个数据集的标注任务（直达与缓存态跳转共用）
+const enterDataset = async (dsId: string) => {
   await loadDatasets()
   const ds = datasets.value.find((d: any) => d.dataset_id === dsId)
   if (!ds) {
@@ -4763,11 +4808,18 @@ const handleUrlEntry = async () => {
   }
 }
 
+// 标注页被缓存后，从数据集页点"去标注"（/annotate?dataset_id=xxx）不会再触发 onMounted，
+// 组件不会重建 → 必须靠路由参数变化来切换数据集。这里在 activated 之前记下目标数据集，
+// 由 onActivated 统一执行（那时页面已重新挂上监听、画布尺寸已就绪）。
+watch(
+  () => route.query.dataset_id,
+  (dsId) => {
+    if (typeof dsId === 'string' && dsId) _annotatePendingDatasetId = dsId
+  }
+)
+
 onUnmounted(() => {
-  window.removeEventListener('keydown', handleKeydown)
-  window.removeEventListener('keyup', handleKeyup)
-  window.removeEventListener('resize', fitView)
-  document.removeEventListener('click', handleDocClick)
+  unbindWindowListeners()
   // 离开页面：抠图队列清空，在途结果也不再落地，免得往已经卸载的画布上写
   cutoutGone = true
   cutoutQueue.value = []

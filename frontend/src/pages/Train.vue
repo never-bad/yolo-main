@@ -630,7 +630,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, onActivated, onDeactivated, watch } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { createTrainJob, listTrainJobs, deleteTrainJob, resumeTrainJob, getTrainJobTree, suggestTrainParams, inferBusiness, listGpus, prepareWeights, type TrainJobRequest } from '@/api/train'
 import { listModels, uploadPretrainedPt, listCustomModels } from '@/api/models'
@@ -1501,6 +1501,8 @@ const jobTitle = (job: any) => {
 }
 let eventSource: EventSource | null = null
 let pollInterval: any = null
+// 记住"当前正在看哪个任务的实时日志"，切走时关掉 SSE/轮询、切回时按它重新订阅
+let currentLogJobId: string | null = null
 
 // 任务列表与逐任务进度都存在 pinia（store/train.ts），组件卸载后仍保留：
 // 切到别的页面再回来，列表和进度条立刻可见，不会被清空重来。
@@ -1824,6 +1826,7 @@ const loadModels = async () => {
 }
 
 const subscribeToLogs = (jobId: string) => {
+  currentLogJobId = jobId
   logStore.setStreaming(true)
   
   // 尝试SSE
@@ -2321,24 +2324,54 @@ onMounted(async () => {
   loadCustomModels()
   loadGpus()
   // 每秒跳动，刷新"最后更新 X 秒前"提示
+  if (nowTimer) clearInterval(nowTimer)
   nowTimer = setInterval(() => { nowTick.value = Date.now() }, 1000)
 })
 
-onUnmounted(() => {
+// 停掉所有"往浏览器推数据"的长连接与定时器（切走时调用，避免在后台白耗连接）
+const stopLiveUpdates = () => {
   if (eventSource) {
     eventSource.close()
+    eventSource = null
   }
   if (pollInterval) {
     clearInterval(pollInterval)
+    pollInterval = null
   }
-  if (nowTimer) {
-    clearInterval(nowTimer)
-  }
-  // 清理所有任务卡牌的独立轮询
   jobPollers.forEach((timer) => clearInterval(timer))
   jobPollers.clear()
   jobOffsets.clear()
   logStore.setStreaming(false)
+}
+
+// keep-alive 缓存后，onMounted 只跑一次；切回本页要走 activated。
+// 首次挂载也会触发 activated，用标志位跳过，避免与 onMounted 重复请求。
+let _trainFirstActivate = true
+onActivated(() => {
+  if (_trainFirstActivate) { _trainFirstActivate = false; return }
+  // 训练在后台持续跑，缓存里的列表/进度会过期，切回时静默刷新一次
+  loadJobs(true)
+  // 重新订阅当前任务的实时日志（SSE 已在切走时关闭）
+  if (currentLogJobId) subscribeToLogs(currentLogJobId)
+  if (nowTimer) clearInterval(nowTimer)
+  nowTimer = setInterval(() => { nowTick.value = Date.now() }, 1000)
+})
+
+// 切走：关 SSE/轮询/计时器；组件实例和已填的表单参数留在内存里，回来原样可见
+onDeactivated(() => {
+  stopLiveUpdates()
+  if (nowTimer) {
+    clearInterval(nowTimer)
+    nowTimer = null
+  }
+})
+
+onUnmounted(() => {
+  stopLiveUpdates()
+  if (nowTimer) {
+    clearInterval(nowTimer)
+    nowTimer = null
+  }
 })
 </script>
 
