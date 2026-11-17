@@ -149,6 +149,20 @@ async def clear_all_annotations(task_id: str):
     except ValueError as e:
         raise HTTPException(400, str(e))
 
+@router.post("/tasks/{task_id}/clean-audit-meta")
+async def clean_audit_meta(task_id: str, missing_iou: float = 0.5, missing_cover: float = 0.8):
+    """清洗审核结论：只丢弃「已处理」的部分（已补上的漏标、已采纳的类别建议），
+    未处理的（真漏标、待修正判定）原样保留。清空前自动备份，已封板/已归档数据集拒绝执行。
+
+    用途：二审结束后手动点，把已处理项清掉，让剩下的条目都是真正待办的。
+    """
+    try:
+        return await annotation_service.clean_audit_meta(
+            task_id, missing_iou=missing_iou, missing_cover=missing_cover
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
 @router.post("/tasks/{task_id}/clean-overlaps")
 async def clean_task_overlaps(task_id: str):
     """清理该任务全部图片的高度重合标注框（跨类别/同类重复），一次性根治历史遗留的重叠标注。

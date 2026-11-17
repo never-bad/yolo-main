@@ -1272,6 +1272,147 @@ class AnnotationService:
 
         return await asyncio.to_thread(_sync)
 
+    async def clean_audit_meta(self, task_id: str, missing_iou: float = 0.5, missing_cover: float = 0.8):
+        """清洗审核结论：只丢掉「已经处理掉」的部分，未处理的结论原样保留。
+
+        背景：audit_meta 写入后不随人工编辑自动失效，补完漏标仍显示「漏标 N」，
+        二审会被已处理项误导。本方法在用户二审完成后手动触发，把已处理的结论清掉，
+        让剩下的 pending 才是真正待办的。
+
+        只清这三类（都要求「已处理」证据）：
+        1. missed_targets：与某个现有框 IoU>=0.5，或该漏标区域被某框覆盖>=missing_cover，
+           即那个目标已经有框了 → 该条漏标建议作废。
+        2. box.audit.suggested_class_id：当前框类别已等于建议类别（建议已采纳）→ 去掉建议。
+        3. 框已被删除后遗留的无主结论：不做处理（框都不在了，结论自然随之消失）。
+        未处理的（真漏标、类别不符的建议、reject/modify 判定）一律保留。
+
+        统计 stats 按清洗后的实际内容重算，避免「漏标 0」但 stats.missed 还是旧数字。
+        audit_meta.duplicate 不动（查重结果是独立事实，与二审是否完成无关）。
+
+        安全：清空前把 annotations/*.json 打包备份到 annotations/backups/；已封板/已归档
+        数据集拒绝执行（与 clear-all 同一套拦截）。
+        """
+        task_dir = self.annotations_dir / task_id
+        task_file = task_dir / "task.json"
+        if not await asyncio.to_thread(lambda: task_file.exists()):
+            return {"ok": False, "error": "Task not found"}
+
+        def _sync():
+            task_meta = load_json(task_file)
+            dataset_id, version = self._task_to_ds(task_meta)
+            if not dataset_id:
+                raise ValueError("标注任务未绑定数据集，无法清洗审核结论")
+
+            dataset_dir = self.datasets_dir / dataset_id
+            meta_path = dataset_dir / "meta.json"
+            if not meta_path.exists():
+                raise ValueError(f"数据集 {dataset_id} 不存在")
+            meta = load_json(meta_path)
+            if meta.get("stage") == "sealed":
+                raise ValueError("数据集已封板（只读），无法清洗审核结论")
+            if meta.get("bucket_archived"):
+                raise ValueError("数据集已归档入桶，无法清洗审核结论（需先解除归档）")
+
+            anns = self._load_all_image_anns(dataset_id, version)
+            has_meta = any((a.get("audit_meta") or {}) for a in anns.values())
+
+            # 1) 备份：只要有审核结论就打包，误清可解压回退
+            backup_path = ""
+            if has_meta:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_dir = self.annotations_dir / "backups"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                backup_path = str(backup_dir / f"{dataset_id}_auditmeta_{ts}.zip")
+                with zipfile.ZipFile(backup_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    ann_dir = dataset_dir / "annotations"
+                    if ann_dir.is_dir():
+                        for f in sorted(ann_dir.glob("*.json")):
+                            zf.write(f, f"annotations/{f.name}")
+
+            def _covered(mt, boxes):
+                """漏标是否已被补上：IoU>=missing_iou，或漏标区域被某框覆盖>=missing_cover。"""
+                ax1, ay1 = float(mt.get("x1") or 0), float(mt.get("y1") or 0)
+                ax2, ay2 = float(mt.get("x2") or 0), float(mt.get("y2") or 0)
+                a_area = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+                if a_area <= 0:
+                    return False
+                for b in boxes:
+                    if self._box_iou(mt, b) >= missing_iou:
+                        return True
+                    bx1, by1 = float(b.get("x1") or 0), float(b.get("y1") or 0)
+                    bx2, by2 = float(b.get("x2") or 0), float(b.get("y2") or 0)
+                    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+                    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+                    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                    if inter / a_area >= missing_cover:
+                        return True
+                return False
+
+            touched_images = removed_missed = removed_suggest = 0
+            for image_id, ann in anns.items():
+                boxes = ann.get("boxes") or []
+                am = ann.get("audit_meta") or {}
+                changed = False
+
+                # 2) 漏标：只删已被补上的，保留真漏标
+                missed = am.get("missed_targets") or []
+                if missed:
+                    keep = [m for m in missed if not _covered(m, boxes)]
+                    if len(keep) != len(missed):
+                        removed_missed += len(missed) - len(keep)
+                        am = {**am, "missed_targets": keep}
+                        changed = True
+
+                # 3) 框级建议：类别已按建议改过 → 去掉建议，避免「用XXX」按钮一直挂着
+                new_boxes = []
+                for b in boxes:
+                    au = b.get("audit") or {}
+                    sug = au.get("suggested_class_id")
+                    if sug is not None and b.get("class_id") == sug:
+                        nb = {**b, "audit": {k: v for k, v in au.items() if k != "suggested_class_id"}}
+                        removed_suggest += 1
+                        new_boxes.append(nb)
+                        changed = True
+                    else:
+                        new_boxes.append(b)
+
+                if not changed:
+                    continue
+
+                # 4) stats 按清洗后内容重算，否则会出现「漏标 0 / stats.missed=2」自相矛盾
+                if am:
+                    acts = [(b.get("audit") or {}).get("action") for b in new_boxes]
+                    kinds = [(b.get("audit") or {}).get("kind") for b in new_boxes]
+                    st = dict(am.get("stats") or {})
+                    st["keep"] = sum(1 for a in acts if a == "keep")
+                    st["modify"] = sum(1 for a in acts if a == "modify")
+                    st["reject"] = sum(1 for a in acts if a == "reject")
+                    st["split"] = sum(1 for k in kinds if k == "merged")
+                    st["missed"] = len(am.get("missed_targets") or [])
+                    am = {**am, "stats": st, "cleaned_at": datetime.now().isoformat()}
+
+                touched_images += 1
+                self._save_image_ann(dataset_id, version, image_id, {
+                    **ann,
+                    "boxes": new_boxes,
+                    "audit_meta": am,
+                    "updated_at": datetime.now().isoformat(),
+                })
+
+            logger.info(
+                f"clean audit_meta {dataset_id} (task={task_id}): images={touched_images} "
+                f"missed={removed_missed} suggest={removed_suggest} backup={backup_path}"
+            )
+            return {
+                "ok": True,
+                "cleaned_images": touched_images,
+                "removed_missed": removed_missed,
+                "removed_suggestions": removed_suggest,
+                "backup": backup_path,
+            }
+
+        return await asyncio.to_thread(_sync)
+
     async def export_to_yolo(self, task_id: str):
         """导出标注为YOLO格式；无框/未标注图片写 0 字节空标签文件（negative sample 约定）"""
         def _export_to_yolo_sync():

@@ -88,6 +88,13 @@ export const cleanTaskOverlaps = async (taskId: string) => {
   return data
 }
 
+// 清洗审核结论：只丢「已处理」的（已补上的漏标、已采纳的类别建议），未处理的原样保留。
+// 二审结束后手动触发；后端清空前自动打包备份，已封板/已归档数据集拒绝执行
+export const cleanAuditMeta = async (taskId: string) => {
+  const { data } = await api.post(`/annotations/tasks/${taskId}/clean-audit-meta`)
+  return data
+}
+
 // 导入 YOLO 格式标注（zip 包内含 labels/*.txt），把外部工具（如 X-AnyLabeling）标注的数据接入平台
 export const importYoloLabels = async (taskId: string, file: File) => {
   const form = new FormData()

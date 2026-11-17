@@ -252,6 +252,11 @@
           <button class="ai-btn" @click="openAuditClassify" :disabled="!items.length" title="按问题类型 / 建议动作双维度列出需人工二审的图片">
             审核结果分类
           </button>
+          <!-- 清洗审核结论：二审结束后点，只丢已处理的（已补上的漏标/已采纳的类别建议），未处理的原样保留 -->
+          <button class="ai-btn" @click="cleanAuditMetaNow" :disabled="cleaningAudit || !items.length" title="清洗已处理的审核结论：删掉「已补上的漏标建议」和「已采纳的类别建议」，真漏标与待修正判定一律保留。建议二审完再点，清空前自动备份">
+            <span v-if="cleaningAudit" class="loading-spinner"></span>
+            {{ cleaningAudit ? '清洗中...' : '清洗已处理结论' }}
+          </button>
           <!-- M3 重复图扫描：MD5+dHash 感知哈希全库查重，不调千问、纯 CPU 数十秒 -->
           <button class="ai-btn batch-btn dup-scan-btn" @click="runDupScan" :disabled="dupScanRunning || !items.length" title="全库重复图检测（MD5 精确 + dHash 感知哈希）：找相同图/近重复图（缩放、压缩、调色），结论写回每图 JSON，审核筛选里出现「重复图片」分组。纯 CPU，1 万张约 1~2 分钟，不调千问">
             <span v-if="dupScanRunning" class="loading-spinner"></span>
@@ -846,7 +851,7 @@
 import { ref, computed, onMounted, onUnmounted, onActivated, onDeactivated, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { BBox } from '@/api/annotations'
-import { createAnnotationTask, findAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotations, exportReviewedZip, clearAiAnnotations, clearAllAnnotations, cleanTaskOverlaps, importYoloLabels, deleteTaskImage } from '@/api/annotations'
+import { createAnnotationTask, findAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotations, exportReviewedZip, clearAiAnnotations, clearAllAnnotations, cleanTaskOverlaps, cleanAuditMeta, importYoloLabels, deleteTaskImage } from '@/api/annotations'
 import { autoLabelImage, interactiveLabelImage, pointLabelImage, erasePolygonRegion, startBatchLabel, getBatchProgress, stopBatchLabel, auditBatchStart, listAuditClassify, dupScanStart, getDupScanStatus, stopDupScan, getSamConfig, updateSamConfig, getSamModels, getSamTrainedVersions, auditImage, listAuditIssues } from '@/api/sam'
 import { listDatasets, approveDatasetReview } from '@/api/datasets'
 import { showConfirm, showPrompt, showAlert } from '@/composables/useDialog'
@@ -925,6 +930,8 @@ const exporting = ref(false)
 const exportingReviewed = ref(false)
 // 清除全部标注（AI + 人工）进行中，防止重复触发
 const clearingAll = ref(false)
+// 清洗审核结论（只丢已处理项）进行中，防止重复触发
+const cleaningAudit = ref(false)
 // 审核通过（标注页顺手点）：与数据集页同一接口，成功后该包进入灌桶资格
 const approvingReview = ref(false)
 const taskDatasetMeta = computed(() =>
@@ -4116,6 +4123,43 @@ const cleanOverlaps = async () => {
     }
   } catch (e: any) {
     if (!e?.__toastShown) showToast('清理失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
+  }
+}
+
+// 清洗审核结论：二审结束后手动点，只丢掉「已处理」的（已补上的漏标、已采纳的类别建议），
+// 未处理的（真漏标、待修正判定）原样保留，避免把真待办一起清掉。
+const cleanAuditMetaNow = async () => {
+  if (!currentTask.value) return
+  if (!(await showConfirm(
+    '将清洗本任务全部图片的审核结论，规则：\n' +
+    '1. 漏标建议：该位置已有框与它重叠（IoU≥0.5 或覆盖≥80%）→ 视为已补上，删掉这条建议\n' +
+    '2. 类别建议：当前框类别已等于 AI 建议 → 视为已采纳，去掉建议按钮\n' +
+    '3. 没处理的（真漏标、待修正/建议删除的判定）一律保留，不会误清\n\n' +
+    '清空前会自动打包备份，误清可解压回退。\n' +
+    '建议先二审完再点，是否继续？'
+  ))) return
+  cleaningAudit.value = true
+  try {
+    const res = await cleanAuditMeta(currentTask.value)
+    await showAlert(
+      `已清洗 ${res.cleaned_images ?? 0} 张图片\n` +
+        `· 移除已补上的漏标建议：${res.removed_missed ?? 0} 条\n` +
+        `· 移除已采纳的类别建议：${res.removed_suggestions ?? 0} 个\n\n` +
+        `备份文件：${res.backup || '（无审核结论，未生成）'}`,
+      '清洗完成'
+    )
+    // 重载当前图：结论变了，面板和画布虚线要一起刷新
+    if (currentImage.value?.annotated) {
+      await loadExistingAnnotation()
+    } else {
+      imageAudit.value = null
+      redrawCanvas()
+    }
+    await loadTaskItems()
+  } catch (e: any) {
+    if (!e?.__toastShown) showAlert('清洗失败: ' + (e.response?.data?.detail || e.message), '错误')
+  } finally {
+    cleaningAudit.value = false
   }
 }
 
