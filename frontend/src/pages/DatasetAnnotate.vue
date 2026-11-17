@@ -841,7 +841,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, onActivated, onDeactivated, nextTick, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import type { BBox } from '@/api/annotations'
 import { createAnnotationTask, findAnnotationTask, getTaskItems, getImageAnnotation, saveAnnotation as saveAnn, exportAnnotations, exportReviewedZip, clearAiAnnotations, clearAllAnnotations, cleanTaskOverlaps, importYoloLabels, deleteTaskImage } from '@/api/annotations'
 import { autoLabelImage, interactiveLabelImage, pointLabelImage, erasePolygonRegion, startBatchLabel, getBatchProgress, stopBatchLabel, auditBatchStart, listAuditClassify, dupScanStart, getDupScanStatus, stopDupScan, getSamConfig, updateSamConfig, getSamModels, getSamTrainedVersions, auditImage, listAuditIssues } from '@/api/sam'
@@ -853,9 +853,8 @@ import { dsTitle } from '@/utils/dsDisplay'
 import { suggestModelLabels, adoptSuggestedLabels } from '@/api/models'
 
 const newTask = ref({ datasetId: '', version: 'v1' })
-// 缓存态下从数据集页跳来的待进入数据集（由 watch route.query.dataset_id 写入、onActivated 消费）
-let _annotatePendingDatasetId: string | null = null
 const route = useRoute()
+const router = useRouter()
 const datasets = ref<any[]>([])
 const loadingDatasets = ref(false)
 const creatingTask = ref(false)
@@ -4752,11 +4751,6 @@ onActivated(async () => {
   // 组件一直活着，重新量一次画布尺寸（切走期间窗口可能变过）
   await nextTick()
   fitView()
-  if (_annotatePendingDatasetId) {
-    const dsId = _annotatePendingDatasetId
-    _annotatePendingDatasetId = null
-    await enterDataset(dsId)
-  }
 })
 
 // 切走：摘掉全局监听、清掉在途的抠图队列（免得往已隐藏的画布上写）
@@ -4798,8 +4792,13 @@ const enterDataset = async (dsId: string) => {
       }
       if (found.task.imported_annotations) importedCount.value = found.task.imported_annotations
       await loadTaskItems()
-      // 直达成功（自动任务已存在），清掉 URL 参数避免刷新时重复触发
-      window.history.replaceState({}, '', '/annotate')
+      // 直达成功后清掉 URL 参数，避免刷新时重复触发。
+      // 必须走 router.replace 而不是 window.history.replaceState：
+      // 后者只改地址栏、不同步 vue-router 的内部状态，路由记录与真实 URL 错位后，
+      // 下一次「去标注」跳转会被判定为同一路由而不生效（实测偶发：URL 变了页面没换）。
+      if (route.query.dataset_id) {
+        await router.replace({ path: '/annotate' })
+      }
     } else {
       await createTask()  // 无任务 → 自动创建（后端 prepare 已建则由 find 命中，此处兜底）
     }
@@ -4809,13 +4808,18 @@ const enterDataset = async (dsId: string) => {
 }
 
 // 标注页被缓存后，从数据集页点"去标注"（/annotate?dataset_id=xxx）不会再触发 onMounted，
-// 组件不会重建 → 必须靠路由参数变化来切换数据集。这里在 activated 之前记下目标数据集，
-// 由 onActivated 统一执行（那时页面已重新挂上监听、画布尺寸已就绪）。
+// 组件不会重建 → 必须靠路由参数变化来切换数据集。
+// 这里直接用 watch 触发切换（flush:'post' 等 DOM 更新完再跑），不再依赖 onActivated 的时序：
+// 切过来时 activated 与 query 变化谁先谁后并不固定，只靠 activated 消费会漏掉。
 watch(
   () => route.query.dataset_id,
-  (dsId) => {
-    if (typeof dsId === 'string' && dsId) _annotatePendingDatasetId = dsId
-  }
+  async (dsId) => {
+    if (typeof dsId !== 'string' || !dsId) return
+    // 已经是这个数据集就不用重复加载（例如进入后自己 replace 掉参数的瞬间）
+    if (currentTask.value && newTask.value.datasetId === dsId) return
+    await enterDataset(dsId)
+  },
+  { flush: 'post' }
 )
 
 onUnmounted(() => {
