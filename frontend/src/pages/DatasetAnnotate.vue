@@ -595,16 +595,19 @@
             <span class="a-modify">~ 待修正 {{ imageAudit.stats?.modify || 0 }}</span>
             <span class="a-reject">✗ 建议删除 {{ imageAudit.stats?.reject || 0 }}</span>
             <span class="a-split">⧉ 粘连 {{ imageAudit.stats?.split || 0 }}</span>
-            <span class="a-miss">漏标 {{ imageAudit.missed_targets?.length || 0 }}</span>
+            <span class="a-miss">漏标 {{ missedPendingCount }}<template v-if="(imageAudit.missed_targets?.length || 0) > missedPendingCount">（已补 {{ (imageAudit.missed_targets?.length || 0) - missedPendingCount }}）</template></span>
           </div>
           <div v-if="auditRejectCount" class="audit-actions">
             <button class="danger small" @click="removeRejectedBoxes">删除被拒框（{{ auditRejectCount }}）</button>
           </div>
           <div v-if="imageAudit.missed_targets?.length" class="audit-missed">
             <div class="audit-missed-title">漏标建议（画布蓝虚线位置，点击补标即落框）</div>
-            <div v-for="(mt, i) in imageAudit.missed_targets" :key="'mt' + i" class="audit-mt-row">
-              <span class="mt-info">{{ classes[mt.class_id] || mt.class_id }}<em v-if="mt.reason">（{{ mt.reason }}）</em></span>
-              <button class="small primary" @click="addMissedTarget(mt)">补标</button>
+            <div v-for="(mt, i) in imageAudit.missed_targets" :key="'mt' + i" :class="['audit-mt-row', { 'mt-done': missedCovered(mt) }]">
+              <span class="mt-info">
+                {{ classes[mt.class_id] || mt.class_id }}<em v-if="mt.reason">（{{ mt.reason }}）</em>
+                <b v-if="missedCovered(mt)" class="mt-done-badge" title="该位置已有标注框与它重叠，视为已补标；审核结论仍保留供二审">已补标</b>
+              </span>
+              <button class="small primary" @click="addMissedTarget(mt)" :disabled="missedCovered(mt)">补标</button>
             </div>
           </div>
         </div>
@@ -3266,6 +3269,33 @@ const drawBox = (box: BBox, index = -1) => {
   }
 }
 
+// 判断一条漏标建议是否「已被补上」：画布上已有框与它位置高度重叠即视为已处理。
+// 用途：漏标结论按你的要求保留在 JSON 里便于二审，但界面上要能一眼区分
+// 「真漏标」和「你已经补过了的」，否则补完还显示待办，二审会被误导。
+const missedCovered = (mt: any): boolean => {
+  const a = [mt.x1, mt.y1, mt.x2, mt.y2]
+  const area = (b: number[]) => Math.max(0, b[2] - b[0]) * Math.max(0, b[3] - b[1])
+  const aArea = area(a)
+  if (aArea <= 0) return false
+  return currentBoxes.value.some((b: any) => {
+    const c = [b.x1, b.y1, b.x2, b.y2]
+    const ix1 = Math.max(a[0], c[0]), iy1 = Math.max(a[1], c[1])
+    const ix2 = Math.min(a[2], c[2]), iy2 = Math.min(a[3], c[3])
+    if (ix2 <= ix1 || iy2 <= iy1) return false
+    const inter = (ix2 - ix1) * (iy2 - iy1)
+    const union = aArea + area(c) - inter
+    // 判据1：IoU>=0.5，与后端漏标闸门同口径（大模型报的漏标若与已有框 IoU>=0.5 本就会被丢弃）
+    if (union > 0 && inter / union >= 0.5) return true
+    // 判据2：漏标区域被这个框覆盖 >=80%。专治「框画得比目标大」的情况——
+    // 大框包住小目标时 IoU 只有 0.25，单靠判据1 会一直显示待补标，二审照样被误导。
+    return inter / aArea >= 0.8
+  })
+}
+// 未处理的漏标条数（面板标题/统计用它，避免补完还显示"漏标 2"）
+const missedPendingCount = computed(() =>
+  (imageAudit.value?.missed_targets || []).filter((m: any) => !missedCovered(m)).length
+)
+
 const redrawCanvas = () => {
   if (!ctx.value || !canvasRef.value || !img.value) return
   const c = canvasRef.value
@@ -3287,16 +3317,18 @@ const redrawCanvas = () => {
     }
   })
   // 千问审核漏标补框：蓝色虚线框（不参与框选中/移动，是"建议"，点面板补标才落框）
+  // 已被补上的漏标改灰细虚线：结论保留，但不再当作待办干扰复核
   ;(imageAudit.value?.missed_targets || []).forEach((mt: any) => {
     if (String(cur) !== '-1' && mt.class_id !== Number(cur)) return
-    ctx.value!.strokeStyle = '#00bcd4'
-    ctx.value!.lineWidth = 2 / viewScale.value
-    ctx.value!.setLineDash([8, 6])
+    const done = missedCovered(mt)
+    ctx.value!.strokeStyle = done ? '#9aa5b1' : '#00bcd4'
+    ctx.value!.lineWidth = (done ? 1.5 : 2) / viewScale.value
+    ctx.value!.setLineDash(done ? [4, 4] : [8, 6])
     ctx.value!.strokeRect(mt.x1, mt.y1, mt.x2 - mt.x1, mt.y2 - mt.y1)
     ctx.value!.setLineDash([])
-    ctx.value!.fillStyle = '#00bcd4'
+    ctx.value!.fillStyle = done ? '#9aa5b1' : '#00bcd4'
     ctx.value!.font = '14px Arial'
-    ctx.value!.fillText('漏:' + (classes.value[mt.class_id] || mt.class_id), mt.x1, Math.max(mt.y1 - 5, 12))
+    ctx.value!.fillText((done ? '已补:' : '漏:') + (classes.value[mt.class_id] || mt.class_id), mt.x1, Math.max(mt.y1 - 5, 12))
   })
   // 正在画的新框
   if (isDrawing.value && editMode.value === 'draw') {
@@ -5768,6 +5800,26 @@ canvas {
 }
 .mt-info { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mt-info em { color: #999; font-style: normal; font-size: 0.72rem; }
+/* 已补标：结论保留供二审，但整行置灰、按钮禁用，避免补完还当待办 */
+.audit-mt-row.mt-done { opacity: 0.55; }
+.audit-mt-row.mt-done .mt-info { text-decoration: line-through; text-decoration-color: #9aa5b1; }
+.mt-done-badge {
+  display: inline-block;
+  margin-left: 0.3rem;
+  padding: 0 0.3rem;
+  border-radius: 0.2rem;
+  background: #eceff1;
+  color: #607d8b;
+  font-size: 0.66rem;
+  font-weight: 600;
+  text-decoration: none;
+  vertical-align: middle;
+}
+.audit-summary .primary[disabled] {
+  background: #e0e0e0;
+  color: #9e9e9e;
+  cursor: not-allowed;
+}
 .audit-summary .primary { background: #1c64f2; color: #fff; border: none; }
 .audit-summary .danger { background: #e02424; color: #fff; border: none; }
 
