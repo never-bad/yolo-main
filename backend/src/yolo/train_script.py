@@ -676,6 +676,23 @@ def main():
         else:
             workers = 4
             print(f"[{datetime.now().isoformat()}] 数据加载进程数: workers=4")
+
+        # ultralytics 内部还会再截一次：build_dataloader 里
+        #   nw = min(os.cpu_count() // max(nd, 1), workers)
+        # nd 是可见 GPU 数。所以容器里看到 2 张卡、宿主 8 核时，
+        # 即便这里传 8，实际也只会跑 4。提前把这个上限打出来，
+        # 免得用户看到日志里「Using N dataloader workers」比设的小就以为参数没生效。
+        if workers > 0:
+            try:
+                import torch as _t
+                _nd = _t.cuda.device_count() or 1
+                _eff = min(os.cpu_count() // max(_nd, 1), workers)
+                if _eff < workers:
+                    print(f"[{datetime.now().isoformat()}] 注意: ultralytics 会按 "
+                          f"cpu_count({os.cpu_count()}) // 可见GPU({_nd}) 截断，"
+                          f"实际生效进程数为 {_eff}（小于设定的 {workers}）")
+            except Exception:
+                pass
         
         train_kwargs = {
             "data": args.data,

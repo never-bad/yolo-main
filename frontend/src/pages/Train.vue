@@ -304,18 +304,28 @@
             数据加载进程 workers
             <span
               class="hint-dot"
-              title="Dataloader 进程数。0=单进程（容器里最稳，但 GPU 常常在等数据）；4~8=多进程预取，dataset 大时能快数倍。改这个不影响模型精度，只影响速度。"
+              title="Dataloader 进程数。0=单进程（容器里最稳，但 GPU 常常在等数据）；多进程预取在数据集大时能快数倍。改这个不影响模型精度，只影响速度。"
             >?</span>
           </label>
           <select v-model.number="trainForm.workers" :disabled="training">
-            <option :value="null">自动（容器内 = 0）</option>
+            <option :value="null">自动（容器内实际为 0）</option>
             <option :value="0">0 — 单进程（最稳）</option>
             <option :value="2">2 进程</option>
-            <option :value="4">4 进程（推荐）</option>
+            <option :value="4">4 进程</option>
             <option :value="6">6 进程</option>
-            <option :value="8">8 进程（最快）</option>
+            <option :value="8">8 进程</option>
           </select>
           <small :class="{ 'warn-text': workersSpeedHint.warn }">{{ workersSpeedHint.text }}</small>
+          <!-- 自动档且图片多时，把后端按规模算出的推荐值给个一键入口，
+               省得用户只能凭手感猜数字 -->
+          <button
+            v-if="(trainForm.workers === null || trainForm.workers === undefined)
+              && suggestParamsRes?.workers && resourceEstimate.imageCount > 2000"
+            type="button"
+            class="link-btn"
+            :disabled="training"
+            @click="applyRecommendedWorkers"
+          >采用推荐值 {{ suggestParamsRes.workers }}</button>
         </div>
         <!-- B-65 数据增强策略：仅 L3 高级模式暴露；留空不传，沿用 ultralytics 默认值 -->
         <div class="augment-block" style="grid-column: 1 / -1; margin-top: 14px;">
@@ -842,22 +852,38 @@ watch(() => trainForm.value.workers, (v) => {
 })
 
 // Workers：YOLO 数据加载工作进程数
-// 注意：这只是「自动」档位下前端给用户看的说明值，真正的执行值由后端/脚本决定
-// （容器内 auto → 0）。用户显式选了就以选择为准，见 workersSpeedHint。
+// 「自动」档位下容器内实际会跑 0（单进程）。这里不假装给个数字，
+// 而是显示后端按数据集规模算出的推荐值，让用户知道「自动 = 慢，推荐 = 多少」。
 const workersValue = computed(() => {
   if (trainForm.value.workers !== null && trainForm.value.workers !== undefined) {
     return String(trainForm.value.workers)
   }
-  const cnt = resourceEstimate.value.imageCount
-  return String(Math.min(8, Math.max(2, Math.floor(cnt / 256) || 2)))
+  const rec = suggestParamsRes.value?.workers
+  return rec === undefined || rec === null ? '0（自动）' : `0（推荐 ${rec}）`
 })
 
-// 选 workers 时给一句人话解释代价，避免用户瞎选
+// Workers 提示：默认自动时明确告知代价，并把推荐值摆出来让用户一键采用。
+// 注意不写死「建议调到 N」—— 共享服务器上可用 CPU 核数随时变，
+// 具体数值由后端按数据集规模推荐，用户可自行上下调。
 const workersSpeedHint = computed(() => {
   const w = trainForm.value.workers
   const cnt = resourceEstimate.value.imageCount
   if (w === null || w === undefined) {
-    return { text: '自动 = 容器内使用单进程（最稳），图片多时会明显变慢', warn: false }
+    const rec = suggestParamsRes.value?.workers
+    if (cnt > 2000) {
+      return {
+        text: `当前是「自动」，容器内实际按单进程跑：${cnt} 张图每轮都要重新读盘，`
+          + 'GPU 会有大量时间空等。'
+          + (rec ? `按本数据集规模推荐 ${rec} 进程（右侧问号可看依据），可点下方按钮采用。` : '')
+          + '这是共享服务器，实际能开到多少取决于当时空闲 CPU 核。',
+        warn: true
+      }
+    }
+    return {
+      text: '自动 = 容器内按单进程跑（最稳）。图少时影响不大，'
+        + '图多时建议手动选个多进程值。',
+      warn: false
+    }
   }
   if (w === 0) {
     return {
@@ -874,6 +900,17 @@ const workersSpeedHint = computed(() => {
     warn: false
   }
 })
+
+// 一键采用后端推荐值（默认 aut 时的小按钮，避免用户只能凭手感瞎选）
+const applyRecommendedWorkers = () => {
+  const rec = suggestParamsRes.value?.workers
+  if (!rec) {
+    showToast('还没有拿到推荐值，请先选择数据集', 'info', 3000)
+    return
+  }
+  trainForm.value.workers = rec
+  showToast(`已将数据加载进程设为推荐值 ${rec}`, 'success', 2400)
+}
 
 // ===== 预训练权重开关（§3.2.1 从零训练 / §3.2.2 跨代迁移入口二） =====
 // 勾选「启用预训练权重」→ 二选一来源：
@@ -1502,6 +1539,35 @@ const jobDuration = (job: any): string => {
 // 去除 ANSI 转义码
 const stripAnsi = (text: string): string => text.replace(/\x1B\[[0-9;]*[mK]/g, '')
 
+// 可选数值字段：这些项留空表示「沿用默认」，不能把空字符串发给后端。
+// v-model.number 在用户清空输入框时给的是 ""（不是 null），而 Pydantic 对
+// Optional[float] 收到 "" 会直接报 float_parsing → 整个训练提交 422，
+// 用户只清空了一个增强项、却连训练都发不出去，且报错信息看不出是哪个字段。
+// 实测确认：mosaic='' / copy_paste='' / close_mosaic='' 三种都会 422。
+const OPTIONAL_NUM_FIELDS = [
+  'lr0', 'weight_decay', 'patience', 'gpu_index', 'workers',
+  'mosaic', 'mixup', 'copy_paste', 'flipud', 'fliplr',
+  'hsv_h', 'hsv_s', 'hsv_v', 'degrees', 'translate', 'scale', 'shear',
+  'perspective', 'erasing', 'crop_fraction', 'close_mosaic',
+  'hard_sample_ratio', 'background_sample_ratio'
+] as const
+
+const sanitizeTrainParams = (p: TrainJobRequest): TrainJobRequest => {
+  const out: any = { ...p }
+  for (const k of OPTIONAL_NUM_FIELDS) {
+    const v = out[k]
+    // 空字符串 / null 一律视为「不传」，交给后端与脚本用默认值
+    if (v === '' || v === null) out[k] = undefined
+  }
+  // 必填数值项被清空时回落到安全默认，避免整体 422
+  if (out.epochs === '' || out.epochs == null) out.epochs = 10
+  if (out.imgsz === '' || out.imgsz == null) out.imgsz = 640
+  if (out.batch === '' || out.batch == null) out.batch = 32
+  // 文本框清空 = 关闭该项增强，不能传空字符串（argparse 会收到 --auto-augment ''）
+  if (out.auto_augment === '') out.auto_augment = undefined
+  return out as TrainJobRequest
+}
+
 const startTraining = async () => {
   if (!trainForm.value.dataset_id) {
     showToast('请选择数据集', 'info', 4000)
@@ -1554,7 +1620,7 @@ const startTraining = async () => {
       library_root_id: effectiveLibraryRootId.value || undefined
     }
     
-    const result = await createTrainJob(params)
+    const result = await createTrainJob(sanitizeTrainParams(params))
     currentJobId.value = result.job_id
     // 阶段1.3：聚合训练结果提示
     if (result.aggregated && result.aggregation) {
@@ -1650,7 +1716,7 @@ const retrainJob = async (job: any) => {
       // B-65 数据增强策略：复用原任务的增强配置（job.augment 由后端档案回传）
       ...(job.augment && typeof job.augment === 'object' ? job.augment : {})
     }
-    const result = await createTrainJob(params)
+    const result = await createTrainJob(sanitizeTrainParams(params))
     restoreScroll(prevScrollY)
     showToast('已重新创建训练任务: ' + result.job_id, 'info', 4000)
     currentJobId.value = result.job_id
@@ -2415,6 +2481,28 @@ onUnmounted(() => {
 .hint-dot:hover {
   background: #2563eb;
   color: #fff;
+}
+
+/* 「采用推荐值」这类行内文字按钮：不抢主按钮的视觉权重 */
+.link-btn {
+  margin-top: 6px;
+  padding: 0;
+  background: none;
+  border: none;
+  color: #2563eb;
+  font-size: 12px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.link-btn:hover:not(:disabled) {
+  color: #1d4ed8;
+}
+
+.link-btn:disabled {
+  color: #9aa7b6;
+  cursor: not-allowed;
 }
 
 .check-line {

@@ -376,6 +376,16 @@ class TrainService:
             f"数据集约 {image_count} 张图 / {class_count} 类，"
             f"已按{mode}场景推荐参数（可手动修改）{cpu_hint}{golden_hint}。"
         )
+        # 把 workers 推荐的依据写清楚：数字不是拍出来的，是「数据规模 + 可用核数」算的
+        try:
+            _aff = (len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity")
+                    else (os.cpu_count() or 0))
+        except Exception:
+            _aff = os.cpu_count() or 0
+        if _aff:
+            reason += (f" 数据加载进程推荐 {params['workers']}"
+                       f"（本机可用 {_aff} 核，最多取一半且不超过 8；"
+                       f"这是共享服务器，实际收益随他人负载变化）。")
 
         return {
             "device": device_info,
@@ -389,24 +399,40 @@ class TrainService:
 
     @staticmethod
     def _suggest_workers(image_count: int) -> int:
-        """按数据集规模推荐 DataLoader 进程数。
+        """按数据集规模 + 本机真实可用 CPU 核数推荐数据加载进程数。
 
-        依据：单进程时 GPU 会在每个 batch 后等 CPU decode 图片，
-        实测 1.3 万张 / batch12 的场景下每 iter 0.94s（正常应 0.1s 级）。
-        进程数不是越多越好 —— 图少时调度与 IPC 开销会反超收益，
-        且每个 worker 都要占一份内存，所以按规模分档。
+        依据：单进程时 GPU 会在每个 batch 后等 CPU 解码图片，
+        实测 1.3 万张 / batch 12 的场景下每迭代 0.94 秒（正常应在 0.1 秒级）。
+        进程数不是越多越好 —— 图少时调度与进程间通信开销会反超收益，
+        且每个进程都要占一份内存，所以按规模分档，再用可用核数封顶。
+
+        核数取 os.sched_getaffinity(0)（容器 cpuset 限制下比 os.cpu_count()
+        更准，后者会报宿主总核数）；Windows 无此接口时退回 cpu_count。
         """
         try:
             n = int(image_count or 0)
         except Exception:
             n = 0
         if n < 500:
-            return 2
-        if n < 3000:
-            return 4
-        if n < 10000:
-            return 6
-        return 8
+            target = 2
+        elif n < 3000:
+            target = 4
+        elif n < 10000:
+            target = 6
+        else:
+            target = 8
+
+        # 用真实可用核数封顶：给数据加载留出余量（不要吃满，否则
+        # 训练主进程与同机其他人的任务都会被拖慢）
+        try:
+            aff = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 0)
+        except Exception:
+            aff = os.cpu_count() or 0
+        if aff > 0:
+            # 最多用一半可用核，且至少留 1 核给主进程
+            cap = max(1, min(8, aff // 2))
+            target = min(target, cap)
+        return target
 
     def _resolve_dataset_yaml(self, dataset_id: str, version: str = "v1") -> Path:
         """定位数据集训练用 data.yaml：
