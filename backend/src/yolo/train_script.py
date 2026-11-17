@@ -640,24 +640,36 @@ def main():
         # 避免多进程 DataLoader 在 fork + CUDA + 共享内存环境下的 [Errno 22] / 卡死 / 崩溃
         if args.workers is not None:
             workers = max(0, int(args.workers))
+            # 把机器的真实 CPU 情况打进日志。这个数是判断 workers 该设多少的
+            # 唯一依据 —— 光看数据集大小是推不出来的（共享服务器上还要看谁在用）。
+            try:
+                _cpu_total = os.cpu_count() or 0
+                _cpu_aff = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else _cpu_total
+                try:
+                    _la = os.getloadavg()
+                    _load = f"{_la[0]:.2f}"
+                except Exception:
+                    _load = "n/a"
+                print(f"[{datetime.now().isoformat()}] CPU: 可见 {_cpu_total} 核 / 本进程亲和 {_cpu_aff} 核"
+                      f" / 当前 1 分钟负载 {_load}")
+            except Exception:
+                _cpu_aff = os.cpu_count() or 0
+                _cpu_total = _cpu_aff
             print(f"[{datetime.now().isoformat()}] 数据加载进程数: workers={workers}（由用户指定）")
             if workers > 0:
-                # 进程数不能超过 CPU 核数，超了只会互相争抢、上下文切换变多
-                try:
-                    _cpu = os.cpu_count() or 4
-                    if workers > _cpu:
-                        print(f"[{datetime.now().isoformat()}] [WARN] workers={workers} 超过 CPU 核数 {_cpu}，按 {_cpu} 执行")
-                        workers = _cpu
-                except Exception:
-                    pass
-                # 说明：这里不强行 set_start_method('spawn')。
-                # ultralytics 的 Dataset 是纯 CPU 的（PIL/OpenCV decode + 几何增强），
-                # DataLoader worker 里不碰 CUDA，默认 fork 是安全的，且比 spawn 快得多
-                # （spawn 每个 epoch 都要重新 import torch）。
-                # 真遇到 "Cannot re-initialize CUDA in forked subprocess" 时，
+                # 进程数不能超过可用 CPU 核，超了只会互相争抢、上下文切换变多
+                if workers > _cpu_aff:
+                    print(f"[{datetime.now().isoformat()}] [WARN] workers={workers} 超过可用核数 {_cpu_aff}，按 {_cpu_aff} 执行")
+                    workers = _cpu_aff
+                # 说明：这里不强行设置进程启动方式为 spawn。
+                # ultralytics 的数据集读取是纯 CPU 工作（PIL/OpenCV 解码 + 几何增强），
+                # 数据加载子进程里完全不碰 CUDA，所以默认的 fork 方式是安全的，
+                # 而且比 spawn 快得多 —— 每开始一个新轮次，spawn 都要重新加载一遍
+                # torch 库，这笔开销在 300 轮的训练里非常可观。
+                # 如果真遇到「Cannot re-initialize CUDA in forked subprocess」，
                 # 把 workers 调回 0 即可，不需要改代码。
-                print(f"[{datetime.now().isoformat()}] DataLoader 多进程预取已启用"
-                      f"（共享内存已配 24G，若报 Errno 22 / 卡死请把 workers 调回 0）")
+                print(f"[{datetime.now().isoformat()}] 数据加载已启用多进程预取"
+                      f"（共享内存已配 24G；若报 Errno 22 或卡死，请把 workers 调回 0）")
         elif os.name == 'nt' or os.path.exists('/.dockerenv') or (Path(__file__).resolve().parent.parent.parent / 'app').exists():
             workers = 0
             print(f"[{datetime.now().isoformat()}] 数据加载进程数: workers=0（容器/单进程模式，最稳定）")
