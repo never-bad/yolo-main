@@ -582,6 +582,12 @@
             <button v-if="box.audit?.suggested_class_id != null" class="small fix-btn" @click.stop="fixBoxClass(idx)" :title="'采纳 AI 建议类别：' + (classes[box.audit.suggested_class_id] ?? '')">
               用{{ classes[box.audit.suggested_class_id] ?? '' }}
             </button>
+            <button v-if="box.audit?.suggested_bbox" class="small fix-btn suggest-btn" @click.stop="adoptSuggestedBox(idx)" title="采纳 AI 建议框：用模型给的贴合框替换当前框（画布绿虚线位置），Ctrl+Z 可撤销">
+              用建议框
+            </button>
+            <button v-if="box.audit?.sub_bboxes?.length >= 2" class="small fix-btn suggest-btn" @click.stop="adoptSubBoxes(idx)" :title="'采纳 AI 拆分建议：把这个粘连框拆成 ' + box.audit.sub_bboxes.length + ' 个独立目标框（画布绿虚线位置），Ctrl+Z 可撤销'">
+              拆{{ box.audit.sub_bboxes.length }}框
+            </button>
             <select :value="box.class_id" class="box-class-select" :title="classes[box.class_id] || ''" @click.stop @change="onBoxClassChange($event, idx)">
               <option v-for="(cls, cIdx) in classes" :key="cIdx" :value="cIdx">{{ cls }}</option>
             </select>
@@ -601,6 +607,7 @@
             <span class="a-reject">✗ 建议删除 {{ imageAudit.stats?.reject || 0 }}</span>
             <span class="a-split">⧉ 粘连 {{ imageAudit.stats?.split || 0 }}</span>
             <span class="a-miss">漏标 {{ missedPendingCount }}<template v-if="(imageAudit.missed_targets?.length || 0) > missedPendingCount">（已补 {{ (imageAudit.missed_targets?.length || 0) - missedPendingCount }}）</template></span>
+            <span v-if="auditSuggestCount" class="a-suggest" title="模型对问题框给出的修正建议（画布绿虚线），在左侧框列表点「用建议框/拆N框」采纳">◈ 建议框 {{ auditSuggestCount }}</span>
           </div>
           <div v-if="auditRejectCount" class="audit-actions">
             <button class="danger small" @click="removeRejectedBoxes">删除被拒框（{{ auditRejectCount }}）</button>
@@ -3337,6 +3344,28 @@ const redrawCanvas = () => {
     ctx.value!.font = '14px Arial'
     ctx.value!.fillText((done ? '已补:' : '漏:') + (classes.value[mt.class_id] || mt.class_id), mt.x1, Math.max(mt.y1 - 5, 12))
   })
+  // 千问审核建议框：绿色虚线（modify 的贴合修正框 / split 的拆分子框）。
+  // 与漏标蓝虚线区分：蓝=「这里缺个框」，绿=「这个框该改成这样」。
+  // 同样是"建议"不参与选中/移动，点框列表的「用建议框/拆N框」才真正替换。
+  currentBoxes.value.forEach((box: any) => {
+    if (String(cur) !== '-1' && box.class_id !== Number(cur)) return
+    const a = box.audit
+    if (!a) return
+    const rects: any[] = []
+    if (a.suggested_bbox) rects.push(a.suggested_bbox)
+    if (Array.isArray(a.sub_bboxes)) rects.push(...a.sub_bboxes)
+    rects.forEach((sb: any) => {
+      if (!sb || !(sb.x2 > sb.x1 && sb.y2 > sb.y1)) return
+      ctx.value!.strokeStyle = '#00c853'
+      ctx.value!.lineWidth = 2 / viewScale.value
+      ctx.value!.setLineDash([6, 4])
+      ctx.value!.strokeRect(sb.x1, sb.y1, sb.x2 - sb.x1, sb.y2 - sb.y1)
+      ctx.value!.setLineDash([])
+      ctx.value!.fillStyle = '#00c853'
+      ctx.value!.font = '13px Arial'
+      ctx.value!.fillText('建议', sb.x1, Math.max(sb.y1 - 4, 12))
+    })
+  })
   // 正在画的新框
   if (isDrawing.value && editMode.value === 'draw') {
     ctx.value.strokeStyle = 'red'
@@ -3791,6 +3820,7 @@ const runAutoLabel = async () => {
       if (j(st.reject)) parts.push(`建议删除 ${j(st.reject)}`)
       if (j(st.split)) parts.push(`粘连 ${j(st.split)}`)
       if (j(st.missed)) parts.push(`漏标 ${j(st.missed)}`)
+      if (j(st.suggested)) parts.push(`建议框 ${j(st.suggested)}`)
       showToast(`L2 审核：${parts.join(' · ') || '全部通过'}`, parts.length ? 'info' : 'success')
     }
     if (!aiBoxes.length) {
@@ -3836,6 +3866,7 @@ const applyAudit = (audit: any) => {
     if (j(st.reject)) parts.push(`建议删除 ${j(st.reject)}`)
     if (j(st.split)) parts.push(`粘连 ${j(st.split)}`)
     if (j(st.missed)) parts.push(`漏标 ${j(st.missed)}`)
+    if (j(st.suggested)) parts.push(`建议框 ${j(st.suggested)}`)
     showToast(`L2 审核：${parts.join(' · ') || '全部通过'}`, parts.length ? 'info' : 'success')
   }
 }
@@ -3924,6 +3955,46 @@ const fixBoxClass = (idx: number) => {
   redrawCanvas()
   showToast(`已修正类别为：${classes.value[b.class_id] || b.class_id}`, 'success')
 }
+
+// 一键采纳"建议框"（modify 修正）：用模型给的贴合框替换当前框坐标。
+// 采纳后清掉 audit（与 fixBoxClass 同范式）——结论已落实，不再当待办；可 Ctrl+Z 撤销。
+const adoptSuggestedBox = (idx: number) => {
+  const b = currentBoxes.value[idx]
+  const sb = b?.audit?.suggested_bbox
+  if (!sb || !(sb.x2 > sb.x1 && sb.y2 > sb.y1)) return
+  pushUndo()
+  b.x1 = sb.x1; b.y1 = sb.y1; b.x2 = sb.x2; b.y2 = sb.y2
+  // 建议框是矩形修正，原分割轮廓不再适用（轮廓还留着会画成旧形状）
+  delete b.polygon
+  delete b.audit
+  redrawCanvas()
+  showToast('已采纳建议框（Ctrl+Z 可撤销）', 'success')
+}
+
+// 一键采纳"拆分子框"（split 修正）：粘连大框换成模型给的各独立目标框。
+// 原框被替换（不是追加），类别沿用原框；同样清 audit、可撤销。
+const adoptSubBoxes = (idx: number) => {
+  const b = currentBoxes.value[idx]
+  const subs = b?.audit?.sub_bboxes
+  if (!Array.isArray(subs) || subs.length < 2) return
+  pushUndo()
+  const news = subs
+    .filter((s: any) => s && s.x2 > s.x1 && s.y2 > s.y1)
+    .map((s: any) => ({ class_id: b.class_id, x1: s.x1, y1: s.y1, x2: s.x2, y2: s.y2, source: 'ai_audit' }))
+  if (news.length < 2) {
+    showToast('子框数据不完整，未拆分', 'info', 4000)
+    return
+  }
+  currentBoxes.value.splice(idx, 1, ...news)
+  selectedBoxIndex.value = -1
+  redrawCanvas()
+  showToast(`已拆分为 ${news.length} 个框（Ctrl+Z 可撤销）`, 'success')
+}
+
+// 待采纳的建议框数（modify 的贴合框 + split 的子框组），面板统计用
+const auditSuggestCount = computed(() =>
+  currentBoxes.value.filter((b: any) => b.audit?.suggested_bbox || (b.audit?.sub_bboxes?.length >= 2)).length
+)
 
 // 一键删除被审核拒绝的框（reject / label_error / merged-reject）
 const auditRejectCount = computed(() =>
@@ -5765,6 +5836,9 @@ canvas {
   cursor: pointer;
 }
 .fix-btn:hover { background: #ffe69c; }
+/* 建议框采纳按钮：绿色系，与「用类别」的黄色系区分（绿虚线=建议框） */
+.fix-btn.suggest-btn { background: #e8f5e9; color: #1b5e20; border-color: #66bb6a; }
+.fix-btn.suggest-btn:hover { background: #c8e6c9; }
 
 .audit-summary {
   margin-top: 0.75rem;
@@ -5832,6 +5906,7 @@ canvas {
 .issue-img { flex: 1; font-family: monospace; word-break: break-all; }
 .issue-badges em { font-style: normal; margin-left: 4px; padding: 1px 6px; border-radius: 4px; font-size: 12px; }
 .a-miss { background: #e0f7fa; color: #0097a7; }
+.a-suggest { background: #e8f5e9; color: #1b5e20; }
 .audit-actions { margin-bottom: 0.4rem; }
 .audit-missed-title { font-size: 0.75rem; font-weight: 600; color: #0097a7; margin-bottom: 0.3rem; }
 .audit-mt-row {

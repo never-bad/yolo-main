@@ -157,8 +157,12 @@ DEFAULT_AUDIT_PROMPT = (
     "   禁止把已有框的一部分、遮挡残影、背景纹理、模糊人影、同一目标的重复部位当作漏标。\n"
     "   没有把握就不报；每张图最多报 2 个。\n"
     "6. 粘连 merged_boxes：仅在**一个框内确实包含两个及以上完整独立目标**时输出。\n"
+    "   若你能看清各目标的边界，**必须给出 sub_bboxes**（每个独立目标一个框）。\n"
     "7. 业务合规 #compliance_issue：**仅当类别定义里明确要求检查合规/违规行为（如未戴安全帽、未穿反光衣）时**才添加。\n"
-    "   类别定义只是描述目标外观或姿态（如「人员摔倒」）时，**一律不要输出该标签**。\n\n"
+    "   类别定义只是描述目标外观或姿态（如「人员摔倒」）时，**一律不要输出该标签**。\n"
+    "8. 建议框 suggested_bbox：**仅对 action=modify 的框**，且你**有把握看清目标真实边界**时，\n"
+    "   给出修正后的贴合框 [x1, y1, x2, y2]（与送审框同一坐标空间）。看不清/没把握就不要给。\n"
+    "   每张图最多给 3 个建议框；reject/keep 的框一律不给 suggested_bbox。\n\n"
     "# 输出要求\n"
     "- reason 必须写明判定依据（你看到了什么），并标注把握程度：高 / 中 / 低。\n"
     "  reason 与 action 必须逻辑一致，不得自相矛盾。\n"
@@ -168,15 +172,18 @@ DEFAULT_AUDIT_PROMPT = (
     "    {\"class_id\": 序号, \"bbox\": [x1, y1, x2, y2], \"reason\": \"依据+把握（限30字）\"}\n"
     "  ],\n"
     "  \"merged_boxes\": [\n"
-    "    {\"box_id\": 1, \"action\": \"split | reject\", \"reason\": \"依据+把握（限30字）\"}\n"
+    "    {\"box_id\": 1, \"action\": \"split | reject\", \"reason\": \"依据+把握（限30字）\",\n"
+    "     \"sub_bboxes\": [[x1, y1, x2, y2], [x1, y1, x2, y2]]}\n"
     "  ],\n"
     "  \"label_errors\": [\n"
     "    {\"box_id\": 3, \"suggested_class\": 正确类别序号, \"reason\": \"依据+把握（限30字）\"}\n"
     "  ],\n"
     "  \"box_reviews\": [\n"
-    "    {\"box_id\": 2, \"action\": \"keep | modify | reject\", \"reason\": \"依据+把握（限30字）\", \"tags\": [\"#occluded\", \"#blur\"]}\n"
+    "    {\"box_id\": 2, \"action\": \"keep | modify | reject\", \"reason\": \"依据+把握（限30字）\",\n"
+    "     \"tags\": [\"#occluded\", \"#blur\"], \"suggested_bbox\": [x1, y1, x2, y2]}\n"
     "  ]\n"
     "}\n"
+    "（sub_bboxes 与 suggested_bbox 都是可选字段：看不清就不输出，不要编造坐标）\n"
 )
 
 
@@ -2245,6 +2252,7 @@ class SAMService:
                 "reason": (str(r.get("reason") or ""))[:50],
                 "tags": tags,
                 "suggested_class_id": None,
+                "suggested_bbox": r.get("suggested_bbox"),
             })
         # ② label_errors：仅在「多类别 且 建议类别确实不同于原类别」时成立。
         # 旧版无条件把该框改成 reject/label_error 且沿用 box_reviews 的 reason，
@@ -2291,11 +2299,14 @@ class SAMService:
                     "box_id": bid, "action": act if act in ("split", "reject") else "split",
                     "kind": "merged", "reason": (str(r.get("reason") or ""))[:50], "tags": [],
                     "suggested_class_id": None,
+                    "sub_bboxes": r.get("sub_bboxes"),
                 })
             else:
                 found["kind"] = "merged"
                 if act in ("split", "reject"):
                     found["action"] = act
+                if r.get("sub_bboxes"):
+                    found["sub_bboxes"] = r.get("sub_bboxes")
         # ④ missed_targets：漏标补框
         # 实测发现模型经常把「已经框好的目标」再当成漏标报一遍：40 条抽样里
         # 50% 与已有框 IoU=1.00，理由还写着「框内人员躺地，符合摔倒定义」。
@@ -2361,7 +2372,68 @@ class SAMService:
                 b["kind"] = "review"
                 b["suggested_class_id"] = None
                 b["tags"] = list(dict.fromkeys((b.get("tags") or []) + ["#needs_review"]))
-        stats = {"keep": 0, "modify": 0, "reject": 0, "split": 0, "missed": len(missed)}
+        # ⑥ 建议框归一化：模型对 modify 框给的修正框 / 对 split 框给的子目标框。
+        # 与漏标同样的教训：模型会编坐标，必须过闸门才落盘——
+        # 只认 modify/split、坐标合法、面积合理、与原框有关联；还原原图坐标并 clamp 到图内。
+        img_w, img_h = (self._qwen_img_size(img_abs) if img_abs is not None else (0, 0))
+        # 原框也还原到原图像素空间：audit_dets 的 bbox 是模型空间（norm1000/缩放像素），
+        # 建议框经 _norm_suggest 已是原图像素，两者必须在同一空间比 IoU/面积，
+        # 否则非正方形图上闸门会整体错位（实测 1000x800 时 IoU 被算成 0.94 而非 0.98）。
+        orig_bbox = {}
+        for d in audit_dets:
+            ob = d["bbox"]
+            if img_abs is not None:
+                ob = self._qwen_model_to_orig(ob, img_abs, cfg or {})
+            orig_bbox[d["box_id"]] = ob
+
+        def _norm_suggest(raw, bid):
+            """模型空间建议框 → 原图像素 {x1,y1,x2,y2}；不合格返回 None。"""
+            if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+                return None
+            try:
+                x1, y1, x2, y2 = (float(v) for v in raw)
+            except (TypeError, ValueError):
+                return None
+            if not (x2 > x1 and y2 > y1):
+                return None
+            if img_abs is not None:
+                x1, y1, x2, y2 = self._qwen_model_to_orig((x1, y1, x2, y2), img_abs, cfg or {})
+            if img_w and img_h:
+                x1, x2 = max(0.0, min(x1, float(img_w))), max(0.0, min(x2, float(img_w)))
+                y1, y2 = max(0.0, min(y1, float(img_h))), max(0.0, min(y2, float(img_h)))
+            if not (x2 > x1 and y2 > y1):
+                return None
+            # 面积闸门：建议框面积必须在原框的 [0.05, 5] 倍之间。
+            # 治两类幻觉：给个指甲盖大的框（0.05 倍以下）、给个铺满全图的框（5 倍以上）。
+            ob = orig_bbox.get(bid)
+            if ob:
+                oa = max(0.0, ob[2] - ob[0]) * max(0.0, ob[3] - ob[1])
+                na = (x2 - x1) * (y2 - y1)
+                if oa > 0 and not (0.05 * oa <= na <= 5.0 * oa):
+                    return None
+            return {"x1": round(x1, 1), "y1": round(y1, 1),
+                    "x2": round(x2, 1), "y2": round(y2, 1)}
+
+        suggested_count = 0
+        for b in box_reviews:
+            raw = b.get("suggested_bbox")
+            subs_raw = b.get("sub_bboxes")
+            b["suggested_bbox"] = None
+            b["sub_bboxes"] = None
+            if b["action"] == "modify" and raw is not None and suggested_count < 3:
+                nb = _norm_suggest(raw, b["box_id"])
+                if nb:
+                    # 建议框与原框几乎一样（IoU≥0.95）→ 没有修正价值，不给
+                    ob = orig_bbox.get(b["box_id"])
+                    if not ob or _iou([nb["x1"], nb["y1"], nb["x2"], nb["y2"]], ob) < 0.95:
+                        b["suggested_bbox"] = nb
+                        suggested_count += 1
+            elif b["action"] == "split" and isinstance(subs_raw, (list, tuple)) and len(subs_raw) >= 2:
+                subs = [nb for nb in (_norm_suggest(s, b["box_id"]) for s in subs_raw[:6]) if nb]
+                if len(subs) >= 2:
+                    b["sub_bboxes"] = subs
+        stats = {"keep": 0, "modify": 0, "reject": 0, "split": 0, "missed": len(missed),
+                 "suggested": suggested_count}
         for b in box_reviews:
             stats[b["action"]] = stats.get(b["action"], 0) + 1
         return {
@@ -2385,9 +2457,12 @@ class SAMService:
                                     "suggested_class_id": (0 % len(classes)) if classes else None,
                                     "tags": [], "reason": "模拟：框中非目标物"})
             elif i == 2:
+                bb = d.get("bbox") or [100, 100, 200, 200]
                 box_reviews.append({"box_id": bid, "action": "modify", "kind": "review",
                                     "tags": ["#occluded"], "reason": "模拟：存在遮挡",
-                                    "suggested_class_id": None})
+                                    "suggested_class_id": None,
+                                    "suggested_bbox": {"x1": bb[0] + 5, "y1": bb[1] + 5,
+                                                       "x2": bb[2] - 5, "y2": bb[3] - 5}})
             else:
                 box_reviews.append({"box_id": bid, "action": "keep", "kind": "review",
                                     "tags": [], "reason": "", "suggested_class_id": None})
@@ -2395,7 +2470,8 @@ class SAMService:
         if audit_dets and len(classes) > 1:
             missed.append({"class_id": 1 % len(classes), "x1": 20, "y1": 20, "x2": 90, "y2": 110,
                            "reason": "模拟：漏标一个目标"})
-        stats = {"keep": 0, "modify": 0, "reject": 0, "split": 0, "missed": len(missed)}
+        stats = {"keep": 0, "modify": 0, "reject": 0, "split": 0, "missed": len(missed),
+                 "suggested": sum(1 for b in box_reviews if b.get("suggested_bbox"))}
         for b in box_reviews:
             stats[b["action"]] = stats.get(b["action"], 0) + 1
         return {
@@ -3109,7 +3185,7 @@ class SAMService:
                                     r = rmap.get(i)
                                     if r:
                                         b["audit"] = {k: r.get(k) for k in
-                                                      ("action", "kind", "reason", "tags", "suggested_class_id")
+                                                      ("action", "kind", "reason", "tags", "suggested_class_id", "suggested_bbox", "sub_bboxes")
                                                       if r.get(k) is not None}
                             else:
                                 bt.audit_errors += 1
@@ -3310,7 +3386,7 @@ class SAMService:
                     if r and orig_i < len(ann_boxes):
                         nb = dict(ann_boxes[orig_i])
                         nb["audit"] = {k: r.get(k) for k in
-                                       ("action", "kind", "reason", "tags", "suggested_class_id")
+                                       ("action", "kind", "reason", "tags", "suggested_class_id", "suggested_bbox", "sub_bboxes")
                                        if r.get(k) is not None}
                         ann_boxes[orig_i] = nb
                 ann["boxes"] = ann_boxes
