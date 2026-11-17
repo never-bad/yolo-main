@@ -539,6 +539,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onActivated, computed } from 'vue'
+import { useRoute } from 'vue-router'
 import { listModels, getModel, updateModel, uploadModel, exportModel, generateTrainingCharts, findSimilarModels, mergeModels, getMergeLogs, rollbackMerge, listPendingPublish, confirmPublish, listLibraries, type ModelDetails } from '@/api/models'
 import { downloadFile } from '@/utils/download'
 import { showAlert, showConfirm, showPrompt, deleteModelWithGuard } from '@/composables/useDialog'
@@ -1764,17 +1765,23 @@ const exportModelFile = async (modelId: string) => {
   }
 }
 
+const modelsRoute = useRoute()
+
 onMounted(() => {
   loadModels()
   loadPendingPublish()
 })
 
-// B-10：keep-alive 缓存后切回本页时静默刷新（首次挂载跳过，避免重复请求）
+// 切回本页不再无条件刷新（原来每次 activated 都重新拉取模型列表 + 待发布列表）。
+// 模型详情页返回走首页、不带参数，模型页没有需要刷新的返回路径，普通切页完全依赖缓存。
+// 仅当显式带 ?refresh=1 时才刷新（预留逃生口）。
 let _modelsFirstActivate = true
 onActivated(() => {
   if (_modelsFirstActivate) { _modelsFirstActivate = false; return }
-  loadModels(true)
-  loadPendingPublish()
+  if (modelsRoute.query.refresh === '1') {
+    loadModels(true)
+    loadPendingPublish()
+  }
 })
 
 // ===== 2.7 相似模型排查与合并 =====

@@ -219,7 +219,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onActivated } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRouter, useRoute } from 'vue-router'
 import { listModels, updateModel, exportModel } from '@/api/models'
 import { deleteModelWithGuard, showConfirm } from '@/composables/useDialog'
 import { listDatasets } from '@/api/datasets'
@@ -227,6 +227,7 @@ import { showToast } from '@/utils/toast'
 import LibraryCreateModal from '@/components/LibraryCreateModal.vue'
 
 const router = useRouter()
+const route = useRoute()
 const loading = ref(true)
 const models = ref<any[]>([])
 const totalDatasets = ref(0)
@@ -483,12 +484,12 @@ async function load() {
   }
 }
 onMounted(load)
-// B-10：keep-alive 缓存后，切回本页时静默刷新（不清空已有数据，不闪骨架屏）。
-// 首次挂载 activated 也会触发，用 flag 跳过，避免与 onMounted 重复请求。
+// 切回本页不再无条件刷新（原来每次 activated 都 load()，普通切页也会重新请求两个列表）。
+// 只有从详情页等带 ?refresh=1 返回、确实需要刷新统计时才重新加载；普通导航切换完全依赖缓存。
 let _dashFirstActivate = true
 onActivated(() => {
   if (_dashFirstActivate) { _dashFirstActivate = false; return }
-  load()
+  if (route.query.refresh === '1') load()
 })
 </script>
 

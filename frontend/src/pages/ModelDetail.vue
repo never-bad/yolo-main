@@ -1,6 +1,6 @@
 <template>
   <div class="model-detail">
-    <button class="back-btn" @click="$router.push('/')">← 返回仓库</button>
+    <button class="back-btn" @click="$router.push({ path: '/', query: { refresh: '1' } })">← 返回仓库</button>
 
     <div v-if="loading" class="loading-state"><span class="loading-spinner"></span>加载算法库详情...</div>
 
