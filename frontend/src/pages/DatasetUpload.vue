@@ -1621,15 +1621,18 @@ onMounted(async () => {
   consumeFocus()
 })
 
-// B-10：keep-alive 缓存后，切回本页静默刷新（不闪骨架屏）；
-// 且从模型详情页带 ?focus= 跳转进来时组件不会重新 onMounted，
-// 需在 activated 里消费 focus，否则高亮定位失效。首次挂载跳过避免重复请求。
-// 注：不做滚动位置恢复——导航栏非 sticky，点导航前必然已滚回顶部，恢复无意义。
+// B-10：keep-alive 缓存后，切回本页不再无条件刷新。
+// 之前每次 activated 都调 loadDatasets(true)，而它内部会执行 advance-buckets（灌桶/封板写操作）
+// + 重新拉取列表 —— 普通切页也会触发，导致桶进度被改动、弹灌桶提示、列表重排，看起来像"刷新/状态丢失"。
+// 现在只有从标注页/模型页带 ?focus= 或 ?stage= 返回时（确实需要重新定位）才刷新；
+// 普通页面切换完全依赖缓存，不发任何请求。
 let _dsFirstActivate = true
 onActivated(() => {
   const skipRefresh = _dsFirstActivate
   _dsFirstActivate = false
-  if (!skipRefresh) {
+  if (skipRefresh) return
+  const needsRelocate = !!(route.query.focus || route.query.stage)
+  if (needsRelocate) {
     loadDatasets(true)
     consumeFocus()
   }
