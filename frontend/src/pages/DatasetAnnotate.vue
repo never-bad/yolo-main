@@ -1748,9 +1748,37 @@ const batchPercent = computed(() => {
 const auditBatchId = ref<string | null>(null)
 const auditBatchProgress = ref<any>(null)
 const auditBatchTimer = ref<any>(null)
+// 本地「已收尾」闸门：用户点过停止、或已判定批次结束后置 true。
+// 为什么不能只看后端 status：stop_batch 只置 bt.cancelled=True，不改 status，
+// 要等当前 chunk（concurrency*4，默认 64 张）全部 gather 完才转 cancelled；
+// 停止请求失败/超时时后端更是完全不知情。只靠 status 判 running，
+// 按钮就会一直转（真机 2026-11-18：取消后按钮转了很久）。
+const auditBatchSettled = ref(false)
+const auditStopping = ref(false)
 const auditBatchRunning = computed(() =>
-  !!auditBatchProgress.value && ['running', 'pending'].includes(auditBatchProgress.value.status)
+  !auditBatchSettled.value
+  && !!auditBatchProgress.value
+  && ['running', 'pending'].includes(auditBatchProgress.value.status)
 )
+// 轮询「代号」：每次启动/恢复/收尾都 +1。在飞的请求回来时代号对不上就整段丢弃，
+// 否则停止后那次已在途的进度响应会把 running 写回来，按钮又开始转。
+let auditPollToken = 0
+const clearAuditBatchTimer = () => {
+  if (auditBatchTimer.value) {
+    clearTimeout(auditBatchTimer.value)
+    auditBatchTimer.value = null
+  }
+}
+// 统一收尾：清定时器 + 作废在飞轮询 + 清 id/进度 + 落盘。
+// 停止、完成、取消、出错、404、切页停用全部走这里，避免各分支漏清一样东西。
+const settleAuditBatch = () => {
+  auditPollToken += 1
+  clearAuditBatchTimer()
+  auditBatchSettled.value = true
+  auditBatchId.value = null
+  auditBatchProgress.value = null
+  saveAnnotateState()
+}
 const auditBatchPercent = computed(() => {
   if (!auditBatchProgress.value || !auditBatchProgress.value.total) return 0
   return Math.round((auditBatchProgress.value.done / auditBatchProgress.value.total) * 100)
@@ -2263,6 +2291,10 @@ const restoreAnnotateState = async () => {
   }
   // 同样恢复批量审核轮询（audit_ 前缀的独立 batch_id，复用 /sam/batch/{id}）
   if (saved.auditBatchId) {
+    clearAuditBatchTimer()
+    auditPollToken += 1
+    auditBatchSettled.value = false
+    auditStopping.value = false
     auditBatchId.value = saved.auditBatchId
     auditBatchProgress.value = { status: 'running', total: 1, done: 0, current_image: '' }
     pollAuditBatch()
@@ -4311,6 +4343,10 @@ const runAuditBatch = async () => {
   ))) return
   try {
     const result = await auditBatchStart(currentTask.value, 16)
+    clearAuditBatchTimer()
+    auditPollToken += 1
+    auditBatchSettled.value = false
+    auditStopping.value = false
     auditBatchId.value = result.batch_id
     auditBatchProgress.value = { status: 'running', total: result.total, done: 0, current_image: '' }
     pollAuditBatch()
@@ -4320,27 +4356,38 @@ const runAuditBatch = async () => {
 }
 
 const pollAuditBatch = async () => {
-  if (!auditBatchId.value) return
+  if (!auditBatchId.value || auditBatchSettled.value) return
+  const token = auditPollToken
+  const batchId = auditBatchId.value
   let res: any
   try {
-    res = await getBatchProgress(auditBatchId.value)  // 复用 /sam/batch/{id}
-  } catch {
+    res = await getBatchProgress(batchId)  // 复用 /sam/batch/{id}
+  } catch (e: any) {
+    // 代号变了（已停止/已收尾/已重启新一轮）→ 这次响应作废，别再排下一次
+    if (token !== auditPollToken || auditBatchSettled.value) return
+    if (e?.response?.status === 404) {
+      // 后端重启导致内存批次丢失：已写回的结论不丢，直接收尾，不能无限重试
+      settleAuditBatch()
+      showToast('批量审核任务已中断（可能因后端重启），已完成图片的审核结论已保存。', 'info', 4000)
+      refreshAuditClassify()
+      return
+    }
+    clearAuditBatchTimer()
     auditBatchTimer.value = setTimeout(pollAuditBatch, 2000)
     return
   }
+  // 在飞期间用户点了停止 / 批次已收尾 → 丢弃这次结果（否则 running 被写回，按钮又转）
+  if (token !== auditPollToken || auditBatchSettled.value || auditBatchId.value !== batchId) return
   if (!res) {
     // 批量审核任务不存在（例如后端重启导致内存任务丢失），已写回的审核结论已保存，不丢数据
-    auditBatchId.value = null
-    auditBatchProgress.value = null
-    saveAnnotateState()
+    settleAuditBatch()
     showToast('批量审核任务已中断（可能因后端重启），已完成图片的审核结论已保存。', 'info', 4000)
     refreshAuditClassify()  // 不重载列表：标注数据未变，保住当前图与筛选
     return
   }
   auditBatchProgress.value = res
   if (res.status === 'done') {
-    auditBatchId.value = null
-    saveAnnotateState()
+    settleAuditBatch()
     const st = res.audit?.stats || {}
     const checked = res.audit?.checked ?? res.result_summary?.checked ?? 0
     const boxes = res.audit?.boxes ?? res.result_summary?.boxes ?? 0
@@ -4370,47 +4417,68 @@ const pollAuditBatch = async () => {
     refreshAuditClassify()
     if (currentImage.value?.annotated) await loadExistingAnnotation()
   } else if (res.status === 'cancelled') {
-    auditBatchId.value = null
-    saveAnnotateState()
-    showToast(`批量审核已取消，已审 ${res.audit?.checked ?? 0} 张图`, 'info', 4000)
+    const checked = res.audit?.checked ?? 0
+    settleAuditBatch()
+    showToast(`批量审核已取消，已审 ${checked} 张图`, 'info', 4000)
     // 同上：取消不重载列表，避免冲掉当前图与筛选状态
     refreshAuditClassify()
     if (currentImage.value?.annotated) await loadExistingAnnotation()
   } else if (res.status === 'error') {
-    auditBatchId.value = null
-    saveAnnotateState()
     const why = res.error || res.audit?.last_error || res.last_error || '未知错误'
+    settleAuditBatch()
     showToast('批量审核出错: ' + why, 'error', 8000)
     refreshAuditClassify()
   } else {
     saveAnnotateState()
+    clearAuditBatchTimer()
     auditBatchTimer.value = setTimeout(pollAuditBatch, 1500)
   }
 }
 
+// 停止批量审核：**先本地立即收尾，再尽力通知后端**。
+// 顺序很重要：停止请求可能 500、可能长时间挂住（后端 stop_batch 只置标志位，
+// 真正转 cancelled 要等当前 chunk 跑完）。以前是「等接口成功才清本地状态」，
+// 接口一失败就什么都不清 → 按钮永远转、刷新还会从 localStorage 复活。
+// 现在无论接口结果如何，界面都立刻回到可再次发起的状态；通知失败时明确告知
+// 「后端可能仍在跑」，而不是假装已取消。
 const stopAuditBatch = async () => {
-  if (!auditBatchId.value) return
+  const batchId = auditBatchId.value
+  if (!batchId || auditStopping.value) return
+  auditStopping.value = true
+  const done = auditBatchProgress.value?.done || 0
+  const checked = auditBatchProgress.value?.audit?.checked ?? done
+  // ① 本地立即收尾（清定时器 + 作废在飞轮询 + 清 id/进度 + 落盘）
+  settleAuditBatch()
+  showToast(`批量审核已停止，已审 ${checked} 张图`, 'info', 4000)
+  // ② 立刻发停止通知，**不 await**：这一步可能挂很久（后端要跑完当前 chunk），
+  //    绝不能让「刷新徽标 / 重载当前图」排在它后面，否则点停止后界面半天没反应。
+  void notifyAuditStop(batchId)
+  // ③ 取消不改变任何标注数据，无需重载整个图片列表（万张图重载很慢，
+  //    且 loadTaskItems 会 selectImage(0) 把用户当前看的图和筛选状态冲掉）。
+  refreshAuditClassify()
+  if (currentImage.value?.annotated) await loadExistingAnnotation()
+}
+
+// 通知后端停止（后台进行）。带 8s 超时：axios 默认 300s，
+// 挂住的请求会让 auditStopping 长期为 true，用户再点停止就被静默忽略。
+// 无论成败都不改本地状态——界面在点停止那一刻就已经收尾了。
+const notifyAuditStop = async (batchId: string) => {
+  const ctl = new AbortController()
+  const timer = setTimeout(() => ctl.abort(), 8000)
   try {
-    await stopBatchLabel(auditBatchId.value)
-    const done = auditBatchProgress.value?.done || 0
-    auditBatchId.value = null
-    auditBatchProgress.value = null
-    saveAnnotateState()
-    showToast(`批量审核已取消，已审 ${done} 张图`, 'info', 4000)
-    // 取消不改变任何标注数据，无需重载整个图片列表（万张图重载很慢，
-    // 且 loadTaskItems 会 selectImage(0) 把用户当前看的图和筛选状态冲掉）。
-    // 只刷新审核徽标映射；若已写回部分结论，徽标会据此更新。
-    refreshAuditClassify()
-    if (currentImage.value?.annotated) await loadExistingAnnotation()
+    await stopBatchLabel(batchId, ctl.signal)
   } catch (e: any) {
-    if (e.response?.status === 404) {
-      auditBatchId.value = null
-      auditBatchProgress.value = null
-      saveAnnotateState()
-      showToast('审核任务已不存在（可能已重启），已停止', 'info', 4000)
-      return
+    if (e?.response?.status === 404) {
+      showToast('审核任务在后端已不存在（可能已重启），已停止', 'info', 4000)
+    } else {
+      const why = e?.response?.data?.detail || (ctl.signal.aborted ? '请求超时' : (e?.message || '网络异常'))
+      showToast('停止请求未送达（' + why
+        + '）。界面已停止跟踪，但后端可能仍在跑完当前一批；如需彻底停止请稍后再点一次或重启服务。',
+        'error', 9000)
     }
-    if (!e?.__toastShown) showToast('停止失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
+  } finally {
+    clearTimeout(timer)
+    auditStopping.value = false
   }
 }
 
@@ -4963,6 +5031,12 @@ onActivated(async () => {
   // 组件一直活着，重新量一次画布尺寸（切走期间窗口可能变过）
   await nextTick()
   fitView()
+  // 切回：若本地还记着在跑的审核批次，重新拉一次真实状态再决定要不要继续轮询。
+  // 不无条件恢复 running —— 切走期间批次可能已完成/已取消/后端已重启。
+  if (auditBatchId.value && !auditBatchTimer.value) {
+    auditBatchSettled.value = false
+    pollAuditBatch()
+  }
 })
 
 // 切走：摘掉全局监听、清掉在途的抠图队列（免得往已隐藏的画布上写）
@@ -4972,6 +5046,11 @@ onDeactivated(() => {
   cutoutQueue.value = []
   if (dirty.value) persistAnnotation(true)
   saveAnnotateState()
+  // 切走必须停掉批量审核轮询：组件被 keep-alive 缓存不会销毁，
+  // 定时器会一直往隐藏页面打接口；且切回时若批次早已结束，
+  // 旧 running 快照会让按钮一直转。切回时按 localStorage 里的 id 重新拉一次真实状态。
+  clearAuditBatchTimer()
+  auditPollToken += 1
 })
 
 // 雪球闭环（1.8）：?dataset_id=xxx 直达 —— 优先复用该数据集已有标注任务，

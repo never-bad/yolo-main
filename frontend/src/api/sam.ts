@@ -125,8 +125,10 @@ export const getBatchProgress = async (batchId: string) => {
   return data
 }
 
-export const stopBatchLabel = async (batchId: string) => {
-  const { data } = await api.post(`/sam/batch/${batchId}/stop`)
+// signal 可选：批量审核停止时传 AbortSignal 做超时兜底（后端 stop 可能长时间挂住）。
+// 不传时行为与原来完全一致，预标注/查重等既有调用点零改动。
+export const stopBatchLabel = async (batchId: string, signal?: AbortSignal) => {
+  const { data } = await api.post(`/sam/batch/${batchId}/stop`, null, signal ? { signal } : undefined)
   return data
 }
 
