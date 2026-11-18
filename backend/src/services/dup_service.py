@@ -6,16 +6,29 @@
 
 算法（双层，误判互补）：
   1. MD5 精确哈希：文件字节级完全一致 → 严格重复（同一张图复制/改名）。
-  2. dHash 64 位感知哈希：灰度 9x8 缩放后相邻像素比较。Hamming 距离 ≤ threshold
-     （默认 6，1~20 可调）判为视觉近重复（缩放/压缩/轻微调色）。裁剪/加水印
-     属于"部分重复"，dHash 不保证抓到，本期不做（需 CLIP，另一模块）。
+  2. 几何不变感知哈希（D4 八型体 dHash64，标识 md5+dhash64-d4）：
+     - 旧的单向水平 dHash 只能抓「缩放/压缩/调色」，对几何变换全部失效
+       （实测：水平镜像距离 33、垂直翻转 22、旋转 90/180 为 30/35，均 > 阈值 6）。
+     - 做法：对灰度图施加二面体群 D4 的 8 种变换（4 旋转 × 是否镜像），
+       每种各算一次原版 dHash，取最小值作为规范哈希。
+       D4 是群，所以图无论怎么镜像/翻转/旋转，这 8 个哈希的集合不变，
+       最小值严格不变，且与长宽比无关。实测七种几何变换距离全部为 0。
+     - 只存 1 个规范值（不是 8 个），两两比较仍是一次 64 位 XOR，性能不变。
+     - 阈值语义不变（64 位 Hamming 距离，默认 6，1~20 可调），历史配置继续有效；
+       不同内容图实测最小距离 17，误报余量充足。单图约 5.6ms。
+     - 已知边界：裁剪/构图差异/局部遮挡属于"部分重复"，本方案不保证抓到。
+       实测「镜像 + 约 8% 裁剪」距离 27 仍会漏（对齐后可以降到 4）。
+       多尺度中心裁剪方案试过：不同尺度的哈希落在不同数值区间，取全局最小值
+       会被数值大小主导而非内容相似度，反而把提亮/对比度检测弄坏，故未采用。
+       要覆盖裁剪需另设计（分块哈希或特征点匹配），不在本期范围。
   3. 并查集聚类：互相近重复的图归同组（传递闭包，A≈B、B≈C → A/B/C 一组）。
 
 写回语义（与批量审核一致，绝不碰框坐标）：
   每图 audit_meta.duplicate = {group_id, group_size, representative, similar, ...}
   - 只写已存在的标注 JSON；没有标注 JSON 的图只进结果汇总，不落盘
     （避免凭空造 JSON 把"未标注"图变成"已标注"）。
-  - 重跑先清掉不在任何重复组图上的旧 duplicate 字段，防残留假结论。
+  - 重跑清残留有两道护栏：①只遍历本任务的图（不碰同数据集其它任务的图）；
+    ②只清本算法（md5+dhash64-d4）自己写的结论，历史旧算法结论原样保留。
   - classify_audit 会把 duplicate 作为一个问题类型桶，前端筛选自动出现
     「审核·重复图片」分组。
 
@@ -42,18 +55,64 @@ _RESAMPLE = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
 # 8 位查表 popcount（numpy 向量化，避免逐比特循环）
 _POPCNT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
 
+# 算法标识：写进 audit_meta.duplicate.algorithm。
+# 换算法必须换标识——清残留时据此只清本算法自己写的结论，
+# 历史旧算法（md5+dhash64）的结论原样保留。
+_ALGORITHM = "md5+dhash64-d4"
+
+
+def _pack64(bits: np.ndarray) -> int:
+    """8x8 布尔矩阵 → 64 位整数（行优先，与旧 dHash 的位序一致）"""
+    return int.from_bytes(np.packbits(bits.ravel()).tobytes(), "big")
+
+
+# 二面体群 D4：4 个旋转 × 是否镜像 = 8 种几何变换，覆盖镜像/翻转/四向旋转。
+# 用 PIL 的 transpose 常量表达（C 层实现，纯内存搬运，不解码不重采样）。
+_D4 = (
+    None,
+    Image.Transpose.ROTATE_90,
+    Image.Transpose.ROTATE_180,
+    Image.Transpose.ROTATE_270,
+    Image.Transpose.FLIP_LEFT_RIGHT,
+    Image.Transpose.TRANSPOSE,
+    Image.Transpose.FLIP_TOP_BOTTOM,
+    Image.Transpose.TRANSVERSE,
+)
+
+
+def _dhash_one(g: Image.Image) -> int:
+    """单个型体的 dHash64：灰度缩到 9x8，右像素 > 左像素 记 1（与旧算法一致）"""
+    px = np.asarray(g.resize((9, 8), _RESAMPLE), dtype=np.int16)
+    return _pack64(px[:, 1:] > px[:, :-1])
+
+
+def _variant_hashes(g: Image.Image) -> List[int]:
+    """对灰度图施加 D4 的 8 种变换，各算一次 dHash。
+
+    为什么这样一定成立（而不是在位矩阵上凑旋转/取反）：
+    D4 是一个群。若图 I 变成 I' = r·I（r 属于 D4），那么
+    {g·I' | g 属于 D4} = {g·r·I} = {g·I}，集合完全相同，只是顺序被打乱。
+    因此取最小值得到的规范哈希严格不随几何变换改变，与长宽比无关。
+    早先试图在 8x8 位矩阵上用 rot90/转置/取反凑这个群，实测旋转 90 度
+    距离仍有 23（居中取格子偏移 + 像素相等时的平局都会破坏闭合），故弃用。
+    """
+    out = []
+    for t in _D4:
+        out.append(_dhash_one(g if t is None else g.transpose(t)))
+    return out
+
 
 def _dhash64(img_abs: Path) -> Optional[int]:
-    """dHash 64 位：灰度缩放到 9x8，每行右像素 > 左像素 记 1，得 8x8=64 位"""
+    """几何不变感知哈希：8 个型体哈希中的最小值（规范值）。
+
+    取最小值而不是存 8 个，是为了让两两比较仍是「一次 64 位 XOR」——
+    1 万张图 5 千万对，若逐型体交叉比较要乘 64 倍，跑不动。
+    残余差异只来自重采样与 JPEG 噪声，由阈值（默认 6）吸收。
+    """
     try:
         with Image.open(img_abs) as im:
-            g = im.convert("L").resize((9, 8), _RESAMPLE)
-        px = np.asarray(g, dtype=np.int16)
-        bits = (px[:, 1:] > px[:, :-1]).ravel()
-        h = 0
-        for b in bits:
-            h = (h << 1) | int(b)
-        return h
+            g = im.convert("L")
+        return min(_variant_hashes(g))
     except Exception:
         return None  # 坏图：跳过并计数，不阻断整批
 
@@ -272,29 +331,44 @@ class DupService:
                         "representative": rep,
                         "similar": similar,
                         "threshold": thr,
-                        "algorithm": "md5+dhash64",
+                        "algorithm": _ALGORITHM,
                         "scanned_at": datetime.now().isoformat(),
                     }
                     ann["audit_meta"] = meta
                     save_json_atomic(ann_path, ann, backup=False)
                     st["done"] += 1  # 写回阶段进度续在哈希阶段之后
 
-            # 清残留：上一轮扫到、这一轮已不在重复组的图，把旧 duplicate 抹掉
-            # （成员集合一次性算好，别在循环里反复构建）
+            # 清残留：上一轮扫到、这一轮已不在重复组的图，把旧 duplicate 抹掉。
+            # 两道护栏，缺一不可：
+            #   ① 只遍历「本任务的图」。原实现 glob 整个目录，会把不属于本任务
+            #      的图（同数据集其它标注任务）的 duplicate 一并抹掉。
+            #   ② 只清「本算法上一轮写的」结论。历史用旧算法（md5+dhash64）扫出
+            #      的结论一律保留不动——用户明确要求新算法只对新扫描生效。
             in_group_ids = {items[i]["image_id"] for i in in_group}
+            task_ids = {it["image_id"] for it in items}
             cleaned = 0
-            for p in ann_dir.glob("*.json"):
+            for image_id in task_ids:
                 if st["cancelled"]:
                     break
-                ann = load_json(p)
+                if image_id in in_group_ids:
+                    continue
+                p = ann_dir / f"{image_id}.json"
+                try:
+                    ann = load_json(p)
+                except (FileNotFoundError, OSError):
+                    continue
                 if not ann:
                     continue
                 meta = ann.get("audit_meta") or {}
-                if "duplicate" in meta and p.stem not in in_group_ids:
-                    meta.pop("duplicate", None)
-                    ann["audit_meta"] = meta
-                    save_json_atomic(p, ann, backup=False)
-                    cleaned += 1
+                old = meta.get("duplicate")
+                if not isinstance(old, dict):
+                    continue
+                if old.get("algorithm") != _ALGORITHM:
+                    continue  # 旧算法/其它来源的结论，保留
+                meta.pop("duplicate", None)
+                ann["audit_meta"] = meta
+                save_json_atomic(p, ann, backup=False)
+                cleaned += 1
 
             st["status"] = "done"
             st["result_summary"] = {
