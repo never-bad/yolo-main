@@ -609,6 +609,11 @@
             <span class="a-miss">漏标 {{ missedPendingCount }}<template v-if="(imageAudit.missed_targets?.length || 0) > missedPendingCount">（已补 {{ (imageAudit.missed_targets?.length || 0) - missedPendingCount }}）</template></span>
             <span v-if="auditSuggestCount" class="a-suggest" title="模型对问题框给出的修正建议（画布绿虚线），在左侧框列表点「用建议框/拆N框」采纳">◈ 建议框 {{ auditSuggestCount }}</span>
           </div>
+          <!-- 清点自检：模型自述「符合类别定义的目标共几个、已覆盖几个、未覆盖几个」。
+               用来判断它有没有真的做「查全」，而不是只看框里对不对就整张放行。 -->
+          <div v-if="imageAudit.scan_summary" class="audit-scan" title="模型对整张画面的清点结果，供你判断是否存在漏标；仅供参考，不自动改动标注">
+            <span class="scan-label">画面清点</span>{{ imageAudit.scan_summary }}
+          </div>
           <div v-if="auditRejectCount" class="audit-actions">
             <button class="danger small" @click="removeRejectedBoxes">删除被拒框（{{ auditRejectCount }}）</button>
           </div>
@@ -5916,6 +5921,10 @@ canvas {
 .a-miss { background: #e0f7fa; color: #0097a7; }
 .a-suggest { background: #e8f5e9; color: #1b5e20; }
 .audit-actions { margin-bottom: 0.4rem; }
+.audit-scan { margin: 0.35rem 0; padding: 0.3rem 0.45rem; background: #f1f8f9; border-left: 3px solid #0097a7;
+  border-radius: 0.2rem; font-size: 0.72rem; color: #37474f; line-height: 1.5; }
+.audit-scan .scan-label { display: inline-block; margin-right: 0.35rem; padding: 0 0.3rem; border-radius: 0.2rem;
+  background: #0097a7; color: #fff; font-size: 0.66rem; font-weight: 600; }
 .audit-missed-title { font-size: 0.75rem; font-weight: 600; color: #0097a7; margin-bottom: 0.3rem; }
 .audit-mt-row {
   display: flex;

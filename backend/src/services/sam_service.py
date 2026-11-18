@@ -151,29 +151,47 @@ DEFAULT_AUDIT_PROMPT = (
     "- 目标类别定义（含审核标准）：\n{labels_text}\n"
     "- 已有标注框：{dets_text}\n"
     "（JSON 格式：box_id 唯一标识每个框，{bbox_hint}，class_id 对应上面的类别序号）\n\n"
+    "# 审核范围（两件事都要做，缺一不可）\n"
+    "A. 查准：**每个已有框**框住的东西对不对、框贴不贴合 → 见规则 1~4、6~8。\n"
+    "B. 查全：**画面上没有被任何框覆盖的地方，还有没有符合类别定义的目标** → 见规则 5。\n"
+    "   只做 A 不做 B 是失职：框里那个判对了，不等于这张图就没问题。\n\n"
     "# 判定规则（严格遵守）\n"
     "1. keep：框内物体与类别定义一致且框贴合 → action=keep。\n"
     "2. modify：框过大/过小/未贴合边缘，但框内**确实是目标类别** → action=modify。\n"
     "   **框质量问题一律用 modify，禁止用 reject。**\n"
-    "3. reject：**仅限**框内物体完全不是目标类别（例如类别是「摔倒」但框内是设备、动物、空白背景）。\n"
+    "3. reject：**仅限**框内物体完全不是目标类别（框内是设备、动物、车辆、空白背景等无关内容）。\n"
     "   reason 必须写明「框内实际是什么」；理由说「符合定义/确实是该目标」时禁止判 reject。\n"
     "4. 标签错误 label_errors：**仅当类别清单有 2 个及以上类别、且能给出确实不同的 suggested_class 时**才输出。\n"
     "   类别清单只有一个类别时，label_errors 必须是空数组（不存在改成别的类的可能）。\n"
-    "5. 漏标 missed_targets：**只报告清晰可辨、完整可见、与已有框不重叠、且你能给出可靠 bbox 的目标**。\n"
-    "   禁止把已有框的一部分、遮挡残影、背景纹理、模糊人影、同一目标的重复部位当作漏标。\n"
-    "   没有把握就不报；每张图最多报 2 个。\n"
+    "5. 漏标 missed_targets（查全，必须按下面三步做，不要跳过清点直接下结论）：\n"
+    "   第1步 清点：**扫视整张画面**（含边角、远景、被遮挡处），在心里列出所有\n"
+    "     **符合类别定义**的目标实例及其位置。只数符合定义的：凡类别定义中\n"
+    "     明确排除的姿态/形态/物体，**不属于该类别，不参与清点，也不得报为漏标**。\n"
+    "   第2步 对照：把清点结果逐个与已有框比对，判断该目标是否**已被某个框覆盖**\n"
+    "     （被覆盖的标准：该目标主体落在框内，或框已框住它的绝大部分）。\n"
+    "   第3步 输出：只把**清点到了、但没有任何框覆盖**的目标写进 missed_targets，\n"
+    "     给出可靠 bbox 与理由。清点结果全部被覆盖时，missed_targets 才是空数组。\n"
+    "   仍然禁止：把已有框的一部分、遮挡残影、背景纹理、模糊到人畜难辨的影子、\n"
+    "     同一目标的重复部位、以及「按常理推断应该有」的目标当作漏标。\n"
+    "   清晰可辨、完整可见、能给出可靠 bbox 的才报；每张图最多报 4 个。\n"
+    "   **注意：本条与规则 1 相互独立。所有已有框都判 keep，也可能存在漏标。**\n"
     "6. 粘连 merged_boxes：仅在**一个框内确实包含两个及以上完整独立目标**时输出。\n"
     "   若你能看清各目标的边界，**必须给出 sub_bboxes**（每个独立目标一个框）。\n"
-    "7. 业务合规 #compliance_issue：**仅当类别定义里明确要求检查合规/违规行为（如未戴安全帽、未穿反光衣）时**才添加。\n"
-    "   类别定义只是描述目标外观或姿态（如「人员摔倒」）时，**一律不要输出该标签**。\n"
+    "7. 业务合规 #compliance_issue：**仅当类别定义里明确要求检查合规/违规行为时**才添加。\n"
+    "   类别定义只是描述目标的外观、状态或姿态时，**一律不要输出该标签**。\n"
     "8. 建议框 suggested_bbox：**仅对 action=modify 的框**，且你**有把握看清目标真实边界**时，\n"
     "   给出修正后的贴合框 [x1, y1, x2, y2]（与送审框同一坐标空间）。看不清/没把握就不要给。\n"
     "   每张图最多给 3 个建议框；reject/keep 的框一律不给 suggested_bbox。\n\n"
     "# 输出要求\n"
     "- reason 必须写明判定依据（你看到了什么），并标注把握程度：高 / 中 / 低。\n"
     "  reason 与 action 必须逻辑一致，不得自相矛盾。\n"
+    "- scan_summary 必填：写清你清点到的**符合类别定义**的目标总数、其中已被框覆盖几个、\n"
+    "  未覆盖几个（例：「符合定义目标2个，已覆盖1个，未覆盖1个」）。\n"
+    "  它必须与 missed_targets 的条数自洽：未覆盖 N 个就应有 N 条漏标（把握不足可不报，\n"
+    "  但要在 scan_summary 里说明「另N个模糊不清未报」）。画面无符合定义目标时写「符合定义目标0个」。\n"
     "- 仅返回标准 JSON，不要包含任何解释文字：\n"
     "{\n"
+    "  \"scan_summary\": \"符合定义目标N个，已覆盖N个，未覆盖N个\",\n"
     "  \"missed_targets\": [\n"
     "    {\"class_id\": 序号, \"bbox\": [x1, y1, x2, y2], \"reason\": \"依据+把握（限30字）\"}\n"
     "  ],\n"
@@ -2541,12 +2559,21 @@ class SAMService:
                  "suggested": suggested_count}
         for b in box_reviews:
             stats[b["action"]] = stats.get(b["action"], 0) + 1
+        # 清点自检（查全）：模型自述「符合定义目标N个/已覆盖N个/未覆盖N个」。
+        # 只作为人工二审的参考证据，不参与任何自动判定；模型没输出时为 None，
+        # 老数据与旧模板同样兼容（不因为缺这个字段而判审核失败）。
+        scan_summary = data.get("scan_summary")
+        if not isinstance(scan_summary, str):
+            scan_summary = None
+        else:
+            scan_summary = scan_summary.strip()[:120] or None
         return {
             "ok": True,
             "box_reviews": box_reviews,
             "missed_targets": missed,
             "stats": stats,
             "box_count": len(audit_dets),
+            "scan_summary": scan_summary,
         }
 
     def _mock_qwen_audit(self, audit_dets: list, classes: list) -> dict:
@@ -2582,6 +2609,8 @@ class SAMService:
         return {
             "ok": True, "box_reviews": box_reviews, "missed_targets": missed,
             "stats": stats, "box_count": len(audit_dets),
+            "scan_summary": f"模拟：符合定义目标{len(audit_dets) + len(missed)}个，"
+                            f"已覆盖{len(audit_dets)}个，未覆盖{len(missed)}个",
         }
 
     def _task_classes(self, task_id: str) -> list:
@@ -3501,6 +3530,8 @@ class SAMService:
                     "audited_at": datetime.now().isoformat(),
                     "model": cfg.get("qwen_model"),
                     "schema": 1,
+                    # 清点自检：供人工二审判断「这张图到底有没有漏」，不参与自动判定
+                    "scan_summary": audit.get("scan_summary"),
                 }
                 # 审核写回不动框坐标、可重复生成，无需 .bak（1 万张图避免成倍备份文件）
                 save_json_atomic(ann_path, ann, backup=False)
