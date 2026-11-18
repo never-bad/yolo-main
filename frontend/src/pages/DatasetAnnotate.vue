@@ -328,13 +328,28 @@
               <span class="a-reject">✗{{ auditBatchProgress.audit.stats.reject }}</span>
               <span class="a-split">⧉{{ auditBatchProgress.audit.stats.split }}</span>
               <span class="a-missed">漏{{ auditBatchProgress.audit.stats.missed }}</span>
-              <span v-if="auditBatchProgress.audit.errors" class="a-reject">({{ auditBatchProgress.audit.errors }} 次失败)</span>
+              <span v-if="auditBatchProgress.audit.skipped_no_box" class="audit-skip-nobox">
+                （{{ auditBatchProgress.audit.skipped_no_box }} 张无框跳过）
+              </span>
+            </div>
+            <!-- 失败数必须在跑的过程中就显示：模型名配错/端点不通时 checked 恒为 0，
+                 若只在结束后提示，进度条看起来一切正常，排查会非常困难 -->
+            <div v-if="auditBatchProgress?.audit?.errors" class="audit-batch-line audit-fail-line">
+              <span class="a-reject">⚠ {{ auditBatchProgress.audit.errors }} 张审核失败</span>
+              <span v-if="auditBatchProgress.audit.last_error" class="audit-last-error"
+                    :title="auditBatchProgress.audit.last_error">
+                原因：{{ auditBatchProgress.audit.last_error }}
+              </span>
             </div>
             <div v-if="auditBatchProgress?.failed_images" class="audit-batch-line">
               <span class="a-reject">⚠ {{ auditBatchProgress.failed_images }} 张审核异常被跳过（非「无框」）</span>
               <span v-if="auditBatchProgress?.last_error" class="audit-last-error" :title="auditBatchProgress.last_error">
                 最后错误：{{ auditBatchProgress.last_error }}
               </span>
+            </div>
+            <!-- 全军覆没的早期预警：跑了 20 张以上、一张都没审成，几乎必然是配置问题 -->
+            <div v-if="auditAllFailing" class="audit-batch-line audit-fail-line">
+              <span class="a-reject">已处理 {{ auditBatchProgress?.done }} 张但无一审核成功，请检查「模型」名称与端点是否正确</span>
             </div>
             <button class="danger small" @click="stopAuditBatch" :disabled="!auditBatchRunning">停止</button>
           </div>
@@ -1739,6 +1754,18 @@ const auditBatchRunning = computed(() =>
 const auditBatchPercent = computed(() => {
   if (!auditBatchProgress.value || !auditBatchProgress.value.total) return 0
   return Math.round((auditBatchProgress.value.done / auditBatchProgress.value.total) * 100)
+})
+// 「全军覆没」早期预警：已处理 20 张以上，成功数为 0，且失败数已占已处理数的一半以上。
+// 排除「大量无框图」的正常情形（那种情况 skipped_no_box 会很高而 errors 为 0）。
+// 目的是让模型名配错这类问题在几十秒内暴露，而不是等上万张跑完才发现。
+const auditAllFailing = computed(() => {
+  const p = auditBatchProgress.value
+  if (!p || p.status !== 'running') return false
+  const a = p.audit
+  if (!a || (a.checked || 0) > 0) return false
+  const done = p.done || 0
+  const errs = (a.errors || 0) + (p.failed_images || 0)
+  return done >= 20 && errs >= Math.max(10, Math.floor(done * 0.5))
 })
 
 // ===== M3 重复图扫描（MD5+dHash 感知哈希，独立于千问批量审核）=====
@@ -4307,7 +4334,7 @@ const pollAuditBatch = async () => {
     auditBatchProgress.value = null
     saveAnnotateState()
     showToast('批量审核任务已中断（可能因后端重启），已完成图片的审核结论已保存。', 'info', 4000)
-    await loadTaskItems()
+    refreshAuditClassify()  // 不重载列表：标注数据未变，保住当前图与筛选
     return
   }
   auditBatchProgress.value = res
@@ -4318,22 +4345,43 @@ const pollAuditBatch = async () => {
     const checked = res.audit?.checked ?? res.result_summary?.checked ?? 0
     const boxes = res.audit?.boxes ?? res.result_summary?.boxes ?? 0
     const errs = res.audit?.errors ?? res.result_summary?.errors ?? 0
+    const skipped = res.audit?.skipped_no_box ?? 0
     let msg = `批量审核完成！共审 ${checked} 张图 / ${boxes} 框`
     msg += `\n通过 ${st.keep || 0} · 待修正 ${st.modify || 0} · 建议删除 ${st.reject || 0} · 粘连 ${st.split || 0} · 漏标 ${st.missed || 0}`
-    if (errs > 0) msg += `（${errs} 张失败）`
-    showToast(msg, 'info', 6000)
-    await loadTaskItems()
-    refreshAuditClassify()  // 刷新列表徽标 + 筛选计数（不再自动弹窗，避免打断挨个查阅）
+    if (skipped > 0) msg += `\n无框跳过 ${skipped} 张`
+    if (errs > 0) {
+      msg += `\n失败 ${errs} 张`
+      const why = res.audit?.last_error
+      if (why) msg += `\n原因：${why}`
+    }
+    // 一张都没审成时不能报「完成」，那会让人以为任务正常结束
+    if (checked === 0) {
+      msg = `批量审核未产生任何结论（共处理 ${res.done || 0} 张）` +
+            (skipped > 0 ? `\n无框跳过 ${skipped} 张` : '') +
+            (errs > 0 ? `\n失败 ${errs} 张` : '') +
+            (res.audit?.last_error ? `\n原因：${res.audit.last_error}` : '') +
+            `\n请检查「模型」名称与端点是否正确`
+      showToast(msg, 'error', 10000)
+    } else {
+      showToast(msg, errs > 0 ? 'error' : 'info', errs > 0 ? 10000 : 6000)
+    }
+    // 完成同样不重载列表：审核只写 audit 字段，标注/框数没变，
+    // 重载会 selectImage(0) 冲掉用户正在看的图。只刷徽标与当前图面板。
+    refreshAuditClassify()
+    if (currentImage.value?.annotated) await loadExistingAnnotation()
   } else if (res.status === 'cancelled') {
     auditBatchId.value = null
     saveAnnotateState()
-    showToast(`批量审核已取消，已审 ${res.done || 0} 张图`, 'info', 4000)
-    await loadTaskItems()
+    showToast(`批量审核已取消，已审 ${res.audit?.checked ?? 0} 张图`, 'info', 4000)
+    // 同上：取消不重载列表，避免冲掉当前图与筛选状态
     refreshAuditClassify()
+    if (currentImage.value?.annotated) await loadExistingAnnotation()
   } else if (res.status === 'error') {
     auditBatchId.value = null
     saveAnnotateState()
-    showToast('批量审核出错: ' + (res.error || '未知错误'), 'error', 4000)
+    const why = res.error || res.audit?.last_error || res.last_error || '未知错误'
+    showToast('批量审核出错: ' + why, 'error', 8000)
+    refreshAuditClassify()
   } else {
     saveAnnotateState()
     auditBatchTimer.value = setTimeout(pollAuditBatch, 1500)
@@ -4349,7 +4397,11 @@ const stopAuditBatch = async () => {
     auditBatchProgress.value = null
     saveAnnotateState()
     showToast(`批量审核已取消，已审 ${done} 张图`, 'info', 4000)
-    await loadTaskItems()
+    // 取消不改变任何标注数据，无需重载整个图片列表（万张图重载很慢，
+    // 且 loadTaskItems 会 selectImage(0) 把用户当前看的图和筛选状态冲掉）。
+    // 只刷新审核徽标映射；若已写回部分结论，徽标会据此更新。
+    refreshAuditClassify()
+    if (currentImage.value?.annotated) await loadExistingAnnotation()
   } catch (e: any) {
     if (e.response?.status === 404) {
       auditBatchId.value = null
@@ -5886,6 +5938,9 @@ canvas {
 .audit-batch-line .a-keep, .audit-batch-line .a-modify, .audit-batch-line .a-reject,
 .audit-batch-line .a-split, .audit-batch-line .a-missed { padding: 0 4px; border-radius: 3px; margin: 0 2px; }
 .audit-last-error { display: block; margin-top: 3px; font-size: 11px; color: #c0392b; max-height: 34px; overflow: hidden; text-overflow: ellipsis; }
+/* 失败提示要在跑的过程中就醒目可见（模型名配错时进度条照涨，极易误判为正常） */
+.audit-fail-line { background: #fde8e8; border-radius: 4px; padding: 4px 6px; color: #c81e1e; }
+.audit-skip-nobox { color: #888; }
 /* 批量审核按钮（蓝色，区别于预标注蓝绿） */
 .audit-batch-btn { background: #1c64f2; }
 .audit-batch-btn:hover:not(:disabled) { background: #1552d6; }

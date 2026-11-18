@@ -127,6 +127,8 @@ class BatchTask:
         self.audit_checked = 0    # 已自动审核的图片数
         self.audit_boxes = 0      # 已审核的 AI 新增框数
         self.audit_errors = 0     # 审核失败/无输出次数
+        self.audit_skipped_no_box = 0  # 无框可审而跳过的图片数（与「失败」区分开）
+        self.audit_last_error: Optional[str] = None  # 最近一次审核失败原因（模型名错/端点不通等）
         # 耗时累计（毫秒）：批量结束后算均值，用于判断瓶颈在检测还是审核
         self.time_detect_ms = 0.0
         self.time_audit_ms = 0.0
@@ -241,6 +243,9 @@ class SAMService:
         self._lock = asyncio.Lock()
         self.batch_tasks: Dict[str, BatchTask] = {}
         self.annotation_service = AnnotationService()
+        # 最近一次千问 HTTP 失败的真实原因（含响应体）。批量审核据此把
+        # 「模型名不存在」这类配置错误显示到界面，而不是只报「无输出」。
+        self._last_qwen_error: Optional[str] = None
 
     # ------------------------------------------------------------------
     # 配置读写
@@ -2121,7 +2126,19 @@ class SAMService:
                     or (body.get("choices") or [{}])[0].get("message", {}).get("content")
                     or "")
         except Exception as e:
-            print(f"qwen: 推理失败 {img_abs or ''}: {e}")
+            # HTTPError 要把响应体读出来：vLLM 的「模型名不存在」等关键原因在 body 里，
+            # 只打印 e 只能看到 "HTTP Error 404: Not Found"，运维据此无法定位。
+            detail = ""
+            try:
+                if hasattr(e, "read"):
+                    detail = (e.read() or b"").decode("utf-8", "ignore")[:300]
+            except Exception:
+                detail = ""
+            msg = f"{e}" + (f" | {detail}" if detail else "")
+            print(f"qwen: 推理失败 {img_abs or ''}: {msg}")
+            # 暂存最近一次真实失败原因，供上层（批量审核进度）透出到界面。
+            # 只留最新一条，避免上万张图累积内存。
+            self._last_qwen_error = msg[:300]
             return ""
 
     # ------------------------------------------------------------------
@@ -2280,7 +2297,10 @@ class SAMService:
             user_msg = f"类别定义：\n{labels_text}\n\n预标注框：\n{dets_text}\n请审核这张图片。"
             content = self._qwen_image_chat(cfg, sys_msg, user_msg, img_abs)
         if not content:
-            return None, "千问审核推理失败（无输出）"
+            # 带上底层真实原因（模型名不存在/端点不通/超时），否则界面只显示
+            # 「无输出」，无法区分是配置错还是模型真的没返回。
+            why = getattr(self, "_last_qwen_error", None)
+            return None, ("千问审核推理失败：" + why) if why else "千问审核推理失败（无输出）"
         return self._parse_qwen_audit(content, audit_dets, labels, classes,
                                       img_abs=img_abs, cfg=cfg), ""
 
@@ -3409,12 +3429,18 @@ class SAMService:
             "preload_warnings": bt.preload_warnings,
             "failed_images": bt.failed_images,
             "summary": bt.result_summary,
+            # audit 段必须「只要跑过审核就返回」，不能用 audit_checked 当开关：
+            # 模型名配错/端点不通时 checked 恒为 0，旧写法会把 errors 一起吞掉，
+            # 前端只显示「1389/11255」进度而无失败数，看起来像在正常跑（实际全失败）。
             "audit": {
                 "checked": bt.audit_checked,
                 "boxes": bt.audit_boxes,
                 "stats": bt.audit_summary,
                 "errors": bt.audit_errors,
-            } if bt.audit_checked else None,
+                "skipped_no_box": getattr(bt, "audit_skipped_no_box", 0),
+                "last_error": getattr(bt, "audit_last_error", None),
+            } if (bt.audit_checked or bt.audit_errors
+                  or getattr(bt, "audit_skipped_no_box", 0)) else None,
         }
 
     async def stop_batch(self, batch_id: str) -> Optional[dict]:
@@ -3475,6 +3501,9 @@ class SAMService:
                 valid_idx = [i for i, b in enumerate(boxes)
                              if b.get("x1") is not None or b.get("polygon")]
                 if not valid_idx:
+                    # 无框可审：单独计数，别和「审核失败」混为一谈。
+                    # 不计数的话，整批空图会表现为「进度飞涨但已审 0」，无法诊断。
+                    bt.audit_skipped_no_box += 1
                     bt.done += 1
                     return
                 # 关键：qwen_audit_detections 内部按 b["x1"]/["y1"]/["x2"]/["y2"] 取坐标
@@ -3492,6 +3521,10 @@ class SAMService:
                     )
                 if not audit or not audit.get("ok"):
                     bt.audit_errors += 1
+                    # 记下失败原因（模型名不存在、端点不通、超时等）。
+                    # 只记第一次之外的最新一条即可，避免上万张图拼出巨型字符串。
+                    reason = (audit or {}).get("error") or msg or "模型无有效输出"
+                    bt.audit_last_error = str(reason)[:300]
                     bt.done += 1
                     return
                 st = audit.get("stats") or {}
