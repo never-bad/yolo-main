@@ -451,7 +451,45 @@ class AnnotationService:
                 return c
         return {}
 
-    def _normalize_boxes(self, boxes: list, classes: list, class_meta: dict) -> list:
+    @staticmethod
+    def _clamp_boxes_to_image(boxes: list, vw: int, vh: int) -> list:
+        """把越界坐标裁回图内，裁完退化的框丢弃（而不是让整张图保存失败）。
+
+        为什么必须裁而不是拒绝：画布允许在图片外的留白区按下/松手（拖框、拖轮廓顶点、
+        整体平移都能拖出边界），一个框越界就把整张图的保存全部拒掉 —— 用户辛苦标的
+        其它几十个框一起存不上，且反复重试都失败（实测 4032×3024 的图 y2=3571.6）。
+        裁到图内既保住数据，又不会让脏坐标污染 YOLO 导出。
+        图尺寸未知（0）时原样返回，避免误杀。
+        """
+        if not (vw and vh and vw > 0 and vh > 0):
+            return boxes
+        out = []
+        for b in boxes:
+            poly = b.get("polygon")
+            if poly:
+                # 分割目标：先裁轮廓点，矩形由读取口按裁后轮廓现算，保证框与掩码一致
+                b = {**b, "polygon": [[round(min(max(float(p[0]), 0.0), float(vw)), 2),
+                                       round(min(max(float(p[1]), 0.0), float(vh)), 2)]
+                                      for p in poly]}
+                x1 = min(p[0] for p in b["polygon"]); x2 = max(p[0] for p in b["polygon"])
+                y1 = min(p[1] for p in b["polygon"]); y2 = max(p[1] for p in b["polygon"])
+                if x2 > x1 and y2 > y1:
+                    out.append(b)
+                continue
+            x1, y1, x2, y2 = b.get("x1"), b.get("y1"), b.get("x2"), b.get("y2")
+            if None in (x1, y1, x2, y2):
+                out.append(b)
+                continue
+            x1 = min(max(float(x1), 0.0), float(vw)); x2 = min(max(float(x2), 0.0), float(vw))
+            y1 = min(max(float(y1), 0.0), float(vh)); y2 = min(max(float(y2), 0.0), float(vh))
+            # 裁完宽或高为 0 = 整框在图外，丢弃该框（零面积框会让导出与训练报错）
+            if not (x2 > x1 and y2 > y1):
+                continue
+            out.append({**b, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+        return out
+
+    def _normalize_boxes(self, boxes: list, classes: list, class_meta: dict,
+                         img_w: int = 0, img_h: int = 0) -> list:
         """规范化框字段：class_id 落盘为数字索引（与 YOLO 类别号一致），并补全标签四字段。
 
         输入 class_id 兼容数字索引（classes 列表下标）或字符串（英文码/中文名/历史英文名）：
@@ -521,7 +559,8 @@ class AnnotationService:
             if audit:
                 nb["audit"] = audit
             out.append(nb)
-        return out
+        # 越界坐标统一裁回图内（详见 _clamp_boxes_to_image）
+        return self._clamp_boxes_to_image(out, img_w, img_h)
 
     def _boxes_for_view(self, boxes: list, classes: list) -> list:
         """响应层兜底：新数据 class_id 已是数字索引，直接透传；
@@ -1043,21 +1082,11 @@ class AnnotationService:
             # 规范化框（补全标签四字段 + 置信度/来源），并判定样本类型
             classes = task_meta.get("classes", []) or []
             class_meta = self._class_meta_map(task_meta.get("model_id", ""))
-            norm_boxes = self._normalize_boxes(boxes, classes, class_meta)
-
-            # P1-1：矩形坐标越界直接拒绝落盘（脏坐标会污染 YOLO 导出）。
-            # 只带轮廓点的分割框跳过（矩形由读取口现算）；图尺寸未知（0）时跳过避免误杀。
             vw = int(info.get("width") or existing.get("width") or 0)
             vh = int(info.get("height") or existing.get("height") or 0)
-            if vw > 0 and vh > 0:
-                for nb in norm_boxes:
-                    x1, y1, x2, y2 = nb.get("x1"), nb.get("y1"), nb.get("x2"), nb.get("y2")
-                    if None in (x1, y1, x2, y2):
-                        continue
-                    if not (0 <= x1 < x2 <= vw and 0 <= y1 < y2 <= vh):
-                        raise ValueError(
-                            f"标注框越界（图片 {vw}×{vh}）: x1={x1}, y1={y1}, x2={x2}, y2={y2}"
-                        )
+            # 越界坐标裁回图内（不再整张图拒绝落盘）：画布留白区可以按下/松手，
+            # 拖框、拖顶点、整体平移都能拖出边界，一个框越界不该让其它几十个框一起存不上。
+            norm_boxes = self._normalize_boxes(boxes, classes, class_meta, vw, vh)
 
             ai = ai_annotated or prev_ai
             s_type, s_reasons = self._resolve_sample_type(norm_boxes, ai, sample_type, sample_reason)

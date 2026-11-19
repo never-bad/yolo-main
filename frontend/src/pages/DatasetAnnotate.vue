@@ -1310,8 +1310,14 @@ const syncBBoxFromPolygon = (b: BBox) => {
   b.x1 = x1; b.y1 = y1; b.x2 = x2; b.y2 = y2
 }
 
-// 整体平移（框 + 轮廓一起动）：每次从快照重放，避免 mousemove 累加漂移
+// 整体平移（框 + 轮廓一起动）：每次从快照重放，避免 mousemove 累加漂移。
+// 位移必须按图边界收敛：光标钳制只约束"当前点"，若从图内往留白拖，
+// dx/dy 仍可把整个框推到图外（框宽不变，钳制光标挡不住），故这里再夹一次。
 const applyMove = (box: BBox, orig: BBox, dx: number, dy: number) => {
+  const iw = img.value?.width || 0
+  const ih = img.value?.height || 0
+  if (iw > 0) dx = Math.min(Math.max(dx, -orig.x1), iw - orig.x2)
+  if (ih > 0) dy = Math.min(Math.max(dy, -orig.y1), ih - orig.y2)
   box.x1 = orig.x1 + dx; box.y1 = orig.y1 + dy
   box.x2 = orig.x2 + dx; box.y2 = orig.y2 + dy
   const op = polyOf(orig), p = polyOf(box)
@@ -2410,6 +2416,19 @@ const loadExistingAnnotation = async () => {
         ...(box.source ? { source: box.source } : {}),
         ...(box.audit ? { audit: box.audit } : {})
       }))
+      // 服务端态整体替换了画布：此前的撤销历史描述的是「另一份数据」，必须作废。
+      // 不作废的后果（实测）：批量审核停止/完成会异步重载当前图，用户接着拖一下框再按
+      // Ctrl+Z，第一次看着正常，第二次就跳回重载前的旧坐标——框凭空变样/移位，
+      // 而且这份旧坐标还会被自动保存写回后端，把审核刚写的数据覆盖掉。
+      // 切图路径（selectImage）本来就会清栈，这里补齐「同一张图被重载」这条路径。
+      undoStack.value = []
+      redoStack.value = []
+      // 选中下标指向的是旧数组里的框，重载后必须解除，否则拖动会改到别的框上
+      selectedBoxIndex.value = -1
+      editMode.value = 'idle'
+      moveStartPt.value = null
+      origBox.value = null
+      dragVertexIdx.value = -1
       // 以服务端为准重新拉画布，避免"框坐标在但看不见"
       redrawCanvas()
     }
@@ -2483,12 +2502,19 @@ const loadImageToCanvas = () => {
   img.value.src = imageUrl
 }
 
+// 画布尺寸 = 容器尺寸，图片居中显示，四周有留白；留白区也能按下/松手，
+// 换算出来的图片坐标会是负数或超出图宽高。以前不钳制 → 一个拖出边界的框
+// 会让整张图保存被后端拒绝（实测 4032×3024 的图出现 y2=3571.6），
+// 其它几十个框一起存不上。这里在坐标入口就钳到图内，从源头不产生越界框。
 const screenToImg = (e: MouseEvent) => {
   const rect = canvasRef.value!.getBoundingClientRect()
-  return {
-    x: (e.clientX - rect.left - viewOffset.value.x) / viewScale.value,
-    y: (e.clientY - rect.top - viewOffset.value.y) / viewScale.value
-  }
+  const iw = img.value?.width || 0
+  const ih = img.value?.height || 0
+  let x = (e.clientX - rect.left - viewOffset.value.x) / viewScale.value
+  let y = (e.clientY - rect.top - viewOffset.value.y) / viewScale.value
+  if (iw > 0) x = Math.min(Math.max(x, 0), iw)
+  if (ih > 0) y = Math.min(Math.max(y, 0), ih)
+  return { x, y }
 }
 
 const getContainerSize = () => {
@@ -3555,8 +3581,20 @@ const pushUndo = () => {
 
 const undo = () => {
   if (!undoStack.value.length) return
-  redoStack.value.push(JSON.parse(JSON.stringify(currentBoxes.value)))
-  currentBoxes.value = undoStack.value.pop()!
+  // 跳过「与当前态完全相同」的空快照：点住顶点/边中点/矩形角点却没真拖动时，
+  // 按下那一刻就压了一层同样的态（grabVertex / grabEdgeVertex / resize 分支）。
+  // 不跳过的话用户按一次 Ctrl+Z 画面毫无反应，会以为撤销坏了而连按，
+  // 第二下就跳过真正想撤的那步、退回更早的状态（表现为「框突然变样」）。
+  const cur = JSON.stringify(currentBoxes.value)
+  let snap: BBox[] | undefined
+  while (undoStack.value.length) {
+    const top = undoStack.value[undoStack.value.length - 1]
+    if (JSON.stringify(top) !== cur) { snap = undoStack.value.pop()!; break }
+    undoStack.value.pop()
+  }
+  if (!snap) return   // 全是空快照 = 没有可撤销的实际改动，不动数据也不标脏
+  redoStack.value.push(JSON.parse(cur))
+  currentBoxes.value = snap
   selectedBoxIndex.value = -1
   redrawCanvas()
   markDirty()
@@ -3564,8 +3602,16 @@ const undo = () => {
 
 const redo = () => {
   if (!redoStack.value.length) return
-  undoStack.value.push(JSON.parse(JSON.stringify(currentBoxes.value)))
-  currentBoxes.value = redoStack.value.pop()!
+  const cur = JSON.stringify(currentBoxes.value)
+  let snap: BBox[] | undefined
+  while (redoStack.value.length) {
+    const top = redoStack.value[redoStack.value.length - 1]
+    if (JSON.stringify(top) !== cur) { snap = redoStack.value.pop()!; break }
+    redoStack.value.pop()
+  }
+  if (!snap) return
+  undoStack.value.push(JSON.parse(cur))
+  currentBoxes.value = snap
   selectedBoxIndex.value = -1
   redrawCanvas()
   markDirty()
