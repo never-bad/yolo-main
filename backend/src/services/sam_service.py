@@ -102,6 +102,11 @@ DEFAULT_CONFIG = {
     # 千问 L2 审核系统提示词模板（留空用内置默认）。占位符：
     # {labels_text}=类别定义(含chinese_desc) {dets_text}=预标注框JSON {bbox_hint}=坐标说明
     "qwen_audit_prompt_template": "",
+    # 批量 L2 审核「全局」并发上限：所有用户/设备/任务的审核批次共享这一个闸门。
+    # 旧版每批各建 Semaphore(16)，多人同开时 16×N 路叠加压向同一张 GPU，
+    # vLLM 排队延迟超过 qwen_timeout(90s) 就成批超时失败。全局闸门让后开的批次
+    # 排队而不是叠加：总吞吐不变，单图延迟可控。A10 24G + 30B-A3B AWQ 建议 16。
+    "qwen_audit_global_concurrency": 16,
 }
 class BatchTask:
     """内存中的批量预标注任务状态"""
@@ -213,7 +218,67 @@ DEFAULT_AUDIT_PROMPT = (
 )
 
 
+# 无框图专用「纯查全」提示词。
+# 为什么单独一份：DEFAULT_AUDIT_PROMPT 的主线是「逐框查准 + 顺带查全」，
+# 对一张一个框都没有的图，模型会被「已有标注框：[]」和逐框规则带偏，
+# 要么直接回「无框可审」，要么编出不存在的 box_id。无框图唯一要回答的问题是
+# 「画面里有没有符合定义、却完全没被标注的目标」，所以把查全三步法提为主线。
+# 与主模板一样：只写方法论，通篇不含任何具体类别名，类别差异由 {labels_text} 注入。
+RECALL_ONLY_PROMPT = (
+    "# Role\n"
+    "你是资深的工业视觉数据审核专家。这张图片**当前没有任何标注框**。\n"
+    "你的唯一任务：判断画面里是否存在**符合类别定义、却完全没有被标注**的目标（漏检）。\n"
+    "核心原则：**只报告有充分把握的目标；不确定就不报。宁可漏报，不可错报。**\n\n"
+    "# Context\n"
+    "- 目标类别定义（含审核标准）：\n{labels_text}\n"
+    "- 已有标注框：无（本图一个框都没有，不存在「已被覆盖」的目标）\n\n"
+    "# 判定步骤（必须按顺序做，不要跳过清点直接下结论）\n"
+    "第1步 清点：**扫视整张画面**（含边角、远景、被遮挡处），在心里列出所有\n"
+    "  **符合类别定义**的目标实例及其位置。只数符合定义的：凡类别定义中\n"
+    "  明确排除的姿态/形态/物体，**不属于该类别，不参与清点，也不得报为漏标**。\n"
+    "第2步 定位：为每个清点到的目标给出可靠 bbox（{bbox_hint}）。\n"
+    "第3步 输出：把**清晰可辨、完整可见、能给出可靠 bbox** 的目标写进 missed_targets。\n"
+    "  画面确实没有符合定义的目标时，missed_targets 为空数组，\n"
+    "  scan_summary 写「符合定义目标0个」——这是正常结论，不要为了凑数编目标。\n"
+    "禁止：把背景纹理、模糊到人畜难辨的影子、同一目标的重复部位、\n"
+    "  以及「按常理推断应该有」的目标当作漏标。每张图最多报 4 个。\n\n"
+    "# 输出要求\n"
+    "- reason 必须写明判定依据（你看到了什么），并标注把握程度：高 / 中 / 低。\n"
+    "- scan_summary 必填：写清你清点到的**符合类别定义**的目标总数、未覆盖几个\n"
+    "  （本图无框，已覆盖恒为 0；例：「符合定义目标2个，已覆盖0个，未覆盖2个」）。\n"
+    "  它必须与 missed_targets 条数自洽（把握不足可不报，但要说明「另N个模糊不清未报」）。\n"
+    "- box_reviews 必须是空数组：本图没有框可审，不要编造 box_id。\n"
+    "- 仅返回标准 JSON，不要包含任何解释文字：\n"
+    "{\n"
+    "  \"scan_summary\": \"符合定义目标N个，已覆盖0个，未覆盖N个\",\n"
+    "  \"missed_targets\": [\n"
+    "    {\"class_id\": 序号, \"bbox\": [x1, y1, x2, y2], \"reason\": \"依据+把握（限30字）\"}\n"
+    "  ],\n"
+    "  \"box_reviews\": []\n"
+    "}\n"
+)
+
+
 class SAMService:
+    # ---- 批量 L2 审核全局并发闸门（类级共享：跨实例、跨用户、跨任务生效）----
+    # 为什么放类级：路由层 sam_service 是模块级单例，但测试/其他服务可能新建实例；
+    # 全局闸门的语义是「整台后端对同一张 GPU 的总在途审核数」，必须与实例无关。
+    # asyncio.Semaphore 在 Python 3.10+ 首次 acquire 时才绑定事件循环，
+    # 类级预创建安全；生产进程只有一个事件循环。
+    _audit_gate: Optional[asyncio.Semaphore] = None
+    _audit_gate_cap: int = 0
+    _audit_inflight: int = 0        # 当前真实在途的审核请求数（测试断言用）
+    _audit_peak_inflight: int = 0   # 历史峰值（只增不减，供验证闸门上限）
+
+    @classmethod
+    def _get_audit_gate(cls, cap: int) -> asyncio.Semaphore:
+        """取（或按新上限重建）全局审核闸门。cap 来自配置，变更即重建。"""
+        cap = max(1, min(int(cap or 16), 64))
+        if cls._audit_gate is None or cls._audit_gate_cap != cap:
+            cls._audit_gate = asyncio.Semaphore(cap)
+            cls._audit_gate_cap = cap
+        return cls._audit_gate
+
     def __init__(self):
         self._detector = None
         self._detector_name = None
@@ -2230,8 +2295,10 @@ class SAMService:
         """
         if not cfg.get("qwen_enabled", False):
             return None, "千问 VL 未启用（AI 标注模型设置 → 启用千问）。启用后，AI 预标注会自动附加 L2 审核。"
+        # 无框图不再直接拒审：一个框都没有，恰恰是「有没有漏检」最该回答的场景。
+        # 走纯查全分支（发无框原图 + 查全专用提示词），只产出 missed_targets/scan_summary。
         if not dets:
-            return None, "没有可审核的框"
+            return self._qwen_recall_only(img_abs, labels_desc, cfg, classes)
 
         # 统一给每个框分配 box_id（调用方已赋值则沿用），作为审核结果回写的索引
         audit_dets = []
@@ -2303,6 +2370,56 @@ class SAMService:
             return None, ("千问审核推理失败：" + why) if why else "千问审核推理失败（无输出）"
         return self._parse_qwen_audit(content, audit_dets, labels, classes,
                                       img_abs=img_abs, cfg=cfg), ""
+
+    def _qwen_recall_only(self, img_abs: Path, labels_desc: Optional[dict],
+                          cfg: dict, classes: list) -> tuple:
+        """无框图的「纯查全」审核：只问「画面里有没有符合定义却没被标注的目标」。
+
+        与有框审核共用解析器 _parse_qwen_audit（audit_dets=[]）：
+        - 已有框为空 → IoU 闸门天然不丢弃任何漏标（无框可重叠）；
+        - box_reviews/label_errors/merged_boxes 的 box_id 都不在空集合里 → 全部被过滤，
+          模型即便编造框号也落不了盘；
+        - missed_targets 的坐标还原、否定词闸门、数量上限与有框路径完全一致。
+
+        不画框（没有框可画），发无框原图；提示词用 RECALL_ONLY_PROMPT，
+        避免主模板里「逐框查准」的规则把模型带偏。
+        """
+        if cfg.get("qwen_mock", False):
+            print(f"qwen recall IN-MOCK: 无框图查全 {img_abs}（本地联调模式，未调用真实模型）")
+            mock_audit = self._mock_qwen_audit([], classes)
+            # 与真实分支保持一致：mock 也要标记 recall_only，
+            # 否则本地联调时旁路不落盘、二审分类拿不到无框图（表现为「联调看着没效果」）。
+            if mock_audit and mock_audit.get("ok"):
+                mock_audit["recall_only"] = True
+            return mock_audit, ""
+
+        labels = (labels_desc or {}).get("labels") or []
+        defs = []
+        for i, c in enumerate(classes):
+            lab = labels[i] if i < len(labels) else None
+            zh = (lab or {}).get("chinese_name") or c
+            desc = (lab or {}).get("chinese_desc") or ""
+            defs.append(f"{i}. {zh}{('：' + desc) if desc else ''}")
+        labels_text = "\n".join(defs)
+        if self._qwen_coord_mode(cfg) == "norm1000":
+            bbox_hint = "bbox 为 0~1000 归一化坐标 [x1,y1,x2,y2]（相对图片宽高的千分比）"
+        else:
+            bbox_hint = "bbox 为图片像素坐标 [x1,y1,x2,y2]"
+        sys_msg = (RECALL_ONLY_PROMPT
+                   .replace("{labels_text}", labels_text or "")
+                   .replace("{bbox_hint}", bbox_hint or ""))
+        user_msg = (f"类别定义：\n{labels_text}\n\n这张图目前没有任何标注框。\n"
+                    f"请清点整张画面，判断是否存在符合类别定义、却完全没有被标注的目标。")
+        content = self._qwen_image_chat(cfg, sys_msg, user_msg, img_abs)
+        if not content:
+            why = getattr(self, "_last_qwen_error", None)
+            return None, ("千问审核推理失败：" + why) if why else "千问审核推理失败（无输出）"
+        audit = self._parse_qwen_audit(content, [], labels, classes,
+                                       img_abs=img_abs, cfg=cfg)
+        if audit and audit.get("ok"):
+            # 标记本图走的是「无框查全」，供落盘与二审区分（不是「没审」也不是「审失败」）
+            audit["recall_only"] = True
+        return audit, ""
 
     def _render_audit_prompt(self, cfg, labels_text, dets_text, bbox_hint):
         """渲染千问 L2 审核系统提示词。
@@ -2619,8 +2736,11 @@ class SAMService:
                 box_reviews.append({"box_id": bid, "action": "keep", "kind": "review",
                                     "tags": [], "reason": "", "suggested_class_id": None})
         missed = []
-        if audit_dets and len(classes) > 1:
-            missed.append({"class_id": 1 % len(classes), "x1": 20, "y1": 20, "x2": 90, "y2": 110,
+        # 无框图（纯查全）也要能模拟出漏标，否则本地联调看不到无框链路的效果。
+        # 有框时仍保持「多类别才给一条」的原行为，不改动既有联调结果。
+        if classes and (not audit_dets or len(classes) > 1):
+            missed.append({"class_id": (1 % len(classes)) if len(classes) > 1 else 0,
+                           "x1": 20, "y1": 20, "x2": 90, "y2": 110,
                            "reason": "模拟：漏标一个目标"})
         stats = {"keep": 0, "modify": 0, "reject": 0, "split": 0, "missed": len(missed),
                  "suggested": sum(1 for b in box_reviews if b.get("suggested_bbox"))}
@@ -2661,11 +2781,6 @@ class SAMService:
         else:
             # 分割目标可以只带轮廓点（矩形由轮廓现算），不能按"有没有矩形"筛掉
             boxes = [b for b in boxes if b.get("x1") is not None or b.get("polygon")]
-        if not boxes:
-            return {
-                "image_id": image_id, "width": item["width"], "height": item["height"],
-                "audit": None, "message": "当前图片没有标注框，无法审核",
-            }
         classes = self._task_classes(task_id)
         labels_desc = self._task_labels_desc(task_id)
         if cfg.get("qwen_enabled", False):
@@ -2674,6 +2789,23 @@ class SAMService:
         audit, message = await asyncio.to_thread(
             self.qwen_audit_detections, img_abs, boxes, labels_desc, cfg, classes
         )
+        if not boxes:
+            # 无框图走纯查全分支（qwen_audit_detections 内部已转 _qwen_recall_only）：
+            # 结论写旁路 audit_recall/，绝不写 annotations/，避免把未标注算成已标注
+            # 而绕过「全标完→人工通过→灌桶封板」的门槛。
+            if audit and audit.get("ok") and cfg.get("qwen_enabled", False):
+                tm = await self._load_task_meta(task_id) or {}
+                ds_id, _ver = self.annotation_service._task_to_ds(tm)
+                self.annotation_service.save_recall_meta(
+                    ds_id, image_id, {
+                        "missed_targets": audit.get("missed_targets") or [],
+                        "scan_summary": audit.get("scan_summary"),
+                        "stats": audit.get("stats") or {},
+                        "audited_at": datetime.now().isoformat(),
+                        "model": cfg.get("qwen_model"),
+                        "schema": 1,
+                        "recall_only": True,
+                    })
         return {
             "image_id": image_id, "width": item["width"], "height": item["height"],
             "audit": audit, "message": message,
@@ -2844,6 +2976,83 @@ class SAMService:
                 if img_abs not in cand["images"]:
                     cand["images"].append(img_abs)
         return list(agg.values()), ""
+
+    # ------------------------------------------------------------------
+    # AI 补描述：已有类别缺 chinese_desc 时，看真实样本图让千问写审核口径
+    # ------------------------------------------------------------------
+    def qwen_describe_labels(self, labels: list, samples: dict, cfg: dict = None) -> tuple:
+        """为「描述为空」的已有类别生成中文描述 + 英文检测提示词（只返回建议，不落盘）。
+
+        labels:  待补描述的类别行 [{english_code, chinese_name}]（调用方已过滤空描述行）
+        samples: {english_code: [图片绝对路径, ...]}，每类 1~3 张含该类的真实标注图
+        返回 (suggestions, message)：
+        - qwen_enabled=False → (None, 启用指引)，不调真实模型
+        - qwen_mock=True → 预设模拟建议（本地联调）
+        - 真实调用：每类发一张样本图，模型只回 JSON；解析失败/无输出的类别跳过并汇总提示
+        suggestions: [{english_code, chinese_desc, ai_prompt_en, image}]
+        """
+        cfg = cfg or self._read_config()
+        if not cfg.get("qwen_enabled", False):
+            return None, (
+                "千问 VL 未启用（SAM 预标注设置 → 检测引擎里勾选「千问 VL」）。"
+                "启用后即可让 AI 看样本图补写类别描述。"
+            )
+        import re, json as _json
+        from pathlib import Path as _Path
+
+        def _mock_desc(lab):
+            zh = (lab.get("chinese_name") or "").strip() or lab.get("english_code")
+            return {"english_code": lab.get("english_code"),
+                    "chinese_desc": f"画面中可见的{zh}目标（模拟描述，需人工确认）",
+                    "ai_prompt_en": str(lab.get("english_code") or "").replace("_", " "),
+                    "image": ""}
+
+        if cfg.get("qwen_mock", False):
+            print(f"qwen describe IN-MOCK：为 {len(labels)} 个类别返回模拟描述（未调用真实模型）")
+            return [_mock_desc(l) for l in labels], ""
+
+        sys_msg = (
+            "你是目标检测标注助手。给定一张真实样本图和图中某个目标类别的名称，"
+            "请观察该类别目标在画面里的实际外观，写出审核口径：\n"
+            "1. chinese_desc：一句中文描述，说清这个类别指什么物体、典型外观与出现场景，"
+            "供视觉大模型审核标注时判断「框里的东西算不算这个类别」；\n"
+            "2. ai_prompt_en：一句英文检测提示词，描述该物体外观，供零样本检测模型使用。\n"
+            "输出严格为 JSON 对象（不要任何解释文字）："
+            '{"chinese_desc": "...", "ai_prompt_en": "..."}'
+        )
+        out, failed = [], []
+        for lab in labels:
+            code = str(lab.get("english_code") or "").strip()
+            paths = samples.get(code) or []
+            img_abs = next((p for p in paths if _Path(p).exists()), None)
+            if img_abs is None:
+                failed.append(f"{code}（无样本图）")
+                continue
+            zh = (lab.get("chinese_name") or "").strip()
+            user_msg = (f"目标类别：{zh + '（' + code + '）' if zh else code}\n"
+                        f"这张样本图里含有该类别的目标，请观察后给出描述。")
+            content = self._qwen_image_chat(cfg, sys_msg, user_msg, _Path(img_abs))
+            if not content:
+                why = getattr(self, "_last_qwen_error", None)
+                failed.append(f"{code}（推理失败{'：' + why if why else ''}）")
+                continue
+            m = re.search(r"\{[\s\S]*\}", content)
+            try:
+                obj = _json.loads(m.group(0)) if m else {}
+            except Exception:
+                obj = {}
+            desc = str(obj.get("chinese_desc") or "").strip()
+            prompt_en = str(obj.get("ai_prompt_en") or "").strip()
+            if not desc:
+                failed.append(f"{code}（模型未给出描述）")
+                continue
+            out.append({"english_code": code, "chinese_desc": desc,
+                        "ai_prompt_en": prompt_en,
+                        "image": _Path(img_abs).name})
+        msg = ""
+        if failed:
+            msg = f"{len(failed)} 个类别未能生成描述：" + "、".join(failed)
+        return out, msg
 
     def _detect_grounding_dino(self, img_abs, classes, conf, cfg, prompts=None) -> list:
         """GroundingDINO（Transformers 集成）文本驱动检测。
@@ -3457,19 +3666,35 @@ class SAMService:
         """启动异步批量审核：对任务内全部已标注图片并发跑千问 L2 审核并把结论写回。
 
         与 batch_auto_label（预标注）不同：本方法不调用检测引擎、不加 _lock 串行化
-        （审核接口 audit_image 本身无锁，实测 vLLM 并发 batching 有效），用 Semaphore
-        控制并发路数（默认 16，上限 32）。复用 BatchTask 状态机 / 取消 / 进度展示。
+        （审核接口 audit_image 本身无锁，实测 vLLM 并发 batching 有效）。
+
+        多人多设备并发治理（两层）：
+        1) 同任务去重：该任务已有 running 的审核批次 → 直接返回那个 batch_id
+           （reused=True），后点的人「围观同一批」而不是另起一批互相覆盖结论；
+        2) 全局并发闸门：所有批次共享 _get_audit_gate（配置
+           qwen_audit_global_concurrency，默认 16），后开批次排队而非叠加，
+           防 16×N 路压垮单卡 vLLM 造成成批 90s 超时。
+        每批内部仍保留 Semaphore(concurrency) 作为批内上限（默认 16，上限 32）。
         """
         task_meta = await self._load_task_meta(task_id)
         if not task_meta:
             raise ValueError("Task not found")
+        # 同任务去重：只认「审核」批次（预标注批次 id 前缀不同，且 kind 未设）
+        for existing in self.batch_tasks.values():
+            if (existing.task_id == task_id
+                    and getattr(existing, "kind", "") == "audit"
+                    and existing.status == "running"
+                    and not existing.cancelled):
+                return {"batch_id": existing.batch_id, "total": existing.total,
+                        "reused": True}
         items = task_meta.get("items", [])
         batch_id = f"audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
         bt = BatchTask(batch_id, task_id, self._task_classes(task_id), 0.0)
+        bt.kind = "audit"
         bt.total = len(items)
         self.batch_tasks[batch_id] = bt
         asyncio.create_task(self._run_audit_batch(batch_id, items, max(1, min(concurrency, 32))))
-        return {"batch_id": batch_id, "total": bt.total}
+        return {"batch_id": batch_id, "total": bt.total, "reused": False}
 
     async def _run_audit_batch(self, batch_id: str, items: list, concurrency: int) -> None:
         bt = self.batch_tasks[batch_id]
@@ -3484,9 +3709,24 @@ class SAMService:
             cfg["qwen_labels_desc"] = ld
         classes = bt.classes
         sem = asyncio.Semaphore(concurrency)
+        # 全局闸门：跨批次/跨用户共享，上限来自配置（默认 16）。
+        # 批内 sem 管「本批最多几路」，全局 gate 管「整台后端最多几路」，两层都过才送审。
+        gate = self._get_audit_gate(cfg.get("qwen_audit_global_concurrency", 16))
         # 任务→数据集映射（ann 路径用），循环内只换 image_id
         tm = await self._load_task_meta(bt.task_id) or {}
         ds_id, _ver = self.annotation_service._task_to_ds(tm)
+
+        async def _gated_audit(img_abs, dets):
+            """过全局闸门后送审，并维护在途计数（峰值供测试断言上限真实生效）。"""
+            async with gate:
+                SAMService._audit_inflight += 1
+                SAMService._audit_peak_inflight = max(
+                    SAMService._audit_peak_inflight, SAMService._audit_inflight)
+                try:
+                    return await asyncio.to_thread(
+                        self.qwen_audit_detections, img_abs, dets, ld, cfg, classes)
+                finally:
+                    SAMService._audit_inflight -= 1
 
         async def _audit_one(item):
             if bt.cancelled:
@@ -3501,9 +3741,33 @@ class SAMService:
                 valid_idx = [i for i, b in enumerate(boxes)
                              if b.get("x1") is not None or b.get("polygon")]
                 if not valid_idx:
-                    # 无框可审：单独计数，别和「审核失败」混为一谈。
-                    # 不计数的话，整批空图会表现为「进度飞涨但已审 0」，无法诊断。
-                    bt.audit_skipped_no_box += 1
+                    # 无框图不再跳过：一个框都没有，恰恰是「有没有漏检」最该回答的场景。
+                    # 走纯查全分支（发无框原图 + 查全专用提示词），只产出 missed_targets。
+                    # 结论写旁路 datasets/{ds}/audit_recall/，绝不写 annotations/ ——
+                    # 否则凭空造出的标注 JSON 会让「全标完→人工通过→灌桶封板」的门槛被绕过。
+                    async with sem:
+                        recall_audit, rmsg = await _gated_audit(img_abs, [])
+                    if not recall_audit or not recall_audit.get("ok"):
+                        bt.audit_errors += 1
+                        reason = (recall_audit or {}).get("error") or rmsg or "模型无有效输出"
+                        bt.audit_last_error = str(reason)[:300]
+                    else:
+                        bt.audit_checked += 1
+                        # 与「有框」路径一致：把本图查全的 stats 累加到批量统计，
+                        # 否则前端批量进度里 missed 恒为 0，与旁路里实际报出的漏标对不上。
+                        st = recall_audit.get("stats") or {}
+                        for k in ("keep", "modify", "reject", "split", "missed"):
+                            bt.audit_summary[k] = bt.audit_summary.get(k, 0) + (st.get(k) or 0)
+                        self.annotation_service.save_recall_meta(
+                            ds_id, image_id, {
+                                "missed_targets": recall_audit.get("missed_targets") or [],
+                                "scan_summary": recall_audit.get("scan_summary"),
+                                "stats": st,
+                                "audited_at": datetime.now().isoformat(),
+                                "model": cfg.get("qwen_model"),
+                                "schema": 1,
+                                "recall_only": True,
+                            })
                     bt.done += 1
                     return
                 # 关键：qwen_audit_detections 内部按 b["x1"]/["y1"]/["x2"]/["y2"] 取坐标
@@ -3516,9 +3780,7 @@ class SAMService:
                     nb["box_id"] = j
                     dets.append(nb)
                 async with sem:
-                    audit, msg = await asyncio.to_thread(
-                        self.qwen_audit_detections, img_abs, dets, ld, cfg, classes
-                    )
+                    audit, msg = await _gated_audit(img_abs, dets)
                 if not audit or not audit.get("ok"):
                     bt.audit_errors += 1
                     # 记下失败原因（模型名不存在、端点不通、超时等）。
@@ -3630,12 +3892,22 @@ class SAMService:
             for it in items:
                 image_id = it.get("image_id")
                 ann = self.annotation_service._load_image_ann(dataset_id, version, image_id)
+                # 无框图没有标注 JSON（ann 为空），查全结论存在旁路 audit_recall/。
+                # 不看旁路的话，无框漏检图会被下面的 `if not ann: continue` 直接丢掉，
+                # 审核分类页永远看不到「无框图查全报出的漏标」。
+                if not (ann and ann.get("boxes")):
+                    recall = self.annotation_service.load_recall_meta(dataset_id, image_id)
+                    if recall:
+                        ann = {"boxes": [], "audit_meta": recall}
                 if not ann:
                     continue
                 boxes = ann.get("boxes") or []
                 meta = ann.get("audit_meta") or {}
                 missed = meta.get("missed_targets") or []
-                types_in_img, actions_in_img, details, has_audit = set(), set(), [], False
+                types_in_img, actions_in_img, details = set(), set(), []
+                # 无框查全也算「审过」：即便没报漏标也归入 clean 桶，
+                # 否则 audited_images 与桶内条数对不上。
+                has_audit = bool(meta.get("recall_only"))
                 for b in boxes:
                     au = b.get("audit") or {}
                     if not au:

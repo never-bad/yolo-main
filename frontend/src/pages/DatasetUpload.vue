@@ -14,6 +14,18 @@
         <small v-else class="form-hint">上传后进入灌桶 → 封板 → 训练流程。</small>
       </div>
       <div class="form-group">
+        <label>任务类型 <i class="required">*</i></label>
+        <div class="mode-seg">
+          <button type="button" :class="{ on: uploadTask === 'detect' }" @click="uploadTask = 'detect'">检测（水平框）</button>
+          <button type="button" :class="{ on: uploadTask === 'segment' }" @click="uploadTask = 'segment'">分割（轮廓）</button>
+          <button type="button" :class="{ on: uploadTask === 'obb' }" @click="uploadTask = 'obb'">旋转框（OBB）</button>
+        </div>
+        <small class="form-hint">
+          决定标签的读法与写法：旋转框与分割四边形在标签文件里同形（9 列），必须靠这里声明区分。
+          包内 data.yaml 带 task 时会自动识别，但仍以这里的选择为准；纯图片无标注的包也按此类型进入标注流程。
+        </small>
+      </div>
+      <div class="form-group">
         <label>选择压缩包文件（支持 .zip / .tar / .tar.gz / .tgz）</label>
         <small class="form-hint">
           内置标准化引擎：VOC(XML) / COCO(JSON) 标注自动转换 YOLO 格式；文件夹结构不统一时自动扫描重组（图片与同名标签自动配对）。
@@ -48,12 +60,12 @@
       <div class="form-group">
         <label>归属算法库 <i class="required">*</i></label>
         <div class="library-row">
-          <select v-model="uploadLibraryId" class="model-code-input" :class="{ invalid: libraryTouched && !uploadLibraryId }">
-            <option value="">— 请选择该数据集归属的算法库 —</option>
-            <option v-for="lib in libraryOptions" :key="lib.model_id" :value="lib.model_id">
-              {{ lib.display_name || lib.model_code || lib.model_id }}{{ lib.dataset_count ? `（已挂 ${lib.dataset_count} 个数据集）` : '' }}
-            </option>
-          </select>
+          <SearchableSelect
+            v-model="uploadLibraryId"
+            :options="librarySelectOptions"
+            placeholder="点击输入关键字搜索算法库（如：安全带 / car）"
+            :invalid="libraryTouched && !uploadLibraryId"
+          />
           <button class="secondary" @click="createLibraryOpen = true" title="没有合适的算法库？先新建一个再归属">+ 新建算法库</button>
         </div>
         <small v-if="libraryTouched && !uploadLibraryId" class="form-hint error-hint">数据集必须归属一个算法库，请先选择；没有合适的库请点「+ 新建算法库」</small>
@@ -449,12 +461,7 @@
         <p class="modal-sub">{{ bindDialog.dataset_id }}<br />数据集必须归属一个算法库，训练产出的模型才会进入该库</p>
         <div class="form-field">
           <label>归属算法库 <i>*</i></label>
-          <select v-model="bindLibraryId">
-            <option value="">— 请选择算法库 —</option>
-            <option v-for="lib in libraryOptions" :key="lib.model_id" :value="lib.model_id">
-              {{ lib.display_name || lib.model_code || lib.model_id }}
-            </option>
-          </select>
+          <SearchableSelect v-model="bindLibraryId" :options="librarySelectOptions" placeholder="输入关键字搜索算法库" />
         </div>
         <div v-if="bindError" class="form-error">{{ bindError }}</div>
         <div class="modal-actions">
@@ -483,12 +490,7 @@
         <p class="modal-sub">图片数达到该值才允许封板；自动灌桶每满该值封一个 B 桶。<br />未达门槛时仍可在封板确认里走「强制封板」，或等 {{ sealMaxDays }} 天时间窗口兜底。</p>
         <div class="form-field">
           <label>作用范围</label>
-          <select v-model="thresholdScope" class="threshold-scope">
-            <option value="__global__">全局默认（未单独设置的算法库都用它）</option>
-            <option v-for="lib in libraryOptions" :key="lib.model_id" :value="lib.model_id">
-              仅 {{ lib.display_name || lib.model_code || lib.model_id }}（单独覆盖）
-            </option>
-          </select>
+          <SearchableSelect v-model="thresholdScope" :options="thresholdScopeOptions" placeholder="输入关键字搜索算法库" />
           <small v-if="thresholdScope !== '__global__' && perModelOverrides[thresholdScope] === undefined" class="form-hint">该库当前跟随全局默认（{{ sealMinImages }} 张），保存后改为单独值</small>
           <small v-else-if="thresholdScope !== '__global__'" class="form-hint">该库已单独设置：{{ perModelOverrides[thresholdScope] }} 张</small>
         </div>
@@ -538,6 +540,7 @@ import { showToast } from '@/utils/toast'
 import FolderTree from '@/components/FolderTree.vue'
 import LibraryCreateModal from '@/components/LibraryCreateModal.vue'
 import ClassAlignConfirmDialog from '@/components/ClassAlignConfirmDialog.vue'
+import SearchableSelect from '@/components/SearchableSelect.vue'
 
 const selectedFile = ref<File | null>(null)
 const router = useRouter()
@@ -546,6 +549,7 @@ const uploadLibraryId = ref('')   // 导入时必选的归属算法库（库根�
 const libraryTouched = ref(false) // 点过上传但没选库 → 显示红字提示
 const createLibraryOpen = ref(false)
 const uploadMode = ref<'train' | 'test'>('train')  // B-47：上传目的（训练集 / 测试集）
+const uploadTask = ref<'detect' | 'segment' | 'obb'>('detect')  // 任务类型（必选，默认检测）：OBB 与分割标签同形，靠声明区分
 // B-50：上传结果改为任务卡列表——每次上传一张卡，新上传不挤旧卡（撤销/泄漏 verdict 各自独立）
 interface UploadTaskCard {
   datasetId: string
@@ -746,6 +750,20 @@ const loadUploadModels = async () => {
 const libraryOptions = computed(() =>
   allModels.value.filter((m: any) => (m.library_root_id || m.model_id) === m.model_id)
 )
+
+// 可搜索下拉的选项：保留「已挂 N 个数据集」提示，搜索时按整串匹配
+const librarySelectOptions = computed(() => libraryOptions.value.map((lib: any) => ({
+  value: lib.model_id,
+  label: `${lib.display_name || lib.model_code || lib.model_id}${lib.dataset_count ? `（已挂 ${lib.dataset_count} 个数据集）` : ''}`,
+})))
+// 门槛弹窗多一个「全局默认」选项
+const thresholdScopeOptions = computed(() => [
+  { value: '__global__', label: '全局默认（未单独设置的算法库都用它）' },
+  ...libraryOptions.value.map((lib: any) => ({
+    value: lib.model_id,
+    label: `仅 ${lib.display_name || lib.model_code || lib.model_id}（单独覆盖）`,
+  })),
+])
 
 const libraryName = (id: string) => {
   const m = allModels.value.find(x => x.model_id === id)
@@ -1381,6 +1399,7 @@ const uploadFile = async () => {
   }
 
   const mode = uploadMode.value  // B-49：快照上传目的，防止准备期间用户切换导致封板分支误判
+  const taskType = uploadTask.value  // 快照任务类型（上传成功后可能切换，本次上传按快照声明）
   const libId = uploadLibraryId.value  // B-50：快照归属库（上传成功后下拉自动清空，卡片/toast 用快照）
   const controller = new AbortController()
   uploadAbort.value = controller
@@ -1392,7 +1411,7 @@ const uploadFile = async () => {
     const result = await uploadDataset(
       selectedFile.value, uploadLibraryId.value,
       (p) => { uploadPercent.value = p },
-      { uploadId: currentUploadId.value, signal: controller.signal, role: mode }
+      { uploadId: currentUploadId.value, signal: controller.signal, role: mode, task: taskType }
     )
     // 取消竞态：响应回来前用户已取消，不要再落结果、不要再触发自动准备
     if (uploadCancelled.value) return

@@ -269,6 +269,19 @@ export const suggestModelLabels = async (modelId: string, datasetId: string, lim
   return data as { ok: boolean; message?: string; candidates?: LabelSuggestion[] }
 }
 
+/** AI 补描述建议（只返回不落盘，用户确认后走 updateLabelsDict 保存） */
+export interface LabelDescSuggestion {
+  english_code: string
+  chinese_desc: string
+  ai_prompt_en: string
+  image: string
+}
+
+export const describeMissingLabels = async (modelId: string, datasetId = '', perClass = 2) => {
+  const { data } = await api.post(`/models/${modelId}/labels/describe`, { dataset_id: datasetId, per_class: perClass })
+  return data as { ok: boolean; message?: string; suggestions?: LabelDescSuggestion[]; dataset_id?: string }
+}
+
 // 采纳 AI 建议的新标签：追加到模型标签字典末尾（跳过已存在项）
 export const adoptSuggestedLabels = async (modelId: string, suggestions: { english_code: string; chinese_name: string; chinese_desc: string }[]) => {
   const { data } = await api.post(`/models/${modelId}/labels/suggest/adopt`, { suggestions })

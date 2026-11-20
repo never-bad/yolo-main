@@ -127,6 +127,72 @@ def polygon_to_bbox(poly: list) -> tuple:
     return min(xs), min(ys), max(xs), max(ys)
 
 
+# ----------------------------------------------------------------------
+# 旋转框（OBB）工具：像素坐标四角点 [[x, y] × 4]
+# 有 obb 字段的框 = 旋转框标注；与 polygon（分割）互斥，一个框不可能同时有两者。
+# 关键区分：YOLO 标签文件里 OBB 行与分割四边形行**同形**（都是类别+8 坐标=9 列），
+# 靠数列数无法区分，必须靠数据集声明的任务类型（task=obb/segment/detect）。
+# ----------------------------------------------------------------------
+def clean_obb(pts) -> list:
+    """校验并规范化旋转框四角点：必须恰好 4 个 [x, y] 数字对，坐标非负、保留两位小数。
+
+    与 clean_polygon 不同：不做首尾去重（4 点就是 4 个角）、不抽稀；
+    点数不是 4 或含非法值一律返回 []（当作没有旋转框处理）。
+    """
+    if not pts or not isinstance(pts, (list, tuple)) or len(pts) != 4:
+        return []
+    out = []
+    for p in pts:
+        if isinstance(p, dict):
+            xy = (p.get("x"), p.get("y"))
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            xy = (p[0], p[1])
+        else:
+            return []
+        try:
+            x, y = float(xy[0]), float(xy[1])
+        except (TypeError, ValueError):
+            return []
+        if x != x or y != y:  # NaN
+            return []
+        out.append([round(max(x, 0.0), 2), round(max(y, 0.0), 2)])
+    return out
+
+
+def rect_to_obb(x1: float, y1: float, x2: float, y2: float) -> list:
+    """水平框 → 0° 旋转框四角点（左上起顺时针）。OBB 数据集里水平框是 0° 特例。"""
+    return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+
+
+def dataset_task(dataset_dir) -> str:
+    """读数据集声明的任务类型：meta.json 的 task 优先，其次根 data.yaml 的 task。
+
+    归一化为 detect / segment / obb 三者之一；读不到或非法值一律 detect（存量默认）。
+    这是标签行读法的唯一判据——OBB 与分割四边形同形，绝不能靠猜。
+    """
+    d = Path(dataset_dir)
+    # meta.json 优先；缺失/损坏不能挡住 data.yaml 兜底（load_json 缺文件会抛异常）
+    try:
+        mp = d / "meta.json"
+        if mp.exists():
+            meta = load_json(mp) or {}
+            t = str(meta.get("task") or "").strip().lower()
+            if t in ("detect", "segment", "obb"):
+                return t
+    except Exception:
+        pass
+    try:
+        yp = d / "data.yaml"
+        if yp.exists():
+            y = _load_yaml(yp) or {}
+            t = str(y.get("task") or "").strip().lower()
+            if t in ("detect", "segment", "obb"):
+                return t
+    except Exception:
+        pass
+    return "detect"
+
+
 def ensure_box_bbox(box: dict) -> dict:
     """读取兜底：分割框没存矩形时，用轮廓外接框现算补回。
 
@@ -136,6 +202,10 @@ def ensure_box_bbox(box: dict) -> dict:
     """
     if box.get("x1") is None and len(box.get("polygon") or []) >= 3:
         x1, y1, x2, y2 = polygon_to_bbox(box["polygon"])
+        return {**box, "x1": x1, "y1": y1, "x2": x2, "y2": y2}
+    if box.get("x1") is None and len(box.get("obb") or []) == 4:
+        # 旋转框：矩形 = 四角点外接框（与分割同款读取兜底，下游按矩形取坐标零改动）
+        x1, y1, x2, y2 = polygon_to_bbox(box["obb"])
         return {**box, "x1": x1, "y1": y1, "x2": x2, "y2": y2}
     return box
 
@@ -161,7 +231,7 @@ def strip_ann_bbox(data: dict) -> dict:
     if isinstance(data, dict) and data.get("boxes"):
         return {**data, "boxes": [
             {k: v for k, v in b.items() if k not in BBOX_KEYS}
-            if b.get("polygon") else b
+            if (b.get("polygon") or b.get("obb")) else b
             for b in data["boxes"]
         ]}
     return data
@@ -188,13 +258,18 @@ def _looks_like_bbox_prefix(nums: list) -> bool:
     return True
 
 
-def decode_yolo_line(parts: list, img_w: float, img_h: float):
-    """解析一行 YOLO 标签 → {class_id, x1, y1, x2, y2[, polygon]}；非法行返回 None。
+def decode_yolo_line(parts: list, img_w: float, img_h: float, task: str = ""):
+    """解析一行 YOLO 标签 → {class_id, x1, y1, x2, y2[, polygon|obb]}；非法行返回 None。
 
     三种写法都认（读入口必须向后兼容，否则历史导出的 zip 全废）：
       检测    class cx cy w h
       分割    class x1 y1 x2 y2 ...       ← ultralytics 官方口径：类别之后全是顶点
       旧导出  class cx cy w h x1 y1 ...    ← 顶点前多 4 列框参数，仅供读历史包
+
+    task="obb" 时走旋转框读法：恰好 8 个坐标 = 四角点（与分割四边形同形，
+    只能靠数据集声明区分，绝不猜）；5 列检测行当 0° 旋转框；
+    跳过旧导出框前缀启发式（OBB 角点可能误命中该判据）。
+    task 缺省/其它值 → 行为与改动前逐字节一致（存量 detect/segment 零感知）。
     """
     if len(parts) < 5:
         return None
@@ -207,6 +282,23 @@ def decode_yolo_line(parts: list, img_w: float, img_h: float):
     def _to_pixels(seq):
         return clean_polygon([[round(seq[i] * img_w, 2), round(seq[i + 1] * img_h, 2)]
                               for i in range(0, len(seq) - 1, 2)])
+
+    if str(task).strip().lower() == "obb":
+        if len(nums) == 8:
+            pts = clean_obb([[nums[i] * img_w, nums[i + 1] * img_h] for i in range(0, 8, 2)])
+            if not pts:
+                return None
+            x1, y1, x2, y2 = polygon_to_bbox(pts)
+            return {"class_id": cls_id, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "obb": pts}
+        if len(nums) == 4:  # 水平框 = 0° 旋转框特例
+            cx, cy, bw, bh = nums
+            x1 = round((cx - bw / 2) * img_w, 2); y1 = round((cy - bh / 2) * img_h, 2)
+            x2 = round((cx + bw / 2) * img_w, 2); y2 = round((cy + bh / 2) * img_h, 2)
+            if not (x2 > x1 and y2 > y1):
+                return None
+            return {"class_id": cls_id, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                    "obb": rect_to_obb(x1, y1, x2, y2)}
+        return None  # OBB 数据集里其它列数 = 脏行，拒绝而不是猜成别的形状
 
     head = 4 if _looks_like_bbox_prefix(nums) else 0
     if head:
@@ -241,7 +333,7 @@ def decode_yolo_line(parts: list, img_w: float, img_h: float):
 
 
 def yolo_label_line(cls_id: int, bbox: tuple, poly: list, img_w: float, img_h: float,
-                    rect_as_poly: bool = False) -> str:
+                    rect_as_poly: bool = False, obb: list = None, task: str = "") -> str:
     """生成一行 YOLO 标签文本（唯一写入口，所有导出路径必须走这里）。
 
     ultralytics 的读法（data/utils.py）是"类别之后的数字两两一组当顶点"，
@@ -251,7 +343,22 @@ def yolo_label_line(cls_id: int, bbox: tuple, poly: list, img_w: float, img_h: f
       检测行： class cx cy w h
     rect_as_poly：整份标签里只要有一条分割行就传 True，此时没有轮廓的框退化成
     4 个角点的分割行 —— 否则混合文件里检测行的 4 列会被当成顶点读成垃圾形状。
+
+    task="obb"：旋转框数据集写口。有 obb 四角点写四角点；没有的框（水平框）
+    退化成 0° 四角点 —— OBB 文件里所有行统一 9 列，绝不混 5 列检测行
+    （ultralytics obb 读法会把 5 列当垃圾）。obb 与 poly 互斥，obb 优先。
+    task 缺省/其它值 → 行为与改动前逐字节一致。
     """
+    if str(task).strip().lower() == "obb":
+        pts = clean_obb(obb)
+        if not pts:
+            bx1, by1, bx2, by2 = bbox
+            pts = rect_to_obb(bx1, by1, bx2, by2)
+        flat = []
+        for px, py in pts:
+            flat.append(f"{min(max(px / img_w, 0.0), 1.0):.6f}")
+            flat.append(f"{min(max(py / img_h, 0.0), 1.0):.6f}")
+        return f"{cls_id} " + " ".join(flat)
     pts = poly
     if not pts and rect_as_poly:
         bx1, by1, bx2, by2 = bbox
@@ -307,6 +414,48 @@ class AnnotationService:
     # ------------------------------------------------------------------
     def _image_ann_path(self, dataset_id: str, version: str, image_id: str) -> Path:
         return self.datasets_dir / dataset_id / "annotations" / f"{image_id}.json"
+
+    # ------------------------------------------------------------------
+    # 无框图「查全」结论的旁路存储
+    # ------------------------------------------------------------------
+    # 为什么不写进 annotations/{id}.json：无框图大多**根本没有标注 JSON**，
+    # 一旦凭空造出来，_count_annotated_files / get_task_items 会把它算成「已标注」，
+    # 于是「全部标完才能审核通过 → 自动灌桶封板」的人工门槛被 AI 审核悄悄绕过。
+    # 所以无框查全结论单独放 datasets/{ds}/audit_recall/{id}.json：
+    #   · 不在 annotations/ 下 → 不影响任何标注计数、导出、封板、样本池判据；
+    #   · 目录名不含 images/labels/annotations → 不被 _find_*_dir 与导入器误认；
+    #   · 只由 classify_audit / get_image_annotation 显式读取。
+    # 一旦人工给这张图补了框（产生真正的标注 JSON），旁路结论即作废并被清理，
+    # 避免「已经补标了还一直提示漏标」。
+    RECALL_DIR_NAME = "audit_recall"
+
+    def _recall_path(self, dataset_id: str, image_id: str) -> Path:
+        return self.datasets_dir / dataset_id / self.RECALL_DIR_NAME / f"{image_id}.json"
+
+    def load_recall_meta(self, dataset_id: str, image_id: str) -> dict:
+        """读取无框图的查全结论；没有则返回 {}。"""
+        try:
+            return load_json(self._recall_path(dataset_id, image_id)) or {}
+        except Exception:
+            return {}
+
+    def save_recall_meta(self, dataset_id: str, image_id: str, meta: dict) -> None:
+        # 注意：本模块第 53 行的本地 save_json_atomic(path, data) 覆盖了 utils 的导入，
+        # 它只接受两个参数、且不建父目录。audit_recall/ 首次写入时目录不存在，需先建。
+        p = self._recall_path(dataset_id, image_id)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        save_json_atomic(p, meta)
+
+    def drop_recall_meta(self, dataset_id: str, image_id: str) -> bool:
+        """删除旁路结论（该图已有真实标注时调用）。返回是否真的删掉了文件。"""
+        p = self._recall_path(dataset_id, image_id)
+        try:
+            if p.exists():
+                p.unlink()
+                return True
+        except OSError:
+            pass
+        return False
 
     def _load_image_ann(self, dataset_id: str, version: str, image_id: str) -> dict:
         p = self._image_ann_path(dataset_id, version, image_id)
@@ -466,13 +615,17 @@ class AnnotationService:
         out = []
         for b in boxes:
             poly = b.get("polygon")
-            if poly:
-                # 分割目标：先裁轮廓点，矩形由读取口按裁后轮廓现算，保证框与掩码一致
-                b = {**b, "polygon": [[round(min(max(float(p[0]), 0.0), float(vw)), 2),
-                                       round(min(max(float(p[1]), 0.0), float(vh)), 2)]
-                                      for p in poly]}
-                x1 = min(p[0] for p in b["polygon"]); x2 = max(p[0] for p in b["polygon"])
-                y1 = min(p[1] for p in b["polygon"]); y2 = max(p[1] for p in b["polygon"])
+            obb_pts = b.get("obb")
+            if poly or obb_pts:
+                # 分割/旋转框目标：先裁顶点，矩形由读取口按裁后顶点现算，保证框与形状一致。
+                # 旋转框逐角点钳制可能把矩形钳成非矩形（与分割同款处理），保住数据优先。
+                src = poly if poly else obb_pts
+                key = "polygon" if poly else "obb"
+                b = {**b, key: [[round(min(max(float(p[0]), 0.0), float(vw)), 2),
+                                 round(min(max(float(p[1]), 0.0), float(vh)), 2)]
+                                for p in src]}
+                x1 = min(p[0] for p in b[key]); x2 = max(p[0] for p in b[key])
+                y1 = min(p[1] for p in b[key]); y2 = max(p[1] for p in b[key])
                 if x2 > x1 and y2 > y1:
                     out.append(b)
                 continue
@@ -535,7 +688,12 @@ class AnnotationService:
                 "chinese_desc": meta.get("chinese_desc") or "",
             }
             poly = clean_polygon(b.get("polygon"))
-            if poly:
+            obb_pts = clean_obb(b.get("obb"))
+            if obb_pts:
+                # 旋转框目标：只存四角点（矩形由读取口现算，永远和四角点一致）。
+                # obb 与 polygon 互斥：同时传来时 obb 优先（旋转框语义更具体）
+                nb["obb"] = obb_pts
+            elif poly:
                 # 分割目标：方框只是 Grounding→SAM 圈定范围的中间产物，用完就扔，
                 # 数据里只保留轮廓点（矩形由读取口 ensure_box_bbox 现算，永远和轮廓一致）
                 nb["polygon"] = poly
@@ -656,7 +814,10 @@ class AnnotationService:
             # 用户输入中的新增类别追加在后；两者合并去重。避免标注任务无类别导致 AI 预标注不可用
             manual = classes or []
             task_classes = auto_classes + [c for c in manual if c not in auto_classes]
-            
+
+            # 数据集声明的任务类型（obb 时 txt 播种按旋转框读法，9 列行不会误入分割通路）
+            ds_task = dataset_task(dataset_dir)
+
             # 收集所有图片
             # 若 images 目录下已有 train/val/test 划分，只遍历划分目录，避免平铺图与划分子目录重复收集
             split_dirs = ["train", "val", "test"]
@@ -704,7 +865,7 @@ class AnnotationService:
                                 has_annotation = bool(existing.get("boxes"))
                             else:
                                 # 首次建任务（如导入外部分割包）才用 txt 播种
-                                boxes = self._load_yolo_labels(label_path, width, height)
+                                boxes = self._load_yolo_labels(label_path, width, height, task=ds_task)
                                 if boxes:
                                     ann_data = {
                                         "image_id": image_id,
@@ -889,8 +1050,13 @@ class AnnotationService:
             # 如果无法获取相对路径，尝试直接在 labels 目录下查找
             return labels_dir / (img_path.stem + '.txt')
     
-    def _load_yolo_labels(self, label_path: Path, img_width: int, img_height: int) -> list:
-        """加载 YOLO 格式标签文件并转换为绝对坐标"""
+    def _load_yolo_labels(self, label_path: Path, img_width: int, img_height: int,
+                          task: str = "") -> list:
+        """加载 YOLO 格式标签文件并转换为绝对坐标。
+
+        task 为数据集声明的任务类型（obb 时 9 列行读成旋转框四角点）；
+        缺省时行为与改动前一致（检测/分割/旧导出三种读法）。
+        """
         boxes = []
         try:
             with open(label_path, 'r', encoding='utf-8') as f:
@@ -902,7 +1068,7 @@ class AnnotationService:
                     parts = line.split()
                     # decode_yolo_line 统一处理"检测行 / 官方分割行 / 平台旧导出分割行"，
                     # 分割轮廓必须保留，否则外部分割包导进来会被静默截成矩形框
-                    box = decode_yolo_line(parts, img_width, img_height)
+                    box = decode_yolo_line(parts, img_width, img_height, task=task)
                     if box:
                         boxes.append(box)
         except Exception as e:
@@ -1010,7 +1176,21 @@ class AnnotationService:
             boxes = annotation.get("boxes", [])
             # JSON 落盘 class_id 为英文名，响应层映射回任务类别下标（前端渲染用）
             boxes = self._boxes_for_view(boxes, view_classes)
-            
+
+            # 图级审核结论必须透传：漏标建议（missed_targets）、画面清点（scan_summary）、
+            # 重复组（duplicate）都存在 audit_meta 里，只透传 boxes 的话，
+            # 无框图的漏标建议、以及审核台的漏标虚线全都拿不到数据。
+            audit_meta = annotation.get("audit_meta") or {}
+            if not boxes:
+                # 无框图：查全结论存在旁路（不写 annotations/，避免把未标注算成已标注）
+                recall = self.load_recall_meta(dataset_id, image_id)
+                if recall:
+                    audit_meta = recall
+            elif audit_meta.get("recall_only"):
+                # 已经有框了，说明漏标已被处理：旁路结论作废
+                self.drop_recall_meta(dataset_id, image_id)
+                audit_meta = {k: v for k, v in audit_meta.items() if k != "recall_only"}
+
             return {
                 "image_id": image_id,
                 "image_path": image_info["image_path"],
@@ -1021,6 +1201,7 @@ class AnnotationService:
                 "sample_reasons": annotation.get("sample_reasons", []),
                 # 人工复核标记（前端切图时回读，决定"轮廓质量"归属）
                 "reviewed": bool(annotation.get("reviewed", False)),
+                "audit_meta": audit_meta or None,
                 "classes": view_classes
             }
         
@@ -1487,9 +1668,12 @@ class AnnotationService:
                 exported_with_labels = 0
                 exported_empty = 0
                 seg_boxes = 0  # 带分割轮廓的框数，用于回显「本次导出含 N 条分割标注」
+                obb_boxes = 0  # 旋转框数（task=obb 数据集）
                 errors = []
                 # class_id（英文名）→ YOLO 数字索引（与任务类别列表顺序一致）
                 _cls_idx = {str(c).lower(): i for i, c in enumerate(task_meta.get("classes") or [])}
+                # 数据集声明的任务类型：obb 时所有行统一写 9 列四角点
+                ds_task = dataset_task(dataset_dir)
                 
                 # 转换每个标注
                 for item in task_meta["items"]:
@@ -1520,9 +1704,12 @@ class AnnotationService:
 
                                 yolo_lines.append(yolo_label_line(
                                     cls_id, (box["x1"], box["y1"], box["x2"], box["y2"]),
-                                    poly, width, height, rect_as_poly=has_seg))
+                                    poly, width, height, rect_as_poly=has_seg,
+                                    obb=box.get("obb"), task=ds_task))
                                 if poly:
                                     seg_boxes += 1
+                                if ds_task == "obb":
+                                    obb_boxes += 1
 
                             # 写入标签文件
                             _write_text(label_path, "\n".join(yolo_lines))
@@ -1544,6 +1731,8 @@ class AnnotationService:
                     "exported_with_labels": exported_with_labels,
                     "exported_empty": exported_empty,
                     "segment_boxes": seg_boxes,
+                    "obb_boxes": obb_boxes,
+                    "task": ds_task,
                 }
                 if errors:
                     result["errors"] = errors
@@ -1586,9 +1775,11 @@ class AnnotationService:
                 images_dir = self._find_images_dir(dataset_dir) if dataset_dir.exists() else None
                 classes = [str(c) for c in (task_meta.get("classes") or [])]
                 cls_idx = {c.lower(): i for i, c in enumerate(classes)}
+                ds_task = dataset_task(dataset_dir) if dataset_dir.exists() else "detect"
 
                 exported = 0
                 seg_boxes = 0
+                obb_boxes = 0
                 skipped_no_image = []
 
                 temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
@@ -1615,9 +1806,12 @@ class AnnotationService:
                                     cls_id = cls_idx.get(str(class_id).lower(), 0)
                                 yolo_lines.append(yolo_label_line(
                                     cls_id, (box["x1"], box["y1"], box["x2"], box["y2"]),
-                                    poly, width, height, rect_as_poly=r_has_seg))
+                                    poly, width, height, rect_as_poly=r_has_seg,
+                                    obb=box.get("obb"), task=ds_task))
                                 if poly:
                                     seg_boxes += 1
+                                if ds_task == "obb":
+                                    obb_boxes += 1
                             # 定位原图文件（与 _determine_label_path 相同的扩展名探测方式）
                             image_file = None
                             if images_dir:
@@ -1632,18 +1826,25 @@ class AnnotationService:
                             zipf.write(image_file, f"images/{image_file.name}")
                             zipf.writestr(f"labels/{image_file.stem}.txt", "\n".join(yolo_lines))
                             exported += 1
-                        # 类别清单与最小 data.yaml，解压后可直接喂给 ultralytics 训练
+                        # 类别清单与最小 data.yaml，解压后可直接喂给 ultralytics 训练。
+                        # task 一律带上（所有类型）：导出包再导入时靠它声明任务类型，
+                        # OBB 与分割四边形行同形，丢了 task 就会被误读成分割
                         if classes:
                             zipf.writestr(
                                 "data.yaml",
                                 yaml.dump(
-                                    {"path": "", "train": "images", "val": "images", "nc": len(classes), "names": classes},
+                                    {"path": "", "train": "images", "val": "images",
+                                     "nc": len(classes), "names": classes, "task": ds_task},
                                     allow_unicode=True,
                                 ),
                             )
                     if exported == 0:
                         os.unlink(zip_path)
-                        return {"ok": False, "error": "还没有\"已修过\"的图片可提取：请先修几张图（画/改一下轮廓并自动保存），列表筛子里\"轮廓·已修过\"有数量后再点"}
+                        # 提示按任务类型给：检测/旋转框数据集没有「轮廓质量」筛子，
+                        # 照抄分割话术会让用户去找一个根本不存在的入口
+                        _hint = ("列表筛子里\"轮廓·已修过\"有数量后再点" if ds_task == "segment"
+                                 else "画/改一下标注框并自动保存即算复核，右侧「导出已复核 zip」括号里有数量后再点")
+                        return {"ok": False, "error": f"还没有\"已复核\"的图片可提取：请先修几张图（{_hint}）"}
                 except Exception:
                     if os.path.exists(zip_path):
                         os.unlink(zip_path)
@@ -1654,6 +1855,8 @@ class AnnotationService:
                     "filename": f"{task_id}_reviewed.zip",
                     "exported_count": exported,
                     "segment_boxes": seg_boxes,
+                    "obb_boxes": obb_boxes,
+                    "task": ds_task,
                     "skipped_no_image": skipped_no_image,
                 }
             except Exception as e:
@@ -1727,6 +1930,8 @@ class AnnotationService:
             items = task_meta["items"]
             classes = task_meta.get("classes", [])
             dataset_id, version = self._task_to_ds(task_meta)
+            # 数据集声明的任务类型：obb 数据集导入 9 列行按旋转框读，不误入分割通路
+            ds_task = dataset_task(self.datasets_dir / dataset_id)
 
             # 解压 zip 到临时目录（S-02：路径遍历 + 解压炸弹校验，收口 utils.zip_guard）
             tmp_dir = task_dir / "import_tmp"
@@ -1760,7 +1965,7 @@ class AnnotationService:
                     skipped.append(stem)
                     continue
                 try:
-                    boxes = self._load_yolo_labels(tf, item["width"], item["height"])
+                    boxes = self._load_yolo_labels(tf, item["width"], item["height"], task=ds_task)
                 except ValueError as e:
                     skipped.append(f"{stem} ({e})")
                     continue

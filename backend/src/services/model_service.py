@@ -1334,6 +1334,113 @@ class ModelService:
             await shadow.sync_model(model_id)
         return result
 
+    async def describe_missing_labels(self, model_id: str, dataset_id: str = "",
+                                      per_class: int = 2) -> dict:
+        """AI 补描述：为标签字典里「描述为空」的已有类别生成中文描述建议。
+
+        从指定数据集（缺省自动选本库标注图最多的数据集）抽含该类的真实标注图，
+        发千问 VL 写 chinese_desc / ai_prompt_en。**只返回建议不落盘**，
+        由前端回填编辑行、用户点「保存标签字典」才生效（与 AI 新标签采纳同一规矩）。
+        """
+        from src.services.sam_service import SAMService
+        model_dir = self.registry_dir / model_id
+        if not await asyncio.to_thread(lambda: model_dir.exists()):
+            return None
+        per_class = max(1, min(int(per_class or 2), 3))
+
+        def _pick_sync():
+            dic = self._load_labels_dict_sync(model_dir)
+            labels = dic.get("labels") or []
+            missing = [l for l in labels
+                       if str(l.get("english_code") or "").strip()
+                       and not str(l.get("chinese_desc") or "").strip()]
+            if not missing:
+                return {"missing": [], "ds_dir": None, "samples": {}}
+            # 候选数据集：显式指定优先；否则本库全部数据集按标注图数量降序
+            candidates = []
+            if dataset_id:
+                d = settings.DATASETS_DIR / dataset_id
+                if (d / "meta.json").exists():
+                    candidates.append(d)
+            else:
+                root = self.resolve_library_root_id(model_id) or model_id
+                candidates = self._library_dataset_dirs_sync(root)
+
+            def _ann_count(d):
+                ann = d / "annotations"
+                return len(list(ann.glob("*.json"))) if ann.exists() else 0
+
+            candidates.sort(key=_ann_count, reverse=True)
+            codes = {str(l.get("english_code") or "").strip().lower() for l in missing}
+            samples = {}   # english_code(原样) -> [绝对路径]
+            ds_used = None
+            for d in candidates:
+                ann_dir = d / "annotations"
+                if not ann_dir.exists():
+                    continue
+                hit_here = False
+                for p in sorted(ann_dir.glob("*.json")):
+                    if all(len(samples.get(str(l.get("english_code")), [])) >= per_class
+                           for l in missing):
+                        break
+                    try:
+                        data = load_json(p)
+                    except Exception:
+                        continue
+                    img_rel = data.get("image_path") or ""
+                    img_abs = (settings.DATA_DIR / img_rel) if img_rel else None
+                    if not img_abs or not img_abs.exists():
+                        continue
+                    seen_codes = set()
+                    for b in data.get("boxes") or []:
+                        ec = str(b.get("english_code") or "").strip()
+                        key = ec.lower()
+                        if not ec or key not in codes or key in seen_codes:
+                            continue
+                        seen_codes.add(key)
+                        # 找回字典里的原样 english_code（大小写以字典为准）
+                        orig = next((str(l.get("english_code")) for l in missing
+                                     if str(l.get("english_code")).lower() == key), ec)
+                        lst = samples.setdefault(orig, [])
+                        if str(img_abs) not in lst and len(lst) < per_class:
+                            lst.append(str(img_abs))
+                            hit_here = True
+                if hit_here and ds_used is None:
+                    ds_used = d.name
+                if all(len(samples.get(str(l.get("english_code")), [])) >= per_class
+                       for l in missing):
+                    break
+            return {"missing": missing, "ds_dir": ds_used, "samples": samples}
+
+        picked = await asyncio.to_thread(_pick_sync)
+        missing = picked["missing"]
+        if not missing:
+            return {"ok": True, "message": "所有类别都已有中文描述，无需补写",
+                    "suggestions": [], "dataset_id": picked["ds_dir"] or ""}
+        if not picked["samples"]:
+            return {"ok": False,
+                    "message": "没有找到含这些类别的已标注图片，无法生成描述。"
+                               "请先在标注页给这些类别画一些框，或换一个有标注的数据集。",
+                    "suggestions": [], "dataset_id": dataset_id}
+        candidates, msg = await asyncio.to_thread(
+            SAMService().qwen_describe_labels, missing, picked["samples"])
+        if candidates is None:
+            return {"ok": False, "message": msg, "suggestions": [],
+                    "dataset_id": picked["ds_dir"] or dataset_id}
+        no_sample = [str(l.get("english_code")) for l in missing
+                     if not picked["samples"].get(str(l.get("english_code")))]
+        parts = []
+        if candidates:
+            parts.append(f"已为 {len(candidates)} 个类别生成描述建议（AI 建议，需人工确认后保存）")
+        if msg:
+            parts.append(msg)
+        if no_sample:
+            parts.append("以下类别在所选数据集里没有标注框，未生成：" + "、".join(no_sample))
+        return {"ok": bool(candidates),
+                "message": "；".join(parts) or "未能生成任何描述",
+                "suggestions": candidates,
+                "dataset_id": picked["ds_dir"] or dataset_id}
+
     # ------------------------------------------------------------------
     # 标签文案同步：把标签字典的中文名/描述刷进本库已标注数据（每图 JSON 的框冗余字段）
     # ------------------------------------------------------------------
@@ -1358,6 +1465,12 @@ class ModelService:
         if not datasets_dir.exists():
             return out
         for ds_dir in datasets_dir.iterdir():
+            # 删除数据集是「先改名成 xxx__deleting，再后台异步删磁盘」。改名那一刻
+            # 列表/详情已经看不见它，但目录和 meta.json 还在；这里不排除的话，
+            # 标签引用统计（已用 N 张图）、文案同步、AI 补描述会继续把它算进来，
+            # 后台删除失败残留时更是永久错数。口径与 dataset_service 列表一致。
+            if not ds_dir.is_dir() or "__deleting" in ds_dir.name:
+                continue
             mf = ds_dir / "meta.json"
             if not mf.exists():
                 continue

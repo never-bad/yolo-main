@@ -31,6 +31,7 @@ from src.utils.json_io import load_json, save_json_atomic
 from src.services.annotation_importers import import_external_annotations
 from src.services.annotation_service import (
     decode_yolo_line, yolo_label_line, clean_polygon, polygon_to_bbox, strip_ann_bbox, boxes_with_bbox,
+    clean_obb, rect_to_obb, dataset_task,
 )
 
 logger = logging.getLogger(__name__)
@@ -596,7 +597,7 @@ class DatasetService:
         self._bucket_state = None  # advance 期间持有的桶账本（跨 _seal_receiving_bucket 使用）
 
     async def upload_dataset(self, file: UploadFile, model_id: str = None, library_root_id: str = None,
-                             upload_id: str = None, role: str = None):
+                             upload_id: str = None, role: str = None, task: str = None):
         """上传数据集压缩包（zip / tar / tar.gz / tgz）
 
         model_id: 归属模型（1.7 模型仓库：数据挂到对应模型下）；为空则由后续采集/绑定流程归属
@@ -681,6 +682,10 @@ class DatasetService:
                 # B-47：直接上传测试集——创建即标记 role=test（跳过灌桶/自动封板，仅走准备抽取标注）
                 "role": role if role in ("train", "test") else "train",
             }
+            # 任务类型（导入界面必选，缺省 detect）：上传即声明，prepare 的 txt→json、
+            # 建任务播种、封板、导出全链路据此决定标签行读法/写法（OBB 与分割同形，靠声明区分）
+            if task in ("detect", "segment", "obb"):
+                meta["task"] = task
             meta_path = dataset_dir / "meta.json"
             await asyncio.to_thread(save_json_atomic, meta_path, meta)
 
@@ -738,12 +743,17 @@ class DatasetService:
 
     # ---------- 多数据集合并为持久新数据集（方案 B） ----------
     def _merge_copy_source(self, s_dir: Path, s_names: list, unified_index: dict,
-                           img_dir: Path, lbl_dir: Path, src_idx: int) -> dict:
+                           img_dir: Path, lbl_dir: Path, src_idx: int,
+                           seen_md5: dict = None) -> dict:
         """逐源复制（同步）：把单个源数据集的图片硬链接 + 标签按统一类目重写到合并目录。
 
         - 图片：images/{split}/<src_idx>_<原名>（保留子目录结构，前缀隔离跨源重名）。
         - 标签：labels/{split}/<src_idx>_<原名>.txt 按 class 序号重映射；被统一类目剔除的行丢弃。
-        - 返回该源的统计（图数/标签数/丢弃类/丢弃行/映射）。
+        - seen_md5 非 None 时启用 MD5 精确去重（跨源共享，先到先得）：
+          内容完全相同的图只保留第一份，后续重复图连同其标签一起跳过；
+          重复图若标注与保留份不同，记入 dedup_label_conflicts 供用户知晓。
+          只按字节级 MD5 匹配，裁剪/压缩过的相似图不动（零误杀）。
+        - 返回该源的统计（图数/标签数/丢弃类/丢弃行/映射/去重数）。
         源数据集只读，不改动。
         """
         mapping = {}
@@ -757,6 +767,24 @@ class DatasetService:
         cnt_img = 0
         cnt_txt = 0
         dropped_rows = 0
+        dedup_skipped = 0
+        label_conflicts = []
+
+        def _remap_txt(txt: Path) -> str:
+            """标签重映射后的规范化文本（用于去重时比对两份标注是否一致）"""
+            out = []
+            with open(txt, "r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    new_id = mapping.get(parts[0])
+                    if new_id is None:
+                        continue
+                    parts[0] = new_id
+                    out.append(" ".join(parts))
+            return "\n".join(sorted(out))
+
         for split in ("train", "val", "test"):
             src_img = s_dir / "images" / split
             src_lbl = s_dir / "labels" / split
@@ -766,17 +794,48 @@ class DatasetService:
             dst_lbl = lbl_dir / split
             dst_img.mkdir(parents=True, exist_ok=True)
             dst_lbl.mkdir(parents=True, exist_ok=True)
-            for img in src_img.rglob("*"):
+            skipped_stems = set()  # 本源本 split 被去重跳过的图（其标签也要跳过）
+            for img in sorted(src_img.rglob("*")):
                 if not img.is_file() or img.suffix.lower() not in IMG_SUFFIX:
                     continue
                 rel = img.relative_to(src_img)
-                dst = dst_img / rel.parent / (f"{src_idx}_{rel.name}")
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                _link_or_copy(img, dst)
+                if seen_md5 is not None:
+                    md5 = hashlib.md5(img.read_bytes()).hexdigest()
+                    if md5 in seen_md5:
+                        dedup_skipped += 1
+                        skipped_stems.add(str(rel.with_suffix("")))
+                        # 同图不同标：比对重映射后的标签文本，不同则记冲突（保留先到先得那份）
+                        kept = seen_md5[md5]
+                        my_txt = src_lbl / rel.with_suffix(".txt")
+                        try:
+                            mine = _remap_txt(my_txt) if my_txt.exists() else ""
+                            theirs = kept.get("norm") or ""
+                            if mine != theirs:
+                                label_conflicts.append({
+                                    "kept": kept.get("dst"), "skipped": f"{s_dir.name}/{split}/{rel}",
+                                })
+                        except Exception:
+                            pass
+                        continue
+                    dst = dst_img / rel.parent / (f"{src_idx}_{rel.name}")
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    _link_or_copy(img, dst)
+                    my_txt = src_lbl / rel.with_suffix(".txt")
+                    seen_md5[md5] = {
+                        "dst": f"{split}/{src_idx}_{rel.name}",
+                        "txt": my_txt,
+                        "norm": _remap_txt(my_txt) if my_txt.exists() else "",
+                    }
+                else:
+                    dst = dst_img / rel.parent / (f"{src_idx}_{rel.name}")
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    _link_or_copy(img, dst)
                 cnt_img += 1
             if src_lbl.exists():
-                for txt in src_lbl.rglob("*.txt"):
+                for txt in sorted(src_lbl.rglob("*.txt")):
                     rel = txt.relative_to(src_lbl)
+                    if seen_md5 is not None and str(rel.with_suffix("")) in skipped_stems:
+                        continue  # 图被去重跳过，标签跟着跳过，保证图/标签配对不串
                     dst = dst_lbl / rel.parent / (f"{src_idx}_{rel.name}")
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     new_lines = []
@@ -801,10 +860,12 @@ class DatasetService:
             "dropped_classes": dropped,
             "dropped_rows": dropped_rows,
             "class_mapping": mapping,
+            "dedup_skipped": dedup_skipped,
+            "dedup_label_conflicts": label_conflicts,
         }
 
     async def merge_datasets(self, dataset_ids: list, library_root_id: str = None,
-                             display_name: str = None) -> dict:
+                             display_name: str = None, dedup: bool = True) -> dict:
         """多数据集合并为持久新数据集（方案 B）：源数据集只读、不被破坏。
 
         产出 ds_merged_<ts> 出现在数据集列表，可直接训练/封板/导出/再次合并。
@@ -812,6 +873,9 @@ class DatasetService:
           否则各源类别并集（首次出现顺序）。
         - 图片硬链接（回退复制）+ 标签按映射重写；写与封板同格式 data.yaml（无 path 键）
           + meta.json（stage=SEALED, annotated=true）。
+        - dedup=True（默认）：跨源按图片字节 MD5 精确去重，先到先得；重复图连同标签
+          一起跳过，避免同一张图混进 train 和 test 造成数据泄漏。裁剪/压缩过的相似图
+          不受影响（零误杀）。dedup=False 恢复旧行为（仅前缀隔离重名，不去重）。
         """
         if not dataset_ids or len(dataset_ids) < 2:
             raise ValueError("合并至少需要 2 个数据集")
@@ -846,7 +910,19 @@ class DatasetService:
             if not (await asyncio.to_thread(lambda p=img_root: p.exists())
                     and await asyncio.to_thread(lambda p=lbl_root: p.exists())):
                 raise ValueError(f"数据集 {ds_id} 缺少 images/labels 目录，无法合并")
-            sources.append({"dir": ds_dir, "names": names})
+            sources.append({"dir": ds_dir, "names": names,
+                            "task": await asyncio.to_thread(dataset_task, ds_dir)})
+
+        # 任务类型一致性：OBB 行与分割四边形行同形（9 列），混任务合并后无法区分读法，
+        # 且 YOLO 不允许混任务训练 → 各源任务类型必须一致（detect 与 segment 历史上可混，
+        # 维持旧行为放行；涉及 obb 的混合一律拒绝）
+        _tasks = {s["task"] for s in sources}
+        if "obb" in _tasks and len(_tasks) > 1:
+            raise ValueError(
+                "合并的数据集任务类型不一致（旋转框与检测/分割不能混并）："
+                + "、".join(f"{s['dir'].name}={s['task']}" for s in sources)
+            )
+        merged_task = "obb" if "obb" in _tasks else ("segment" if "segment" in _tasks else "detect")
 
         # 2. 统一类别命名空间
         unified_names = []
@@ -894,16 +970,21 @@ class DatasetService:
         lbl_dir = ds_dir / "labels"
 
         # 4. 逐源复制（每个源一个同步块，避免成千上万次 to_thread）
+        #    seen_md5 跨源共享：内容相同的图先到先得，后来的连同标签一起跳过
         per_ds = []
         total_images = 0
         total_labels = 0
+        seen_md5 = {} if dedup else None
         for i, s in enumerate(sources):
             stat = await asyncio.to_thread(
-                self._merge_copy_source, s["dir"], s["names"], unified_index, img_dir, lbl_dir, i
+                self._merge_copy_source, s["dir"], s["names"], unified_index, img_dir, lbl_dir, i,
+                seen_md5
             )
             per_ds.append(stat)
             total_images += stat["images"]
             total_labels += stat["labels"]
+        dedup_skipped = sum(int(s.get("dedup_skipped") or 0) for s in per_ds)
+        dedup_conflicts = [c for s in per_ds for c in (s.get("dedup_label_conflicts") or [])]
 
         # 按已写目录统计各 split 图数（决定 data.yaml 是否含 test / val 回退）
         split_counts = {}
@@ -912,7 +993,8 @@ class DatasetService:
             split_counts[split] = await asyncio.to_thread(_count_images, d) if d.exists() else 0
 
         # 5. data.yaml（同封板格式，无 path 键；无独立 val 时回退 train 作验证集）
-        yaml_data = {"nc": len(unified_names), "names": unified_names, "task": "detect"}
+        # task 跟随源数据集（各源已校验一致）：obb 源合并后仍是 obb，标签行保持 9 列四角点
+        yaml_data = {"nc": len(unified_names), "names": unified_names, "task": merged_task}
         if split_counts.get("train"):
             yaml_data["train"] = "images/train"
         if split_counts.get("val"):
@@ -947,6 +1029,9 @@ class DatasetService:
             "model_id": library_root_id,
             "is_merged": True,
             "split_counts": {k: v for k, v in split_counts.items() if v},
+            "merge_dedup": bool(dedup),
+            "dedup_skipped": dedup_skipped,
+            "task": merged_task,
         }
         await asyncio.to_thread(save_json_atomic, ds_dir / "meta.json", meta)
 
@@ -965,6 +1050,8 @@ class DatasetService:
             "total_labels": total_labels,
             "sources": per_ds,
             "library_root_id": library_root_id,
+            "dedup_skipped": dedup_skipped,
+            "dedup_label_conflicts": dedup_conflicts,
         }
 
     async def _rollback_model_binding_on_prepare_failure(self, meta_path: Path):
@@ -1035,6 +1122,24 @@ class DatasetService:
             raise
         t_extract = time.time()
         logger.info(f"prepare {dataset_id}: extract took {t_extract - t0:.1f}s")
+
+        # 任务类型落地：meta.task（上传时导入界面声明）优先；未声明时读包内 data.yaml 的 task
+        # 自动识别（平台导出的包一律带 task）。两者都没有 → detect（存量默认）。
+        # 写回 meta 后，下方 txt→json / 建任务 / 封板 / 导出全链路按此读法走。
+        _declared_task = str(meta.get("task") or "").strip().lower()
+        if _declared_task not in ("detect", "segment", "obb"):
+            _declared_task = ""
+            try:
+                for _yp in version_dir.rglob("data.yaml"):
+                    _yc = yaml.safe_load(_yp.read_text(encoding="utf-8")) or {}
+                    _yt = str(_yc.get("task") or "").strip().lower()
+                    if _yt in ("detect", "segment", "obb"):
+                        _declared_task = _yt
+                        break
+            except Exception:
+                pass
+        meta["task"] = _declared_task or "detect"
+        await asyncio.to_thread(save_json_atomic, meta_path, meta)
         
         # 「准备」= 把数据集改造成平台可用格式：
         # 0) 外部分类格式（COCO / LabelMe / VOC）→ 直接产出 YOLO 扁平格式（数据链路阶段B），
@@ -1496,13 +1601,30 @@ class DatasetService:
         for im in orphans:
             move_flat(im, tmp_images)
 
+        # 重组会重写 data.yaml：原包根 data.yaml 的任务类型声明必须带过来，
+        # 否则 obb/segment 包重组后 task 丢失，txt→json 反填会按 detect 读法误读
+        _orig_task = ""
+        _orig_yaml = root_dir / "data.yaml"
+        if _orig_yaml.exists():
+            try:
+                _oc = yaml.safe_load(_orig_yaml.read_text(encoding="utf-8")) or {}
+                _ot = str(_oc.get("task") or "").strip().lower()
+                if _ot in ("detect", "segment", "obb"):
+                    _orig_task = _ot
+            except Exception:
+                pass
         if classes:
-            _save_yaml(staging / "data.yaml", {"nc": len(classes), "names": list(classes)})
+            _ydata = {"nc": len(classes), "names": list(classes)}
+            if _orig_task:
+                _ydata["task"] = _orig_task
+            _save_yaml(staging / "data.yaml", _ydata)
 
         # 4) 清空根目录并移入整理结果（zip 原始文件保留在 uploads，可随时重新准备）
         for child in list(root_dir.iterdir()):
             if child.name == ".staging":
                 continue
+            if child.name == "meta.json":
+                continue  # 平台元数据（含任务类型声明）不是 zip 产物，重组不得删除
             if child.is_dir():
                 shutil.rmtree(child, ignore_errors=True)
             else:
@@ -1581,6 +1703,21 @@ class DatasetService:
         - class 为 [0, nc) 内整数；坐标均为 [0,1] 归一化浮点
         - 允许 1e-3 数值容差（第三方工具常有 -0.0001 / 1.0001 这类边界抖动）
         """
+        # 恰好 10 列、且前后各 5 列都像完整检测行 → 上游把两行少写了一个换行符。
+        # 必须单独报出来：通用文案只会让人以为是 OBB/分割脏行，实际源包两条框都在，
+        # 拆分后 462/462 行可直接通过校验（ds_20261118_162929 实测 231 个文件）。
+        if len(parts) == 10:
+            def _valid_detect5(chunk):
+                try:
+                    cid = int(float(chunk[0]))
+                    vals = [float(x) for x in chunk[1:]]
+                except (ValueError, TypeError):
+                    return False
+                if cid < 0 or (nc and cid >= nc):
+                    return False
+                return all(-1e-3 <= v <= 1 + 1e-3 for v in vals)
+            if _valid_detect5(parts[:5]) and _valid_detect5(parts[5:]):
+                return False, "10 列非法：疑似两条 5 列检测行被拼成一行（缺换行），请拆成两行"
         if len(parts) != 5 and (len(parts) < 7 or len(parts) % 2 == 0):
             return False, f"{len(parts)} 列非法（应为 5 列检测行，或 ≥7 列的奇数列分割行）"
         try:
@@ -1727,6 +1864,7 @@ class DatasetService:
         labels_dir = dataset_dir / "labels"
         if not images_dir.exists():
             return []
+        ds_task = dataset_task(dataset_dir)
 
         img_pool = []
         if images_dir.is_dir():
@@ -1763,8 +1901,9 @@ class DatasetService:
                     for line in f:
                         parts = line.strip().split()
                         # decode_yolo_line 同时认"官方分割行（类别后全是顶点）/ 检测行 /
-                        # 平台旧导出行"，轮廓必须带进 JSON，否则外部包会被静默截成矩形框
-                        box = decode_yolo_line(parts, w, h)
+                        # 平台旧导出行"，轮廓必须带进 JSON，否则外部包会被静默截成矩形框；
+                        # task=obb 时 9 列行按旋转框四角点读
+                        box = decode_yolo_line(parts, w, h, task=ds_task)
                         if box:
                             boxes.append(box)
             except Exception:
@@ -2419,6 +2558,62 @@ class DatasetService:
             "summary": align["summary"],
         }
 
+    async def heal_seal_after_alignment(self, dataset_id: str) -> dict:
+        """确认类别映射后自愈封板产物。
+
+        场景：数据集曾被 force 封板，但封板那一刻类别还是 needs_confirm，
+        label_guard 拒绝生成产物 → 只打了 sealed 标、写了 seal_skipped_reason。
+        用户随后到上传页确认映射，此前 confirm_class_alignment 只重写标签文件，
+        不会回头补 train/val/test，于是永久卡在「封板中止，需先处理」，且普通封板
+        因 stage=sealed 幂等直接返回，无法补救。
+
+        本方法在映射确认成功后调用：若数据集处于 sealed 且产物缺失（或仍带中止标记），
+        复用 _backfill_seal_artifacts 补生成划分/txt/data.yaml 并清掉中止标记。
+        产物已齐全且无中止标记时不动，保证幂等。
+        """
+        ds_dir = self.datasets_dir / dataset_id
+        mp = ds_dir / "meta.json"
+        if not await asyncio.to_thread(lambda: mp.exists()):
+            return {"healed": False, "reason": "dataset_not_found"}
+        meta = await asyncio.to_thread(load_json, mp)
+        if meta.get("stage") != STAGE_SEALED:
+            return {"healed": False, "reason": "not_sealed"}
+
+        has_artifacts = ((ds_dir / "data.yaml").exists()
+                         and (ds_dir / "labels" / "train").is_dir()
+                         and (ds_dir / "images" / "train").is_dir())
+        has_skip = bool(meta.get("seal_skipped_reason"))
+        if has_artifacts and not has_skip:
+            return {"healed": False, "reason": "artifacts_complete"}
+
+        if has_artifacts and has_skip:
+            # 产物已齐全（曾手动补过/后续流程补过），只清残留中止标记，不重建：
+            # 大几千张图重建划分很贵，且 SealDataset 幂等分支也是只清标记。
+            meta.pop("seal_skipped_reason", None)
+            try:
+                split = meta.get("sealed_split") or {}
+                nm = split.get("names") or []
+                if nm:
+                    meta["classes"] = list(nm)
+                boxes = int(sum(((split.get("class_stats") or {}).get("boxes_by_class") or {}).values()) or 0)
+                if boxes:
+                    meta["label_count"] = boxes
+                    meta["has_labels"] = True
+            except Exception:
+                pass
+            await asyncio.to_thread(save_json_atomic, mp, meta)
+            from src.db import shadow
+            await shadow.sync_dataset(dataset_id)
+            return {"healed": True, "reason": "flag_cleared"}
+
+        _ensure_stage_fields(meta)
+        meta = await self._backfill_seal_artifacts(ds_dir, mp, meta)
+        err = meta.get("seal_artifacts_error")
+        if err:
+            return {"healed": False, "reason": "backfill_failed", "error": err}
+        return {"healed": True, "reason": "artifacts_backfilled",
+                "split_counts": meta.get("split_counts")}
+
     def _build_training_artifacts(self, dataset_dir: Path, meta: dict, split_ratio: dict,
                                   out_dir: Path = None, label_guard: bool = False) -> dict:
         """封板一次性产出：划分 train/val/test + 每图 JSON → YOLO txt + 生成 data.yaml（数据链路阶段E）
@@ -2619,9 +2814,12 @@ class DatasetService:
                 dd.mkdir(parents=True, exist_ok=True)
 
         counts = {}
+        # 数据集声明的任务类型：obb 时所有行统一写 9 列四角点（水平框=0° 特例）
+        ds_task = dataset_task(dataset_dir)
         # 分割/检测行数统计：用于判断本次封板产物是不是分割数据集
         seg_lines = 0
         rect_lines = 0
+        obb_lines = 0
         split_class_stats = {s: {"images": 0, "boxes": {}} for s in ("train", "val", "test")}
         for split, recs in splits.items():
             counts[split] = 0
@@ -2646,8 +2844,11 @@ class DatasetService:
                     else:
                         cls_id = _cls_idx.get(str(cid).lower(), 0)  # JSON 英文名 → YOLO 索引
                     lines.append(yolo_label_line(cls_id, (x1, y1, x2, y2), poly, w, h,
-                                                 rect_as_poly=any_poly))
-                    if poly:
+                                                 rect_as_poly=any_poly,
+                                                 obb=b.get("obb"), task=ds_task))
+                    if ds_task == "obb":
+                        obb_lines += 1
+                    elif poly:
                         seg_lines += 1
                     else:
                         rect_lines += 1
@@ -2672,8 +2873,9 @@ class DatasetService:
             "nc": len(names),
             "names": names,
         }
-        # 只要有一条分割轮廓就标 segment（ultralytics 按行内列数自适应，纯检测行仍当检测框学）
-        yaml_data["task"] = "segment" if seg_lines > 0 else "detect"
+        # 任务类型：数据集声明 obb → obb（行已全部写成 9 列四角点）；
+        # 否则只要有一条分割轮廓就标 segment（ultralytics 按行内列数自适应，纯检测行仍当检测框学）
+        yaml_data["task"] = "obb" if ds_task == "obb" else ("segment" if seg_lines > 0 else "detect")
         if counts["test"] > 0:
             yaml_data["test"] = "images/test"
         _save_yaml(out_dir / "data.yaml", yaml_data)
@@ -2690,7 +2892,7 @@ class DatasetService:
         logger.info(
             f"seal artifacts: total={n} splits={counts} nc={len(names)} "
             f"class_boxes={class_box_stats} blank={blank_images} "
-            f"task={yaml_data['task']} seg_lines={seg_lines} rect_lines={rect_lines}"
+            f"task={yaml_data['task']} seg_lines={seg_lines} rect_lines={rect_lines} obb_lines={obb_lines}"
         )
         return {
             "total": n,
@@ -2707,6 +2909,7 @@ class DatasetService:
             "has_segment": seg_lines > 0,
             "segment_boxes": seg_lines,
             "rect_boxes": rect_lines,
+            "obb_boxes": obb_lines,
             "mixed": seg_lines > 0 and rect_lines > 0,
         }
 
@@ -2954,6 +3157,10 @@ class DatasetService:
                             meta["annotated_count"] = self._count_annotated_files(
                                 dataset_dir
                             )
+                            # 任务类型统一暴露（存量 meta 无 task 时按 data.yaml 兜底，缺省 detect）：
+                            # 标注页工具条显隐、训练页提示都按这个字段走
+                            if str(meta.get("task") or "").strip().lower() not in ("detect", "segment", "obb"):
+                                meta["task"] = dataset_task(dataset_dir)
                             datasets.append(meta)
                         except Exception:
                             continue
@@ -3001,6 +3208,8 @@ class DatasetService:
                                 "annotated": True,
                                 "standard_yolo": True,
                                 "split_counts": stats,
+                                "task": str(cfg.get("task") or "detect").strip().lower()
+                                        if str(cfg.get("task") or "").strip().lower() in ("detect", "segment", "obb") else "detect",
                             }
                             datasets.append(meta)
             return datasets
@@ -3236,7 +3445,11 @@ class DatasetService:
         real_classes = self._resolve_real_classes(dataset_dir, meta)
         if real_classes != meta.get("classes"):
             meta["classes"] = real_classes
-        
+
+        # 任务类型统一暴露（与 list_datasets 同款兜底）：标注页工具条显隐按此字段
+        if str(meta.get("task") or "").strip().lower() not in ("detect", "segment", "obb"):
+            meta["task"] = dataset_task(dataset_dir)
+
         # 添加图片列表（在线程中执行）
         def _get_images():
             # 数据集一律为 datasets/{dataset_id}（无 version 子目录）
@@ -3980,6 +4193,10 @@ class DatasetService:
                             zip_yaml["names"] = src.get("names", [])
                         except Exception:
                             pass
+                    # task 一律带上（所有类型，封没封板都一样）：导出包再导入时靠它
+                    # 声明任务类型。OBB 与分割四边形行同形（9 列），丢了 task 会被误读成分割。
+                    # dataset_task 内部 meta.json 优先、data.yaml 兜底、缺省 detect。
+                    zip_yaml["task"] = dataset_task(dataset_dir)
                     zipf.writestr("data.yaml", yaml.dump(zip_yaml, allow_unicode=True))
                 else:
                     # 未划分：平铺打包 images/ 与 labels/
@@ -3993,10 +4210,22 @@ class DatasetService:
                             if label_file.is_file():
                                 arcname = label_file.relative_to(dataset_dir)
                                 zipf.write(label_file, arcname)
-                    # 未划分时 data.yaml 保持原样
+                    # 未划分：data.yaml 原样打包，但 task 一律补上（所有类型）——
+                    # 存量数据集的 yaml 可能没有 task 字段，导出包再导入时不能丢任务声明
                     data_yaml = dataset_dir / "data.yaml"
                     if data_yaml.exists():
-                        zipf.write(data_yaml, "data.yaml")
+                        try:
+                            _src = yaml.safe_load(data_yaml.read_text(encoding="utf-8")) or {}
+                            if str(_src.get("task") or "").strip().lower() not in ("detect", "segment", "obb"):
+                                _src["task"] = dataset_task(dataset_dir)
+                                zipf.writestr("data.yaml", yaml.dump(_src, allow_unicode=True))
+                            else:
+                                zipf.write(data_yaml, "data.yaml")
+                        except Exception:
+                            zipf.write(data_yaml, "data.yaml")
+                    else:
+                        # 连 data.yaml 都没有（纯图包）：补一份最小声明，导入侧可据此预选任务类型
+                        zipf.writestr("data.yaml", yaml.dump({"task": dataset_task(dataset_dir)}, allow_unicode=True))
             
             return temp_zip_path
         

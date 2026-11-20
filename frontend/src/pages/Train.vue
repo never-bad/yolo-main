@@ -9,14 +9,22 @@
             <button
               type="button"
               class="merge-btn"
-              :disabled="!canMerge || merging"
-              :title="canMerge ? '将选中的多个数据集合并为一个持久数据集（源不被覆盖）' : '请勾选 ≥2 个已准备的数据集'"
-              @click="mergeSelected"
+              :disabled="merging || (!mergeMode && datasets.length < 2) || (mergeMode && !canMerge)"
+              :title="mergeMode
+                ? (canMerge ? '将选中的多个数据集合并为一个持久数据集（源不被覆盖）' : '请勾选 ≥2 个已准备的数据集')
+                : '进入多选合并模式（平时点卡片为单选）'"
+              @click="mergeMode ? mergeSelected() : (mergeMode = true)"
             >
               <span v-if="merging" class="loading-spinner"></span>
-              {{ merging ? '合并中...' : '合并为新数据集' }}
+              {{ merging ? '合并中...' : (mergeMode ? '确认合并' : '合并为新数据集') }}
             </button>
-            <span v-if="selectedDatasetIds.length" class="ds-selected-count">已选 {{ selectedDatasetIds.length }} 个</span>
+            <button v-if="mergeMode && !merging" type="button" class="refresh-btn" @click="exitMergeMode">取消多选</button>
+            <span v-if="mergeMode" class="ds-selected-count">合并模式：已选 {{ selectedDatasetIds.length }} 个（点卡片加选/取消）</span>
+            <span v-else-if="selectedDatasetIds.length" class="ds-selected-count">已选 1 个</span>
+            <label v-if="mergeMode" class="merge-dedup-opt" title="按图片内容精确匹配（MD5）：两个源里内容完全相同的图只保留一份，防止同一张图混进训练集和测试集导致指标虚高。裁剪/压缩过的相似图不受影响">
+              <input type="checkbox" v-model="mergeDedup" :disabled="merging" />
+              自动去掉完全相同的图片
+            </label>
           </div>
           <button type="button" @click="loadDatasets" class="refresh-btn" :disabled="loadingDatasets">
             <span v-if="loadingDatasets" class="loading-spinner"></span>
@@ -42,6 +50,7 @@
           >
             <div class="ds-card-header">
               <span class="ds-name">{{ dsTitle(ds) }} <span v-if="trainForm.dataset_id === ds.dataset_id" class="ds-main-tag">主</span></span>
+              <span class="ds-task-text">类型：{{ taskBadgeLabel(ds) }}</span>
               <span :class="'status-badge status-' + ds.status">{{ getDatasetStatus(ds) }}</span>
             </div>
             <div class="ds-card-info">
@@ -56,7 +65,7 @@
           </div>
           <div v-if="!loadingDatasets && datasets.length === 0" class="empty-state">暂无已标注导出的数据集，请先在标注页完成标注并导出</div>
         </div>
-        <small>提示：仅显示已标注的数据集，点击卡片可多选（再次点击取消）；选中 ≥2 个后点「合并为新数据集」可把它们合成一个持久数据集一起训练（源数据集不会被覆盖）</small>
+        <small>提示：仅显示已标注的数据集。平时点卡片为单选（点哪个选哪个）；需要多个数据集一起训练时，点「合并为新数据集」进入多选模式，勾选 ≥2 个后确认合并成一个持久数据集（源数据集不会被覆盖）</small>
         <small v-if="!presetLibraryRootId && primaryLibraryId" class="lib-pick-info">
           主数据集归属算法库「{{ libraryNameOf(primaryLibraryId) }}」——训练产出会作为该库的新版本
         </small>
@@ -670,8 +679,17 @@ const trainForm = ref<TrainJobRequest>({
 // 回忆集混训抽取比例（L3 滑块 5%~30%，默认 10%）
 const recallRatio = ref(0.1)
 
-// 阶段1.3（训练任务聚合）：多选数据集 → 聚合为同一训练任务（第一个选中者为主数据集）
+// 阶段1.3（训练任务聚合）：默认单选（点哪个选哪个）；
+// 只有点「合并为新数据集」进入 mergeMode 后才允许多选切换（第一个选中者为主数据集）
 const selectedDatasetIds = ref<string[]>([])
+const mergeMode = ref(false)
+// 退出多选模式：只保留主数据集（第一个选中），避免残留一堆旧选中项
+const exitMergeMode = () => {
+  mergeMode.value = false
+  const main = trainForm.value.dataset_id || selectedDatasetIds.value[0] || ''
+  selectedDatasetIds.value = main ? [main] : []
+  trainForm.value.dataset_id = main
+}
 // 阶段1.4（雪球）：自动带入同业务「未完成训练」数据集
 const aggregateIncomplete = ref(false)
 const isDsSelected = (id: string) => selectedDatasetIds.value.includes(id)
@@ -1119,7 +1137,14 @@ const restoreTrainFormConfig = () => {
       trainForm.value = { ...trainForm.value, ...saved.trainForm }
     }
     if (typeof saved?.recallRatio === 'number') recallRatio.value = saved.recallRatio
-    if (Array.isArray(saved?.selectedDatasetIds)) selectedDatasetIds.value = saved.selectedDatasetIds.filter((x: any) => typeof x === 'string')
+    if (Array.isArray(saved?.selectedDatasetIds)) {
+      const savedIds = saved.selectedDatasetIds.filter((x: any) => typeof x === 'string')
+      // 旧版是多选模式，存档可能残留多个选中项；单选化后只恢复主数据集那一个，
+      // 否则一进训练页就高亮一堆旧数据集，用户还得逐个点掉
+      const main = trainForm.value.dataset_id
+      selectedDatasetIds.value = main && savedIds.includes(main) ? [main] : savedIds.slice(0, 1)
+      trainForm.value.dataset_id = selectedDatasetIds.value[0] || ''
+    }
     if (typeof saved?.aggregateIncomplete === 'boolean') aggregateIncomplete.value = saved.aggregateIncomplete
     if (typeof saved?.migrationEnabled === 'boolean') migrationEnabled.value = saved.migrationEnabled
     return true
@@ -1364,6 +1389,15 @@ const getDatasetStatus = (dataset: any) => {
   return dataset.status || '未知'
 }
 
+// 数据集卡片的任务类型徽标（与标注页同一口径）：detect/segment/obb → 检测/分割/旋转框。
+// 训练页要按任务选模型（yolov8n-obb.pt 等），卡片上直接标出来免得选错。
+const taskOf = (ds: any): 'detect' | 'segment' | 'obb' => {
+  const t = String(ds?.task || '').trim().toLowerCase()
+  return t === 'segment' || t === 'obb' ? t : 'detect'
+}
+const TASK_BADGE: Record<string, string> = { detect: '目标检测', segment: '实例分割', obb: '旋转框检测' }
+const taskBadgeLabel = (ds: any) => TASK_BADGE[taskOf(ds)]
+
 // 检查数据集是否已准备（允许 prepared 和 uploaded 状态）
 const isDatasetPrepared = (dataset: any) => {
   // 封板中止（类别与算法库字典冲突等）：产物 data.yaml 没生成，选了也训练不了
@@ -1371,7 +1405,9 @@ const isDatasetPrepared = (dataset: any) => {
   return dataset.status === 'prepared' || dataset.status === 'uploaded'
 }
 
-// 卡片式选择数据集（多选切换：点击加入/取消；第一个选中者为主数据集，用于模型/版本推断与训练提交）
+// 卡片式选择数据集：
+// - 平时（非合并模式）= 单选，点哪个就是哪个，替换掉之前的选中，不会残留多选；
+// - 合并模式 = 多选切换（点击加入/取消；第一个选中者为主数据集，用于模型/版本推断与训练提交）
 const selectDataset = (ds: any) => {
   if (!isDatasetPrepared(ds)) {
     // 封板中止的具体原因直接说清楚，别让用户对着英文报错猜
@@ -1382,6 +1418,12 @@ const selectDataset = (ds: any) => {
         : '该数据集尚未准备，请先在"数据集"页面执行"准备/封板"操作',
       'info', 6000
     )
+    return
+  }
+  if (!mergeMode.value) {
+    // 单选：直接替换，之前的选中自动取消
+    selectedDatasetIds.value = [ds.dataset_id]
+    trainForm.value.dataset_id = ds.dataset_id
     return
   }
   const idx = selectedDatasetIds.value.indexOf(ds.dataset_id)
@@ -1398,6 +1440,8 @@ const selectDataset = (ds: any) => {
 
 // 合并数据集（方案 B）：选中 ≥2 且全部就绪 → 合并为持久新数据集，成功后刷新并自动选中它
 const merging = ref(false)
+// 合并时按图片 MD5 精确去重（默认开：防同图混进 train/test 数据泄漏；MD5 零误杀）
+const mergeDedup = ref(true)
 const canMerge = computed(() =>
   selectedDatasetIds.value.length >= 2 &&
   selectedDatasetIds.value.every((id: string) => {
@@ -1414,15 +1458,21 @@ const mergeSelected = async () => {
     const libraryRootId = first?.library_root_id || first?.model_id || null
     const libName = first ? libraryNameOf(libraryRootId) : ''
     const displayName = (libName ? libName + '合并' : '合并数据集') + `（${ids.length}源）`
-    const res = await mergeDatasets(ids, libraryRootId, displayName)
+    const res = await mergeDatasets(ids, libraryRootId, displayName, mergeDedup.value)
+    const dedupN = Number(res.dedup_skipped || 0)
+    const conflictN = (res.dedup_label_conflicts || []).length
     showToast(
-      `已合并为「${res.display_name}」：${res.total_images} 张图、${res.unified_names.length} 类。可直接开始训练`,
+      `已合并为「${res.display_name}」：${res.total_images} 张图、${res.unified_names.length} 类`
+      + (dedupN ? `，自动去重 ${dedupN} 张相同图片` : '')
+      + (conflictN ? `（其中 ${conflictN} 张两份标注不一致，已保留先选源那份）` : '')
+      + '。可直接开始训练',
       'info', 6000
     )
     await loadDatasets()
-    // 自动选中新合并的数据集（旧源保留，不覆盖）
+    // 自动选中新合并的数据集（旧源保留，不覆盖），并退出多选模式回到单选
     selectedDatasetIds.value = [res.dataset_id]
     trainForm.value.dataset_id = res.dataset_id
+    mergeMode.value = false
   } catch (e: any) {
     const detail = e?.response?.data?.detail || e?.message || '未知错误'
     showToast('合并失败：' + detail, 'error', 6000)
@@ -2816,6 +2866,16 @@ onUnmounted(() => {
   color: #5b6472;
 }
 
+.merge-dedup-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.8rem;
+  color: #5b6472;
+  cursor: pointer;
+  user-select: none;
+}
+
 .merge-btn {
   padding: 0.35rem 0.8rem;
   border: 1px solid #2f7d3b;
@@ -2931,6 +2991,14 @@ onUnmounted(() => {
   font-weight: bold;
   font-size: 0.9rem;
   word-break: break-all;
+  margin-right: auto;
+}
+
+/* 任务类型直接用文字说明，不靠颜色区分（颜色对色弱/小屏不友好） */
+.ds-task-text {
+  font-size: 0.72rem;
+  color: #5b6673;
+  white-space: nowrap;
 }
 
 .status-badge {

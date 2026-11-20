@@ -588,11 +588,27 @@
           </table>
           <div class="set-row modal-actions">
             <button class="ghost small" @click="addLabelRow">+ 添加类别</button>
+            <button class="secondary small" :disabled="descGenLoading || !hasEmptyDesc"
+                    :title="hasEmptyDesc ? '让千问 VL 看样本图，为描述为空的类别补写中文描述（只回填表格，保存后才生效）' : '所有类别都已有描述'"
+                    @click="genMissingDescs">
+              {{ descGenLoading ? 'AI 生成中...' : '✨ AI 补描述' }}
+            </button>
             <button class="primary small" :disabled="savingLabels" @click="saveLabels">
               {{ savingLabels ? '保存中...' : '保存标签字典' }}
             </button>
             <button class="secondary small" @click="closeLabelModal">关闭</button>
             <span v-if="labelsMsg" class="labels-msg">{{ labelsMsg }}</span>
+          </div>
+
+          <!-- AI 补描述：只回填编辑行，点「保存标签字典」才真正生效 -->
+          <div v-if="descGenMsg || descGenLoading" class="desc-gen">
+            <div class="ls-title">AI 补描述</div>
+            <div v-if="descGenLoading" class="form-hint">正在让千问 VL 查看样本图并撰写描述，请稍候…</div>
+            <p v-if="descGenMsg" class="form-hint" :class="{ 'desc-gen-err': descGenErr }">{{ descGenMsg }}</p>
+            <p v-if="descGenFilled.length" class="form-hint">
+              已回填 {{ descGenFilled.length }} 个类别：{{ descGenFilled.join('、') }}。
+              请检查表格里的描述与 AI 提示词，可手动修改；确认无误后点「保存标签字典」生效，点「关闭」则放弃。
+            </p>
           </div>
 
           <!-- 已标注数据的文案同步（改描述只影响之后，老标注里存的是当时那份） -->
@@ -741,6 +757,7 @@ import {
   getLabelsDict, updateLabelsDict, generateTrainingCharts, listModels,
   uploadModel,
   syncLabelsToAnnotations, rollbackLabelSync, getLabelsUsage, confirmPublish, overrideModel,
+  describeMissingLabels,
   type ModelDataset, type LabelsDict, type LabelSyncResult, type LabelsUsage
 } from '@/api/models'
 import {
@@ -791,6 +808,9 @@ function openLabelModal() {
   syncLabelRows()
   labelSyncInfo.value = null
   labelUsage.value = null
+  descGenMsg.value = ''
+  descGenErr.value = false
+  descGenFilled.value = []
   labelModalOpen.value = true
   loadLabelUsage() // 不阻塞弹窗：统计回来后再把在用的英文名格子锁住
 }
@@ -798,7 +818,10 @@ function openLabelModal() {
 function closeLabelModal() {
   labelModalOpen.value = false
   labelSyncInfo.value = null
-  syncLabelRows() // 关闭即回滚未保存的编辑
+  descGenMsg.value = ''
+  descGenErr.value = false
+  descGenFilled.value = []
+  syncLabelRows() // 关闭即回滚未保存的编辑（含 AI 补描述的回填）
 }
 
 const normVer = (v?: string) => (v && !String(v).toLowerCase().startsWith('v') ? 'v' + v : v || '—')
@@ -1578,6 +1601,54 @@ async function saveLabels() {
 const savingLabels = ref(false)
 const labelsMsg = ref('')
 
+// ===== AI 补描述：描述为空的已有类别 → 千问看样本图写描述 → 回填编辑行（保存才生效） =====
+const descGenLoading = ref(false)
+const descGenMsg = ref('')
+const descGenErr = ref(false)
+const descGenFilled = ref<string[]>([])
+const hasEmptyDesc = computed(() =>
+  labelRows.value.some((r) => String(r.english_code || '').trim() && !String(r.chinese_desc || '').trim()))
+
+async function genMissingDescs() {
+  if (descGenLoading.value || !hasEmptyDesc.value) return
+  descGenLoading.value = true
+  descGenMsg.value = ''
+  descGenErr.value = false
+  descGenFilled.value = []
+  labelsMsg.value = ''
+  try {
+    // 优先用本库已挂载的数据集（标注最多者优先）；没有挂载则传空让后端自动选
+    const mounted = datasetsView.value
+      .filter((d: any) => (d.annotated_images || 0) > 0)
+      .sort((a: any, b: any) => (b.annotated_images || 0) - (a.annotated_images || 0))
+    const dsId = mounted[0]?.dataset_id || ''
+    const res = await describeMissingLabels(modelId, dsId, 2)
+    const suggestions = res.suggestions || []
+    const filled: string[] = []
+    for (const s of suggestions) {
+      const key = String(s.english_code || '').trim().toLowerCase()
+      const row = labelRows.value.find((r) => String(r.english_code || '').trim().toLowerCase() === key)
+      if (!row) continue
+      // 只补空字段：用户已写过的描述/提示词绝不覆盖
+      if (!String(row.chinese_desc || '').trim() && s.chinese_desc) {
+        row.chinese_desc = s.chinese_desc
+        filled.push(row.chinese_name || row.english_code)
+      }
+      if (!String(row.ai_prompt_en || '').trim() && s.ai_prompt_en) {
+        row.ai_prompt_en = s.ai_prompt_en
+      }
+    }
+    descGenFilled.value = filled
+    descGenMsg.value = res.message || (filled.length ? `已回填 ${filled.length} 个类别的描述` : '未能生成描述')
+    descGenErr.value = !res.ok && !filled.length
+  } catch (e: any) {
+    descGenErr.value = true
+    descGenMsg.value = 'AI 补描述失败：' + (e?.response?.data?.detail || e?.message)
+  } finally {
+    descGenLoading.value = false
+  }
+}
+
 // ===== 已标注数据的文案同步：把字典里的中文名/描述刷进本库各图的标注 =====
 const labelSyncing = ref(false)
 const labelSyncInfo = ref<LabelSyncResult | null>(null)
@@ -2084,6 +2155,12 @@ onMounted(async () => {
   margin-top: 14px; padding: 12px 14px;
   background: #fbfcfe; border: 1px solid #e3e9f1; border-radius: 8px;
 }
+.desc-gen {
+  margin-top: 14px; padding: 12px 14px;
+  background: #f6fbf7; border: 1px solid #d8ecd9; border-radius: 8px;
+}
+.desc-gen .form-hint { margin: 0 0 8px; line-height: 1.6; color: #4a5568; }
+.desc-gen .desc-gen-err { color: #c0392b; }
 .ls-title { font-size: 0.86rem; font-weight: 700; color: #2c3e50; margin-bottom: 6px; }
 .label-sync .form-hint { margin: 0 0 10px; line-height: 1.6; }
 .ls-detail { margin-top: 10px; font-size: 0.8rem; color: #4a5568; line-height: 1.6; }

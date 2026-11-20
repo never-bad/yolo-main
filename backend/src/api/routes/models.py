@@ -329,6 +329,20 @@ async def adopt_model_labels(model_id: str, request: AdoptSuggestRequest):
         raise HTTPException(404, "Model not found")
     return result
 
+class DescribeLabelsRequest(BaseModel):
+    dataset_id: Optional[str] = ""   # 空=自动选本库标注图最多的数据集
+    per_class: Optional[int] = 2     # 每类抽几张样本图（1~3）
+
+@router.post("/{model_id}/labels/describe")
+async def describe_model_labels(model_id: str, request: DescribeLabelsRequest):
+    """AI 补描述：为字典里描述为空的已有类别抽真实标注图发千问 VL，
+    返回 chinese_desc/ai_prompt_en 建议（不落盘，用户确认后走保存标签字典生效）"""
+    result = await model_service.describe_missing_labels(
+        model_id, request.dataset_id or "", request.per_class or 2)
+    if result is None:
+        raise HTTPException(404, "Model not found")
+    return result
+
 class SyncLabelsRequest(BaseModel):
     dry_run: bool = True
 

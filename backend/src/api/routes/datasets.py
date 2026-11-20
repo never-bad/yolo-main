@@ -32,6 +32,7 @@ class MergeRequest(BaseModel):
     dataset_ids: list[str]          # 至少 2 个待合并的数据集 id
     library_root_id: Optional[str] = None  # 归属算法库（缺省取第一个源的归属库）
     display_name: Optional[str] = None    # 合并后数据集命名（缺省 merged_<时间>）
+    dedup: bool = True              # 跨源按图片 MD5 精确去重（默认开，防同图混进 train/test 泄漏）
 
 class ClassAlignmentRequest(BaseModel):
     # [{"src_index": 0, "target_id": 1}]；target_id=null/-1 表示忽略该源类
@@ -45,9 +46,14 @@ async def confirm_class_alignment(dataset_id: str, request: ClassAlignmentReques
     把报告置为 confirmed；未确认的数据集会在封板时被 label_guard 明确拒绝。
     """
     try:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             dataset_service.confirm_class_alignment, dataset_id, request.decisions
         )
+        # 已封板但类别未对齐被中止的数据集：确认映射后自动补齐封板产物，
+        # 清掉「封板中止，需先处理」标记（否则 stage=sealed 幂等返回，永远补不上）。
+        heal = await dataset_service.heal_seal_after_alignment(dataset_id)
+        result["seal_heal"] = heal
+        return result
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -96,6 +102,7 @@ async def upload_dataset(
     model_id: Optional[str] = None,
     upload_id: Optional[str] = None,
     role: Optional[str] = None,
+    task: Optional[str] = None,
 ):
     """上传数据集压缩包（zip / tar / tar.gz / tgz）
 
@@ -115,13 +122,16 @@ async def upload_dataset(
     if role not in (None, "train", "test"):
         raise HTTPException(400, "role 仅支持 train / test")
 
+    if task not in (None, "detect", "segment", "obb"):
+        raise HTTPException(400, "task 仅支持 detect / segment / obb")
+
     if not model_id:
         raise HTTPException(400, "请先选择该数据集归属的算法库（没有合适的库请先新建算法库）")
     library_root_id = model_service.resolve_library_root_id(model_id)
     if not library_root_id:
         raise HTTPException(400, f"归属的算法库不存在：{model_id}")
 
-    return await dataset_service.upload_dataset(file, library_root_id, library_root_id, upload_id, role)
+    return await dataset_service.upload_dataset(file, library_root_id, library_root_id, upload_id, role, task)
 
 
 @router.post("/upload/cancel")
@@ -162,7 +172,8 @@ async def merge_datasets_endpoint(request: MergeRequest):
     """
     try:
         return await dataset_service.merge_datasets(
-            request.dataset_ids, request.library_root_id, request.display_name
+            request.dataset_ids, request.library_root_id, request.display_name,
+            request.dedup
         )
     except ValueError as e:
         raise HTTPException(400, str(e))

@@ -12,7 +12,7 @@ export interface UpdateDatasetRequest {
 export const uploadDataset = async (
   file: File, modelId: string,
   onProgress?: (percent: number) => void,
-  options?: { uploadId?: string; signal?: AbortSignal; role?: 'train' | 'test' }
+  options?: { uploadId?: string; signal?: AbortSignal; role?: 'train' | 'test'; task?: 'detect' | 'segment' | 'obb' }
 ) => {
   const formData = new FormData()
   formData.append('file', file)
@@ -20,7 +20,8 @@ export const uploadDataset = async (
     params: {
       model_id: modelId,
       ...(options?.uploadId ? { upload_id: options.uploadId } : {}),
-      ...(options?.role ? { role: options.role } : {})
+      ...(options?.role ? { role: options.role } : {}),
+      ...(options?.task ? { task: options.task } : {})
     },
     signal: options?.signal,
     timeout: 0,
@@ -166,12 +167,14 @@ export const advanceBuckets = async () => {
 export const mergeDatasets = async (
   datasetIds: string[],
   libraryRootId?: string | null,
-  displayName?: string | null
+  displayName?: string | null,
+  dedup: boolean = true
 ) => {
   const { data } = await api.post('/datasets/merge', {
     dataset_ids: datasetIds,
     library_root_id: libraryRootId ?? null,
     display_name: displayName ?? null,
+    dedup,
   })
   return data
 }

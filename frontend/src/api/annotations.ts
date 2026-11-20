@@ -7,6 +7,8 @@ export interface BBox {
   x2: number
   y2: number
   polygon?: number[][]     // 分割轮廓（像素坐标 [[x,y],...]）；有则该框是分割标注
+  obb?: number[][]         // 旋转框四角点（像素坐标 [[x,y]×4]，顺时针）；与 polygon 互斥。
+                           // x1..y2 恒为四角点的外接矩形（后端 strip_ann_bbox 同口径）
   confidence?: number
   source?: string
   box_id?: number          // AI 预标注返回列表下标，用于映射千问审核结论

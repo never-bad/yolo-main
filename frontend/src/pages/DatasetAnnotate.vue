@@ -43,6 +43,7 @@
           >
             <div class="ds-card-header">
               <span class="ds-name">{{ dsTitle(ds) }}</span>
+              <span class="ds-task-text">类型：{{ taskBadgeLabel(ds) }}</span>
               <span :class="'status-badge status-' + ds.status">{{ getDatasetStatus(ds) }}</span>
             </div>
             <div class="ds-card-info">
@@ -74,6 +75,9 @@
         <h3 class="list-title" @dblclick="jumpToIndex" title="双击可跳转到指定张数">
           图片列表 ({{ visibleItems.length }}<span v-if="visibleItems.length !== items.length" class="list-count-total"> / {{ items.length }}</span>)
         </h3>
+        <div v-if="pinnedUnannotatedCount" class="pinned-hint" title="这些图刚才在「未标注」队列里标完，先留在列表方便连续翻图；换筛选或刷新列表后按真实状态重新归类">
+          含刚标注 {{ pinnedUnannotatedCount }} 张（继续翻图不受影响）
+        </div>
         <div v-if="importedCount > 0" class="import-info">
           已导入 {{ importedCount }} 个标注
         </div>
@@ -116,8 +120,9 @@
                   @click="setFilter('ai')"
                 >↳ AI标注（{{ counts.ai }}）</div>
               </div>
-              <!-- 轮廓质量：按"图上有没有轮廓 + 人工有没有修过"分三档，挑图精修不用自己翻 -->
-              <div class="filter-menu-group">
+              <!-- 轮廓质量：按"图上有没有轮廓 + 人工有没有修过"分三档，挑图精修不用自己翻。
+                   只对分割任务有意义：检测/旋转框数据集没有轮廓，这一组恒为「还没有」，纯干扰 -->
+              <div v-if="isSegTask" class="filter-menu-group">
                 <div class="filter-menu-item group-header label-only">轮廓质量</div>
                 <div
                   class="filter-menu-item sub"
@@ -262,27 +267,34 @@
             <span v-if="dupScanRunning" class="loading-spinner"></span>
             {{ dupScanRunning ? '重复图扫描中...' : '重复图扫描' }}
           </button>
+          <!-- 人工二审入口：批量审核 / 重复图扫描跑完后，跳审核台并排看图、批量通过/删除。
+               独立页面（新标签打开），审完点「审核完成」核对成果，再回本页刷新即可。 -->
+          <button class="ai-btn review-btn" @click="openReviewWorkbench" :disabled="!currentTask || !items.length"
+            title="打开人工审核台（新标签页）：并排看多张图，按问题类型分类，快速通过/删除、批量采纳 AI 建议、重复组只留一张。&#10;建议先跑「批量审核」和「重复图扫描」，审核台会直接按结论分类。&#10;审完在审核台点「审核完成」核对是否已写入数据集，再回本页点「刷新」。">
+            人工二审 →
+          </button>
           <!-- 一级入口：选哪个 AI 模型（原来藏在 ⋯更多 → 标注模型设置，不好找） -->
           <button class="ai-btn model-btn" @click="openModelCfg"
             :title="'当前 AI 识别模型：' + detectorLabel + '\n点击可选择/切换模型（支持多个引擎同时检测）'">
             模型: {{ detectorLabel }}
           </button>
-          <!-- 一级开关：AI 出的是「轮廓（多边形/分割）」还是「方框（四边形/检测）」 -->
-          <span class="shape-seg" :title="samOn
+          <!-- 一级开关：AI 出的是「轮廓（多边形/分割）」还是「方框（四边形/检测）」。
+               形态由数据集导入时声明的任务类型决定，检测/旋转框任务不给切（切了也不该出轮廓） -->
+          <span v-if="isSegTask" class="shape-seg" :title="samOn
             ? '当前 AI 沿目标边缘描轮廓 → 多边形分割标注（可训练分割模型，较慢）。\n图中特征：轮廓内有半透明填充、拐角是实心小方块，右侧列表带「分割」徽标'
             : '当前 AI 只画外接方框 → 普通检测标注（速度快）。\n图中特征：只有一圈边框线，选中后八向手柄可拉伸'">
             <button class="seg-btn" :class="{ active: samOn }" :disabled="samSaving" @click="setSamEnabled(true)">轮廓·分割</button>
             <button class="seg-btn" :class="{ active: !samOn }" :disabled="samSaving" @click="setSamEnabled(false)">方框·检测</button>
           </span>
-          <!-- 描轮廓绘制开关：选「轮廓·分割」时会自动进入，这里给一个显性的手动入口/退出 -->
-          <button class="ai-btn poly-toggle" :class="{ active: polyDrawMode }" @click="togglePolyDrawMode"
+          <!-- 描轮廓绘制开关：选「轮廓·分割」时会自动进入，这里给一个显性的手动入口/退出。仅分割任务 -->
+          <button v-if="isSegTask" class="ai-btn poly-toggle" :class="{ active: polyDrawMode }" @click="togglePolyDrawMode"
             :title="polyDrawMode
               ? '正在逐点描轮廓：左键逐个点顶点 · 回车或点回起点闭合 · Esc 取消本条 · 右键顶点删点。点此退出，恢复拖框绘制'
               : '手动描分割轮廓（多边形）：逐点落顶点，用于修正 AI 轮廓或精雕边界'">
             {{ polyDrawMode ? '描轮廓中·退出' : '手动描轮廓' }}
           </button>
-          <!-- 批量预标注是另一套开关（默认只出方框），这里明示避免分不清 -->
-          <button class="shape-note" @click="openModelCfg"
+          <!-- 批量预标注是另一套开关（默认只出方框），这里明示避免分不清。仅分割任务 -->
+          <button v-if="isSegTask" class="shape-note" @click="openModelCfg"
             title="批量预标注默认只出方框（比出轮廓快一倍以上）；点这里在「AI 标注模型设置」里勾选「批量也描轮廓」">
             批量出: {{ batchSamOn ? '轮廓' : '方框' }}
           </button>
@@ -400,30 +412,36 @@
             class="view-hint poly-hint"
             title="空白处左键逐个点顶点 · 点回起点或按回车闭合成一个分割标注 · 绘制中右键=删上一个点 · Esc 取消本条 · 按 F 复位视图 · 已有目标：点住白色方块拖动改拐点、点轮廓内部拖动整体平移、边上空心圆加点、右键点删点"
           >描轮廓中：空白处逐点画新轮廓 · 点已有目标先选中，拖方块改拐点、拖内部平移</span>
+          <span v-else-if="isObbTask" class="view-hint" title="滚轮缩放 · 空格+拖拽平移 · 按 F 或双击复位 · 空白处拖框新建旋转框 · 选中后拖四角方块改角点、拖顶部圆柄旋转（按住 Shift 每 15° 吸附）· 拖框内部整体平移 · 按 C 清空本图所有标注框（Ctrl+Z 撤销）">滚轮缩放 · 拖框画旋转框 · 拖角点改形 · 拖圆柄旋转(Shift 15°) · 按 F 复位</span>
           <span v-else class="view-hint" title="滚轮缩放 · 空格+拖拽平移 · 按 F 或双击复位 · 拖框移动/角点缩放 · 分割目标：点住拐点直接拖、拖轮廓内部整体平移 · 按 G 进入智能抠图（点哪儿抠哪儿）· 按 C 清空本图所有标注框（Ctrl+Z 撤销）">滚轮缩放 · 拖框绘制 · 按 F 复位 · 按 G 抠图 · 按 C 清空</span>
           <span>缩放 {{ Math.round(viewScale * 100) }}%</span>
           <button class="small" @click.stop="zoomBy(1.2)" title="放大">+</button>
           <button class="small" @click.stop="zoomBy(1 / 1.2)" title="缩小">−</button>
           <button class="small" @click.stop="fitView" title="适应窗口">适应窗口</button>
+          <!-- 以下四项都是分割轮廓专用（描点 / 判边 / 贴边 / 掩码填充），
+               检测与旋转框任务下没有轮廓可描，一律隐藏，工具条只留缩放三件 -->
           <button
+            v-if="isSegTask"
             class="small"
             :class="{ active: polyDrawMode }"
             @click.stop="togglePolyDrawMode"
             title="手动描分割轮廓（多边形）：用于修正 AI 轮廓或给目标精雕边界"
           >{{ polyDrawMode ? '退出轮廓绘制' : '轮廓绘制' }}</button>
           <button
+            v-if="isSegTask"
             class="small"
             :class="{ active: edgeOverlayOn }"
             @click.stop="edgeOverlayOn = !edgeOverlayOn; onEdgeOverlayToggle()"
             title="边缘增强叠加层（快捷键 E）：青色细线显形 Sobel 强梯度（水陆过渡带、纹理恢复线），用于规范 v1.3 §1.6 的 B/C 类模糊边界判边"
           >边缘</button>
           <button
+            v-if="isSegTask"
             class="small"
             :class="{ active: snapToEdgeOn }"
             @click.stop="snapToEdgeOn = !snapToEdgeOn; onSnapToggle()"
             title="顶点吸附（快捷键 S）：落点/拖点自动贴到半径内最强边缘（A/B 类边界可压到 ±2px）。C 类不可见边界按物理线索画时建议关闭"
           >吸附</button>
-          <label class="alpha-ctl" title="分割标注内部填充的遮盖度：调低看清水面原貌，调高看清标注范围；0=只显示描边">
+          <label v-if="isSegTask" class="alpha-ctl" title="分割标注内部填充的遮盖度：调低看清水面原貌，调高看清标注范围；0=只显示描边">
             填充
             <input type="range" min="0" max="0.4" step="0.02" v-model.number="maskAlpha" @input="onMaskAlphaChange" />
           </label>
@@ -505,9 +523,11 @@
               <div v-else-if="taskDatasetId && counts.total > 0" class="menu-hint" :title="approveHintTitle">
                 {{ approveHintText }}
               </div>
-              <button @click="exportReviewedPackage(); moreOpen = false" :disabled="exportingReviewed || counts.reviewed === 0" title="只把人工修过（筛子里“轮廓·已修过”）的图片+YOLO标签打包成 zip 下载，labels 为分割格式，解压即可用">
+              <!-- 「已修过」= 人工复核标记（reviewed），三种任务通用；
+                   标签格式由后端按数据集任务类型写（detect 5 列 / segment 多边形 / obb 四角点） -->
+              <button @click="exportReviewedPackage(); moreOpen = false" :disabled="exportingReviewed || counts.reviewed === 0" :title="'只把人工复核过的图片+YOLO标签打包成 zip 下载，labels 按本数据集任务类型写（' + (isObbTask ? '旋转框四角点' : isSegTask ? '分割多边形' : '检测方框') + '），解压即可用'">
                 <span v-if="exportingReviewed" class="loading-spinner"></span>
-                {{ exportingReviewed ? '打包中...' : `导出已修过 zip（${counts.reviewed}）` }}
+                {{ exportingReviewed ? '打包中...' : `导出已复核 zip（${counts.reviewed}）` }}
               </button>
               <label class="import-label" title="导入 X-AnyLabeling 等外部工具导出的 YOLO 标注（zip 内含 labels/*.txt）">
                 <input type="file" accept=".zip" class="import-input" @change="onImportYolo" />
@@ -586,6 +606,7 @@
             <span class="box-color" :style="{ background: classColors[box.class_id] || '#999' }"></span>
             <span class="box-class-name" :title="classes[box.class_id] || ('类别' + box.class_id)">{{ classes[box.class_id] || ('类别' + box.class_id) }}</span>
             <span v-if="box.polygon && box.polygon.length >= 3" class="seg-chip" :title="'分割标注：' + box.polygon.length + ' 个轮廓顶点（选中后可在图上拖点微调）'">分割</span>
+            <span v-else-if="box.obb && box.obb.length === 4" class="seg-chip obb-chip" :title="'旋转框：角度 ' + obbAngleDeg(box.obb).toFixed(1) + '°（选中后拖四角改形、拖顶部圆柄旋转）'">旋转 {{ obbAngleDeg(box.obb).toFixed(0) }}°</span>
             <span
               v-if="box.audit"
               class="audit-chip"
@@ -603,6 +624,29 @@
             <button v-if="box.audit?.sub_bboxes?.length >= 2" class="small fix-btn suggest-btn" @click.stop="adoptSubBoxes(idx)" :title="'采纳 AI 拆分建议：把这个粘连框拆成 ' + box.audit.sub_bboxes.length + ' 个独立目标框（画布绿虚线位置），Ctrl+Z 可撤销'">
               拆{{ box.audit.sub_bboxes.length }}框
             </button>
+            <!-- 旋转框数据集里，历史水平框（AI 预标注/旧导入）给一个显式转换入口 -->
+            <button
+              v-if="isObbTask && !(box.obb && box.obb.length === 4)"
+              class="small fix-btn"
+              @click.stop="convertBoxToObb(idx)"
+              title="把这个水平框转成旋转框（四角点），转换后可拖角点改形、拖圆柄旋转"
+            >转旋转框</button>
+            <!-- 角度精调：只对选中的旋转框显示，避免每行都塞一个输入框把列表撑爆 -->
+            <span
+              v-if="isObbTask && idx === selectedBoxIndex && box.obb && box.obb.length === 4"
+              class="obb-angle-ctl"
+              @click.stop
+              title="旋转框角度（度，第 0→1 边与水平方向的夹角）：输入数值回车即精确定角，也可用上下方向键微调"
+            >
+              <input
+                type="number"
+                class="obb-angle-input"
+                step="1"
+                v-model="obbAngleText"
+                @keydown.enter.prevent="commitObbAngle(idx)"
+                @blur="commitObbAngle(idx)"
+              />°
+            </span>
             <select :value="box.class_id" class="box-class-select" :title="classes[box.class_id] || ''" @click.stop @change="onBoxClassChange($event, idx)">
               <option v-for="(cls, cIdx) in classes" :key="cIdx" :value="cIdx">{{ cls }}</option>
             </select>
@@ -733,7 +777,9 @@
           </p>
         </template>
       </div>
-      <div class="cfg-block">
+      <!-- 标注形态只对分割任务开放：检测/旋转框数据集的形态由导入时声明的任务类型定死，
+           在这里勾轮廓只会产出与任务不符的标签 -->
+      <div class="cfg-block" v-if="isSegTask">
         <span class="cfg-title">标注形态：轮廓（多边形）还是方框（四边形）</span>
         <label class="row">
           <input type="checkbox" v-model="samEnabledModel" />
@@ -744,6 +790,15 @@
           <span>「批量预标注」也描轮廓 <em class="dim">（默认不勾：批量只出方框，速度快一倍以上）</em></span>
         </label>
         <p class="hint">怎么在图上分辨两种标注：<b>轮廓</b>=形状内有半透明填充、拐角是实心小方块（可拖动微调）、右侧列表带「分割」徽标；<b>方框</b>=只有一圈边框线、选中后八个手柄拉伸。</p>
+      </div>
+      <div class="cfg-block" v-else>
+        <span class="cfg-title">标注形态</span>
+        <p class="hint">
+          本数据集任务类型为 <b>{{ isObbTask ? '旋转框（obb）' : '检测（detect）' }}</b>，形态在导入时已确定，不能在这里切换。<br />
+          {{ isObbTask
+            ? 'AI 预标注先出水平框，人工在框列表点「转旋转框」后拖角点/圆柄摆正角度；保存时统一写成四角点格式。'
+            : 'AI 预标注只出水平方框；如需分割轮廓，请在上传数据集时选「分割」任务类型。' }}
+        </p>
       </div>
       <div class="cfg-block">
         <span class="cfg-title">AI 阈值</span>
@@ -969,6 +1024,15 @@ const cleaningAudit = ref(false)
 const approvingReview = ref(false)
 const taskDatasetMeta = computed(() =>
   (datasets.value || []).find((d: any) => d.dataset_id === taskDatasetId.value) || null)
+// 当前任务数据集的任务类型（导入时声明，后端 list/get 统一暴露）：
+// detect=水平框（存量默认）/ segment=分割轮廓 / obb=旋转框。
+// 工具条按钮显隐、画布画法、保存读法全按它走；读不到一律 detect，存量零感知。
+const dsTask = computed<'detect' | 'segment' | 'obb'>(() => {
+  const t = String(taskDatasetMeta.value?.task || '').trim().toLowerCase()
+  return (t === 'segment' || t === 'obb') ? t : 'detect'
+})
+const isObbTask = computed(() => dsTask.value === 'obb')
+const isSegTask = computed(() => dsTask.value === 'segment')
 const approveEligible = computed(() => {
   const d = taskDatasetMeta.value
   if (!d || !taskDatasetId.value) return false
@@ -1027,6 +1091,16 @@ const getDatasetStatus = (dataset: any) => {
   if (dataset.status === 'uploaded') return '已上传'
   return dataset.status || '未知'
 }
+
+// 数据集卡片上的任务类型徽标：detect=检测 / segment=分割 / obb=旋转框。
+// 后端 list_datasets 已统一暴露 task（存量无值兜底 detect），这里只做归一化和文案映射，
+// 避免同一份「detect/segment/obb → 中文」判断在两个页面各写一遍。
+const taskOf = (ds: any): 'detect' | 'segment' | 'obb' => {
+  const t = String(ds?.task || '').trim().toLowerCase()
+  return t === 'segment' || t === 'obb' ? t : 'detect'
+}
+const TASK_BADGE: Record<string, string> = { detect: '目标检测', segment: '实例分割', obb: '旋转框检测' }
+const taskBadgeLabel = (ds: any) => TASK_BADGE[taskOf(ds)]
 
 // 标注页只展示"已准备"的数据集（未准备无法创建标注任务）
 const preparedDatasets = computed(() => {
@@ -1176,6 +1250,10 @@ const adoptSuggest = async () => {
 const canvasRef = ref<HTMLCanvasElement | null>(null)
 const ctx = ref<CanvasRenderingContext2D | null>(null)
 const img = ref<HTMLImageElement | null>(null)
+// 切图时序闸门：图片 onload 之前禁止 redrawCanvas 画框，否则新框会先画在上一张图上。
+// loadToken 让快速连点时的过期 onload 直接作废，防止旧图后到覆盖新图。
+const imageReady = ref(false)
+let imageLoadToken = 0
 const isDrawing = ref(false)
 const startPos = ref({ x: 0, y: 0 })
 const currentPos = ref({ x: 0, y: 0 })
@@ -1276,10 +1354,35 @@ const panStart = ref({ x: 0, y: 0 })
 const spaceDown = ref(false)
 
 // 交互/编辑状态
-const editMode = ref<'idle' | 'draw' | 'move' | 'resize' | 'vertex'>('idle')
+const editMode = ref<'idle' | 'draw' | 'move' | 'resize' | 'vertex' | 'obb_corner' | 'obb_rotate'>('idle')
 const resizeHandle = ref(-1)  // 控制点索引 0-3 角 / 4-7 边
 const moveStartPt = ref<{ x: number; y: number } | null>(null)
 const origBox = ref<BBox | null>(null)
+// 旋转框编辑状态：被拖的角点下标（0-3）；旋转柄按下时的起始角度
+const obbCornerIdx = ref(-1)
+const obbRotateStart = ref<{ angle: number; pts: number[][] } | null>(null)
+// 旋转柄位置：顶边中点沿外法线方向外推 24 屏幕像素
+const obbRotateHandlePos = (pts: number[][]) => {
+  const mx = (pts[0][0] + pts[1][0]) / 2
+  const my = (pts[0][1] + pts[1][1]) / 2
+  const c = obbCenter(pts)
+  let nx = mx - c.x, ny = my - c.y
+  const len = Math.hypot(nx, ny) || 1
+  const d = 24 / viewScale.value
+  return { x: mx + nx / len * d, y: my + ny / len * d, mx, my }
+}
+// 命中旋转框手柄：0-3=四角点，4=旋转柄，-1=未命中
+const hitObbHandle = (idx: number, p: { x: number; y: number }) => {
+  const pts = obbOf(currentBoxes.value[idx])
+  if (!pts) return -1
+  const r = hitRadius()
+  for (let i = 0; i < 4; i++) {
+    if (Math.abs(p.x - pts[i][0]) <= r && Math.abs(p.y - pts[i][1]) <= r) return i
+  }
+  const h = obbRotateHandlePos(pts)
+  if (Math.abs(p.x - h.x) <= r && Math.abs(p.y - h.y) <= r) return 4
+  return -1
+}
 
 // ----------------------------------------------------------------------
 // 分割轮廓（多边形）交互状态
@@ -1297,6 +1400,74 @@ const hitRadius = () => 9 / viewScale.value
 // 取框的轮廓（不足 3 点视为无轮廓 = 普通检测框）
 const polyOf = (b: BBox | null | undefined): number[][] | null =>
   (Array.isArray(b?.polygon) && (b!.polygon as number[][]).length >= 3 ? (b!.polygon as number[][]) : null)
+
+// ----------------------------------------------------------------------
+// 旋转框（OBB）工具函数：四角点 [[x,y]×4] 与外接矩形同步，obb 与 polygon 互斥
+// ----------------------------------------------------------------------
+const obbOf = (b: BBox | null | undefined): number[][] | null =>
+  (Array.isArray(b?.obb) && (b!.obb as number[][]).length === 4 ? (b!.obb as number[][]) : null)
+
+// 水平矩形 → 0° 旋转框四角点（左上起顺时针）
+const rectToObb = (x1: number, y1: number, x2: number, y2: number): number[][] =>
+  [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+
+// 四角点外接矩形写回 x1..y2（与后端 polygon_to_bbox 同口径）
+const syncBBoxFromObb = (b: BBox) => {
+  const pts = obbOf(b)
+  if (!pts) return
+  let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity
+  pts.forEach(pt => {
+    x1 = Math.min(x1, pt[0]); y1 = Math.min(y1, pt[1])
+    x2 = Math.max(x2, pt[0]); y2 = Math.max(y2, pt[1])
+  })
+  b.x1 = x1; b.y1 = y1; b.x2 = x2; b.y2 = y2
+}
+
+// 四角点质心（旋转中心）
+const obbCenter = (pts: number[][]) => ({
+  x: pts.reduce((s, p) => s + p[0], 0) / 4,
+  y: pts.reduce((s, p) => s + p[1], 0) / 4,
+})
+
+// 旋转框角度（度）：取第 0→1 边与水平方向的夹角，归一化到 [-90, 90)
+const obbAngleDeg = (pts: number[][]): number => {
+  const dx = pts[1][0] - pts[0][0], dy = pts[1][1] - pts[0][1]
+  let a = Math.atan2(dy, dx) * 180 / Math.PI
+  while (a >= 90) a -= 180
+  while (a < -90) a += 180
+  return a
+}
+
+// 绕质心旋转四角点（角度制），返回新数组
+const rotateObb = (pts: number[][], deg: number): number[][] => {
+  const c = obbCenter(pts)
+  const rad = deg * Math.PI / 180
+  const cos = Math.cos(rad), sin = Math.sin(rad)
+  return pts.map(p => {
+    const dx = p[0] - c.x, dy = p[1] - c.y
+    return [c.x + dx * cos - dy * sin, c.y + dx * sin + dy * cos]
+  })
+}
+
+// 四角点逐点钳制到图内（与后端 _clamp_boxes_to_image 同口径：钳后零面积丢弃由调用方判）
+const clampObbToImage = (pts: number[][]): number[][] => {
+  const iw = img.value?.width || 0
+  const ih = img.value?.height || 0
+  return pts.map(p => [
+    iw > 0 ? Math.min(Math.max(p[0], 0), iw) : p[0],
+    ih > 0 ? Math.min(Math.max(p[1], 0), ih) : p[1],
+  ])
+}
+
+// 旋转框面积（鞋带公式）：钳制后判零面积用
+const obbArea = (pts: number[][]): number => {
+  let s = 0
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length]
+    s += a[0] * b[1] - b[0] * a[1]
+  }
+  return Math.abs(s) / 2
+}
 
 // 有轮廓时矩形必须跟着轮廓走，否则导出会出现"框与分割掩码不符"
 const syncBBoxFromPolygon = (b: BBox) => {
@@ -1327,6 +1498,14 @@ const applyMove = (box: BBox, orig: BBox, dx: number, dy: number) => {
       p[i][1] = op[i][1] + dy
     }
   }
+  // 旋转框：四角点随外接矩形一起平移（dx/dy 已按外接矩形钳过，角点必在图内）
+  const oo = obbOf(orig), ob = obbOf(box)
+  if (oo && ob) {
+    for (let i = 0; i < 4; i++) {
+      ob[i][0] = oo[i][0] + dx
+      ob[i][1] = oo[i][1] + dy
+    }
+  }
 }
 
 // 射线法：点是否落在多边形轮廓内
@@ -1340,8 +1519,12 @@ const pointInPolygon = (p: { x: number; y: number }, poly: number[][]) => {
   return inside
 }
 
-// 复制一份框（轮廓必须深拷贝，否则拖动时 origBox 与当前框共享同一数组）
-const cloneBox = (b: BBox): BBox => ({ ...b, polygon: polyOf(b)?.map(pt => [pt[0], pt[1]]) })
+// 复制一份框（轮廓/旋转框角点必须深拷贝，否则拖动时 origBox 与当前框共享同一数组）
+const cloneBox = (b: BBox): BBox => ({
+  ...b,
+  polygon: polyOf(b)?.map(pt => [pt[0], pt[1]]),
+  obb: obbOf(b)?.map(pt => [pt[0], pt[1]]),
+})
 
 // 命中选中框的轮廓顶点：返回 ≥0 为顶点下标，-(边下标+2) 为该边中点（点击即插入新顶点），-1 未命中
 const hitVertex = (idx: number, p: { x: number; y: number }) => {
@@ -1378,6 +1561,8 @@ const hitPolygonInterior = (p: { x: number; y: number }) => {
 const pointInsideBox = (b: BBox, p: { x: number; y: number }) => {
   const poly = polyOf(b)
   if (poly) return pointInPolygon(p, poly)
+  const ob = obbOf(b)
+  if (ob) return pointInPolygon(p, ob)
   return p.x >= b.x1 && p.x <= b.x2 && p.y >= b.y1 && p.y <= b.y2
 }
 
@@ -1550,6 +1735,11 @@ const addDraftPoint = (p: { x: number; y: number }) => {
 
 // 启用/退出多边形绘制模式（与交互式标注互斥，两者都要用鼠标框选）
 const togglePolyDrawMode = () => {
+  // 任务类型闸门：检测/旋转框数据集不该出轮廓（按钮已隐藏，这里挡住快捷键与残留调用）
+  if (!isSegTask.value) {
+    showToast('当前数据集是「' + (isObbTask.value ? '旋转框' : '检测') + '」任务，不支持描轮廓；如需分割请在导入时选「分割」', 'info')
+    return
+  }
   polyDrawMode.value = !polyDrawMode.value
   polyPending.value = null
   if (!polyDrawMode.value) cancelPolygonDraft()
@@ -1679,6 +1869,7 @@ const batchSamModel = computed({
 // 形态开关联动画布绘制方式：切到「轮廓·分割」= 自动进入逐点描轮廓（和 CVAT 切换工具一致）
 watch(samOn, (on) => {
   if (!img.value) return // 还没打开图片时不预设，避免一进页面就被锁成描轮廓
+  if (!isSegTask.value) return // 非分割任务：全局 SAM 开关变化不该把画布锁进描轮廓
   polyDrawMode.value = on
   if (on) {
     interactiveMode.value = false
@@ -1691,6 +1882,20 @@ watch(samOn, (on) => {
     showToast('已退出描轮廓：可以直接在图上拖框绘制', 'info')
   }
   redrawCanvas()
+})
+// 换任务（换数据集）时，分割专属的绘制模式必须复位：
+// 上一个分割任务留在描轮廓/抠图态，切到检测/旋转框任务后左键仍被逐点占用，
+// 按钮又已隐藏，用户会以为画布坏了。轮廓质量筛选同理要退回「全部」。
+watch(dsTask, (t) => {
+  if (t === 'segment') return
+  if (polyDrawMode.value || cutoutMode.value || polyDraft.value.length) {
+    polyDrawMode.value = false
+    polyPending.value = null
+    cancelPolygonDraft()
+    exitCutoutMode()
+    redrawCanvas()
+  }
+  if (String(imageFilter.value).startsWith('poly_')) imageFilter.value = 'all'
 })
 const batchId = ref<string | null>(null)
 const batchProgress = ref<any>(null)
@@ -1919,7 +2124,23 @@ const currentFilterLabel = computed(() => {
 const setFilter = (val: FilterKey) => {
   imageFilter.value = val
   filterOpen.value = false
+  // 换筛选=用户主动重建队列，之前的「刚标注仍留在未标注队列」钉住项一并失效
+  pinnedUnannotated.value = new Set()
 }
+
+// 「未标注」队列钉住项：标完一张后 row.annotated 会变 true，
+// 若立刻从未标注列表移除，用户就没法在当前队列里上一张/下一张连续标了。
+// 这里把本次会话里在「未标注」筛选下标过的图钉住，直到用户主动换筛选或刷新列表。
+// 只影响列表呈现，counts.unannotated 仍按真实状态递减，不伪造统计。
+const pinnedUnannotated = ref<Set<string>>(new Set())
+const pinnedUnannotatedCount = computed(() => {
+  if (imageFilter.value !== 'unannotated') return 0
+  let n = 0
+  for (const it of items.value) {
+    if (it.annotated && pinnedUnannotated.value.has(it.image_id)) n += 1
+  }
+  return n
+})
 // 从 classify 结果一次性构建两张映射表：
 //  - image_id → primary_type（徽标/筛选计数）
 //  - image_id → 重复组 group_id（duplicate 明细里带，供重复图片按组相邻排列）
@@ -1983,7 +2204,7 @@ const filteredItems = computed(() => {
     case 'annotated': return items.value.filter(i => i.annotated)
     case 'ai': return items.value.filter(i => i.ai_annotated)
     case 'manual': return items.value.filter(i => i.annotated && !i.ai_annotated)
-    case 'unannotated': return items.value.filter(i => !i.annotated)
+    case 'unannotated': return items.value.filter(i => !i.annotated || pinnedUnannotated.value.has(i.image_id))
     case 'poly_refined': return items.value.filter(i => i.has_polygon && i.reviewed)
     case 'poly_draft': return items.value.filter(i => i.has_polygon && !i.reviewed)
     case 'poly_none': return items.value.filter(i => !i.has_polygon)
@@ -2153,7 +2374,9 @@ const createTask = async () => {
 
 const loadTaskItems = async () => {
   if (!currentTask.value) return
-  
+  // 重新拉列表=队列重建（用户刷新 / 审核台回传 / 换任务），钉住项失效
+  pinnedUnannotated.value = new Set()
+
   loadingItems.value = true
   try {
     const result = await getTaskItems(currentTask.value)
@@ -2316,6 +2539,11 @@ const restoreAnnotateState = async () => {
   try {
     const result = await getTaskItems(currentTask.value)
     items.value = result.items
+    // 刷新恢复必须和 loadTaskItems 一样回填数据集 id：
+    // taskDatasetMeta / dsTask 全靠它取，漏了之后刷新页面（URL 参数已被 replace 清掉）
+    // 会把分割/OBB 数据集退回 detect，轮廓筛选和旋转框工具条凭空消失。
+    taskDatasetId.value = result.dataset_id || ''
+    taskModelId.value = result.model_id || ''
     if (result.classes && result.classes.length > 0) {
       classes.value = result.classes
       classesInput.value = result.classes.join(', ')
@@ -2373,13 +2601,16 @@ const selectImage = async (index: number) => {
   manualTouched.value = false
 
   await nextTick()
-  
-  // 如果图片已有标注，先加载标注
-  if (currentImage.value.annotated && currentTask.value) {
-    await loadExistingAnnotation()
-  }
-  
-  loadImageToCanvas()
+
+  // 图片与标注并行取，但图片必须先落下 imageReady=false 闸门再发标注请求：
+  // 标注先回时只写数据，redrawCanvas 被闸门挡住；图片 onload 的 fitView 会用已到的框重绘。
+  // 两个请求并行，切图总时长从「图片 + 标注」降到 max(图片, 标注)，不会因防框先出现而变慢。
+  const imagePromise = loadImageToCanvas()
+  const annotationPromise = (currentImage.value.annotated && currentTask.value)
+    ? loadExistingAnnotation()
+    : Promise.resolve()
+  await Promise.all([imagePromise, annotationPromise])
+
   saveAnnotateState()
 }
 
@@ -2409,6 +2640,8 @@ const loadExistingAnnotation = async () => {
         y2: box.y2,
         // 分割轮廓必须回填，否则重新打开图片时分割标注只剩矩形（顶点也就无从微调）
         ...(box.polygon && box.polygon.length >= 3 ? { polygon: box.polygon as number[][] } : {}),
+        // 旋转框四角点同理：不回填就只剩外接矩形，角度信息丢失（保存是整体覆盖写）
+        ...(box.obb && box.obb.length === 4 ? { obb: box.obb as number[][] } : {}),
         // 这三个字段必须原样带回：保存是「整体覆盖写」，不回填就等于
         // 一改框就把大模型审核结论（audit）、置信度、来源全清掉，
         // 该图也会从「问题图」队列里静默消失。
@@ -2445,61 +2678,79 @@ const loadExistingAnnotation = async () => {
   }
 }
 
-const loadImageToCanvas = () => {
-  if (!currentImage.value || !canvasRef.value) return
-  // 切图先清掉上一张的边缘数据：onload 前若有重绘（fitView/标注刷新），旧图叠加层会"残留"到新图上
-  edgeData = null
-  edgeOverlayCanvas = null
-
-  const canvas = canvasRef.value
-  ctx.value = canvas.getContext('2d')
-  
-  // 处理图片路径
-  // 后端返回的路径应该是相对于 DATA_DIR 的（例如：datasets/ds_xxx/images/xxx.jpg）
-  // 静态文件服务挂载在 /static，目录是 backend/data
-  // 所以需要：/static/datasets/...
-  let imagePath = currentImage.value.image_path
-  // 统一转换为正斜杠
-  imagePath = imagePath.replace(/\\/g, '/')
-  // 去掉可能的 backend/data/ 或 data/ 前缀（兼容旧格式）
-  imagePath = imagePath.replace(/^(backend\/)?data\//, '')
-  // 确保路径不以 / 开头（因为会加上 /prod-api/static/ 前缀）
-  imagePath = imagePath.replace(/^\//, '')
-  // 静态文件路径统一走 /prod-api/static 通道（经 nginx 重写到后端 /static，兼容外网隧道/反代）
-  const imageUrl = '/prod-api/static/' + imagePath
-  
-  img.value = new Image()
-  img.value.crossOrigin = 'anonymous'
-  
-  img.value.onload = () => {
-    if (!img.value || !ctx.value) return
-    canvas.width = img.value.width
-    canvas.height = img.value.height
-
-    // 边缘辅助：离线构建 Sobel 梯度场与叠加层（异步不阻塞首帧）
-    setTimeout(buildEdgeMap, 0)
-
-    // 新图片加载后重置视图并居中
-    fitView()
-
-    // 绘制已有标注
-    if (currentBoxes.value.length > 0) {
-      redrawCanvas()
+const loadImageToCanvas = (): Promise<void> => {
+  return new Promise<void>((resolve) => {
+    if (!currentImage.value || !canvasRef.value) {
+      resolve()
+      return
     }
-  }
-  
-  img.value.onerror = (error) => {
-    console.error('Image load error:', {
-      url: imageUrl,
-      originalPath: currentImage.value.image_path,
-      error
-    })
-    // 显示更友好的错误提示
-    const errorMsg = `图片加载失败\n路径: ${imageUrl}\n\n请检查：\n1. 后端服务是否运行\n2. 静态文件服务是否正常\n3. 图片文件是否存在`
-    showToast(errorMsg, 'error', 5000)
-  }
-  
-  img.value.src = imageUrl
+    const token = ++imageLoadToken
+    const wantedId = currentImage.value.image_id
+    // 切图第一帧先清屏：旧图旧框不能留在新图加载的空窗里
+    imageReady.value = false
+
+    // 切图先清掉上一张的边缘数据：onload 前若有重绘（fitView/标注刷新），旧图叠加层会"残留"到新图上
+    edgeData = null
+    edgeOverlayCanvas = null
+
+    const canvas = canvasRef.value
+    ctx.value = canvas.getContext('2d')
+    ctx.value?.clearRect(0, 0, canvas.width, canvas.height)
+
+    // 处理图片路径
+    // 后端返回的路径应该是相对于 DATA_DIR 的（例如：datasets/ds_xxx/images/xxx.jpg）
+    // 静态文件服务挂载在 /static，目录是 backend/data
+    // 所以需要：/static/datasets/...
+    let imagePath = currentImage.value.image_path
+    // 统一转换为正斜杠
+    imagePath = imagePath.replace(/\\/g, '/')
+    // 去掉可能的 backend/data/ 或 data/ 前缀（兼容旧格式）
+    imagePath = imagePath.replace(/^(backend\/)?data\//, '')
+    // 确保路径不以 / 开头（因为会加上 /prod-api/static/ 前缀）
+    imagePath = imagePath.replace(/^\//, '')
+    // 静态文件路径统一走 /prod-api/static 通道（经 nginx 重写到后端 /static，兼容外网隧道/反代）
+    const imageUrl = '/prod-api/static/' + imagePath
+
+    const next = new Image()
+    next.crossOrigin = 'anonymous'
+
+    next.onload = () => {
+      // 快速连点切图时，后到的旧图直接作废，不能覆盖当前选中图
+      if (token !== imageLoadToken || currentImage.value?.image_id !== wantedId) {
+        resolve()
+        return
+      }
+      img.value = next
+      canvas.width = next.width
+      canvas.height = next.height
+      imageReady.value = true
+
+      // 边缘辅助：离线构建 Sobel 梯度场与叠加层（异步不阻塞首帧）
+      setTimeout(buildEdgeMap, 0)
+
+      // 新图片加载后重置视图并居中（fitView 内部会 redrawCanvas，此时画的是新图）
+      fitView()
+      resolve()
+    }
+
+    next.onerror = (error) => {
+      if (token !== imageLoadToken) {
+        resolve()
+        return
+      }
+      console.error('Image load error:', {
+        url: imageUrl,
+        originalPath: currentImage.value?.image_path,
+        error
+      })
+      imageReady.value = false
+      const errorMsg = `图片加载失败\n路径: ${imageUrl}\n\n请检查：\n1. 后端服务是否运行\n2. 静态文件服务是否正常\n3. 图片文件是否存在`
+      showToast(errorMsg, 'error', 5000)
+      resolve()
+    }
+
+    next.src = imageUrl
+  })
 }
 
 // 画布尺寸 = 容器尺寸，图片居中显示，四周有留白；留白区也能按下/松手，
@@ -2592,14 +2843,21 @@ const onCanvasLeave = () => {
 const hitBox = (p: { x: number; y: number }) => {
   const cur = currentClass.value
   const visible = (b: BBox) => String(cur) === '-1' || b.class_id === Number(cur)
-  // 第一轮：精确命中（分割框=点在轮廓内，检测框=点在矩形内）
+  // 第一轮：精确命中（分割框=点在轮廓内，旋转框=点在四角形内，检测框=点在矩形内）
   for (let i = currentBoxes.value.length - 1; i >= 0; i--) {
     const b = currentBoxes.value[i]
     if (!visible(b)) continue
     const poly = polyOf(b)
     if (poly) {
       if (pointInPolygon(p, poly)) return i
-    } else if (p.x >= b.x1 && p.x <= b.x2 && p.y >= b.y1 && p.y <= b.y2) {
+      continue
+    }
+    const ob = obbOf(b)
+    if (ob) {
+      if (pointInPolygon(p, ob)) return i
+      continue
+    }
+    if (p.x >= b.x1 && p.x <= b.x2 && p.y >= b.y1 && p.y <= b.y2) {
       return i
     }
   }
@@ -2617,6 +2875,8 @@ const hitHandle = (idx: number, p: { x: number; y: number }) => {
   const b = currentBoxes.value[idx]
   // 分割框不允许拖角缩放：矩形是由轮廓反推出来的，单独改矩形会让框与轮廓对不上
   if (!b || polyOf(b)) return -1
+  // 旋转框走专用手柄（四角+旋转柄），不走八向矩形手柄
+  if (obbOf(b)) return -1
   const hw = 10 / viewScale.value
   const pts = [
     { x: b.x1, y: b.y1 }, { x: (b.x1 + b.x2) / 2, y: b.y1 }, { x: b.x2, y: b.y1 },
@@ -2737,6 +2997,26 @@ const startDrawing = (e: MouseEvent) => {
   // 1.5) 贴住轮廓边（放大后没点准拐点）→ 在投影点插顶点并拖动，避免误触发整体平移
   const en = hitPolyEdgeNear(p)
   if (en && grabEdgeVertex(en[0], en[1], en[2], en[3])) return
+  // 1.8) 旋转框手柄：四角点拖动改形 / 旋转柄绕质心转（obb 数据集专用）
+  if (selectedBoxIndex.value >= 0 && obbOf(currentBoxes.value[selectedBoxIndex.value])) {
+    const oh = hitObbHandle(selectedBoxIndex.value, p)
+    if (oh >= 0) {
+      const box = currentBoxes.value[selectedBoxIndex.value]
+      origBox.value = cloneBox(box)
+      pushUndo()
+      if (oh === 4) {
+        editMode.value = 'obb_rotate'
+        const pts = obbOf(box)!
+        const c = obbCenter(pts)
+        obbRotateStart.value = { angle: Math.atan2(p.y - c.y, p.x - c.x), pts: pts.map(q => [q[0], q[1]]) }
+      } else {
+        editMode.value = 'obb_corner'
+        obbCornerIdx.value = oh
+      }
+      redrawCanvas()
+      return
+    }
+  }
   // 2) 命中矩形控制点 → 缩放
   if (selectedBoxIndex.value >= 0) {
     const h = hitHandle(selectedBoxIndex.value, p)
@@ -2830,6 +3110,37 @@ const drawing = (e: MouseEvent) => {
   if (editMode.value === 'resize' && selectedBoxIndex.value >= 0) {
     applyResize(screenToImg(e))
     redrawCanvas()
+    return
+  }
+  // 旋转框角点拖动：只动被抓住的那个角，外接矩形实时跟着反推
+  if (editMode.value === 'obb_corner' && selectedBoxIndex.value >= 0 && obbCornerIdx.value >= 0) {
+    const box = currentBoxes.value[selectedBoxIndex.value]
+    const pts = obbOf(box)
+    if (pts) {
+      const p = screenToImg(e)
+      pts[obbCornerIdx.value] = [p.x, p.y]
+      syncBBoxFromObb(box)
+      redrawCanvas()
+    }
+    return
+  }
+  // 旋转柄拖动：绕质心整体旋转（每次从按下时的快照重放，避免累加漂移）
+  if (editMode.value === 'obb_rotate' && selectedBoxIndex.value >= 0 && obbRotateStart.value) {
+    const box = currentBoxes.value[selectedBoxIndex.value]
+    const pts = obbOf(box)
+    if (pts) {
+      const p = screenToImg(e)
+      const c = obbCenter(obbRotateStart.value.pts)
+      const a = Math.atan2(p.y - c.y, p.x - c.x)
+      let deg = (a - obbRotateStart.value.angle) * 180 / Math.PI
+      // 按住 Shift：15° 步进吸附，方便摆正
+      if (e.shiftKey) deg = Math.round(deg / 15) * 15
+      const rotated = rotateObb(obbRotateStart.value.pts, deg)
+      for (let i = 0; i < 4; i++) { pts[i][0] = rotated[i][0]; pts[i][1] = rotated[i][1] }
+      syncBBoxFromObb(box)
+      redrawCanvas()
+    }
+    return
   }
 }
 
@@ -2908,7 +3219,13 @@ const endDrawing = async (e: MouseEvent) => {
       if (Number.isNaN(cls) || cls < 0) cls = 0
       if (classes.value.length && cls >= classes.value.length) cls = classes.value.length - 1
       pushUndo()
-      currentBoxes.value.push({ class_id: cls, x1, y1, x2, y2 })
+      if (isObbTask.value) {
+        // 旋转框数据集：拖出的矩形先落成 0° 四角点，再用旋转柄/角点/角度输入调姿态
+        const box: BBox = { class_id: cls, x1, y1, x2, y2, obb: rectToObb(x1, y1, x2, y2), source: 'manual' }
+        currentBoxes.value.push(box)
+      } else {
+        currentBoxes.value.push({ class_id: cls, x1, y1, x2, y2 })
+      }
       selectedBoxIndex.value = currentBoxes.value.length - 1
     }
     redrawCanvas()
@@ -2919,6 +3236,32 @@ const endDrawing = async (e: MouseEvent) => {
     if (box) syncBBoxFromPolygon(box)
     editMode.value = 'idle'
     dragVertexIdx.value = -1
+    redrawCanvas()
+    return
+  }
+  // 旋转框编辑收尾：四角点钳制到图内（越界必须裁不能拒），零面积丢弃并提示
+  if (editMode.value === 'obb_corner' || editMode.value === 'obb_rotate') {
+    const idx = selectedBoxIndex.value
+    const box = idx >= 0 ? currentBoxes.value[idx] : null
+    const pts = box ? obbOf(box) : null
+    if (box && pts) {
+      const clamped = clampObbToImage(pts)
+      if (obbArea(clamped) < 1) {
+        // 拖成零面积 = 无效框：回退到本次编辑前的快照（撤销栈顶就是按下时压的）
+        showToast('旋转框被拖成零面积，已还原', 'info')
+        undo()
+      } else {
+        for (let i = 0; i < 4; i++) { pts[i][0] = clamped[i][0]; pts[i][1] = clamped[i][1] }
+        syncBBoxFromObb(box)
+      }
+    }
+    editMode.value = 'idle'
+    obbCornerIdx.value = -1
+    obbRotateStart.value = null
+    origBox.value = null
+    // 角度输入框跟着画布走，否则拖完柄数字还停在旧角度
+    const nowPts = box ? obbOf(box) : null
+    if (nowPts) obbAngleText.value = obbAngleDeg(nowPts).toFixed(1)
     redrawCanvas()
     return
   }
@@ -3247,6 +3590,11 @@ const toggleCutoutMode = () => {
     redrawCanvas()
     return
   }
+  // 任务类型闸门：抠图产物是分割轮廓，检测/旋转框任务不该进这个模式
+  if (!isSegTask.value) {
+    showToast('当前数据集是「' + (isObbTask.value ? '旋转框' : '检测') + '」任务，智能抠图只用于分割数据集', 'info')
+    return
+  }
   if (!img.value) {
     showToast('先打开一张图再抠图', 'info')
     return
@@ -3302,6 +3650,7 @@ const drawBox = (box: BBox, index = -1) => {
   const color = classColors.value[box.class_id] || 'lime'
   const a = box.audit
   const poly = polyOf(box)
+  const obb = obbOf(box)
   ctx.value.strokeStyle = selected ? 'orange' : color
   // 线宽按屏幕像素恒定：画布坐标系已乘 viewScale，不除的话放大后线条成倍变粗糊住边界
   ctx.value.lineWidth = (selected ? 3 : 2) / viewScale.value
@@ -3315,6 +3664,22 @@ const drawBox = (box: BBox, index = -1) => {
     ctx.value.fillStyle = selected ? 'orange' : color
     ctx.value.fill()
     ctx.value.restore()
+    ctx.value.stroke()
+  } else if (obb) {
+    // 旋转框：沿四角点描边（不填充，与分割的半透明填充区分）；
+    // 顶边中点画一根短刻度线标示"这条边是角度基准"
+    ctx.value.beginPath()
+    obb.forEach((pt, i) => (i === 0 ? ctx.value!.moveTo(pt[0], pt[1]) : ctx.value!.lineTo(pt[0], pt[1])))
+    ctx.value.closePath()
+    ctx.value.stroke()
+    const mx = (obb[0][0] + obb[1][0]) / 2, my = (obb[0][1] + obb[1][1]) / 2
+    const c = obbCenter(obb)
+    let nx = mx - c.x, ny = my - c.y
+    const len = Math.hypot(nx, ny) || 1
+    const tick = 6 / viewScale.value
+    ctx.value.beginPath()
+    ctx.value.moveTo(mx, my)
+    ctx.value.lineTo(mx + nx / len * tick, my + ny / len * tick)
     ctx.value.stroke()
   } else {
     ctx.value.strokeRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1)
@@ -3361,6 +3726,31 @@ const drawBox = (box: BBox, index = -1) => {
       ctx.value.beginPath()
       ctx.value.moveTo(cx - k, cy); ctx.value.lineTo(cx + k, cy)
       ctx.value.moveTo(cx, cy - k); ctx.value.lineTo(cx, cy + k)
+      ctx.value.stroke()
+    } else if (obb) {
+      // 旋转框手柄：四角实心方块（拖=改角点）+ 顶边外法线方向的圆柄（拖=整体旋转）
+      ctx.value.fillStyle = '#fff'
+      ctx.value.strokeStyle = 'orange'
+      ctx.value.lineWidth = 1.5 / viewScale.value
+      obb.forEach(pt => {
+        ctx.value!.fillRect(pt[0] - s / 2, pt[1] - s / 2, s, s)
+        ctx.value!.strokeRect(pt[0] - s / 2, pt[1] - s / 2, s, s)
+      })
+      const h = obbRotateHandlePos(obb)
+      // 连接杆：让用户看出圆柄属于这个框，而不是凭空一个点
+      ctx.value.beginPath()
+      ctx.value.moveTo(h.mx, h.my); ctx.value.lineTo(h.x, h.y)
+      ctx.value.stroke()
+      const r = s * 0.55
+      ctx.value.beginPath()
+      ctx.value.arc(h.x, h.y, r, 0, Math.PI * 2)
+      ctx.value.fill(); ctx.value.stroke()
+      // 质心十字 = 提示框内部可整体拖动
+      const c = obbCenter(obb)
+      const k = s * 0.9
+      ctx.value.beginPath()
+      ctx.value.moveTo(c.x - k, c.y); ctx.value.lineTo(c.x + k, c.y)
+      ctx.value.moveTo(c.x, c.y - k); ctx.value.lineTo(c.x, c.y + k)
       ctx.value.stroke()
     } else {
       const pts = [
@@ -3409,6 +3799,11 @@ const missedPendingCount = computed(() =>
 const redrawCanvas = () => {
   if (!ctx.value || !canvasRef.value || !img.value) return
   const c = canvasRef.value
+  // 图片还没就位时只清屏，绝不把框画到上一张图上
+  if (!imageReady.value) {
+    ctx.value.clearRect(0, 0, c.width, c.height)
+    return
+  }
   ctx.value.clearRect(0, 0, c.width, c.height)
   ctx.value.save()
   ctx.value.translate(viewOffset.value.x, viewOffset.value.y)
@@ -3625,6 +4020,50 @@ const onBoxClassChange = (e: Event, idx: number) => {
   pushUndo()
   currentBoxes.value[idx].class_id = val
   redrawCanvas()
+}
+
+// 旋转框角度精调：鼠标拖柄摆到 ±1° 很难，给一个数值输入直接定角。
+// 语义是「把第 0→1 边摆到指定角度」，所以按当前角与目标角之差绕质心旋转，
+// 不重排角点顺序（保持导入时的角点语义，避免长宽被交换）。
+const obbAngleText = ref('')
+watch(selectedBoxIndex, (i) => {
+  const pts = i >= 0 ? obbOf(currentBoxes.value[i]) : null
+  obbAngleText.value = pts ? obbAngleDeg(pts).toFixed(1) : ''
+})
+const commitObbAngle = (idx: number) => {
+  const box = currentBoxes.value[idx] as BBox
+  const pts = obbOf(box)
+  const deg = parseFloat(obbAngleText.value)
+  if (!pts || !Number.isFinite(deg)) {
+    obbAngleText.value = pts ? obbAngleDeg(pts).toFixed(1) : ''
+    return
+  }
+  const delta = deg - obbAngleDeg(pts)
+  if (Math.abs(delta) < 0.05) return
+  const rotated = clampObbToImage(rotateObb(pts, delta))
+  // 旋出图外被钳成零面积：不压撤销快照、不写回，输入框退回原角度
+  if (obbArea(rotated) < 1) {
+    showToast('这个角度会把框转出图片外，已还原', 'info')
+    obbAngleText.value = obbAngleDeg(pts).toFixed(1)
+    return
+  }
+  pushUndo()
+  box.obb = rotated
+  syncBBoxFromObb(box)
+  obbAngleText.value = obbAngleDeg(rotated).toFixed(1)
+  redrawCanvas()
+}
+
+// 水平框 → 旋转框（旋转框数据集里，AI 预标注/导入的历史水平框可以一键转成可旋转的四角点）
+const convertBoxToObb = (idx: number) => {
+  const box = currentBoxes.value[idx] as BBox
+  if (obbOf(box)) return
+  pushUndo()
+  box.obb = rectToObb(box.x1, box.y1, box.x2, box.y2)
+  delete (box as any).polygon   // obb 与 polygon 互斥
+  selectedBoxIndex.value = idx
+  redrawCanvas()
+  showToast('已转为旋转框：拖四角改形状，拖顶部圆柄旋转（Shift 每 15° 吸附）', 'success')
 }
 
 // 类别颜色：按黄金角在 HSL 色环上均匀分配，肉眼可区分
@@ -4384,7 +4823,7 @@ const runAuditBatch = async () => {
     `确认对 ${items.value.length} 张图片执行批量 L2 审核？\n` +
     '· 只对已有标注框做语义二审（漏标/粘连/标签错误/框质量/合规），不改框本身\n' +
     '· 结论写回每图 JSON（框级 box.audit + 图级 audit_meta），供你人工二审\n' +
-    '· 默认 16 路并发；1 万张约 30 分~2 小时（取决于 vLLM 吞吐）\n' +
+    '· 默认 16 路并发（全平台共享上限，多人同开自动排队）；1 万张约 30 分~2 小时\n' +
     '· 中途可「停止」，已完成图片的审核结论已落盘，可继续'
   ))) return
   try {
@@ -4394,7 +4833,19 @@ const runAuditBatch = async () => {
     auditBatchSettled.value = false
     auditStopping.value = false
     auditBatchId.value = result.batch_id
-    auditBatchProgress.value = { status: 'running', total: result.total, done: 0, current_image: '' }
+    if (result.reused) {
+      // 同任务已有别人（或自己另一台设备）发起的审核批次：不另起一批，直接围观进度。
+      // 进度不置 0，先拉一次真实状态，避免显示「0/N」倒退。
+      showToast('该任务已有批量审核正在进行，已接入同一批次的进度（不会重复审核）', 'info', 5000)
+      try {
+        const st = await getBatchProgress(result.batch_id)
+        auditBatchProgress.value = st
+      } catch {
+        auditBatchProgress.value = { status: 'running', total: result.total, done: 0, current_image: '' }
+      }
+    } else {
+      auditBatchProgress.value = { status: 'running', total: result.total, done: 0, current_image: '' }
+    }
     pollAuditBatch()
   } catch (e: any) {
     if (!e?.__toastShown) showToast('启动批量审核失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
@@ -4642,6 +5093,25 @@ const openAuditClassify = async () => {
   }
 }
 
+// 打开人工审核台（独立静态页，部署在后端 DATA_DIR/tools/ 下，经 /static 暴露）。
+// 用新标签页而不是内嵌 iframe：审核台是全屏工作台，需要完整的屏幕高度和键盘焦点，
+// 嵌在标注页里两者会互相挤占。新标签打开后本页状态原样保留，审完回来刷新即可。
+const openReviewWorkbench = () => {
+  if (!newTask.value.datasetId) {
+    showToast('请先选择数据集', 'info', 3000)
+    return
+  }
+  // 审核台内部用 /prod-api 取数，与生产静态路径一致；
+  // 开发环境下 vite 已把 /prod-api 代理并剥前缀转发到后端，同样可用。
+  const url = `/prod-api/static/tools/review.html?from=platform&dataset=${encodeURIComponent(newTask.value.datasetId)}`
+  const w = window.open(url, '_blank')
+  if (!w) {
+    showToast('浏览器拦截了新标签页，请允许弹出窗口后重试', 'error', 5000)
+    return
+  }
+  showToast('已在新标签页打开审核台，审完回来点「刷新」同步结果', 'info', 4500)
+}
+
 // 从分类清单跳转到指定图片
 const gotoClassifyImage = (imageId: string) => {
   const idx = items.value.findIndex((it: any) => it.image_id === imageId)
@@ -4694,6 +5164,10 @@ const persistAnnotation = (silent = false): Promise<boolean> => {
       })
       await saveAnn(taskId, imageId, payloadBoxes, aiFlag, manualType, manualType ? 'manual' : undefined, touched)
       // 列表状态按 image_id 回写（await 后 currentIndex 可能已指向别的图）
+      // 未标注队列里标完的图先钉住，否则它立刻从列表消失，没法在当前队列继续翻上一张/下一张
+      if (imageFilter.value === 'unannotated') {
+        pinnedUnannotated.value = new Set(pinnedUnannotated.value).add(imageId)
+      }
       const row = items.value.find((it: any) => it.image_id === imageId)
       if (row) {
         row.annotated = true
@@ -4815,8 +5289,8 @@ const exportReviewedPackage = async () => {
     const prefix = title ? `${title}_` : ''
     downloadFile(blob, `${prefix}${currentTask.value}_reviewed.zip`)
     showToast(
-      `已开始下载 zip：包含您修过的 ${counts.value.reviewed} 张图片。\n` +
-      `解压后：images/ 是图片，labels/ 是 YOLO 标签（含分割轮廓），还有 classes.txt 和 data.yaml，可直接用于训练。`,
+      `已开始下载 zip：包含您人工复核过的 ${counts.value.reviewed} 张图片。\n` +
+      `解压后：images/ 是图片，labels/ 是 YOLO 标签（${isObbTask.value ? '旋转框四角点' : isSegTask.value ? '含分割轮廓' : '检测方框'}），data.yaml 带 task 声明，可直接用于训练。`,
       'info',
       5000
     )
@@ -4981,13 +5455,16 @@ const handleKeydown = (e: KeyboardEvent) => {
       break
     case 'e':
     case 'E':
-      // 快捷键 E：边缘增强叠加层开关（规范 v1.3 §1.6 判边辅助）
+      // 快捷键 E：边缘增强叠加层开关（规范 v1.3 §1.6 判边辅助）。
+      // 判边是给描轮廓用的，检测/旋转框任务下按钮已隐藏，快捷键一并失效
+      if (!isSegTask.value) break
       edgeOverlayOn.value = !edgeOverlayOn.value
       onEdgeOverlayToggle()
       break
     case 's':
     case 'S':
-      // 快捷键 S：顶点吸附开关（C 类不可见边界按物理线索画时关掉）
+      // 快捷键 S：顶点吸附开关（C 类不可见边界按物理线索画时关掉）。仅分割任务
+      if (!isSegTask.value) break
       snapToEdgeOn.value = !snapToEdgeOn.value
       onSnapToggle()
       break
@@ -5051,9 +5528,49 @@ onMounted(() => {
   loadDatasets()
   loadSamConfigAndModels()
   bindWindowListeners()
+  // 跨标签消息监听独立于 keep-alive 的摘挂：审核台在另一个标签页，
+  // 用户可能审着审着顺手切到数据集页，此时标注页 deactivated 会摘掉普通监听，
+  // 但审核完成的 postMessage 照样会到 —— 必须让 message 监听一直活着。
+  bindReviewMessageListener()
   handleUrlEntry()
   restoreAnnotateState()
 })
+
+// 审核台（独立标签页）审完/中途退出时会 postMessage 回来。
+// 收到就自动刷新图片清单 —— 用户切回本页看到的就是最新结果，不用手点刷新。
+// 只认同源 + source 标记，避免被其它页面/扩展的消息误触发。
+const handleReviewMessage = async (e: MessageEvent) => {
+  if (e.origin !== window.location.origin) return
+  const d: any = e.data
+  if (!d || d.source !== 'wb-review') return
+  if (d.type !== 'review-finished' && d.type !== 'review-close') return
+  const p = d.payload || {}
+  // 只处理当前数据集的消息（用户可能同时开着别的审核台标签）
+  if (p.datasetId && p.datasetId !== newTask.value.datasetId) return
+  await loadTaskItems()
+  refreshAuditClassify()
+  if (d.type === 'review-finished') {
+    showToast(`人工二审已完成：现存 ${p.liveCount ?? '—'} 张，本次删除 ${p.deletedCount ?? 0} 张。可以封板训练了`, 'success', 6000)
+  } else {
+    showToast(`已退出人工二审（还剩 ${p.undecidedCount ?? 0} 张未决），进度已保存，可随时再进去接着审`, 'info', 5000)
+  }
+}
+
+// keep-alive 下组件被缓存不销毁，message 监听跟着页面可见性摘挂会丢消息：
+// 审核台 postMessage 的那一刻标注页可能正处于 deactivated（用户切去别的页面了）。
+// 所以这个监听只在 onMounted 挂、onUnmounted 摘，与 bindWindowListeners 彻底分开。
+// 模块级 flag 守卫避免重复挂载（Vue 严格模式下 onMounted 理论上只触发一次，但多实例/热更新保险）。
+let reviewMessageBound = false
+const bindReviewMessageListener = () => {
+  if (reviewMessageBound) return
+  window.addEventListener('message', handleReviewMessage)
+  reviewMessageBound = true
+}
+const unbindReviewMessageListener = () => {
+  if (!reviewMessageBound) return
+  window.removeEventListener('message', handleReviewMessage)
+  reviewMessageBound = false
+}
 
 const bindWindowListeners = () => {
   window.addEventListener('keydown', handleKeydown)
@@ -5161,6 +5678,8 @@ watch(
 
 onUnmounted(() => {
   unbindWindowListeners()
+  // 组件真正销毁才摘跨标签消息监听（keep-alive 的 deactivated 不会走这里）
+  unbindReviewMessageListener()
   // 离开页面：抠图队列清空，在途结果也不再落地，免得往已经卸载的画布上写
   cutoutGone = true
   cutoutQueue.value = []
@@ -5426,6 +5945,16 @@ onUnmounted(() => {
 .list-title {
   cursor: pointer;
   user-select: none;
+}
+
+/* 未标注队列里刚标完仍被钉住的图，给一行说明，避免「筛选数字 vs 列表张数」看着不一致 */
+.pinned-hint {
+  font-size: 0.7rem;
+  color: #2c6ec5;
+  background: #eaf2ff;
+  border-radius: 6px;
+  padding: 3px 6px;
+  margin-bottom: 0.4rem;
 }
 
 /* 图片名搜索框 */
@@ -6012,6 +6541,28 @@ canvas {
   background: #17a2b8;
   flex: none;
 }
+/* 旋转框徽标用紫色，与分割的青色区分开 */
+.obb-chip {
+  background: #8e44ad;
+}
+.obb-angle-ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.15rem;
+  margin-right: 0.4rem;
+  font-size: 0.72rem;
+  color: #666;
+  flex: none;
+}
+.obb-angle-input {
+  width: 3.6rem;
+  padding: 0.1rem 0.2rem;
+  font-size: 0.72rem;
+  border: 1px solid #ccc;
+  border-radius: 3px;
+  background: #fff;
+  color: #333;
+}
 .fix-btn {
   flex: initial !important;
   width: auto !important;
@@ -6070,6 +6621,10 @@ canvas {
 .audit-batch-btn { background: #1c64f2; }
 .audit-batch-btn:hover:not(:disabled) { background: #1552d6; }
 .audit-batch-progress { border-left: 3px solid #1c64f2; }
+/* 人工二审入口：AI 审核链路的终点，用紫色区别于前面几个蓝/蓝绿按钮，
+   加粗描边让「跑完 AI 该去人工二审了」这一步在工具栏里一眼可见 */
+.review-btn { background: #7c3aed; font-weight: 600; box-shadow: 0 0 0 1px rgba(124,58,237,.35); }
+.review-btn:hover:not(:disabled) { background: #6d28d9; }
 /* 双维度分类弹窗 */
 .classify-dialog { width: 720px; max-width: 92vw; }
 .seg-tabs { display: inline-flex; gap: 4px; }
@@ -6255,6 +6810,14 @@ canvas {
   font-weight: bold;
   font-size: 0.9rem;
   word-break: break-all;
+  margin-right: auto;
+}
+
+/* 任务类型直接用文字说明，不靠颜色区分（颜色对色弱/小屏不友好） */
+.ds-task-text {
+  font-size: 0.72rem;
+  color: #5b6673;
+  white-space: nowrap;
 }
 
 .status-badge {
