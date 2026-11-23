@@ -20,7 +20,7 @@ import numpy as np
 
 from src.core.settings import settings
 from src.services.device_manager import get_best_device
-from src.services.annotation_service import AnnotationService
+from src.services.annotation_service import AnnotationService, dataset_task
 from src.utils.json_io import load_json, save_json_atomic
 
 
@@ -653,6 +653,29 @@ class SAMService:
         meta = self._trained_meta(model_id)
         return str(meta.get("library_root_id") or model_id)
 
+    def _apply_task_type_gate(self, task_id: str, cfg: dict) -> dict:
+        """B-21a 任务类型闸门：detect/obb 数据集的预标注一律不产 polygon，只出矩形。
+
+        预标注的全部轮廓产出（零样本+SAM 精修 :3261、本库已训分割模型 :1721）都只看
+        cfg["sam_return_polygon"]，所以在能拿到 task_id 的入口统一把它关掉即可，
+        各引擎/精修函数零改动。sam_enabled / batch_sam_enabled 语义不动：
+        detect 下 SAM 仍照常跑，只收紧外接矩形、不输出轮廓。
+        segment（含缺省兜底以外的显式声明）完全不受影响。
+        任务→数据集解析失败时不加闸（保持旧行为，不因排障信息缺失改变产出）。
+        """
+        try:
+            ds_id, _ = self._task_dataset_model(task_id)
+            if not ds_id:
+                return cfg
+            task_type = dataset_task(settings.DATASETS_DIR / ds_id)
+            if task_type in ("detect", "obb"):
+                cfg = dict(cfg)
+                cfg["sam_return_polygon"] = False
+                print(f"task_gate: task={task_id} dataset={ds_id} 任务类型={task_type}，预标注只出矩形框")
+        except Exception as e:
+            print(f"task_gate: 解析数据集任务类型失败(不加闸): {e}")
+        return cfg
+
     def _task_dataset_model(self, task_id: str) -> tuple:
         """标注任务 → (数据集 id, 数据集归属的模型/算法库 id)。"""
         try:
@@ -878,6 +901,9 @@ class SAMService:
         img_abs = settings.DATA_DIR / item["image_path"]
         if not img_abs.exists():
             raise ValueError(f"Image file not found: {img_abs}")
+
+        # B-21a：detect/obb 数据集不产轮廓（叠加在 sam_return_polygon 全局开关之上）
+        cfg = self._apply_task_type_gate(task_id, cfg)
 
         # 标签字典（中文名/中文描述/英文检测提示词）：千问靠中文描述理解业务类别，
         # GroundingDINO / YOLO-World 靠 ai_prompt_en 才认得"积水"这类英文不存在的词，
@@ -1278,6 +1304,9 @@ class SAMService:
         if not img_abs.exists():
             raise ValueError(f"Image file not found: {img_abs}")
 
+        # B-21a：detect/obb 数据集不产轮廓（叠加在 sam_return_polygon 全局开关之上）
+        cfg = self._apply_task_type_gate(task_id, cfg)
+
         # 标签字典（同单图预标注）：英文提示词给 GD/YOLO-World，中文描述给千问
         ld = self._task_labels_desc(task_id)
         if ld:
@@ -1578,13 +1607,40 @@ class SAMService:
         info = cfg.get("qwen_labels_desc") or {}
         return info.get("labels") or []
 
+    @staticmethod
+    def _code_to_phrase(code: str) -> str:
+        """把下划线/驼峰/连字符形式的类别 code 兜底成自然英文空格分词。
+
+        只做格式规范化，不猜语义：play_phone → play phone、callPhone → call phone、
+        fire-extinguisher → fire extinguisher；纯拼音/单词（zijiuqi/hat）原样返回。
+        零样本文本编码器（GroundingDINO/YOLO-World）在自然英文上训练，下划线 code
+        是 OOV 无效输入（实测 jishui→整图一个框、积水→0 框）。有 ai_prompt_en 时
+        本函数不会被调用——用户/AI 补描述写的完整描述永远是第一选择。
+        """
+        import re  # 局部导入，避免改动模块顶层依赖
+        s = str(code or "").strip()
+        if not s:
+            return s
+        # 驼峰拆分：callPhone → call Phone（连续大写缩写 URL/API 不当专有词处理，保持简单）
+        s = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", s)
+        # 下划线、连字符一律视为分词符；连续分隔符折叠成一个，去首尾空格
+        s = re.sub(r"[_\-]+", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        # 兜底短语统一小写：零样本文本编码器对大小写不敏感，但规范化输出更可预期
+        return s.lower()
+
     def _prompts_with_dict(self, classes, prompts, cfg) -> list:
-        """英文检测提示词优先级：标签字典 ai_prompt_en > 前端传入 prompts > 原类别名。
+        """英文检测提示词优先级：标签字典 ai_prompt_en > 规范化 code > 前端传入 prompts > 原类别名。
 
         GroundingDINO / YOLO-World 只认英文，业务类别名（如 jishui）或中文（积水）原样发过去
         等于无效输入（实测：jishui → 整张图一个框；积水 → 0 个框）。在字典里为类别填一句
         英文描述（如 standing water or puddle on the road）即可让零样本引擎"看得懂"业务类别。
-        只替换提示词内容、不改列表长度与顺序，因此检测结果按位置回 class_id 的映射不受影响。
+
+        线上实测 14 个类别里 13 个 ai_prompt_en 为空，且多为下划线 code（play_phone/
+        coal_pile/zijiuqi）。这类空值以前原样送出等于无效输入；现在有标签字典命中但提示词
+        为空时，把 code 规范化成自然英文空格分词兜底（play_phone → play phone），不猜语义、不
+        改列表长度与顺序，class_id 位置映射不受影响。无标签字典时保持原逻辑（前端 prompts
+        或 classes 原样），不改变历史行为。
         """
         base = [str(p) for p in (prompts if prompts else (classes or []))]
         labels = self._dict_labels(cfg)
@@ -1599,8 +1655,19 @@ class SAMService:
         out = []
         for i, p in enumerate(base):
             code = str(classes[i]).strip().lower() if classes and i < len(classes) else p.strip().lower()
-            dict_prompt = by_code.get(code) or ""
-            out.append(dict_prompt if dict_prompt else p)
+            # 只有在该类确实存在于标签字典中、但 ai_prompt_en 为空时，才做兜底；
+            # 用哨兵区分「字典无此类」与「字典有此类但提示词为空」两种状态。
+            if code in by_code:
+                dict_prompt = by_code[code]
+                if dict_prompt:
+                    out.append(dict_prompt)
+                else:
+                    # 字典命中但提示词空 → 用规范化后的 code 兜底
+                    raw = str(classes[i]) if classes and i < len(classes) else p
+                    out.append(self._code_to_phrase(raw))
+            else:
+                # 字典无此类 → 保持原优先级（前端 prompts / 原类别名）
+                out.append(p)
         return out
 
     def _detect(self, img_abs, classes, conf, cfg, prompts=None) -> list:
@@ -3366,6 +3433,9 @@ class SAMService:
         # 批量加速：默认关闭 SAM 精修（CPU 上 SAM 是每图最贵的一步，关掉速度翻倍以上；
         # 框贴合度略降，单图 AI 标注不受影响；sam_config.json 中 batch_sam_enabled 可开回）
         cfg["sam_enabled"] = cfg.get("batch_sam_enabled", False)
+        # B-21a：detect/obb 数据集不产轮廓（叠加在 sam_return_polygon 全局开关之上；
+        # 放在 batch_sam_enabled 覆写之后，降阈/换引擎/千问兜底用的 dict(cfg) 均继承闸门）
+        cfg = self._apply_task_type_gate(bt.task_id, cfg)
         # 标签字典：整批只解析一次复用（英文提示词给 GD/YOLO-World，中文描述给千问）
         ld = self._task_labels_desc(bt.task_id)
         if ld:

@@ -2937,6 +2937,23 @@ class DatasetService:
                 parts.append(d.name)
                 parts.append(_fp(d / "meta.json"))
                 parts.append(_fp(d / "data.yaml"))
+                # 标注目录指纹（文件数 + 最新 mtime）：annotated_count 由这里数出来，
+                # 但旧签名只看 meta/data.yaml，加/删标注 JSON 不会失效 → 计数陈旧。
+                # 用 scandir 单遍取 entry.stat（Windows 下目录项自带元数据，近乎免费），
+                # 不逐文件 rglob，避免把上千标注文件 stat 一遍拖慢热路径。
+                ann = d / "annotations"
+                try:
+                    n, mx = 0, 0
+                    with os.scandir(ann) as it:
+                        for e in it:
+                            if e.name.endswith(".json"):
+                                n += 1
+                                st = e.stat()
+                                if st.st_mtime_ns > mx:
+                                    mx = st.st_mtime_ns
+                    parts.append(f"ann|{n}|{mx}")
+                except OSError:
+                    parts.append("ann|-")
         except OSError:
             pass
         try:
@@ -3114,7 +3131,10 @@ class DatasetService:
         """列出所有数据集（带签名缓存：磁盘无变化时直接返回上次结果，秒出）"""
         # 缓存命中：签名（关键文件 mtime/size 聚合）未变且未过 TTL → 直接返回，
         # 跳过全量扫描/rglob/shadow 自愈（这些合计 100~1800ms）。
-        _TTL = 2.0
+        # TTL 从 2s 拉长到 60s：正确性主要靠签名（任一关键文件增删改即失效），
+        # TTL 只是「训练子进程绕过 meta」等极端情况的兜底上限。旧 2s 让用户正常
+        # 打开间隔（>2s）每次都过期重扫，是「每次打开都转圈」的另一半主因。
+        _TTL = 60.0
         sig = await asyncio.to_thread(self._list_cache_signature)
         now = time.time()
         with _LIST_CACHE_LOCK:
@@ -4514,6 +4534,7 @@ class DatasetService:
         poured_events, sealed_events = [], []
         pending_review = []  # 标完但未按「审核通过」的包：不灌桶，前端据此展示待审核
         skipped = 0
+        state_dirty = False  # 本轮是否真改了桶账本（灌桶/封板/归档/新建接收桶）
         try:
             # 1) 候选源包：已准备、标注阶段、归属模型、未归档
             groups = {}
@@ -4547,11 +4568,13 @@ class DatasetService:
             # 2) 按模型处理（组内按上传时间 FIFO）
             for model_id, pkgs in groups.items():
                 pkgs.sort(key=lambda x: str(x[1].get("uploaded_at", "")))
-                mst = models_state.setdefault(
-                    model_id, {"bucket_version_count": 0, "receiving": None, "sealed": []}
-                )
+                if model_id not in models_state:
+                    models_state[model_id] = {"bucket_version_count": 0, "receiving": None, "sealed": []}
+                    state_dirty = True
+                mst = models_state[model_id]
                 if not mst.get("receiving"):
                     mst["receiving"] = {"index": 1, "poured": 0, "members": []}
+                    state_dirty = True
                 for dataset_id, meta, version_dir, total, meta_path in pkgs:
                     annotated = self._count_annotated_files(version_dir)
                     if annotated < total:
@@ -4571,6 +4594,7 @@ class DatasetService:
                             meta["bucket_archived_at"] = datetime.now().isoformat()
                             meta["bucket_index"] = meta.get("bucket_index") or mst["receiving"]["index"]
                             save_json_atomic(meta_path, meta)
+                            state_dirty = True
                             logger.info(f"bucket: {dataset_id} fully poured -> archived B{meta['bucket_index']}")
                         continue
                     pour_n = total - sealed_n - pending_n
@@ -4584,6 +4608,7 @@ class DatasetService:
                     meta["bucket_index"] = int(recv["index"])
                     meta["bucket_poured_at"] = datetime.now().isoformat()
                     save_json_atomic(meta_path, meta)
+                    state_dirty = True
                     poured_events.append({
                         "model_id": model_id, "dataset_id": dataset_id,
                         "bucket_index": int(recv["index"]), "count": pour_n,
@@ -4598,8 +4623,13 @@ class DatasetService:
                         if not snap:
                             break
                         sealed_events.append({"model_id": model_id, **snap})
+                        state_dirty = True
         finally:
-            self._save_bucket_state(state)
+            # 只在真有变更时落盘：空转轮（无灌/无封/无归档）若也重写 buckets.json，
+            # 会刷新其 mtime → 打掉 list_datasets 的签名缓存。后台 bucket_poll_loop
+            # 每 60s 强制灌桶一次，正是「列表缓存永远命中不了、每次打开都全量重扫」的主因。
+            if state_dirty:
+                self._save_bucket_state(state)
             self._bucket_state = None
         return {"poured": poured_events, "sealed": sealed_events, "skipped": skipped,
                 "pending_review": pending_review}

@@ -473,9 +473,9 @@ function isBest(m: any, key: 'map' | 'speed') {
 // ---- 数据加载 ----
 async function load() {
   try {
-    const modelRes = await listModels()
+    // 两个接口互不依赖，并行拉取：总耗时≈较慢的一个，而非两者累加。
+    const [modelRes, dsRes] = await Promise.all([listModels(), listDatasets()])
     models.value = modelRes.models || []
-    const dsRes = await listDatasets()
     const all = dsRes.datasets || []
     datasets.value = all
     totalDatasets.value = all.length

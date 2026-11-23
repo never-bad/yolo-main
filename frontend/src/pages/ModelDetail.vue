@@ -1618,9 +1618,11 @@ async function genMissingDescs() {
   labelsMsg.value = ''
   try {
     // 优先用本库已挂载的数据集（标注最多者优先）；没有挂载则传空让后端自动选
+    // 真实接口字段是 annotated_count，mock/旧接口可能是 annotated_images —— 两者兼容，否则排序恒失效
+    const annCount = (d: any) => Number(d.annotated_count ?? d.annotated_images ?? 0) || 0
     const mounted = datasetsView.value
-      .filter((d: any) => (d.annotated_images || 0) > 0)
-      .sort((a: any, b: any) => (b.annotated_images || 0) - (a.annotated_images || 0))
+      .filter((d: any) => annCount(d) > 0)
+      .sort((a: any, b: any) => annCount(b) - annCount(a))
     const dsId = mounted[0]?.dataset_id || ''
     const res = await describeMissingLabels(modelId, dsId, 2)
     const suggestions = res.suggestions || []
@@ -1917,6 +1919,9 @@ async function refresh() {
 }
 
 onMounted(async () => {
+  // 必须串行：loadJobs() 依赖 refresh() 填充的 model.value 与 versions.value
+  // （见 loadJobs 里 rootId / versionJobIds 的取用），并行会让任务按错误的库根
+  // id 过滤、历史任务恒为空。refresh() 内部 6 个接口已经 Promise.all 并行。
   await refresh()
   await loadJobs()
 })

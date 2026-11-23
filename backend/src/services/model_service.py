@@ -1356,22 +1356,30 @@ class ModelService:
                        and not str(l.get("chinese_desc") or "").strip()]
             if not missing:
                 return {"missing": [], "ds_dir": None, "samples": {}}
-            # 候选数据集：显式指定优先；否则本库全部数据集按标注图数量降序
-            candidates = []
-            if dataset_id:
-                d = settings.DATASETS_DIR / dataset_id
-                if (d / "meta.json").exists():
-                    candidates.append(d)
-            else:
-                root = self.resolve_library_root_id(model_id) or model_id
-                candidates = self._library_dataset_dirs_sync(root)
+            # 候选数据集：显式指定优先抽；抽不满时把本库其它集作为补充，避免
+            # 「前端选中的标注最多集恰好没有缺描述类别的框」就误报无样本。
+            root = self.resolve_library_root_id(model_id) or model_id
+            library_dirs = self._library_dataset_dirs_sync(root)
 
             def _ann_count(d):
                 ann = d / "annotations"
                 return len(list(ann.glob("*.json"))) if ann.exists() else 0
 
-            candidates.sort(key=_ann_count, reverse=True)
+            library_dirs.sort(key=_ann_count, reverse=True)
+            candidates = []
+            if dataset_id:
+                d = settings.DATASETS_DIR / dataset_id
+                if (d / "meta.json").exists():
+                    candidates.append(d)
+            # 把库内其它集追加到候选尾部（去重）；不传 dataset_id 时这里就是全集
+            for d in library_dirs:
+                if all(x.resolve() != d.resolve() for x in candidates):
+                    candidates.append(d)
             codes = {str(l.get("english_code") or "").strip().lower() for l in missing}
+            # 老标注框只有 class_id、没有 english_code，必须与 _labels_usage_sync 同口径：
+            # 框里英文名缺失时按 class_id 回查标签字典，否则一个样本都抽不到（线上 hat 就是这种）
+            code_by_index = {i: str(l.get("english_code") or "").strip().lower()
+                             for i, l in enumerate(sorted(labels, key=lambda x: int(x.get("index") or 0)))}
             samples = {}   # english_code(原样) -> [绝对路径]
             ds_used = None
             for d in candidates:
@@ -1394,8 +1402,14 @@ class ModelService:
                     seen_codes = set()
                     for b in data.get("boxes") or []:
                         ec = str(b.get("english_code") or "").strip()
+                        if not ec:
+                            try:
+                                cid = int(b.get("class_id"))
+                            except (TypeError, ValueError):
+                                cid = -1
+                            ec = code_by_index.get(cid, "")
                         key = ec.lower()
-                        if not ec or key not in codes or key in seen_codes:
+                        if not key or key not in codes or key in seen_codes:
                             continue
                         seen_codes.add(key)
                         # 找回字典里的原样 english_code（大小写以字典为准）

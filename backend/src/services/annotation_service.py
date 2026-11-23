@@ -820,6 +820,9 @@ class AnnotationService:
 
             # 收集所有图片
             # 若 images 目录下已有 train/val/test 划分，只遍历划分目录，避免平铺图与划分子目录重复收集
+            # 注意：不要用 rglob("*") 一次扫描再按后缀过滤——实测（1000 文件目录）反而比
+            # 三次 rglob("*.png") 慢一个数量级：glob 模式在遍历时剪枝，而 rglob("*") 会把
+            # 所有文件（含 txt）列出来再在 Python 层判断，is_file() 还逐个 stat。保持三次扫描。
             split_dirs = ["train", "val", "test"]
             has_split = any((images_dir / s).exists() for s in split_dirs)
             if has_split:
@@ -849,7 +852,12 @@ class AnnotationService:
                         width, height = img.size
                     
                     image_id = img_path.stem
-                    
+
+                    # 图片相对路径只算一次：_calculate_image_path 内部有 resolve()（磁盘
+                    # realpath 解析），原来播种分支和 items 分支各算一次，2 张图就多 1 次
+                    # 解析成本。两处共用同一结果，行为完全等价。
+                    image_path = self._calculate_image_path(img_path)
+
                     # 检查是否有对应的标签文件（导入后的 YOLO txt）
                     has_annotation = False
                     if labels_dir:
@@ -869,7 +877,7 @@ class AnnotationService:
                                 if boxes:
                                     ann_data = {
                                         "image_id": image_id,
-                                        "image_path": self._calculate_image_path(img_path),
+                                        "image_path": image_path,
                                         "width": width,
                                         "height": height,
                                         "model_id": model_id,
@@ -883,9 +891,7 @@ class AnnotationService:
                                     has_annotation = True
                                     loaded_count += 1
                     
-                    # 计算图片路径，相对于 DATA_DIR（静态文件服务的根目录）
-                    image_path = self._calculate_image_path(img_path)
-                    
+                    # image_path 已在循环开头算好（相对 DATA_DIR，静态服务根目录）
                     items.append({
                         "image_id": image_id,
                         "image_path": image_path,

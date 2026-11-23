@@ -201,6 +201,16 @@
                 title="打开该数据集的标注任务（无任务自动创建，直达标注页）"
               >去标注</button>
               <button
+                v-if="validationBadge(dataset).text"
+                @click="revalidateItem(dataset)"
+                class="secondary"
+                :disabled="revalidatingDataset === dataset.dataset_id"
+                title="重新扫描标签文件并刷新校验结果（导出/修复标注后点这里，再封板）"
+              >
+                <span v-if="revalidatingDataset === dataset.dataset_id" class="loading-spinner"></span>
+                {{ revalidatingDataset === dataset.dataset_id ? '校验中...' : '重新校验' }}
+              </button>
+              <button
                 v-if="canApprove(dataset)"
                 @click="approveItem(dataset)"
                 class="primary"
@@ -323,7 +333,7 @@
           <span class="loading-spinner large"></span>
           <span>加载数据集详情...</span>
         </div>
-        <template v-else>
+        <div v-else class="viewer-body">
           <!-- 统计信息 -->
           <div class="viewer-stats">
             <div class="stat-item">
@@ -434,7 +444,7 @@
               </div>
             </div>
           </template>
-        </template>
+        </div>
       </div>
     </div>
 
@@ -528,9 +538,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, watch, onMounted, onActivated, nextTick } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onActivated, onDeactivated, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { uploadDataset, cancelUpload, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel, getSealThreshold, setSealThreshold, setDatasetAsTestSet, confirmClassAlignment } from '@/api/datasets'
+import { uploadDataset, cancelUpload, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel, getSealThreshold, setSealThreshold, setDatasetAsTestSet, confirmClassAlignment, validateDataset } from '@/api/datasets'
 import { listModels } from '@/api/models'
 import { addHardSamples, addBackgroundSamples } from '@/api/samplePool'
 import { downloadFile } from '@/utils/download'
@@ -696,6 +706,7 @@ const editingDataset = ref<string | null>(null)  // 正在编辑的数据集ID
 const deletingDataset = ref<string | null>(null)  // 正在删除的数据集ID
 const exportingDataset = ref<string | null>(null)  // 正在导出的数据集ID
 const sealingDataset = ref<string | null>(null)  // 正在封板的数据集ID
+const revalidatingDataset = ref<string | null>(null)  // 正在重新校验的数据集ID
 const approvingDataset = ref<string | null>(null)  // 正在审核确认的数据集ID
 const unpouringDataset = ref<string | null>(null)  // 正在撤回（退桶）的数据集ID
 const viewingDataset = ref<any | null>(null)  // 正在预览的数据集
@@ -1045,6 +1056,25 @@ const validationBadge = (d: any) => {
     errs.length > 5 ? `…另有 ${errs.length - 5} 条错误` : ''
   ].filter(Boolean).join('\n')
   return { text: `校验✗ ${v.invalid_lines ?? 0} 行`, cls: 'badge-invalid', tip }
+}
+
+// 重新校验：校验✗ 徽标出现时卡片直接给入口（原来只在算法库页 ⋯ 菜单里，藏太深）。
+// 导出/修复标注后旧 label_validation 缓存不会自动刷新，点这里重扫并更新徽标，再封板。
+async function revalidateItem(d: any) {
+  revalidatingDataset.value = d.dataset_id
+  try {
+    const v: any = await validateDataset(d.dataset_id)
+    if (v?.status === 'ok') {
+      showToast('校验通过：0 行异常，可以封板', 'success', 4000)
+    } else {
+      showToast(`校验仍未通过：${v?.invalid_lines ?? 0} 行异常（${v?.invalid_files ?? 0} 个文件），请修复标注或先导出`, 'error', 5000)
+    }
+  } catch (e: any) {
+    if (!e?.__toastShown) showToast('校验失败: ' + (e.response?.data?.detail || e.message), 'error', 4000)
+  } finally {
+    revalidatingDataset.value = null
+    loadDatasets(true)
+  }
 }
 
 // B-64 类别对齐闸门：卡片徽标 + 详情弹窗里逐类人工确认（零新增组件库依赖）
@@ -1631,6 +1661,30 @@ const consumeFocus = () => {
   if (f) applyFocus(f)
   if (route.query.stage) filterStatus.value = route.query.stage === 'sealed' ? '已封板' : '训练失败'
 }
+
+// 弹窗打开期间锁住背景滚动：本页任一弹窗打开时，滚轮不再带动背后整页滚动
+// （弹窗内部滚动由 .viewer-body / .file-preview-* 自己承接，overscroll-behavior 防穿透）。
+// 关闭全部弹窗后恢复原值；keep-alive 切走页面时也必须恢复，避免把锁带到别的页面。
+const anyModalOpen = computed(() =>
+  !!viewingDataset.value || !!filePreview.value || !!bindDialog.value ||
+  thresholdOpen.value || alignConfirmOpen.value || createLibraryOpen.value)
+let _savedBodyOverflow = ''
+let _bodyLocked = false
+const lockBodyScroll = () => {
+  if (_bodyLocked) return
+  _savedBodyOverflow = document.body.style.overflow
+  document.body.style.overflow = 'hidden'
+  _bodyLocked = true
+}
+const unlockBodyScroll = () => {
+  if (!_bodyLocked) return
+  document.body.style.overflow = _savedBodyOverflow
+  _bodyLocked = false
+}
+watch(anyModalOpen, (open) => { open ? lockBodyScroll() : unlockBodyScroll() })
+onDeactivated(() => unlockBodyScroll())
+// keep-alive 切回时若弹窗仍开着，watch 不会重触发（值没变），须按当前态补锁
+onActivated(() => { if (anyModalOpen.value) lockBodyScroll() })
 
 onMounted(async () => {
   // D-02：消费 ?focus= —— 列表加载后滚动到目标数据集并高亮
@@ -2241,6 +2295,16 @@ button {
   overflow: hidden;
 }
 
+/* 滚动收进弹窗本体：内容超高时在弹窗内部滚，头部固定；
+   overscroll-behavior 防止滚到底后继续滚动穿透到背后页面 */
+.viewer-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-bottom: 1rem;
+}
+
 .viewer-header {
   display: flex;
   justify-content: space-between;
@@ -2461,6 +2525,7 @@ button {
 .file-preview-img-wrap {
   flex: 1;
   overflow: auto;
+  overscroll-behavior: contain;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2477,6 +2542,7 @@ button {
 .file-preview-text {
   flex: 1;
   overflow: auto;
+  overscroll-behavior: contain;
   margin: 0;
   padding: 1rem 1.25rem;
   font-size: 0.8rem;

@@ -1176,8 +1176,10 @@ const generateModelName = () => {
 }
 
 // 监听版本和大小变化，更新 model_name（或迁移目标架构）
+// 保护：已选自定义导入权重时，改版本/大小不得覆盖用户选择（实测曾把 yolov8s.pt
+// 悄悄换回官方 yolov8m.pt）。要回官方权重，请在自定义下拉选「使用上方 YOLO 预训练模型」。
 watch([selectedVersion, selectedModelSize], () => {
-  if (pretrainSource.value === 'universal') {
+  if (pretrainSource.value === 'universal' && !customSelectedPath.value) {
     trainForm.value.model_name = generateModelName()
   }
 })

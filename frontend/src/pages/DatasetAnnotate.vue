@@ -1481,6 +1481,32 @@ const syncBBoxFromPolygon = (b: BBox) => {
   b.x1 = x1; b.y1 = y1; b.x2 = x2; b.y2 = y2
 }
 
+// polygon → 外接矩形（纯函数，与 syncBBoxFromPolygon/后端 polygon_to_bbox 同口径）。
+// F-21b：detect/obb 任务收到「只有 polygon 没有矩形」的历史分割框时，用它现算矩形收下，绝不丢框。
+const polygonToBBox = (poly: number[][]) => {
+  let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity
+  poly.forEach(pt => {
+    x1 = Math.min(x1, pt[0]); y1 = Math.min(y1, pt[1])
+    x2 = Math.max(x2, pt[0]); y2 = Math.max(y2, pt[1])
+  })
+  return { x1, y1, x2, y2 }
+}
+
+// F-21b 任务类型兜底闸门：AI 结果（单图预标注/交互式/点选抠图）里的 polygon 只在分割任务透传。
+// detect/obb 任务即使后端（历史数据/跨库已训分割模型）送来 polygon 也一律丢弃、只留矩形；
+// 框若只有 polygon 没有矩形（历史分割落盘形态，写盘口会剥掉矩形），由 polygon 现算外接矩形收下。
+// polygon-only 且不足 3 点的框无几何可收，返回 null 由调用方过滤。
+const gateAiBox = (b: any): { x1: number; y1: number; x2: number; y2: number; polygon?: number[][] } | null => {
+  const poly = (Array.isArray(b?.polygon) && b.polygon.length >= 3) ? b.polygon as number[][] : null
+  const keepPoly = isSegTask.value && !!poly
+  const hasRect = [b?.x1, b?.y1, b?.x2, b?.y2].every(v => typeof v === 'number' && Number.isFinite(v))
+  let rect: { x1: number; y1: number; x2: number; y2: number }
+  if (hasRect) rect = { x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2 }
+  else if (poly) rect = polygonToBBox(poly)
+  else return null
+  return keepPoly ? { ...rect, polygon: poly! } : rect
+}
+
 // 整体平移（框 + 轮廓一起动）：每次从快照重放，避免 mousemove 累加漂移。
 // 位移必须按图边界收敛：光标钳制只约束"当前点"，若从图内往留白拖，
 // dx/dy 仍可把整个框推到图外（框宽不变，钳制光标挡不住），故这里再夹一次。
@@ -2488,7 +2514,9 @@ const peekPointDraft = (taskId: string, imageId: string) => {
 const applyPointDraft = (draft: any) => {
   const poly: number[][] = Array.isArray(draft.poly) ? draft.poly : []
   const cutout: { x: number; y: number; label: number }[] = Array.isArray(draft.cutout) ? draft.cutout : []
-  if (poly.length >= 2) {
+  // F-21b：非分割任务不得把画布锁进描轮廓模式（与 watch(samOn)/loadSamConfigAndModels 同口径）；
+  // 残留的轮廓草稿不恢复，落到下面抠图点位分支或由 persistPointDraft 清掉
+  if (isSegTask.value && poly.length >= 2) {
     polyDrawMode.value = true
     polyDraft.value = poly
     showToast(`已恢复上次未闭合的轮廓草稿（${poly.length} 个顶点）：继续描点，点回起点或回车闭合`, 'info', 8000)
@@ -2632,23 +2660,42 @@ const loadExistingAnnotation = async () => {
       manualTouched.value = !!result.reviewed
       // 无条件赋值：图确实是「无框」状态时也要显式清空，
       // 不能只在有框时才写（否则上一次的框会残留在画布上）
-      currentBoxes.value = (result.boxes || []).map((box: any) => ({
-        class_id: box.class_id,
-        x1: box.x1,
-        y1: box.y1,
-        x2: box.x2,
-        y2: box.y2,
-        // 分割轮廓必须回填，否则重新打开图片时分割标注只剩矩形（顶点也就无从微调）
-        ...(box.polygon && box.polygon.length >= 3 ? { polygon: box.polygon as number[][] } : {}),
-        // 旋转框四角点同理：不回填就只剩外接矩形，角度信息丢失（保存是整体覆盖写）
-        ...(box.obb && box.obb.length === 4 ? { obb: box.obb as number[][] } : {}),
-        // 这三个字段必须原样带回：保存是「整体覆盖写」，不回填就等于
-        // 一改框就把大模型审核结论（audit）、置信度、来源全清掉，
-        // 该图也会从「问题图」队列里静默消失。
-        ...(box.confidence != null ? { confidence: box.confidence } : {}),
-        ...(box.source ? { source: box.source } : {}),
-        ...(box.audit ? { audit: box.audit } : {})
-      }))
+      // F-21b：加载链路同样过任务类型闸门——批量预标注/历史分割落盘（polygon-only）由后端写盘、
+      // 前端切图回读时经此渲染；detect/obb 不得把 polygon 当分割收下，polygon-only 现算外接矩形。
+      // 分割任务轮廓照常回填（顶点可微调）；obb/audit/confidence/source 原样保留。
+      currentBoxes.value = (result.boxes || [])
+        .map((box: any) => {
+          const g = gateAiBox(box)
+          if (!g) return null
+          return {
+            class_id: box.class_id,
+            ...g,
+            // 旋转框四角点同理：不回填就只剩外接矩形，角度信息丢失（保存是整体覆盖写）
+            ...(box.obb && box.obb.length === 4 ? { obb: box.obb as number[][] } : {}),
+            // 这三个字段必须原样带回：保存是「整体覆盖写」，不回填就等于
+            // 一改框就把大模型审核结论（audit）、置信度、来源全清掉，
+            // 该图也会从「问题图」队列里静默消失。
+            ...(box.confidence != null ? { confidence: box.confidence } : {}),
+            ...(box.source ? { source: box.source } : {}),
+            ...(box.audit ? { audit: box.audit } : {})
+          }
+        })
+        .filter((x: any) => x !== null)
+      // 图级审核摘要还原：批量审核把 missed_targets / scan_summary / stats 落进
+      // 每图 JSON 的 audit_meta（无框图走旁路），以前加载只读 boxes，导致刷新后
+      // 框上的审核徽标还在（box.audit），「AI 审核」汇总面板和漏标蓝虚线却整个消失。
+      // 后端落盘结构没有 ok 标志，这里补上；且只在确有审核内容时才挂面板，
+      // 避免 M3 重复扫描只写 audit_meta.duplicate 的图显示一排全 0 的假统计。
+      const auditMeta: any = result.audit_meta
+      const ast: any = auditMeta?.stats || {}
+      const hasAudit = !!auditMeta && (
+        (auditMeta.missed_targets || []).length > 0 ||
+        !!auditMeta.scan_summary ||
+        ['keep', 'modify', 'reject', 'split', 'missed'].some((k) => (ast[k] || 0) > 0)
+      )
+      imageAudit.value = hasAudit
+        ? { ...auditMeta, ok: true, box_reviews: auditMeta.box_reviews || [] }
+        : null
       // 服务端态整体替换了画布：此前的撤销历史描述的是「另一份数据」，必须作废。
       // 不作废的后果（实测）：批量审核停止/完成会异步重载当前图，用户接着拖一下框再按
       // Ctrl+Z，第一次看着正常，第二次就跳回重载前的旧坐标——框凭空变样/移位，
@@ -3352,14 +3399,12 @@ const runInteractiveLabel = async () => {
     )
     const base = single ? drawClass.value : 0
     // SAM 精修返回的分割轮廓必须透传，否则前端只显示矩形，分割标注就白做了
-    const newBoxes: BBox[] = (res.boxes || []).map((b: any) => ({
-      class_id: base + (b.class_id ?? 0),
-      x1: b.x1,
-      y1: b.y1,
-      x2: b.x2,
-      y2: b.y2,
-      ...(b.polygon && b.polygon.length >= 3 ? { polygon: b.polygon as number[][] } : {})
-    }))
+    const newBoxes: BBox[] = (res.boxes || [])
+      .map((b: any) => {
+        const g = gateAiBox(b)   // F-21b：非分割任务丢 polygon，polygon-only 框现算外接矩形
+        return g ? { class_id: base + (b.class_id ?? 0), ...g } : null
+      })
+      .filter((x: BBox | null): x is BBox => x !== null)
     if (newBoxes.length) {
       pushUndo()
       currentBoxes.value.push(...newBoxes)
@@ -3563,11 +3608,13 @@ const pumpCutout = async () => {
       cutoutCoverage.value = Number(raw[0].coverage ?? 1)
     } else {
       // coverage / point_indices 是"点是否连成一片"的判定元数据，不能混进标注体系落库
-      const geoms = raw.map(b => ({
-        class_id: job.classId,
-        x1: b.x1, y1: b.y1, x2: b.x2, y2: b.y2,
-        ...(b.polygon && b.polygon.length >= 3 ? { polygon: b.polygon as number[][] } : {})
-      }))
+      // F-21b：非分割任务丢 polygon，polygon-only 框现算外接矩形（gateAiBox）
+      const geoms = raw
+        .map(b => {
+          const g = gateAiBox(b)
+          return g ? { class_id: job.classId, ...g } : null
+        })
+        .filter((x): x is { class_id: number; x1: number; y1: number; x2: number; y2: number; polygon?: number[][] } => x !== null)
       const split = raw.length > 1 || Number(raw[0].coverage ?? 1) < 1
       cutoutCoverage.value = Number(raw[0].coverage ?? 1)
       await landCutout(job, geoms, split, Array.isArray(raw[0].point_indices) ? raw[0].point_indices : undefined)
@@ -4161,7 +4208,8 @@ const loadSamConfigAndModels = async () => {
     const cfg = await getSamConfig()
     samConfig.value = cfg
     // 页面打开时按已保存的形态对齐绘制工具：上次选的是「轮廓·分割」就直接进入描轮廓
-    polyDrawMode.value = samOn.value
+    // F-21b：与 watch(samOn) 同口径——非分割任务不得把画布锁进描轮廓模式
+    polyDrawMode.value = isSegTask.value && samOn.value
     if (typeof cfg.conf === 'number') aiConf.value = cfg.conf
     if (typeof cfg.iou === 'number') aiIou.value = cfg.iou
   } catch (e: any) {
@@ -4337,17 +4385,18 @@ const runAutoLabel = async () => {
     }
     const auditMap = new Map<number, any>()
     ;(result.audit?.box_reviews || []).forEach((r: any) => auditMap.set(r.box_id, r))
-    const aiBoxes = (result.boxes || []).map((b: any) => ({
-      class_id: b.class_id,
-      x1: b.x1,
-      y1: b.y1,
-      x2: b.x2,
-      y2: b.y2,
-      source: b.source || 'ai',
-      // SAM 分割轮廓（有则透传，无则仍是检测框）
-      ...(b.polygon && b.polygon.length >= 3 ? { polygon: b.polygon as number[][] } : {}),
-      box_id: b.box_id != null ? b.box_id : undefined
-    }))
+    const aiBoxes = (result.boxes || [])
+      .map((b: any) => {
+        // F-21b：非分割任务丢 polygon，polygon-only 框现算外接矩形（gateAiBox）
+        const g = gateAiBox(b)
+        return g ? {
+          class_id: b.class_id,
+          ...g,
+          source: b.source || 'ai',
+          box_id: b.box_id != null ? b.box_id : undefined
+        } : null
+      })
+      .filter((x: any) => x !== null)
     // 按 IoU 去重：与已有任意类别框重叠 >=0.5 的视为同一目标，避免重复标注（含跨类别）
     const newAiBoxes = aiBoxes.filter(
       (ab: any) => !currentBoxes.value.some((cb: any) => iou(cb, ab) >= 0.5)
