@@ -11,7 +11,9 @@ import json
 import asyncio
 import uuid
 import os
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -145,6 +147,10 @@ class BatchTask:
         self.failed_images = 0
         self.last_error: Optional[str] = None
         self.audit_summary = {"keep": 0, "modify": 0, "reject": 0, "split": 0, "missed": 0}
+        # B-40：本批实际调用过 sam.predict 的图数（按图去重；兜底重试同一张图多次只计 1）。
+        # 与「有检出框图数/写入图数」刻意区分：SAM 可能加载失败降级或 predict 抛错，
+        # 只有真实调用过才算，批量结束日志据此消除「SAM 跑没跑全靠猜」的取证盲区。
+        self.sam_refined_images: set = set()
 
 
 # 千问 L2 审核内置默认系统提示词（用户未在「AI 标注模型设置」配置模板时使用）。
@@ -289,6 +295,12 @@ class SAMService:
         self._sam_pred = None
         self._sam_pred_img = None      # 预测器当前已编码的图（路径）
         self._sam_pred_key = None      # 权重|imgsz|device 指纹，配置变了就重建
+        # B-40：SAM 单例是跨请求共享的（批量精修/单图 AI 标注/点选抠图都在用），
+        # 批量收尾要卸载还显存，但不能把正在跑的单图推理打断 → 用占用计数保护：
+        # 每条推理路径登记占用，批量 finally 只在计数归零时才真正置 None。
+        # threading.Lock 而非 asyncio.Lock：登记发生在 to_thread 的工作线程里。
+        self._sam_users = 0
+        self._sam_users_lock = threading.Lock()
         # GroundingDINO（Transformers 集成）缓存
         self._gd_processor = None
         self._gd_model = None
@@ -407,6 +419,16 @@ class SAMService:
         self._trained_id = None
         self._trained_map = None
         self._trained_map_key = None
+        # B-40：此前独漏 SAM——改 sam_weights/imgsz 后旧模型仍常驻显存且被继续复用。
+        # 与检测器同一语义：丢引用让下次推理按新配置重载；_sam_pred 连同 img/key
+        # 一起清，否则旧预测器（内部持有权重）还在缓存里，等于没卸。
+        self._sam = None
+        self._sam_name = None
+        self._sam_pred = None
+        self._sam_pred_img = None
+        self._sam_pred_key = None
+        # 只丢 Python 引用不会把显存还给 OS：CUDA 缓存分配器仍持有历史块，必须显式归还
+        self._release_cuda_cache()
         return cfg
 
     # ------------------------------------------------------------------
@@ -806,6 +828,67 @@ class SAMService:
         return self._sam
 
     # ------------------------------------------------------------------
+    # B-40：SAM 显存回收（占用计数 + 安全 empty_cache）
+    # ------------------------------------------------------------------
+    class _SamUseGuard:
+        """同一个对象既能 `with`（工作线程/同步段）又能 `async with`（协程段）。
+        为什么不用 @contextmanager：批量主循环要在 async with self._lock 后继续
+        登记占用，同步上下文管理器没有 __aenter__，分开写两套又容易漏配对。"""
+
+        def __init__(self, svc):
+            self._svc = svc
+
+        def __enter__(self):
+            with self._svc._sam_users_lock:
+                self._svc._sam_users += 1
+            return self
+
+        def __exit__(self, *exc):
+            with self._svc._sam_users_lock:
+                self._svc._sam_users -= 1
+            return False
+
+        async def __aenter__(self):
+            return self.__enter__()
+
+        async def __aexit__(self, *exc):
+            return self.__exit__(*exc)
+
+    def _sam_in_use(self):
+        """登记一次 SAM 占用（批量/单图/点选/交互式推理都走这里）。
+        批量收尾卸载前看计数：>0 说明还有别的请求正拿着模型跑，不能置 None。"""
+        return self._SamUseGuard(self)
+
+    def _release_cuda_cache(self) -> None:
+        """把 PyTorch 缓存分配器持有的空闲显存块还给 OS（置 None 只丢引用，不触发归还）。
+        torch 未安装 / CPU 部署 / CUDA 不可用时静默跳过——参照 train_script.py:620-626
+        的既有写法，任何环境都不允许因为这行清理而抛错。"""
+        try:
+            import gc
+            import torch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def _release_sam_after_batch(self) -> None:
+        """批量收尾（正常/异常/取消共用）：没有其他使用者时卸载 SAM 并归还显存。
+        仍有占用就什么都不动：宁可本批显存延后回收（下一个批量收尾或改配置时再卸），
+        也不能打断正在进行的单图/点选请求（能力边界见 B-40 文档）。
+        GroundingDINO 刻意不动：检测主引擎下一批还要用，卸载只会拖慢。"""
+        with self._sam_users_lock:
+            busy = self._sam_users > 0
+        if busy:
+            return
+        self._sam = None
+        self._sam_name = None
+        self._sam_pred = None
+        self._sam_pred_img = None
+        self._sam_pred_key = None
+        self._release_cuda_cache()
+
+    # ------------------------------------------------------------------
     # 可用性 / 校验
     # ------------------------------------------------------------------
     async def is_available(self) -> dict:
@@ -916,7 +999,9 @@ class SAMService:
         # 模型推理非线程安全，加锁串行化，避免并发访问导致模型状态损坏
         t_det = time.perf_counter()
         async with self._lock:
-            boxes = await asyncio.to_thread(self._run_auto_label_sync, img_abs, classes, conf, cfg, prompts)
+            # B-40：登记占用，防止批量收尾把本请求正在用的 SAM 单例卸掉
+            with self._sam_in_use():
+                boxes = await asyncio.to_thread(self._run_auto_label_sync, img_abs, classes, conf, cfg, prompts)
         det_ms = (time.perf_counter() - t_det) * 1000
         # L2 千问审核（设计文档 §6.2/§6.3）：qwen 启用时对预标注结果自动二次审核。
         # box_id = 返回列表下标，前端按此映射审核结论到对应框。
@@ -976,9 +1061,11 @@ class SAMService:
 
         # 模型推理非线程安全，与预标注共用同一把锁串行化
         async with self._lock:
-            boxes = await asyncio.to_thread(
-                self._run_point_label_sync, img_abs, class_id, pts, cfg
-            )
+            # B-40：点选抠图同样持有 _sam/_sam_pred，登记占用防批量收尾误卸
+            with self._sam_in_use():
+                boxes = await asyncio.to_thread(
+                    self._run_point_label_sync, img_abs, class_id, pts, cfg
+                )
         return {
             "image_id": image_id,
             "width": item["width"],
@@ -1315,9 +1402,11 @@ class SAMService:
 
         # 模型推理非线程安全，加锁串行化
         async with self._lock:
-            boxes = await asyncio.to_thread(
-                self._run_interactive_label_sync, img_abs, classes, conf, cfg, prompts, region
-            )
+            # B-40：交互式标注也会走 SAM 精修，登记占用防批量收尾误卸
+            with self._sam_in_use():
+                boxes = await asyncio.to_thread(
+                    self._run_interactive_label_sync, img_abs, classes, conf, cfg, prompts, region
+                )
         return {
             "image_id": image_id,
             "width": item["width"],
@@ -3287,6 +3376,12 @@ class SAMService:
             print(f"Warning: SAM refine failed, fallback to detect boxes: {e}")
             return det_boxes
 
+        # B-40：predict 真实调用成功才计数（失败降级/未启用不计）。按图去重：
+        # 兜底重试同一张图可能进来多次，set 保证「图数」口径。单图路径 cfg 无此键，零影响。
+        _bt = cfg.get("_batch_task_ref")
+        if _bt is not None:
+            _bt.sam_refined_images.add(str(img_abs))
+
         want_polygon = bool(cfg.get("sam_return_polygon", True))
         eps_px = float(cfg.get("sam_polygon_eps_px", 0.5) or 0.5)
         max_points = int(cfg.get("sam_polygon_max_points", 3000) or 3000)
@@ -3441,6 +3536,11 @@ class SAMService:
         if ld:
             cfg = dict(cfg)
             cfg["qwen_labels_desc"] = ld
+        # B-40：SAM 精修计数（口径=实际调用过 sam.predict 的图数，重试同图去重）。
+        # 借 cfg 把 BatchTask 传给 _refine_with_sam（该函数被单图/交互式共用，
+        # 不能改签名）；无此键的单图路径不计数，行为完全不变。
+        cfg = dict(cfg)
+        cfg["_batch_task_ref"] = bt
         try:
             # 预加载模型，避免逐张重复实例化（CPU 上模型加载较慢，提前检查取消）
             if bt.cancelled:
@@ -3478,7 +3578,10 @@ class SAMService:
                 # SAM 精修只是锦上添花：权重缺失/加载失败时降级成「只出方框」，
                 # 不该让整批直接失败
                 try:
-                    await asyncio.to_thread(self._load_sam, cfg)
+                    # B-40：预加载也登记占用——加载期间批量若被取消/抛错走 finally，
+                    # 不能把另一个线程正在实例化的模型置 None
+                    with self._sam_in_use():
+                        await asyncio.to_thread(self._load_sam, cfg)
                 except Exception as e:
                     cfg = dict(cfg)
                     cfg["sam_enabled"] = False
@@ -3538,7 +3641,8 @@ class SAMService:
                     t_det = time.perf_counter()
                     if img_abs.exists():
                         # 加锁串行化推理，避免与单图标注并发访问模型
-                        async with self._lock:
+                        # B-40：登记占用，覆盖首跑+全部兜底重试；finally 收尾据此判断能否卸载
+                        async with self._lock, self._sam_in_use():
                             boxes = await asyncio.to_thread(
                                 self._run_auto_label_sync, img_abs, bt.classes, bt.conf, cfg, bt.prompts
                             )
@@ -3681,12 +3785,20 @@ class SAMService:
                 "avg_detect_ms": round(bt.time_detect_ms / processed),
                 "avg_audit_ms": round(bt.time_audit_ms / processed),
             }
+            # B-40：只追加 SAM精修 字段（既有字段一字不动，线上排障脚本在 grep 它们）。
+            # SAM 未启用/加载失败时恒为 0，字段不缺席，解析口径稳定。
             print(f"qwen: 批量结束 图片={bt.total} 写入={bt.boxes_written} "
                   f"检出均值={bt.result_summary['avg_detect_ms']}ms/图 "
-                  f"审核均值={bt.result_summary['avg_audit_ms']}ms/图")
+                  f"审核均值={bt.result_summary['avg_audit_ms']}ms/图 "
+                  f"SAM精修={len(bt.sam_refined_images)}张")
         except Exception as e:
             bt.status = "error"
             bt.error = str(e)
+        finally:
+            # B-40：正常/异常/取消（含各提前 return）三条路径都必须归还 SAM 显存。
+            # 放 finally 而非 except 尾部：cancelled 的提前 return 不经过 except。
+            # 状态写回（status/result_summary/日志）都在上面完成后才走到这里，顺序不变。
+            self._release_sam_after_batch()
 
     async def get_batch_status(self, batch_id: str) -> Optional[dict]:
         bt = self.batch_tasks.get(batch_id)

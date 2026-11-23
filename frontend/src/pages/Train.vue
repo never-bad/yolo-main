@@ -2246,28 +2246,69 @@ const JOB_TEXT_EXTS = ['yaml', 'yml', 'csv', 'txt', 'log', 'json', 'py', 'md']
 // 后端 build_tree 的 ext 自带点（'.png'），归一化为不带点再比对（B-19 乱码根因）
 const fileExt = (ext?: string) => (ext || '').replace(/^\./, '').toLowerCase()
 
+// ===== F-47：大日志预览「加载慢 + 关不掉」修复 =====
+// 根因：训练日志（300 epoch 可达数 MB / 数万行）经 /static/ 全文返回后，
+// 一次性塞进 <pre>（pre-wrap + break-all）触发整段布局，主线程长时间阻塞，
+// 「关闭」按钮点不动；且 fetch 无取消机制，关弹窗后回包仍 setState。
+// 修法：只渲染尾部 N 行（全文仍可「下载原文件」获取）+ AbortController 可取消。
+// 用 window 挂开关供 e2e 反向对照（还原旧行为），生产环境恒为修复态。
+const PREVIEW_TAIL_LINES = (window as any).__F47_TAIL_LINES ?? 2000
+const PREVIEW_ABORT_ENABLED = (window as any).__F47_ABORT !== false
+let jobFilePreviewAbort: AbortController | null = null
+
 // 点击文件：图片直接预览，文本读取内容，二进制提示下载
 const openJobFile = async (node: any) => {
+  // 打开新预览前先取消上一次未完成的读取，避免旧回包覆盖新内容
+  jobFilePreviewAbort?.abort()
+  const ac = new AbortController()
+  jobFilePreviewAbort = ac
   jobFilePreview.value = node
   jobFilePreviewContent.value = ''
   jobFilePreviewIsImage.value = JOB_IMG_EXTS.includes(fileExt(node.ext))
   jobFilePreviewIsText.value = JOB_TEXT_EXTS.includes(fileExt(node.ext))
   if (jobFilePreviewIsImage.value || !jobFilePreviewIsText.value) return
   try {
-    const res = await fetch('/prod-api/static/' + node.path)
+    const res = await fetch('/prod-api/static/' + node.path,
+      PREVIEW_ABORT_ENABLED ? { signal: ac.signal } : undefined)
     if (!res.ok) throw new Error('HTTP ' + res.status)
-    jobFilePreviewContent.value = await res.text()
+    const text = await res.text()
+    // 弹窗已关闭或已切到别的文件：丢弃回包，不再 setState
+    if (jobFilePreview.value?.path !== node.path) return
+    const lines = text.split('\n')
+    if (PREVIEW_TAIL_LINES > 0 && lines.length > PREVIEW_TAIL_LINES) {
+      // 只渲染尾部 N 行：巨量文本一次性进 DOM 会卡死主线程（「关不掉」的真因）
+      jobFilePreviewContent.value =
+        `…（文件共 ${lines.length} 行，仅显示最后 ${PREVIEW_TAIL_LINES} 行；完整内容请点右上「下载原文件」）\n` +
+        lines.slice(-PREVIEW_TAIL_LINES).join('\n')
+    } else {
+      jobFilePreviewContent.value = text
+    }
   } catch (e: any) {
+    // 主动取消（关弹窗/切文件）不算错误，不写错误文案
+    if (e?.name === 'AbortError') return
+    if (jobFilePreview.value?.path !== node.path) return
     jobFilePreviewContent.value = '无法读取该文件：' + (e.message || e)
   }
 }
 
 const closeJobFilePreview = () => {
+  // 加载中也要能关：立即中断下载，回包不再进 DOM
+  jobFilePreviewAbort?.abort()
+  jobFilePreviewAbort = null
   jobFilePreview.value = null
   jobFilePreviewContent.value = ''
   jobFilePreviewIsImage.value = false
   jobFilePreviewIsText.value = false
 }
+
+// ESC 关闭：只关最上层（内层预览优先），避免一次按键把两层全关
+const onJobViewerKeydown = (e: KeyboardEvent) => {
+  if (e.key !== 'Escape') return
+  if (jobFilePreview.value) closeJobFilePreview()
+  else if (jobFiles.value) closeJobFiles()
+}
+onMounted(() => window.addEventListener('keydown', onJobViewerKeydown))
+onUnmounted(() => window.removeEventListener('keydown', onJobViewerKeydown))
 
 const handleFileImgError = (e: any) => {
   const el = e.target as HTMLImageElement

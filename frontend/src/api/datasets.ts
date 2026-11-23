@@ -59,6 +59,17 @@ export const confirmClassAlignment = async (
   return data
 }
 
+/** F-30 标签一键入库：把对齐报告里未匹配的源类批量追加进归属算法库字典，
+ *  返回 mapping_suggestions 可直接整表提交 confirmClassAlignment 完成映射。
+ *  items 不传/为 null = 全部未匹配源类；缺省中文名由后端用源类名兜底。 */
+export const adoptNewLabels = async (
+  datasetId: string,
+  items: Array<{ src_name: string; chinese_name?: string; chinese_desc?: string; ai_prompt_en?: string }> | null = null
+) => {
+  const { data } = await api.post(`/datasets/${datasetId}/class-alignment/adopt-new-labels`, items ? { items } : {})
+  return data
+}
+
 export const listDatasets = async () => {
   const { data } = await api.get('/datasets')
   return data

@@ -2503,6 +2503,124 @@ class DatasetService:
                        {"nc": len(canonical), "names": list(canonical)})
         return cmap, touched, dropped
 
+    async def adopt_new_labels_for_alignment(self, dataset_id: str,
+                                             items: Optional[list] = None) -> dict:
+        """B-30 标签一键入库：对齐弹窗里把未匹配源类批量追加进归属算法库字典，
+        随后刷新 canonical 快照并重算对齐，使「先入库 → 再 confirm」链路走通。
+
+        items: [{"src_name": str, "chinese_name": str?, "chinese_desc": str?,
+                 "ai_prompt_en": str?}]；不传默认全部 unresolved 源类。
+        缺省约定：english_code = 源类名本身；chinese_name 缺省 = 源类名
+        （源类多为中文可读名，留空反而丢信息；可被 items 显式覆盖）。
+
+        复用 ModelService.adopt_suggested_labels（只追加、按小写去重、绝不动在用类别）；
+        本方法不重写 labels/*.txt 与每图 JSON——文件重映射仍由 confirm 完成，
+        职责边界与 confirm 保持一致（本方法只改库字典 + meta 对齐报告快照）。
+        """
+        ds_dir = self.datasets_dir / dataset_id
+        mp = ds_dir / "meta.json"
+        if not await asyncio.to_thread(lambda: mp.exists()):
+            raise ValueError(f"数据集不存在: {dataset_id}")
+        meta = await asyncio.to_thread(load_json, mp)
+        align = meta.get("class_alignment") or {}
+        source = [str(c) for c in (align.get("source_classes") or [])]
+        unresolved = [int(i) for i in (align.get("unresolved") or [])]
+        if align.get("status") == "confirmed":
+            return {"ok": True, "dataset_id": dataset_id, "status": "confirmed",
+                    "added": [], "skipped": [], "mapping_suggestions": [],
+                    "unresolved_after": [],
+                    "message": "类别映射已人工确认，无需再入库"}
+
+        # 归属算法库解析：与 prepare/bind 同口径（meta.model_id → ModelService 换算库根）；
+        # 未绑定或库记录不存在时明确报错，绝不猜一个库。
+        from src.services.model_service import ModelService
+        model_id = meta.get("model_id") or align.get("model_id")
+        root_id = self._library_root_id_of(model_id) if model_id else None
+        if not root_id:
+            raise ValueError("该数据集尚未绑定算法库，请先在数据集详情绑定算法库后再一键入库")
+
+        # 待入库清单：items 按源类名（小写）匹配 source_classes 全集——
+        # 含「此前已入库、本次重算后已解析」的类，让 adopt 的 skipped 分支如实回报（幂等）。
+        # 不传 items 默认全部 unresolved。
+        by_name = {}
+        for it in items or []:
+            nm = str((it or {}).get("src_name") or "").strip()
+            if nm:
+                by_name.setdefault(nm.lower(), it)
+        if items:
+            targets = [i for i, nm in enumerate(source)
+                       if nm.strip().lower() in by_name]
+            if not targets:
+                raise ValueError("没有可入库的源类（请检查 src_name 是否属于本数据集的源类清单）")
+            # 注：items 命中的源类即使已解析（此前已入库/别名命中）也照送 adopt，
+            # 由其 skipped 分支如实回报（幂等重提不静默）。
+        else:
+            targets = list(unresolved)
+        if not targets:
+            # 幂等兜底：unresolved 已空（此前已入库/已对齐）→ 不写库，只重算并返回现状
+            rows = read_label_rows(root_id)
+            fresh = class_alignment(source, model_id=root_id, rows=rows,
+                                    canonical_names=model_class_names(root_id))
+            return {"ok": True, "dataset_id": dataset_id, "library_root_id": root_id,
+                    "added": [], "skipped": [], "status": fresh.get("status"),
+                    "canonical_names": fresh.get("canonical_names") or [],
+                    "mapping_suggestions": [
+                        {"src_index": p["src_index"], "target_id": p["class_id"]}
+                        for p in (fresh.get("pairs") or []) if p.get("class_id") is not None],
+                    "unresolved_after": fresh.get("unresolved") or [],
+                    "summary": fresh.get("summary"),
+                    "message": "没有待入库的未匹配源类（可能已入库），未改动标签字典"}
+
+        suggestions = []
+        seen_req = set()
+        for i in targets:
+            nm = source[i].strip()
+            key = nm.lower()
+            if not nm or key in seen_req:
+                continue
+            seen_req.add(key)
+            it = by_name.get(key) or {}
+            suggestions.append({
+                "english_code": nm,
+                "chinese_name": str(it.get("chinese_name") or "").strip() or nm,
+                "chinese_desc": str(it.get("chinese_desc") or "").strip(),
+                "ai_prompt_en": str(it.get("ai_prompt_en") or "").strip(),
+            })
+        adopt = await ModelService().adopt_suggested_labels(root_id, suggestions)
+        if adopt is None:
+            raise ValueError(f"归属算法库记录不存在: {root_id}")
+
+        # 关键：刷新 canonical 快照并重算对齐（否则 confirm 仍拿导入时旧快照 → 越界报错）。
+        # rows/canonical 都取库根实时字典，与封板 _resolve_seal_names 的回退口径一致。
+        rows = read_label_rows(root_id)
+        canonical = model_class_names(root_id)
+        fresh = class_alignment(source, model_id=root_id, rows=rows,
+                                canonical_names=canonical)
+        fresh["refreshed_at"] = datetime.now().isoformat()
+        fresh["adopt_new_labels"] = {"added": adopt.get("added") or [],
+                                     "skipped": adopt.get("skipped") or []}
+        # 可直接用于 confirm 的映射建议：全部已唯一解析的源类（含原本已对齐的），
+        # 前端可整表提交 confirm；仍 ambiguous/unknown 的不在其中，需人工决策。
+        suggestions_map = [
+            {"src_index": p["src_index"], "target_id": p["class_id"]}
+            for p in (fresh.get("pairs") or []) if p.get("class_id") is not None
+        ]
+        meta["class_alignment"] = fresh
+        # meta.class_map 维持原口径：仅 aligned 时落盘（needs_confirm 仍为 None，封板照旧被拦）
+        meta["class_map"] = fresh.get("class_map") if fresh.get("status") == "aligned" else None
+        await asyncio.to_thread(save_json_atomic, mp, meta)
+        from src.db import shadow
+        await shadow.sync_dataset(dataset_id)
+        return {
+            "ok": True, "dataset_id": dataset_id, "library_root_id": root_id,
+            "added": adopt.get("added") or [], "skipped": adopt.get("skipped") or [],
+            "status": fresh.get("status"),
+            "canonical_names": fresh.get("canonical_names") or [],
+            "mapping_suggestions": suggestions_map,
+            "unresolved_after": fresh.get("unresolved") or [],
+            "summary": fresh.get("summary"),
+        }
+
     def confirm_class_alignment(self, dataset_id: str, decisions: list) -> dict:
         """人工确认导入类别映射（B-64 导入闸门）。
 

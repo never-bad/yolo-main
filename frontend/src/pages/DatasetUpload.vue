@@ -382,10 +382,16 @@
                 <span v-if="p.status === 'ambiguous'" class="align-warn">有歧义，候选 {{ (p.candidates || []).join(', ') }}</span>
               </div>
               <div class="align-actions">
-                <button class="primary" :disabled="alignSubmitting" @click="submitClassAlignment">
+                <!-- F-30：未匹配类一键入库 + 自动映射（不必先去模型页手工加标签） -->
+                <button class="secondary adopt-new-labels-btn" :disabled="alignSubmitting || adoptSubmitting"
+                  title="把未匹配的源类批量追加进算法库标签字典，并自动完成映射" @click="adoptAndMapNewLabels">
+                  <span v-if="adoptSubmitting" class="loading-spinner"></span>
+                  {{ adoptSubmitting ? '入库中…' : '新增到算法库' }}
+                </button>
+                <button class="primary" :disabled="alignSubmitting || adoptSubmitting" @click="submitClassAlignment">
                   {{ alignSubmitting ? '处理中…' : '确认映射' }}
                 </button>
-                <span class="align-hint">确认后会同步改写标签、每图标注与 data.yaml；未确认不能封板/训练</span>
+                <span class="align-hint">未匹配的类可「新增到算法库」一键入库并自动映射；或逐类选择后确认。未确认不能封板/训练</span>
               </div>
             </div>
           </div>
@@ -540,7 +546,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch, onMounted, onActivated, onDeactivated, nextTick } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { uploadDataset, cancelUpload, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel, getSealThreshold, setSealThreshold, setDatasetAsTestSet, confirmClassAlignment, validateDataset } from '@/api/datasets'
+import { uploadDataset, cancelUpload, prepareDataset as prepareDst, listDatasets, getDataset, getDatasetTree, updateDataset, deleteDataset, sealDataset as sealDst, exportAnnotatedDataset, exportOriginalDataset, advanceBuckets, approveDatasetReview, unpourDatasetBucket, bindDatasetModel, getSealThreshold, setSealThreshold, setDatasetAsTestSet, confirmClassAlignment, adoptNewLabels, validateDataset } from '@/api/datasets'
 import { listModels } from '@/api/models'
 import { addHardSamples, addBackgroundSamples } from '@/api/samplePool'
 import { downloadFile } from '@/utils/download'
@@ -1117,6 +1123,62 @@ const submitClassAlignment = async () => {
     showToast('确认失败: ' + (e.response?.data?.detail || e.message), 'error', 5000)
   } finally {
     alignSubmitting.value = false
+  }
+}
+
+// F-30 标签一键入库：未匹配源类批量入库 → 用返回的 mapping_suggestions 整表 confirm → 刷新状态
+const adoptSubmitting = ref(false)
+const adoptAndMapNewLabels = async () => {
+  const dsId = viewingDataset.value?.dataset_id
+  if (!dsId || adoptSubmitting.value || alignSubmitting.value) return  // 防重复点击
+  adoptSubmitting.value = true
+  try {
+    const res = await adoptNewLabels(dsId)  // 不传 items = 全部未匹配源类，中文名后端兜底
+    // 入库后先刷新详情：拿到重算后的对齐报告（新 canonical 快照 + 剩余 unresolved）
+    viewerDetail.value = await getDataset(dsId)
+    const srcNames = (viewerDetail.value?.class_alignment?.source_classes || [])
+    const leftTxt = (res.unresolved_after || []).map((i: number) => srcNames[i] ?? `第 ${i} 类`).join('、')
+    // B-30 契约①：已人工确认分支（mapping_suggestions 为空），如实透出不谎报
+    if (res.status === 'confirmed' && res.message) {
+      showToast(res.message, 'info', 4500)
+    } else if ((res.mapping_suggestions || []).length) {
+      // 推荐链路：整表提交映射建议；aligned 时后端幂等早退返回 aligned，两种 status 均视为成功。
+      // unresolved_after 非空时后端 confirm 要求剩余类全部给出决定（部分提交必 400），
+      // 此分支不盲提，留给用户在弹窗里人工选完再点「确认映射」。
+      if ((res.unresolved_after || []).length === 0) {
+        const conf = await confirmClassAlignment(dsId, res.mapping_suggestions)
+        if (conf.status === 'aligned' || conf.status === 'confirmed') {
+          const addedTxt = (res.added || []).length
+            ? `已新增标签：${res.added.join('、')}；`
+            : '已入库，无需重复新增；'  // added 为空但 ok=true：幂等重提，如实提示而非报错
+          showToast(`${addedTxt}已自动完成映射，可以封板`, 'success', 5000)
+        } else {
+          showToast('入库成功，但映射确认返回异常状态：' + (conf.status || '未知'), 'error', 5000)
+        }
+      } else {
+        showToast(`已入库 ${(res.added || []).length} 个标签，但仍有 ${res.unresolved_after.length} 个类别未解析（${leftTxt}），请为剩余类选择标签或忽略后再确认映射`, 'info', 6000)
+      }
+    } else if ((res.unresolved_after || []).length) {
+      // 无任何可提交建议且仍有未解析类：不谎报完成
+      showToast(`仍有 ${res.unresolved_after.length} 个类别未解析（${leftTxt}），请人工选择标签或忽略后再确认映射`, 'info', 6000)
+    } else {
+      // B-30 契约②：没有待入库的未匹配源类（幂等兜底），如实透出
+      showToast(res.message || '已入库，无需重复新增', 'info', 4500)
+    }
+    // 按刷新后的报告预填：已唯一解析的默认选中，剩余 ambiguous/unknown 留空待人工选
+    const c: Record<number, string> = {}
+    for (const pr of (viewerDetail.value?.class_alignment?.pairs || [])) {
+      c[pr.src_index] = (pr.status === 'exact' || pr.status === 'alias' || pr.status === 'confirmed')
+        ? String(pr.class_id) : ''
+    }
+    Object.keys(alignChoices).forEach(k => delete alignChoices[Number(k)])
+    Object.assign(alignChoices, c)
+    await loadDatasets(true)  // 静默刷新列表/卡片徽标
+  } catch (e: any) {
+    // 未绑定算法库等 400：原样透出后端指引文案，不静默失败
+    showToast('一键入库失败: ' + (e.response?.data?.detail || e.message), 'error', 6000)
+  } finally {
+    adoptSubmitting.value = false
   }
 }
 

@@ -1361,6 +1361,8 @@ const origBox = ref<BBox | null>(null)
 // 旋转框编辑状态：被拖的角点下标（0-3）；旋转柄按下时的起始角度
 const obbCornerIdx = ref(-1)
 const obbRotateStart = ref<{ angle: number; pts: number[][] } | null>(null)
+// F-32 拖角交互期实时宽高提示（松手清空）
+const obbDragWH = ref<{ x: number; y: number; w: number; h: number } | null>(null)
 // 旋转柄位置：顶边中点沿外法线方向外推 24 屏幕像素
 const obbRotateHandlePos = (pts: number[][]) => {
   const mx = (pts[0][0] + pts[1][0]) / 2
@@ -1467,6 +1469,35 @@ const obbArea = (pts: number[][]): number => {
     s += a[0] * b[1] - b[0] * a[1]
   }
   return Math.abs(s) / 2
+}
+
+// F-32 拖角保持矩形（对标 roLabelImg getAdjointPoints，但用向量投影替代 tan(theta) 求交，
+// 避免 90° 附近除零/数值爆炸）：锚定被拖角的对角点，沿框自身两条正交轴把鼠标位置投影成
+// 新宽高，再由 锚点+两轴 重建四点 → 四点恒为矩形、旋转角不变，拖角只改尺寸。
+// 纯函数不碰状态，便于测试注入对照。返回 null = 本步非法（退化/越界），调用方拒绝整步。
+const OBB_MIN_SIDE = 2   // 最小边长（图像像素）：拖到宽高趋零时拒绝该步，不产生退化四点
+const obbCornerResize = (pts: number[][], idx: number, px: number, py: number, iw: number, ih: number): number[][] | null => {
+  const anchor = pts[(idx + 2) % 4]
+  // 轴 A = 框的角度基准边（0→1 边）方向：拖角只改宽高、旋转角不变，所以轴向必须取
+  // 基准边而不是「锚点连相邻角」的边——存量数据经保存期钳制可能已是非矩形，
+  // 若取邻边为轴会把歪斜固化下来；取基准边+其垂线则第一次拖角就把框重建回矩形。
+  const eA = [pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]]
+  const lA = Math.hypot(eA[0], eA[1])
+  if (lA < 1e-9) return null   // 已退化的框不再参与重建
+  const uA = [eA[0] / lA, eA[1] / lA]
+  const uB = [-uA[1], uA[0]]   // 垂直轴（向量旋转 90°，无 tan/除法，任意角度数值稳定）
+  const vx = px - anchor[0], vy = py - anchor[1]
+  const w = vx * uA[0] + vy * uA[1]   // 鼠标位移在轴 A 上的投影 = 新边长（带符号，允许拖过锚点翻边）
+  const h = vx * uB[0] + vy * uB[1]
+  if (Math.abs(w) < OBB_MIN_SIDE || Math.abs(h) < OBB_MIN_SIDE) return null
+  const out: number[][] = [[0, 0], [0, 0], [0, 0], [0, 0]]
+  out[(idx + 2) % 4] = [anchor[0], anchor[1]]
+  out[(idx + 1) % 4] = [anchor[0] + uA[0] * w, anchor[1] + uA[1] * w]
+  out[(idx + 3) % 4] = [anchor[0] + uB[0] * h, anchor[1] + uB[1] * h]
+  out[idx] = [anchor[0] + uA[0] * w + uB[0] * h, anchor[1] + uA[1] * w + uB[1] * h]
+  // 交互期越界拒绝整步（保住矩形；保存期钳制口径在 endDrawing，不动）
+  if (iw > 0 && ih > 0 && out.some(q => q[0] < 0 || q[1] < 0 || q[0] > iw || q[1] > ih)) return null
+  return out
 }
 
 // 有轮廓时矩形必须跟着轮廓走，否则导出会出现"框与分割掩码不符"
@@ -3159,15 +3190,23 @@ const drawing = (e: MouseEvent) => {
     redrawCanvas()
     return
   }
-  // 旋转框角点拖动：只动被抓住的那个角，外接矩形实时跟着反推
+  // F-32 旋转框角点拖动：保持矩形——固定对角点、旋转角不变，沿框自身两轴投影重建四点；
+  // 任一新角点出图或宽高趋零 → 拒绝整步（保持上一合法状态），不再是单点自由移动
   if (editMode.value === 'obb_corner' && selectedBoxIndex.value >= 0 && obbCornerIdx.value >= 0) {
     const box = currentBoxes.value[selectedBoxIndex.value]
     const pts = obbOf(box)
     if (pts) {
       const p = screenToImg(e)
-      pts[obbCornerIdx.value] = [p.x, p.y]
-      syncBBoxFromObb(box)
-      redrawCanvas()
+      const next = obbCornerResize(pts, obbCornerIdx.value, p.x, p.y, img.value?.width || 0, img.value?.height || 0)
+      if (next) {
+        for (let i = 0; i < 4; i++) { pts[i][0] = next[i][0]; pts[i][1] = next[i][1] }
+        syncBBoxFromObb(box)
+        // 实时宽高反馈（对标 roLabelImg 的 width/height 提示）：画在被拖角旁
+        obbDragWH.value = { x: next[obbCornerIdx.value][0], y: next[obbCornerIdx.value][1],
+                            w: Math.hypot(next[1][0] - next[0][0], next[1][1] - next[0][1]),
+                            h: Math.hypot(next[3][0] - next[0][0], next[3][1] - next[0][1]) }
+        redrawCanvas()
+      }
     }
     return
   }
@@ -3292,19 +3331,24 @@ const endDrawing = async (e: MouseEvent) => {
     const box = idx >= 0 ? currentBoxes.value[idx] : null
     const pts = box ? obbOf(box) : null
     if (box && pts) {
-      const clamped = clampObbToImage(pts)
-      if (obbArea(clamped) < 1) {
+      if (obbArea(pts) < 1) {
         // 拖成零面积 = 无效框：回退到本次编辑前的快照（撤销栈顶就是按下时压的）
         showToast('旋转框被拖成零面积，已还原', 'info')
         undo()
-      } else {
+      } else if (editMode.value === 'obb_rotate') {
+        // F-32 仅旋转柄保留收尾逐点钳制（保存期「越界必须裁不能拒」口径不动）；
+        // 拖角路径交互期已拒绝整步、四点恒在图内，收尾不再钳制以免破坏矩形
+        const clamped = clampObbToImage(pts)
         for (let i = 0; i < 4; i++) { pts[i][0] = clamped[i][0]; pts[i][1] = clamped[i][1] }
+        syncBBoxFromObb(box)
+      } else {
         syncBBoxFromObb(box)
       }
     }
     editMode.value = 'idle'
     obbCornerIdx.value = -1
     obbRotateStart.value = null
+    obbDragWH.value = null
     origBox.value = null
     // 角度输入框跟着画布走，否则拖完柄数字还停在旧角度
     const nowPts = box ? obbOf(box) : null
@@ -3792,6 +3836,13 @@ const drawBox = (box: BBox, index = -1) => {
       ctx.value.beginPath()
       ctx.value.arc(h.x, h.y, r, 0, Math.PI * 2)
       ctx.value.fill(); ctx.value.stroke()
+      // F-32 拖角实时宽高提示（对标 roLabelImg 的 width/height 显示）
+      if (editMode.value === 'obb_corner' && obbDragWH.value) {
+        const wh = obbDragWH.value
+        ctx.value.fillStyle = 'orange'
+        ctx.value.font = `${12 / viewScale.value}px Arial`
+        ctx.value.fillText(`宽 ${Math.round(wh.w)} × 高 ${Math.round(wh.h)}`, wh.x + 8 / viewScale.value, wh.y - 8 / viewScale.value)
+      }
       // 质心十字 = 提示框内部可整体拖动
       const c = obbCenter(obb)
       const k = s * 0.9
@@ -5146,13 +5197,18 @@ const openAuditClassify = async () => {
 // 用新标签页而不是内嵌 iframe：审核台是全屏工作台，需要完整的屏幕高度和键盘焦点，
 // 嵌在标注页里两者会互相挤占。新标签打开后本页状态原样保留，审完回来刷新即可。
 const openReviewWorkbench = () => {
-  if (!newTask.value.datasetId) {
+  // F-45：刷新/keep-alive 恢复路径（restoreAnnotateState）只回填 taskDatasetId，
+  // 不回填创建表单的 newTask.datasetId。只认表单值会把"已在任务里、图已加载"的
+  // 用户误拦成「请先选择数据集」。用当前任务的数据集兜底；两者都空仍拦住，
+  // 避免打开一个没有数据集上下文的无效审核台。
+  const dsId = newTask.value.datasetId || taskDatasetId.value
+  if (!dsId) {
     showToast('请先选择数据集', 'info', 3000)
     return
   }
   // 审核台内部用 /prod-api 取数，与生产静态路径一致；
   // 开发环境下 vite 已把 /prod-api 代理并剥前缀转发到后端，同样可用。
-  const url = `/prod-api/static/tools/review.html?from=platform&dataset=${encodeURIComponent(newTask.value.datasetId)}`
+  const url = `/prod-api/static/tools/review.html?from=platform&dataset=${encodeURIComponent(dsId)}`
   const w = window.open(url, '_blank')
   if (!w) {
     showToast('浏览器拦截了新标签页，请允许弹出窗口后重试', 'error', 5000)
@@ -5594,8 +5650,10 @@ const handleReviewMessage = async (e: MessageEvent) => {
   if (!d || d.source !== 'wb-review') return
   if (d.type !== 'review-finished' && d.type !== 'review-close') return
   const p = d.payload || {}
-  // 只处理当前数据集的消息（用户可能同时开着别的审核台标签）
-  if (p.datasetId && p.datasetId !== newTask.value.datasetId) return
+  // 只处理当前数据集的消息（用户可能同时开着别的审核台标签）。
+  // F-45：与二审入口同口径 —— 恢复路径下 newTask.datasetId 为空，
+  // 只认它会把本任务审完的回传误丢弃（列表不自动刷新），须用 taskDatasetId 兜底。
+  if (p.datasetId && p.datasetId !== (newTask.value.datasetId || taskDatasetId.value)) return
   await loadTaskItems()
   refreshAuditClassify()
   if (d.type === 'review-finished') {

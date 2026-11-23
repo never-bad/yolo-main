@@ -57,6 +57,22 @@ async def confirm_class_alignment(dataset_id: str, request: ClassAlignmentReques
     except ValueError as e:
         raise HTTPException(400, str(e))
 
+class AdoptNewLabelsRequest(BaseModel):
+    # 可选：要入库的未匹配源类清单；不传默认全部 unresolved。
+    # [{"src_name": "未戴安全帽", "chinese_name": "...", "chinese_desc": "...", "ai_prompt_en": "..."}]
+    items: Optional[List[dict]] = None
+
+@router.post("/{dataset_id}/class-alignment/adopt-new-labels")
+async def adopt_new_labels_for_alignment(dataset_id: str, request: AdoptNewLabelsRequest):
+    """B-30 标签一键入库：把对齐报告里未匹配的源类批量追加进归属算法库标签字典
+    （只追加、跳过已存在、不动在用类别），随后刷新 canonical 快照重算对齐，
+    返回可直接用于 confirm-class-alignment 的映射建议（mapping_suggestions）。
+    """
+    try:
+        return await dataset_service.adopt_new_labels_for_alignment(dataset_id, request.items)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
 @router.get("/{dataset_id}/bind-check")
 async def check_dataset_bind(dataset_id: str, model_id: str = Query(...)):
     """挂载前校验：该数据集换绑到 model_id 后，已标注类别的序号会不会错位
