@@ -12,7 +12,7 @@ from pathlib import Path
 from datetime import datetime
 from PIL import Image
 from src.core.settings import settings
-from src.utils.class_labels import model_class_names, merge_classes_with_model
+from src.utils.class_labels import model_class_names, merge_classes_with_model, norm_class_name
 from src.utils import zip_guard
 from src.utils.json_io import load_json, save_json_atomic
 
@@ -1141,7 +1141,9 @@ class AnnotationService:
                 "classes": live_classes(task_meta.get("classes") or [], task_meta.get("model_id") or ""),
                 "dataset_id": task_meta.get("dataset_id", ""),
                 "model_id": task_meta.get("model_id", ""),
-                "imported_annotations": task_meta.get("imported_annotations", 0)
+                "imported_annotations": task_meta.get("imported_annotations", 0),
+                # B-64：透传数据集任务类型（唯一判据 dataset_task），审核台按类型决定是否画/编辑旋转框
+                "task": dataset_task(self.datasets_dir / dataset_id)
             }
         
         return await asyncio.to_thread(_get_task_items_sync)
@@ -1208,7 +1210,9 @@ class AnnotationService:
                 # 人工复核标记（前端切图时回读，决定"轮廓质量"归属）
                 "reviewed": bool(annotation.get("reviewed", False)),
                 "audit_meta": audit_meta or None,
-                "classes": view_classes
+                "classes": view_classes,
+                # B-64：透传数据集任务类型（唯一判据 dataset_task），单图载入时兜底判定旋转框能力
+                "task": dataset_task(self.datasets_dir / dataset_id)
             }
         
         return await asyncio.to_thread(_get_image_annotation_sync)
@@ -1268,6 +1272,36 @@ class AnnotationService:
             
             # 规范化框（补全标签四字段 + 置信度/来源），并判定样本类型
             classes = task_meta.get("classes", []) or []
+            # B-52 保存闸门：类别未对齐/错位时禁止落盘。
+            # 为什么：保存路径会按任务类别快照的位置重算每框 english_code
+            # （_normalize_boxes），若快照与数据集对齐状态不一致（needs_confirm
+            # 未确认，或历史任务的库序快照与源序真值错位），保存就会把错误类名
+            # 写进标注 JSON，把「显示错位」固化成「数据损坏」（B-50 事故情形 C）。
+            # 注意：这与「坐标越界必须裁不能拒」是两回事——坐标问题裁切保数据，
+            # 类别语义错位时任何落盘都是污染，必须拒绝并引导先完成类别对齐。
+            # 数据集 meta 读不到（历史任务/目录已删）不拦，维持既有行为。
+            try:
+                ds_meta = load_json(self.datasets_dir / dataset_id / "meta.json")
+            except Exception:
+                ds_meta = {}
+            align = ds_meta.get("class_alignment") or {}
+            if align.get("status") == "needs_confirm":
+                return {"ok": False,
+                        "error": "该数据集类别尚未完成对齐确认（needs_confirm），"
+                                 "保存会把错误类名写进标注。请先在数据集详情完成类别对齐确认后再保存。"}
+            canon = [str(c).strip() for c in (align.get("canonical_names") or [])]
+            if canon and classes:
+                # confirmed 后 meta.classes 已收敛为库字典全序（比任务快照长属正常），
+                # 只要求任务快照与 canonical 前缀逐位一致；前缀错位=历史污染快照，拒绝。
+                # 纯中文名 norm 后为空，退回原文小写比对（与 merge 同口径），避免漏检。
+                def _ckey(s):
+                    return norm_class_name(s) or str(s).strip().lower()
+                n = min(len(canon), len(classes))
+                shifted = any(_ckey(classes[i]) != _ckey(canon[i]) for i in range(n))
+                if shifted:
+                    return {"ok": False,
+                            "error": "标注任务的类别顺序与数据集类别对齐结果不一致（历史错位快照），"
+                                     "保存会写坏类别语义。请先完成类别对齐确认并重建标注任务后再保存。"}
             class_meta = self._class_meta_map(task_meta.get("model_id", ""))
             vw = int(info.get("width") or existing.get("width") or 0)
             vh = int(info.get("height") or existing.get("height") or 0)

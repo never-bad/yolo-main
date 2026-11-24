@@ -2503,6 +2503,33 @@ class DatasetService:
                        {"nc": len(canonical), "names": list(canonical)})
         return cmap, touched, dropped
 
+    @staticmethod
+    def _downgrade_alignment_if_shifted(fresh: dict) -> dict:
+        """B-52：adopt 重算出的 aligned 报告，若源序与 canonical 位置不一致则降级 needs_confirm。
+
+        为什么：class_alignment 的 aligned 只表示「每个源类都能唯一解析到库标签」，
+        并不校验位置。入库把新标签追加到库尾部后，源类 0 可能解析到库 index 1
+        （库头已有别的类），此时标注文件的 class_id 仍是源序、从未重映射——
+        若照旧判 aligned 并落盘 class_map，封板守卫放行、显示层按库序解释，
+        就把「显示错位」固化成「数据损坏」（B-50 事故 ds_20261123_111902）。
+        所以只要 class_map 不是恒等映射（存在 src_index != target_id），
+        就必须降级 needs_confirm，让既有 confirm/_remap_alignment_files
+        权威迁移路径完成重映射后才能封板。pairs/class_map（建议值）原样保留，
+        confirm 的 mapping_suggestions 与决策校验不受影响。
+        仅 adopt 这一侧调用，不改 class_alignment 的通用语义（其它调用方不受影响）。
+        """
+        if fresh.get("status") != "aligned":
+            return fresh
+        cmap = fresh.get("class_map") or {}
+        if all(int(k) == int(v) for k, v in cmap.items()):
+            return fresh
+        fresh["status"] = "needs_confirm"
+        fresh["summary"] = (
+            "类别已全部入库，但源类别顺序与库标签字典位置不一致，标注文件的类别号尚未重映射："
+            "请先在类别对齐弹窗逐类确认映射（confirm 会重写标注文件），确认前禁止封板/训练。"
+        )
+        return fresh
+
     async def adopt_new_labels_for_alignment(self, dataset_id: str,
                                              items: Optional[list] = None) -> dict:
         """B-30 标签一键入库：对齐弹窗里把未匹配源类批量追加进归属算法库字典，
@@ -2561,6 +2588,19 @@ class DatasetService:
             rows = read_label_rows(root_id)
             fresh = class_alignment(source, model_id=root_id, rows=rows,
                                     canonical_names=model_class_names(root_id))
+            fresh = self._downgrade_alignment_if_shifted(fresh)
+            # B-57 F1：幂等分支也必须落盘降级结果，否则响应说 needs_confirm 而磁盘仍 aligned，
+            # confirm 会被「无需重复确认」挡住，恢复链路死锁（B-56 F1）。
+            # 与主路径同口径补 refreshed_at（不加 adopt_new_labels：本分支未入库，加了会误导）；
+            # 只落 meta 对齐状态，绝不写 labels_dict.json（幂等承诺「未改动标签字典」）；
+            # 不碰 meta["classes"]：源序快照是数据真值，只有 confirm 才收敛。
+            fresh["refreshed_at"] = datetime.now().isoformat()
+            meta["class_alignment"] = fresh
+            # 仅 aligned（恒等映射）时落 class_map；needs_confirm 置 None，封板照旧被拦（与主路径一致）
+            meta["class_map"] = fresh.get("class_map") if fresh.get("status") == "aligned" else None
+            await asyncio.to_thread(save_json_atomic, mp, meta)
+            from src.db import shadow
+            await shadow.sync_dataset(dataset_id)
             return {"ok": True, "dataset_id": dataset_id, "library_root_id": root_id,
                     "added": [], "skipped": [], "status": fresh.get("status"),
                     "canonical_names": fresh.get("canonical_names") or [],
@@ -2596,6 +2636,9 @@ class DatasetService:
         canonical = model_class_names(root_id)
         fresh = class_alignment(source, model_id=root_id, rows=rows,
                                 canonical_names=canonical)
+        # B-52：源序与库序位置不一致（需重映射）时降级 needs_confirm，
+        # 防止「已入库但未重映射」被误判 aligned 而放行封板/错位显示。
+        fresh = self._downgrade_alignment_if_shifted(fresh)
         fresh["refreshed_at"] = datetime.now().isoformat()
         fresh["adopt_new_labels"] = {"added": adopt.get("added") or [],
                                      "skipped": adopt.get("skipped") or []}

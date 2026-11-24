@@ -100,12 +100,20 @@ def model_class_names(model_id: str) -> list:
 
 
 def merge_classes_with_model(existing, live) -> list:
-    """数据集快照类别 ← 库字典实时类别，按 index 位置合并，绝不截断。
+    """数据集快照类别 ← 库字典实时类别合并（B-52：源序优先，绝不截断）。
 
     - live 为空（无归属模型/未配字典）→ 原样返回 existing，行为与改动前一致
+    - existing 为空 → 返回 live（没有已落盘类空间，无从谈位置语义）
     - live 全是占位名而 existing 有真名 → 保留 existing（不能被假名盖掉）
-    - live 更长 → 末尾追加（库新增标签立即可见）
-    - live 更短 → 保留 existing 尾部（截断会让已落盘 class_id 越界）
+    - 其余：existing 既有 index 原样保留，库中不重名的新标签按库序追加到尾部。
+
+    为什么（B-52 数据污染事故）：已落盘标注的 class_id 是「下标即类别」的数据真值，
+    其每个 index 的语义由数据集自己的类空间（meta.classes 快照）决定；库字典只是
+    命名来源。旧实现 `lv + ex[len(lv):]` 在库比快照长时用库序整段覆盖快照——
+    库头部新增一个标签（如 private_car 占 index 0）就会把所有已落盘 class_id 的
+    含义整体错位（0 号 bulldozer 被解释成 private_car），保存路径再按错位名重算
+    english_code 就把显示错位固化成真数据损坏。所以库的新标签只能追加到快照尾部，
+    绝不挤占既有 index；名字比对用本文件统一归一化口径 norm_class_name。
     """
     ex = [str(c).strip() for c in (existing or [])]
     lv = [str(c).strip() for c in (live or [])]
@@ -115,7 +123,20 @@ def merge_classes_with_model(existing, live) -> list:
         return lv
     if is_placeholder_classes(lv) and not is_placeholder_classes(ex):
         return ex
-    return lv + ex[len(lv):]
+    seen = {norm_class_name(c) for c in ex if c}
+    seen_raw = {c.lower() for c in ex if c}
+    tail = []
+    for c in lv:
+        if not c:
+            continue
+        k = norm_class_name(c)
+        # 归一化名为空（如纯中文名）时只按原文小写比对，避免多个中文名互相吞并
+        if (k and k in seen) or c.lower() in seen_raw:
+            continue
+        seen.add(k)
+        seen_raw.add(c.lower())
+        tail.append(c)
+    return ex + tail
 
 
 # --------------------------------------------------------------------------- #
