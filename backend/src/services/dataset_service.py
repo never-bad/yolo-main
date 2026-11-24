@@ -1329,6 +1329,8 @@ class DatasetService:
             # YOLO labels/*.txt → 每图 JSON（统一权威标注源；标注页可直接读原标注）
             # 重映射：txt class_id（源包类空间）→ 模型标签索引；只保留本模型需要的类（剔除冗余标签）
             # 源 labels 目录保留（原始标注供追溯），每图 JSON 为平台权威源
+            # B-72 D1：class_map 键改为三态标记——None=未重映射 / False=尝试过但对齐失败
+            # / True=JSON 已迁到库序。confirm 据此区分存量 JSON 的类号语义，杜绝二次映射。
             txt_to_json = {"converted": 0, "labels_removed": False, "class_map": None, "dropped_boxes": 0}
             class_filter = None
             if labels_dir and labels_dir.is_dir() and final_has_labels and label_count > 0:
@@ -1363,6 +1365,20 @@ class DatasetService:
                     # class_map 有效 → 数据集类别空间收敛为模型标签字典（与框索引对齐）
                     if class_map and model_labels:
                         detected_classes = list(model_labels)
+                        # B-72 D1：JSON 已迁库序，labels/*.txt 与 data.yaml 必须同步重写，
+                        # 三者类号语义始终一致。此前只迁 JSON、txt/yaml 仍源序，
+                        # adopt/confirm 按「文件仍源序」假设再映射一次 → 丢框/串号
+                        #（B-68 实测 A 丢 10 框 / B 丢 6 框；B-70 取证 4 个假集受损）。
+                        if txt_to_json.get("converted", 0) > 0:
+                            await asyncio.to_thread(self._remap_yolo_labels, labels_dir, class_map)
+                            await asyncio.to_thread(
+                                _save_yaml, version_dir / "data.yaml",
+                                {"nc": len(detected_classes), "names": list(detected_classes)},
+                            )
+                            logger.info(
+                                f"prepare {dataset_id}: labels/data.yaml synced to model "
+                                f"{model_id_ds} class order (B-72)"
+                            )
                 except Exception:
                     logger.exception(f"prepare {dataset_id}: txt->json import failed, labels kept")
         else:
@@ -2455,53 +2471,194 @@ class DatasetService:
                 cmap.pop(i, None)
             else:
                 cmap[i] = t
-        # 1) YOLO labels：重写类号；用户选择忽略的类，其标签行直接丢弃
-        labels_dir = ds_dir / "labels"
-        if labels_dir.is_dir():
-            self._remap_yolo_labels(labels_dir, cmap)
-        # 2) 每图 JSON（编辑器/抽查/导出的权威源）：同步 class_id 与 english_code
-        touched = dropped = 0
+        # B-72 D1：先判定每图 JSON 与 labels/*.txt 的当前类号语义（源序 / 已迁库序 / 无法判别）。
+        # cmap 的键是「源序类号」。若文件已被 prepare/旧 confirm 迁到库序，再按 cmap
+        # 映射一次就是双重映射（丢框/串号，B-68 D1）。判别绝不猜：
+        #   - 恒等映射（含空 cmap）：怎么映都不改类号，无需判别；
+        #   - prepare 三态标记 txt_to_json.class_map=True：修复后 JSON+txt 都已迁库序；
+        #   - 无标记/False（存量老集）：JSON 用源 txt 同图几何配对做一致性判别；
+        #     txt 用「JSON 判定结果 + 逐图类号一致性」判别（旧版 confirm 会重写 txt）。
+        #     唯一命中才认定；无法判别 → 拒绝，绝不猜着映射。
+        identity = all(k == v for k, v in cmap.items())
+        try:
+            meta_now = load_json(ds_dir / "meta.json")
+        except Exception:
+            meta_now = {}
+        prep_flag = (meta_now.get("txt_to_json") or {}).get("class_map")
+        # 逐图收集 txt 框与 JSON 框（一次扫描，两个判别共用）
+        txt_boxes, json_boxes = {}, {}
+        try:
+            for rec in self._collect_legacy_txt_annotations(ds_dir):
+                txt_boxes[rec["image_id"]] = rec["boxes"]
+        except Exception:
+            txt_boxes = {}
         ann_dir = ds_dir / "annotations"
+        ann_docs = {}
         if ann_dir.is_dir():
             for p in ann_dir.glob("*.json"):
                 try:
                     doc = load_json(p)
                 except Exception:
                     continue
-                boxes = doc.get("boxes") or []
-                if not boxes:
+                ann_docs[p] = doc
+                if doc.get("boxes"):
+                    json_boxes[doc.get("image_id") or p.stem] = doc["boxes"]
+        # 同图逐框几何配对（曼哈顿距离 ≤2px，与 B-70 取证同口径）：
+        # pairs = [(txt类号, json类号)]，只收数字类号框
+        pairs = []
+        for iid, tbs in txt_boxes.items():
+            jbs = json_boxes.get(iid)
+            if not jbs:
+                continue
+            used = set()
+            for tb in tbs:
+                tcid = tb.get("class_id")
+                if tcid is None:
                     continue
-                out, changed = [], False
-                for b in boxes:
-                    cid = b.get("class_id")
-                    if isinstance(cid, int) or (isinstance(cid, str) and str(cid).isdigit()):
-                        key = int(cid)
-                    else:
-                        nm = str(cid or "").strip().lower()
-                        key = next((i for i, s in enumerate(source)
-                                    if str(s).strip().lower() == nm), None)
+                hit = None
+                for j, jb in enumerate(jbs):
+                    if j in used:
+                        continue
+                    jcid = jb.get("class_id")
+                    if not (isinstance(jcid, int) or (isinstance(jcid, str) and str(jcid).isdigit())):
+                        continue
+                    if all(abs(float(tb.get(k, 0)) - float(jb.get(k, 0))) <= 2.0
+                           for k in ("x1", "y1", "x2", "y2")):
+                        hit = (j, int(jcid))
+                        break
+                if hit is not None:
+                    used.add(hit[0])
+                    pairs.append((int(tcid), hit[1]))
+        json_state = self._detect_json_class_space(cmap, identity, prep_flag, pairs)
+        # json_state: "identity"=无需动 JSON / "source"=按 cmap 正常迁移 /
+        #             "library"=已是库序，只补类名不重映射 / "ambiguous"=拒绝
+        if json_state == "ambiguous":
+            raise ValueError(
+                "无法可靠判断该数据集标注 JSON 当前的类别号是源序还是库序"
+                "（prepare 未留下重映射标记，且与源 txt 逐框比对不唯一）。"
+                "为避免二次映射丢框/串号，本次确认已中止，标注文件未做任何改动。"
+                "请重新上传源包走最新 prepare 链路，或联系管理员核对标注文件后处理。"
+            )
+        # 1) YOLO labels：重写类号；用户选择忽略的类，其标签行直接丢弃。
+        #    txt 若已迁库序（修复后 prepare 同步重写 / 旧版 confirm 已重写过），
+        #    不能再按源序 cmap 重写。
+        labels_dir = ds_dir / "labels"
+        txt_state = self._detect_txt_class_space(cmap, identity, prep_flag, pairs)
+        if labels_dir.is_dir() and txt_state == "source":
+            self._remap_yolo_labels(labels_dir, cmap)
+        # 2) 每图 JSON（编辑器/抽查/导出的权威源）：同步 class_id 与 english_code
+        touched = dropped = 0
+        for p, doc in ann_docs.items():
+            boxes = doc.get("boxes") or []
+            if not boxes:
+                continue
+            out, changed = [], False
+            for b in boxes:
+                cid = b.get("class_id")
+                if isinstance(cid, int) or (isinstance(cid, str) and str(cid).isdigit()):
+                    key = int(cid)
+                else:
+                    nm = str(cid or "").strip().lower()
+                    key = next((i for i, s in enumerate(source)
+                                if str(s).strip().lower() == nm), None)
+                if json_state in ("library", "identity"):
+                    # 已是库序 / 恒等映射：key 即库标签下标。只补/正类名，绝不再映射；
+                    # 越界（不在库字典内）才视为脏框丢弃（正常不会发生）。
+                    if key is None or not (0 <= key < len(canonical)):
+                        dropped += 1
+                        changed = True
+                        continue
+                    target = key
+                else:  # source：正常一次性权威迁移
                     if key is None or key not in cmap:
                         dropped += 1
                         changed = True
                         continue
-                    nb = dict(b)
-                    nb["class_id"] = cmap[key]
-                    nb["english_code"] = canonical[cmap[key]]
-                    for fld in ("class_name", "label", "name"):
-                        if isinstance(nb.get(fld), str):
-                            nb[fld] = canonical[cmap[key]]
-                    out.append(nb)
-                    if nb != b:
-                        changed = True
-                if changed:
-                    doc["boxes"] = out
-                    save_json_atomic(p, doc)
-                    touched += 1
+                    target = cmap[key]
+                nb = dict(b)
+                nb["class_id"] = target
+                nb["english_code"] = canonical[target]
+                for fld in ("class_name", "label", "name"):
+                    if isinstance(nb.get(fld), str):
+                        nb[fld] = canonical[target]
+                out.append(nb)
+                if nb != b:
+                    changed = True
+            if changed:
+                doc["boxes"] = out
+                save_json_atomic(p, doc)
+                touched += 1
         # 3) data.yaml 的 names 收敛到库字典（类别真值）
         if (ds_dir / "data.yaml").exists():
             _save_yaml(ds_dir / "data.yaml",
                        {"nc": len(canonical), "names": list(canonical)})
         return cmap, touched, dropped
+
+    @staticmethod
+    def _detect_json_class_space(cmap: dict, identity: bool, prep_flag, pairs: list) -> str:
+        """B-72：判定每图 JSON 当前类号语义。返回 identity/source/library/ambiguous。
+
+        判别依据（按优先级）：
+        1. 恒等映射（cmap 全 k==v，含空）→ identity：重映射不改变任何类号，无需判别。
+        2. prepare 三态标记 txt_to_json.class_map：True=已迁库序（library）、
+           False=对齐失败未迁移（source）。修复后新集的权威依据。
+        3. 无标记（存量老集）：用同图几何配对出的 (txt类号, json类号) 对检验两个假设——
+           H_src：json == txt（JSON 仍源序）；H_lib：json == cmap[txt]（已迁库序）。
+           恰好一个假设全量成立 → 采信；都成立（cmap 在该集实际出现的类上无位移，
+           两种解释结果相同）→ identity 等价安全；都不成立 / 无可比对 → ambiguous
+           （拒绝，绝不猜）。
+        """
+        if identity:
+            return "identity"
+        if prep_flag is True:
+            return "library"
+        if prep_flag is False:
+            return "source"
+        if not pairs:
+            return "ambiguous"
+        h_src = all(j == t for t, j in pairs)
+        h_lib = all(t in cmap and j == cmap[t] for t, j in pairs)
+        if h_src and not h_lib:
+            return "source"
+        if h_lib and not h_src:
+            return "library"
+        if h_src and h_lib:
+            return "identity"
+        return "ambiguous"
+
+    @staticmethod
+    def _detect_txt_class_space(cmap: dict, identity: bool, prep_flag, pairs: list) -> str:
+        """B-72：判定 labels/*.txt 当前类号语义（source=仍源序需重写 / 其它=不动）。
+
+        - 恒等映射 → identity（重写与否结果相同）。
+        - prep_flag=True（修复后 prepare 已同步重写 txt）→ library，不动。
+        - 无标记/False（存量）：用 (txt类号, json类号) 配对检验两个假设——
+          H_src：txt 类号全在 cmap 键域，且与 json 的关系符合「txt 源序」
+                 （json==txt 两者都源序，或 json==cmap[txt] txt源序+json已库序）；
+          H_lib：txt 类号全在 cmap 值域，且 txt==json（两者都已库序，
+                 旧版 confirm 重写 txt 后的形态）。
+          恰好一个成立 → 采信；都成立 / 都不成立 / 无可比对 → 不动 txt
+          （JSON 是权威源，封板由 JSON 重新生成 txt，txt 不动不污染训练产物）。
+          宁可不改，绝不猜着映射。
+        """
+        if identity:
+            return "identity"
+        if prep_flag is True:
+            return "library"
+        if not pairs:
+            return "keep"
+        keys = set(cmap.keys())
+        vals = set(cmap.values())
+        # 假设1：txt 与 json 同为源序（未迁移）
+        h_both_src = all(t in keys and j == t for t, j in pairs)
+        # 假设2：txt 源序 + json 已库序（受损前态：prepare 只迁了 JSON）
+        h_split = all(t in keys and j == cmap[t] for t, j in pairs) and any(j != t for t, j in pairs)
+        # 假设3：txt 与 json 同为库序（旧 confirm 重写 txt / 修复后 prepare 同步重写）
+        h_both_lib = all(t in vals and j == t for t, j in pairs)
+        votes = [h_both_src or h_split, h_both_lib]
+        if sum(votes) == 1:
+            return "source" if votes[0] else "library"
+        return "keep"
 
     @staticmethod
     def _downgrade_alignment_if_shifted(fresh: dict) -> dict:
@@ -2689,6 +2846,9 @@ class DatasetService:
         decided = self._validate_alignment_decisions(align, decisions)
         canonical = [str(c) for c in (align.get("canonical_names") or [])]
         cmap, touched, dropped = self._remap_alignment_files(ds_dir, align, decided, canonical)
+        # B-72：确认完成后 JSON/txt/yaml 已统一为库序，落权威标记，
+        # 后续换库等路径再进 _remap_alignment_files 时据此跳过二次映射。
+        meta.setdefault("txt_to_json", {})["class_map"] = True
 
         # 4) 报告与 meta 落盘
         for pair in align.get("pairs") or []:

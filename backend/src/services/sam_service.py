@@ -9,6 +9,7 @@
 """
 import json
 import asyncio
+import math
 import uuid
 import os
 import threading
@@ -222,6 +223,174 @@ DEFAULT_AUDIT_PROMPT = (
     "}\n"
     "（sub_bboxes 与 suggested_bbox 都是可选字段：看不清就不输出，不要编造坐标）\n"
 )
+
+
+# B-71：obb（旋转框）数据集专用审核系统提示词，与 DEFAULT_AUDIT_PROMPT 并存、按数据集
+# task 选择（qwen_audit_detections 入口按 task 注入 cfg["qwen_audit_task"]）。
+# 设计依据（B-69 实测，40 图/140 框真值对照）：
+# - 「判断」与「给几何」必须解耦：B2 组「凡 modify 必须给几何」把 modify 率从 23.6%
+#   推到 77.1%，108 个建议里 46 个与真值 IoU>=0.95（无修正价值）。故本模板措辞是
+#   「框明显不贴合才判 modify；给得出可靠几何就给 suggested_obb，给不出就只写 reason」。
+# - 保留反照抄约束：B2 有 33/108 逐点照抄输入坐标，必须要求观察真实边缘重新估计。
+# - 输入侧每框带 obb 四角点（与 bbox 同一坐标空间），图上画的是旋转四边形。
+# 占位符与主模板相同：{labels_text}{dets_text}{bbox_hint}，.replace 注入。
+OBB_AUDIT_PROMPT = (
+    "# Role\n"
+    "你是资深的工业视觉数据审核专家，对当前图片及已标注的**旋转框（obb）**做**保守、克制**的二次审核。\n"
+    "核心原则：**只报告有充分把握的问题；不确定就判 keep。宁可漏报，不可错报。**\n\n"
+    "# Context\n"
+    "- 目标类别定义（含审核标准）：\n{labels_text}\n"
+    "- 已有标注框：{dets_text}\n"
+    "（JSON 格式：box_id 唯一标识每个框，{bbox_hint}，class_id 对应上面的类别序号。\n"
+    "  obb 是该框的旋转四角点 [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]，按沿边框顺序排列；\n"
+    "  bbox 只是它的外接正矩形，仅供定位参考，**判断贴合度一律以 obb 四条边为准**。）\n\n"
+    "# 审核范围（两件事都要做，缺一不可）\n"
+    "A. 查准：**每个已有框**框住的东西对不对、旋转四边形的四条边贴不贴合目标边缘。\n"
+    "B. 查全：**画面上没有被任何框覆盖的地方，还有没有符合类别定义的目标**。\n"
+    "   只做 A 不做 B 是失职：框里那个判对了，不等于这张图就没问题。\n\n"
+    "# 判定规则（严格遵守）\n"
+    "1. keep：框内物体与类别定义一致，且旋转四边形的边基本贴住目标边缘 → action=keep。\n"
+    "   轻微的不贴合（差几个像素、角度略偏但主体已框住）一律 keep，不要苛求完美。\n"
+    "2. modify：框内**确实是目标类别**，但旋转框**明显不贴合**（角度明显歪了、边明显\n"
+    "   离开目标边缘、框明显过大/过小）→ action=modify。**框质量问题一律用 modify，禁止用 reject。**\n"
+    "   **判断与给几何是两件独立的事**：先按上面的标准判 action；判了 modify 之后，\n"
+    "   只有当你**能看清目标真实边缘、有把握给出更贴合的四角点**时，才附加 suggested_obb；\n"
+    "   给不出可靠几何就只写 reason，不给 suggested_obb——这同样是合法且常见的结论。\n"
+    "3. reject：**仅限**框内物体完全不是目标类别（框内是设备、动物、车辆、空白背景等无关内容）。\n"
+    "   reason 必须写明「框内实际是什么」；理由说「符合定义/确实是该目标」时禁止判 reject。\n"
+    "   特别注意：钻杆/管道常由工人手持、架设在地面或金属横梁旁——**手持的、地上的、\n"
+    "   架在横梁边的钻杆仍然是钻杆**，只要框住的是杆件本体就判 keep/modify，禁止因\n"
+    "   「工人手持」「地面管道」「金属横梁」等背景把框判成 reject。\n"
+    "4. 标签错误 label_errors：**仅当类别清单有 2 个及以上类别、且能给出确实不同的 suggested_class 时**才输出。\n"
+    "   类别清单只有一个类别时，label_errors 必须是空数组。\n"
+    "5. 漏标 missed_targets（查全，必须按下面三步做，不要跳过清点直接下结论）：\n"
+    "   第1步 清点：**扫视整张画面**（含边角、远景、被遮挡处），在心里列出所有\n"
+    "     **符合类别定义**的目标实例及其位置。类别定义中明确排除的形态不参与清点。\n"
+    "   第2步 对照：把清点结果逐个与已有旋转框比对，判断该目标是否**已被某个框覆盖**\n"
+    "     （被覆盖的标准：该目标主体落在旋转四边形内，或框已框住它的绝大部分）。\n"
+    "   第3步 输出：只把**清点到了、但没有任何框覆盖**的目标写进 missed_targets，\n"
+    "     给出可靠 bbox（外接正矩形 [x1,y1,x2,y2]）与理由。全部被覆盖时才是空数组。\n"
+    "   禁止：把已有框的一部分、遮挡残影、背景纹理、模糊难辨的影子、同一目标的重复部位、\n"
+    "     「按常理推断应该有」的目标当作漏标。清晰可辨、完整可见的才报；每张图最多报 4 个。\n"
+    "   **注意：本条与规则 1 相互独立。所有已有框都判 keep，也可能存在漏标。**\n"
+    "6. 粘连 merged_boxes：仅在**一个框内确实包含两个及以上完整独立目标**时输出，\n"
+    "   能看清各目标边界时给出 sub_bboxes（每个独立目标一个外接正矩形）。\n"
+    "7. 业务合规 #compliance_issue：**仅当类别定义里明确要求检查合规/违规行为时**才添加。\n"
+    "8. 建议几何 suggested_obb：**仅对 action=modify 的框**、且你有把握看清目标真实边界时，\n"
+    "   给出修正后的旋转四角点 [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]（与输入 obb 同一坐标空间，\n"
+    "   沿边框顺序一圈）。**四角点必须是你观察图中目标真实边缘后重新估计的结果，\n"
+    "   禁止照抄输入 obb 的数值**——输入框本身可能不准，照抄没有修正价值。\n"
+    "   看不清/没把握就不要给。每张图最多给 3 个；reject/keep 的框一律不给 suggested_obb。\n"
+    "   **每个框的建议只能描述该编号框住的那个目标，禁止把相邻框的角度/位置安到本框上。**\n\n"
+    "# 输出要求\n"
+    "- reason 必须写明判定依据（你看到了什么），并标注把握程度：高 / 中 / 低。\n"
+    "  reason 与 action 必须逻辑一致，不得自相矛盾。\n"
+    "- scan_summary 必填：写清你清点到的**符合类别定义**的目标总数、其中已被框覆盖几个、\n"
+    "  未覆盖几个（例：「符合定义目标2个，已覆盖1个，未覆盖1个」）。\n"
+    "  它必须与 missed_targets 的条数自洽。画面无符合定义目标时写「符合定义目标0个」。\n"
+    "- 仅返回标准 JSON，不要包含任何解释文字：\n"
+    "{\n"
+    "  \"scan_summary\": \"符合定义目标N个，已覆盖N个，未覆盖N个\",\n"
+    "  \"missed_targets\": [\n"
+    "    {\"class_id\": 序号, \"bbox\": [x1, y1, x2, y2], \"reason\": \"依据+把握（限30字）\"}\n"
+    "  ],\n"
+    "  \"merged_boxes\": [\n"
+    "    {\"box_id\": 1, \"action\": \"split | reject\", \"reason\": \"依据+把握（限30字）\",\n"
+    "     \"sub_bboxes\": [[x1, y1, x2, y2], [x1, y1, x2, y2]]}\n"
+    "  ],\n"
+    "  \"label_errors\": [\n"
+    "    {\"box_id\": 3, \"suggested_class\": 正确类别序号, \"reason\": \"依据+把握（限30字）\"}\n"
+    "  ],\n"
+    "  \"box_reviews\": [\n"
+    "    {\"box_id\": 2, \"action\": \"keep | modify | reject\", \"reason\": \"依据+把握（限30字）\",\n"
+    "     \"tags\": [\"#occluded\", \"#blur\"],\n"
+    "     \"suggested_obb\": [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]}\n"
+    "  ]\n"
+    "}\n"
+    "（sub_bboxes 与 suggested_obb 都是可选字段：看不清就不输出，不要编造坐标）\n"
+)
+
+
+# ---- B-71：纯 python 凸多边形几何工具（obb 审核闸门/漏检去重用，禁止引入 shapely 等新依赖）----
+# 实现与 B-69 实验脚本 probe_b69_obb_audit_capability.py 的 poly_iou 完全一致
+# （Sutherland–Hodgman 裁剪 + 鞋带面积），该实现已在 40 图/140 框实测中验证。
+
+def _poly_area(p) -> float:
+    s = 0.0
+    for i in range(len(p)):
+        x1, y1 = p[i]
+        x2, y2 = p[(i + 1) % len(p)]
+        s += x1 * y2 - x2 * y1
+    return abs(s) / 2.0
+
+
+def _poly_ccw(p):
+    s = 0.0
+    for i in range(len(p)):
+        x1, y1 = p[i]
+        x2, y2 = p[(i + 1) % len(p)]
+        s += x1 * y2 - x2 * y1
+    return p if s >= 0 else p[::-1]
+
+
+def _clip_poly(subject, clipper):
+    """subject 被凸 clipper 裁剪，返回交集多边形顶点列表。"""
+    out = _poly_ccw(list(subject))
+    cp = _poly_ccw(list(clipper))
+    for i in range(len(cp)):
+        if not out:
+            return []
+        ax, ay = cp[i]
+        bx, by = cp[(i + 1) % len(cp)]
+
+        def inside(px, py):
+            return (bx - ax) * (py - ay) - (by - ay) * (px - ax) >= -1e-9
+
+        def inter(p1, p2):
+            x1, y1 = p1
+            x2, y2 = p2
+            dx, dy = x2 - x1, y2 - y1
+            ex, ey = bx - ax, by - ay
+            den = dx * ey - dy * ex
+            if abs(den) < 1e-12:
+                return p2
+            t = ((ax - x1) * ey - (ay - y1) * ex) / den
+            return (x1 + t * dx, y1 + t * dy)
+
+        inp, out = out, []
+        for j in range(len(inp)):
+            cur, prev = inp[j], inp[j - 1]
+            ci, pi = inside(*cur), inside(*prev)
+            if ci:
+                if not pi:
+                    out.append(inter(prev, cur))
+                out.append(cur)
+            elif pi:
+                out.append(inter(prev, cur))
+    return out
+
+
+def _poly_iou(a, b) -> float:
+    aa, ab = _poly_area(a), _poly_area(b)
+    if aa <= 0 or ab <= 0:
+        return 0.0
+    inter = _poly_area(_clip_poly(a, b))
+    u = aa + ab - inter
+    return inter / u if u > 0 else 0.0
+
+
+def _quad_from_raw(raw):
+    """模型输出四角点（扁平 8 数或 4×2）→ [(x,y)*4]；非法返回 None。"""
+    if not isinstance(raw, (list, tuple)):
+        return None
+    if len(raw) == 8 and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in raw):
+        return [(float(raw[i]), float(raw[i + 1])) for i in range(0, 8, 2)]
+    if len(raw) == 4 and all(isinstance(p, (list, tuple)) and len(p) == 2 for p in raw):
+        try:
+            return [(float(p[0]), float(p[1])) for p in raw]
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 # 无框图专用「纯查全」提示词。
@@ -1013,9 +1182,12 @@ class SAMService:
             for i, b in enumerate(boxes):
                 b["box_id"] = i
             t_audit = time.perf_counter()
+            # B-71：按数据集 task 分流审核链路（obb 走旋转框专用一套）
+            cfg_audit = dict(cfg)
+            cfg_audit["qwen_audit_task"] = self._audit_task_type(task_id)
             audit, audit_msg = await asyncio.to_thread(
                 self.qwen_audit_detections, img_abs, boxes,
-                cfg.get("qwen_labels_desc"), cfg, classes
+                cfg.get("qwen_labels_desc"), cfg_audit, classes
             )
             audit_ms = (time.perf_counter() - t_audit) * 1000
         elif boxes and cfg.get("qwen_enabled", False):
@@ -2284,7 +2456,28 @@ class SAMService:
             except Exception:
                 ci = 0
             color = self._AUDIT_DRAW_COLORS[ci % len(self._AUDIT_DRAW_COLORS)]
-            draw.rectangle([x1, y1, x2, y2], outline=color, width=lw)
+            # B-71：框带 obb 四角点（仅 obb 数据集链路会附带）→ 画旋转四边形闭合连线，
+            # 让模型看见目标真实朝向（B-69 C 组实测：仅换画法误拒 6→1）。
+            # 无 obb 的框（detect/segment 及 obb 集里的水平框）走原 draw.rectangle，逐字节不变。
+            pts = None
+            obb_m = d.get("obb")
+            if isinstance(obb_m, (list, tuple)) and len(obb_m) == 4:
+                try:
+                    pts = []
+                    for (mx, my) in obb_m:
+                        ox, oy = self._qwen_model_to_orig(
+                            [float(mx), float(my), float(mx) + 1, float(my) + 1], img_abs, cfg)[:2]
+                        pts.append((max(0, min(w - 1, ox * down)), max(0, min(h - 1, oy * down))))
+                except (TypeError, ValueError):
+                    pts = None
+            if pts:
+                draw.polygon(pts, outline=color, width=lw)
+                # 编号标签沿用原逻辑，用 obb 最小 x/y 定位（与 B-69 已验证复刻同口径：
+                # 浮点最小值直接参与标签定位，不取整——取整会把标签挪 1px 造成字节差）
+                x1 = min(p[0] for p in pts)
+                y1 = min(p[1] for p in pts)
+            else:
+                draw.rectangle([x1, y1, x2, y2], outline=color, width=lw)
             label = f"#{d.get('box_id')}"
             if font is not None:
                 tb = draw.textbbox((0, 0), label, font=font)
@@ -2456,6 +2649,11 @@ class SAMService:
         if not dets:
             return self._qwen_recall_only(img_abs, labels_desc, cfg, classes)
 
+        # B-71：数据集任务类型（调用方按 task 注入；缺省 detect=原行为）。
+        # obb 数据集走独立链路：画旋转四边形 + OBB 专用提示词 + 四角点解析/闸门 + 多边形 IoU 去重。
+        task_type = str(cfg.get("qwen_audit_task") or "detect").strip().lower()
+        is_obb = task_type == "obb"
+
         # 统一给每个框分配 box_id（调用方已赋值则沿用），作为审核结果回写的索引
         audit_dets = []
         for i, b in enumerate(dets):
@@ -2463,19 +2661,33 @@ class SAMService:
             if bid is None:
                 bid = i
                 b["box_id"] = i
-            audit_dets.append({
+            ad = {
                 "box_id": bid,
                 "class_id": b.get("class_id"),
                 "bbox": [round(float(b["x1"]), 1), round(float(b["y1"]), 1),
                          round(float(b["x2"]), 1), round(float(b["y2"]), 1)],
                 "score": round(float(b.get("score") or b.get("confidence") or 0.9), 3),
-            })
+            }
+            # B-71：obb 框附带四角点（上游标注里的 obb 字段，原图像素）。
+            # 仅 obb 数据集附带——detect/segment 的 audit_dets 结构逐字节维持原样。
+            if is_obb:
+                obb = b.get("obb")
+                if isinstance(obb, (list, tuple)) and len(obb) == 4:
+                    try:
+                        ad["obb"] = [[round(float(p[0]), 1), round(float(p[1]), 1)] for p in obb]
+                    except (TypeError, ValueError, IndexError):
+                        pass
+            audit_dets.append(ad)
 
         # 模型看到的坐标空间与我方原图不同（qwen3-vl 用 0~1000 归一化；其他后端用缩放图像素）。
         # 送审的框必须先换算到「模型空间」，否则模型会认为框在画面之外；
         # 模型回传的 missed_targets 再由 _parse_qwen_audit 按同一约定还原回原图。
         for d in audit_dets:
             d["bbox"] = [round(v, 1) for v in self._qwen_orig_to_model(d["bbox"], img_abs, cfg)]
+            if "obb" in d:
+                # 四角点逐点换算（复用 _qwen_orig_to_model：借 1px 宽高的退化矩形带一个点过桥）
+                d["obb"] = [[round(v, 1) for v in self._qwen_orig_to_model(
+                    [p[0], p[1], p[0] + 1, p[1] + 1], img_abs, cfg)[:2]] for p in d["obb"]]
 
         if cfg.get("qwen_mock", False):
             print(f"qwen audit IN-MOCK: {len(audit_dets)} boxes for {img_abs}（本地联调模式，未调用真实模型）")
@@ -2489,13 +2701,32 @@ class SAMService:
             desc = (lab or {}).get("chinese_desc") or ""
             defs.append(f"{i}. {zh}{('：' + desc) if desc else ''}")
         labels_text = "\n".join(defs)
-        dets_text = json.dumps(audit_dets, ensure_ascii=False)
         if self._qwen_coord_mode(cfg) == "norm1000":
             bbox_hint = "bbox 为 0~1000 归一化坐标 [x1,y1,x2,y2]（相对图片宽高的千分比）"
         else:
             bbox_hint = "bbox 为图片像素坐标 [x1,y1,x2,y2]"
+        if is_obb:
+            # obb 集：坐标说明补充四角点约定（detect/segment 的 bbox_hint 逐字节不变）
+            bbox_hint += ("；obb 为旋转框四角点 [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]"
+                          "（沿边框顺序，与 bbox 同一坐标空间）")
+
+        # B-71 上下文超限防护（仅 obb 链路）：线上 vLLM max_model_len=4096，多框图
+        # prompt 会撞限（B-69 实测 13 框图 prompt 4022 token，20.7% 框无声丢失）。
+        # 方案：按框数分批送审（默认每批 <=8 框，配置 qwen_audit_max_boxes_per_request），
+        # 每批独立画框/提示词/解析，结论按 box_id 合并；任一批失败 → 整图显式失败并
+        # 带上真实原因（含上下文超限字样），绝不静默丢框。detect/segment 不分批（原行为）。
+        # obb 一律走分批器（哪怕只有 1 框）：4096 预算下「输入撞限 400」与「输出截断
+        # 致 JSON 不完整」都可能发生在任意框数（B-71 实测 4 框图 prompt 3755 + 输出即撞限），
+        # 分批器内含「失败对半拆分递归」兜底，单框仍失败才显式报错。
+        max_per = int(cfg.get("qwen_audit_max_boxes_per_request") or 8)
+        if is_obb and max_per > 0:
+            return self._qwen_audit_obb_batched(img_abs, audit_dets, labels, classes,
+                                                labels_text, bbox_hint, cfg, max_per)
+
+        dets_text = json.dumps(audit_dets, ensure_ascii=False)
         # 审核系统提示词：用户自定义模板优先（占位符 {labels_text}/{dets_text}/{bbox_hint}），未配置回退内置默认
-        sys_msg = self._render_audit_prompt(cfg, labels_text, dets_text, bbox_hint)
+        prompt_notes: List[str] = []
+        sys_msg = self._render_audit_prompt(cfg, labels_text, dets_text, bbox_hint, notes=prompt_notes)
         # 默认把待审框画到发送副本上（带 #编号），让模型「看图对框」而不是靠坐标心算。
         # 画框失败（坏图/PIL 异常）一律回退无框原图，绝不因为画框而丢掉整次审核。
         drawn = False
@@ -2505,17 +2736,15 @@ class SAMService:
                 drawn = bool(b64)
             except Exception as e:
                 print(f"qwen audit: 画框副本生成失败，回退无框原图 {img_abs}: {e}")
-        if drawn:
-            sys_msg += ("\n\n# 图片说明（重要）\n"
-                        "发送给你的这张图上**已经画出了全部待审框**，每个框左上角有形如 #0、#1 的编号标签，"
-                        "与上面 JSON 里的 box_id 一一对应，框线颜色按类别区分。\n"
-                        "请**直接看编号框圈住的画面内容**来判定该框，不要凭坐标推算位置，"
-                        "也不要把某个框的结论写到另一个编号上。\n"
-                        "这些框线与编号是我方叠加的辅助标记，**不是画面里的真实物体**："
-                        "不要把它们当作目标、遮挡物或漏标目标；漏标只报框线之外真实存在的目标。")
-            user_msg = (f"类别定义：\n{labels_text}\n\n预标注框（编号与图上 #标签对应）：\n{dets_text}\n"
-                        f"请逐个查看图上 #编号 框内的实际内容，审核这张图片。")
-            content = self._qwen_chat_raw(cfg, sys_msg, user_msg, b64, img_abs)
+            if drawn:
+                sys_msg += self._audit_draw_note(obb=is_obb)
+                if is_obb:
+                    user_msg = (f"类别定义：\n{labels_text}\n\n预标注旋转框（编号与图上 #标签对应）：\n{dets_text}\n"
+                                f"请逐个查看图上 #编号 旋转框内的实际内容，审核这张图片。")
+                else:
+                    user_msg = (f"类别定义：\n{labels_text}\n\n预标注框（编号与图上 #标签对应）：\n{dets_text}\n"
+                                f"请逐个查看图上 #编号 框内的实际内容，审核这张图片。")
+                content = self._qwen_chat_raw(cfg, sys_msg, user_msg, b64, img_abs)
         else:
             user_msg = f"类别定义：\n{labels_text}\n\n预标注框：\n{dets_text}\n请审核这张图片。"
             content = self._qwen_image_chat(cfg, sys_msg, user_msg, img_abs)
@@ -2524,8 +2753,177 @@ class SAMService:
             # 「无输出」，无法区分是配置错还是模型真的没返回。
             why = getattr(self, "_last_qwen_error", None)
             return None, ("千问审核推理失败：" + why) if why else "千问审核推理失败（无输出）"
-        return self._parse_qwen_audit(content, audit_dets, labels, classes,
-                                      img_abs=img_abs, cfg=cfg), ""
+        audit = self._parse_qwen_audit(content, audit_dets, labels, classes,
+                                       img_abs=img_abs, cfg=cfg)
+        if prompt_notes and audit and audit.get("ok"):
+            audit["prompt_notes"] = prompt_notes
+        return audit, ""
+
+    @staticmethod
+    def _audit_draw_note(obb: bool = False) -> str:
+        """画框副本的「图片说明」附言。obb=False 时与历史文案逐字节一致。"""
+        note = ("\n\n# 图片说明（重要）\n"
+                "发送给你的这张图上**已经画出了全部待审框**，每个框左上角有形如 #0、#1 的编号标签，"
+                "与上面 JSON 里的 box_id 一一对应，框线颜色按类别区分。\n"
+                "请**直接看编号框圈住的画面内容**来判定该框，不要凭坐标推算位置，"
+                "也不要把某个框的结论写到另一个编号上。\n"
+                "这些框线与编号是我方叠加的辅助标记，**不是画面里的真实物体**："
+                "不要把它们当作目标、遮挡物或漏标目标；漏标只报框线之外真实存在的目标。")
+        if obb:
+            note += ("\n图上画出的框是**旋转四边形**（沿目标真实朝向的四条边），不是正矩形，"
+                     "不要把斜框当成画歪了的正框。JSON 里每个框的 obb 字段是它的四个角点，"
+                     "与图上画出的四边形一一对应；判断框贴不贴合时，以旋转四边形的四条边"
+                     "是否贴住目标边缘为准。")
+        return note
+
+    def _qwen_audit_obb_batched(self, img_abs, audit_dets, labels, classes,
+                                labels_text, bbox_hint, cfg, max_per):
+        """B-71：obb 多框图按框数分批送审（防 4096 上下文撞限静默丢框）。
+
+        每批独立画框/渲染提示词/解析，box_reviews 按 box_id 合并（各批 box_id 不相交），
+        missed_targets 合并后按多边形 IoU 去重（跨批可能报同一漏标）。
+        任一批推理失败 → 整图返回 (None, 原因)，原因里带批号与底层错误（含上下文超限），
+        由调用方计入失败——绝不把「没审到的框」静默当成 keep。
+        """
+        batches = [audit_dets[i:i + max_per] for i in range(0, len(audit_dets), max_per)]
+        merged_reviews, raw_missed, notes = [], [], []
+        scans = []
+        n_ctx_split = 0   # 因上下文超限触发的对半拆分次数（供返回透出）
+
+        def _run_chunk(chunk, depth):
+            """审一个批次；撞 4096 上下文或输出截断且框数>1 → 对半拆分递归重审。
+
+            返回 (part, err)：part 为合并后的解析结果（含 missed/reviews/scans），
+            err 非空表示该批（含递归子批）最终失败。单框仍失败 → 显式失败，绝不静默。
+            """
+            nonlocal n_ctx_split
+            dets_text = json.dumps(chunk, ensure_ascii=False)
+            pn: List[str] = []
+            sys_msg = self._render_audit_prompt(cfg, labels_text, dets_text, bbox_hint, notes=pn)
+            for n in pn:
+                if n not in notes:
+                    notes.append(n)
+            drawn = False
+            if cfg.get("qwen_audit_draw_boxes", True):
+                try:
+                    b64 = self._qwen_audit_render_b64(cfg, img_abs, chunk)
+                    drawn = bool(b64)
+                except Exception as e:
+                    print(f"qwen audit: 画框副本生成失败，回退无框原图 {img_abs}: {e}")
+            if drawn:
+                sys_msg += self._audit_draw_note(obb=True)
+                user_msg = (f"类别定义：\n{labels_text}\n\n预标注旋转框（编号与图上 #标签对应）：\n{dets_text}\n"
+                            f"请逐个查看图上 #编号 旋转框内的实际内容，审核这张图片。")
+                content = self._qwen_chat_raw(cfg, sys_msg, user_msg, b64, img_abs)
+            else:
+                user_msg = f"类别定义：\n{labels_text}\n\n预标注框：\n{dets_text}\n请审核这张图片。"
+                content = self._qwen_image_chat(cfg, sys_msg, user_msg, img_abs)
+            why = getattr(self, "_last_qwen_error", None) or ""
+            ctx_hit = (not content) and ("context length" in why or "max_model_len" in why
+                                         or "Input length" in why)
+            part = self._parse_qwen_audit(content, chunk, labels, classes,
+                                          img_abs=img_abs, cfg=cfg) if content else None
+            parse_bad = bool(content) and (not part or not part.get("ok"))
+            if (ctx_hit or parse_bad) and len(chunk) > 1 and depth < 6:
+                # 输入撞限（400）或输出被 4096 预算截断（JSON 不完整）→ 框数减半重试。
+                # 每半的 dets_text/输出都约减半，递归到单框为止；单框仍失败才显式报错。
+                n_ctx_split += 1
+                mid = len(chunk) // 2
+                p1, e1 = _run_chunk(chunk[:mid], depth + 1)
+                if e1:
+                    return None, e1
+                p2, e2 = _run_chunk(chunk[mid:], depth + 1)
+                if e2:
+                    return None, e2
+                merged = {"ok": True,
+                          "box_reviews": (p1.get("box_reviews") or []) + (p2.get("box_reviews") or []),
+                          "missed_targets": (p1.get("missed_targets") or []) + (p2.get("missed_targets") or []),
+                          "scan_summary": "；".join(s for s in (p1.get("scan_summary"), p2.get("scan_summary")) if s)}
+                return merged, ""
+            if not content:
+                return None, (f"千问审核推理失败（框{chunk[0]['box_id']}~{chunk[-1]['box_id']}未审）："
+                              + (why or "无输出"))
+            if parse_bad:
+                return None, (f"千问审核输出不可解析（框{chunk[0]['box_id']}~{chunk[-1]['box_id']}未审，"
+                              f"疑似上下文超限截断）：" + str((part or {}).get("error") or ""))
+            return part, ""
+
+        for bi, chunk in enumerate(batches):
+            part, err = _run_chunk(chunk, 0)
+            if err:
+                return None, f"第{bi + 1}/{len(batches)}批 {err}"
+            merged_reviews.extend(part.get("box_reviews") or [])
+            raw_missed.extend(part.get("missed_targets") or [])
+            if part.get("scan_summary"):
+                scans.append(f"批{bi + 1}:{part['scan_summary']}")
+        # 跨批查全对照：每批只画/只给本批的框，模型可能把「其他批已审的框」当漏标
+        # 报出来（假漏标）。合并后对全部输入框补一次去重闸门（与单图口径一致：
+        # 候选外接矩形 vs 已有旋转四边形多边形 IoU>=0.5 → 同一目标，丢弃）。
+        merged_missed = []
+        for mt in raw_missed:
+            try:
+                cand = [float(mt["x1"]), float(mt["y1"]), float(mt["x2"]), float(mt["y2"])]
+            except (TypeError, ValueError, KeyError):
+                continue
+            cq = [(cand[0], cand[1]), (cand[2], cand[1]), (cand[2], cand[3]), (cand[0], cand[3])]
+            covered = False
+            for d in audit_dets:
+                om = d.get("obb")
+                if isinstance(om, (list, tuple)) and len(om) == 4:
+                    try:
+                        if _poly_iou(cq, [(float(p[0]), float(p[1])) for p in om]) >= 0.5:
+                            covered = True
+                            break
+                        continue
+                    except (TypeError, ValueError, IndexError):
+                        pass
+                eb = d.get("bbox")
+                if isinstance(eb, (list, tuple)) and len(eb) == 4:
+                    try:
+                        eb = [float(v) for v in eb]
+                    except (TypeError, ValueError):
+                        continue
+                    ix1, iy1 = max(cand[0], eb[0]), max(cand[1], eb[1])
+                    ix2, iy2 = min(cand[2], eb[2]), min(cand[3], eb[3])
+                    if ix2 > ix1 and iy2 > iy1:
+                        inter = (ix2 - ix1) * (iy2 - iy1)
+                        union = ((cand[2] - cand[0]) * (cand[3] - cand[1])
+                                 + (eb[2] - eb[0]) * (eb[3] - eb[1]) - inter)
+                        if union > 0 and inter / union >= 0.5:
+                            covered = True
+                            break
+            if not covered:
+                merged_missed.append(mt)
+        # 跨批漏标去重：同一目标可能被两批各报一次（外接矩形 IoU>=0.5 视为同一目标）
+        dedup = []
+        for mt in merged_missed:
+            bb = [mt["x1"], mt["y1"], mt["x2"], mt["y2"]]
+            dup = False
+            for kept in dedup:
+                kb = [kept["x1"], kept["y1"], kept["x2"], kept["y2"]]
+                ix1, iy1 = max(bb[0], kb[0]), max(bb[1], kb[1])
+                ix2, iy2 = min(bb[2], kb[2]), min(bb[3], kb[3])
+                if ix2 > ix1 and iy2 > iy1:
+                    inter = (ix2 - ix1) * (iy2 - iy1)
+                    union = ((bb[2] - bb[0]) * (bb[3] - bb[1])
+                             + (kb[2] - kb[0]) * (kb[3] - kb[1]) - inter)
+                    if union > 0 and inter / union >= 0.5:
+                        dup = True
+                        break
+            if not dup:
+                dedup.append(mt)
+        stats = {"keep": 0, "modify": 0, "reject": 0, "split": 0, "missed": len(dedup),
+                 "suggested": sum(1 for b in merged_reviews
+                                  if b.get("suggested_bbox") or b.get("suggested_obb"))}
+        for b in merged_reviews:
+            stats[b["action"]] = stats.get(b["action"], 0) + 1
+        audit = {"ok": True, "box_reviews": merged_reviews, "missed_targets": dedup,
+                 "stats": stats, "box_count": len(audit_dets),
+                 "scan_summary": "；".join(scans)[:120] or None,
+                 "audit_batches": len(batches), "audit_ctx_splits": n_ctx_split}
+        if notes:
+            audit["prompt_notes"] = notes
+        return audit, ""
 
     def _qwen_recall_only(self, img_abs: Path, labels_desc: Optional[dict],
                           cfg: dict, classes: list) -> tuple:
@@ -2577,12 +2975,33 @@ class SAMService:
             audit["recall_only"] = True
         return audit, ""
 
-    def _render_audit_prompt(self, cfg, labels_text, dets_text, bbox_hint):
+    def _render_audit_prompt(self, cfg, labels_text, dets_text, bbox_hint, notes=None):
         """渲染千问 L2 审核系统提示词。
         优先用「AI 标注模型设置」里用户自定义的模板（占位符 {labels_text}/{dets_text}/{bbox_hint}），
-        未配置或渲染异常时回退内置 DEFAULT_AUDIT_PROMPT。"""
-        tpl = (cfg or {}).get("qwen_audit_prompt_template") or ""
-        tpl = (tpl or "").strip()
+        未配置或渲染异常时回退内置 DEFAULT_AUDIT_PROMPT。
+
+        B-71 obb 分流（cfg["qwen_audit_task"]=="obb" 时）：
+        - 无自定义模板 → 内置 OBB_AUDIT_PROMPT（与 detect 模板并存，按 task 选择）。
+        - 自定义模板**含 obb 关键字**（suggested_obb / obb / 旋转）→ 视为用户已适配旋转框，
+          尊重「自定义模板优先」既有约定，原样使用。
+        - 自定义模板**不含 obb 关键字** → 该模板按正矩形口径写就，用在旋转框上会重演
+          B-69 B 组「33 个 modify 判定 0 个给坐标（格式合规率 0%）」的失效。此时回退内置
+          OBB 模板，并把原因写进 notes（调用方透出到审核返回 prompt_notes），**不静默用错模板**。
+        detect/segment 路径完全不受影响（notes 缺省 None 时行为与旧版逐字节一致）。
+        """
+        cfg = cfg or {}
+        is_obb = str(cfg.get("qwen_audit_task") or "detect").strip().lower() == "obb"
+        tpl = (cfg.get("qwen_audit_prompt_template") or "").strip()
+        if is_obb:
+            if tpl and not any(k in tpl.lower() for k in ("suggested_obb", "obb", "旋转")):
+                msg = ("obb 数据集：自定义审核模板未包含旋转框(obb)指令，已改用内置 obb 专用模板；"
+                       "如需自定义，请在模板中加入 obb 四角点与 suggested_obb 约定")
+                print(f"qwen: {msg}")
+                if notes is not None:
+                    notes.append(msg)
+                tpl = ""
+            if not tpl:
+                tpl = OBB_AUDIT_PROMPT
         if not tpl:
             tpl = DEFAULT_AUDIT_PROMPT
         try:
@@ -2592,7 +3011,7 @@ class SAMService:
                     .replace("{bbox_hint}", bbox_hint or ""))
         except Exception as e:
             print(f"qwen: 审核提示词模板渲染失败，回退内置默认模板: {e}")
-            return (DEFAULT_AUDIT_PROMPT
+            return ((OBB_AUDIT_PROMPT if is_obb else DEFAULT_AUDIT_PROMPT)
                     .replace("{labels_text}", labels_text or "")
                     .replace("{dets_text}", dets_text or "")
                     .replace("{bbox_hint}", bbox_hint or ""))
@@ -2610,6 +3029,9 @@ class SAMService:
             return {"ok": False, "error": "千问审核输出 JSON 解析失败", "raw": m.group(0)[:500]}
         if not isinstance(data, dict):
             return {"ok": False, "error": "千问审核输出格式异常", "raw": content[:300]}
+
+        # B-71：obb 数据集走四角点解析/闸门/多边形 IoU 去重；detect/segment 原路径不变。
+        is_obb_parse = str((cfg or {}).get("qwen_audit_task") or "detect").strip().lower() == "obb"
 
         def cls_to_id(val) -> Optional[int]:
             """类别名（中文名/英文 code/序号）→ class_id；无法映射返回 None"""
@@ -2661,7 +3083,7 @@ class SAMService:
             tags = [str(t) for t in (r.get("tags") or []) if str(t).strip()]
             if not compliance_required:
                 tags = [t for t in tags if not t.lower().startswith("#compliance")]
-            box_reviews.append({
+            br = {
                 "box_id": bid,
                 "action": (str(r.get("action") or "keep").lower() if str(r.get("action") or "").strip() else "keep"),
                 "kind": "review",
@@ -2669,7 +3091,12 @@ class SAMService:
                 "tags": tags,
                 "suggested_class_id": None,
                 "suggested_bbox": r.get("suggested_bbox"),
-            })
+            }
+            # B-71：obb 模板的建议几何字段。仅 obb 链路添加——detect/segment 的
+            # 解析输出结构（含键集合与 JSON 序列化）必须与改前逐字节一致。
+            if is_obb_parse:
+                br["suggested_obb"] = r.get("suggested_obb")
+            box_reviews.append(br)
         # ② label_errors：仅在「多类别 且 建议类别确实不同于原类别」时成立。
         # 旧版无条件把该框改成 reject/label_error 且沿用 box_reviews 的 reason，
         # 导致「理由：人员摔倒，符合定义 / 动作：删除」这种自相矛盾结论。
@@ -2737,14 +3164,28 @@ class SAMService:
                      + (b[2] - b[0]) * (b[3] - b[1]) - inter)
             return inter / union if union > 0 else 0.0
 
+        # B-71：obb 数据集的漏检去重改用多边形 IoU（纯 python，无新依赖）。
+        # 病因（B-69 实测）：30° 与 60° 两根平行杆件的外接矩形 IoU=0.5972，
+        # 矩形口径会把「另一根杆」误判成「已框住的同一目标」而吞掉真漏标。
         existing_bboxes = []
+        existing_polys = []       # 仅 obb：四角点（模型空间）列表
+        existing_poly_idx = {}    # existing_bboxes 下标 → existing_polys 下标（无 obb 的框不在内）
         for d in audit_dets:
             e = d.get("bbox")
             if isinstance(e, (list, tuple)) and len(e) == 4:
                 try:
-                    existing_bboxes.append([float(v) for v in e])
+                    eb = [float(v) for v in e]
                 except (TypeError, ValueError):
-                    pass
+                    continue
+                if is_obb_parse:
+                    om = d.get("obb")
+                    if isinstance(om, (list, tuple)) and len(om) == 4:
+                        try:
+                            existing_poly_idx[len(existing_bboxes)] = len(existing_polys)
+                            existing_polys.append([(float(p[0]), float(p[1])) for p in om])
+                        except (TypeError, ValueError, IndexError):
+                            existing_poly_idx.pop(len(existing_bboxes), None)
+                existing_bboxes.append(eb)
         # 这些措辞说明模型在描述「不是目标」或「框内已框住的内容」，不是漏标
         MISSED_NEG = ("非摔倒", "未摔倒", "不是摔倒", "并非摔倒", "与类别不符",
                       "站立", "弯腰", "坐姿", "坐着", "无目标")
@@ -2759,9 +3200,23 @@ class SAMService:
             except (TypeError, ValueError):
                 continue
             reason_m = (str(mt.get("reason") or ""))[:50]
-            # 闸门1：与任一已有框 IoU>=0.5 → 就是同一个目标，不算漏标
+            # 闸门1：与任一已有框 IoU>=0.5 → 就是同一个目标，不算漏标。
+            # obb 集：候选外接矩形 vs 已有旋转四边形的多边形 IoU（无 obb 的水平框退回矩形口径）。
             cand = [x1, y1, x2, y2]
-            if any(_iou(cand, e) >= 0.5 for e in existing_bboxes):
+            if is_obb_parse:
+                cand_quad = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+                dup = False
+                for j, eb in enumerate(existing_bboxes):
+                    if j in existing_poly_idx:
+                        if _poly_iou(cand_quad, existing_polys[existing_poly_idx[j]]) >= 0.5:
+                            dup = True
+                            break
+                    elif _iou(cand, eb) >= 0.5:
+                        dup = True
+                        break
+                if dup:
+                    continue
+            elif any(_iou(cand, e) >= 0.5 for e in existing_bboxes):
                 continue
             # 闸门2：理由自相矛盾，或在描述已有框里的内容
             if (any(n in reason_m for n in MISSED_NEG)
@@ -2796,11 +3251,66 @@ class SAMService:
         # 建议框经 _norm_suggest 已是原图像素，两者必须在同一空间比 IoU/面积，
         # 否则非正方形图上闸门会整体错位（实测 1000x800 时 IoU 被算成 0.94 而非 0.98）。
         orig_bbox = {}
+        orig_obb = {}   # B-71：原框旋转四角点（原图像素），仅 obb 链路有值
         for d in audit_dets:
             ob = d["bbox"]
             if img_abs is not None:
                 ob = self._qwen_model_to_orig(ob, img_abs, cfg or {})
             orig_bbox[d["box_id"]] = ob
+            if is_obb_parse:
+                om = d.get("obb")
+                if isinstance(om, (list, tuple)) and len(om) == 4:
+                    try:
+                        pts = [(float(p[0]), float(p[1])) for p in om]
+                        if img_abs is not None:
+                            pts = [tuple(self._qwen_model_to_orig(
+                                [x, y, x + 1, y + 1], img_abs, cfg or {})[:2]) for x, y in pts]
+                        orig_obb[d["box_id"]] = pts
+                    except (TypeError, ValueError, IndexError):
+                        pass
+
+        def _norm_suggest_obb(raw, bid):
+            """B-71 obb 分支：模型空间建议四角点（8 数/4×2）→ 原图像素四角点；不合格返回 None。
+
+            闸门（B-69 实测教训逐条对治）：
+            - 非退化：鞋带面积 >= 1px²；
+            - 面积闸门：沿用 detect 的 [0.05, 5] 倍口径（对旋转框用真实多边形面积）；
+            - 反照抄：与输入 obb 逐点最大距离 < 2px 判无效（B2 实测 33/108 逐点照抄、
+              8 个近照抄；2px 容差覆盖 norm1000 一位小数的舍入抖动 ~1.3px@1280，
+              真实修正哪怕只挪 3px 也能过闸）；
+            - 串框：建议框与同图其他框的多边形 IoU 高于与本框 → 丢弃
+              （治 20495 把邻框角度安到本框、17275 两框输出同坐标两类灾难）；
+            - 无修正价值：与本框多边形 IoU >= 0.95 → 不给（与 detect 的 0.95 口径一致）。
+            """
+            pts = _quad_from_raw(raw)
+            if not pts:
+                return None
+            if img_abs is not None:
+                pts = [tuple(self._qwen_model_to_orig(
+                    [x, y, x + 1, y + 1], img_abs, cfg or {})[:2]) for x, y in pts]
+            if img_w and img_h:
+                pts = [(max(0.0, min(x, float(img_w))), max(0.0, min(y, float(img_h))))
+                       for x, y in pts]
+            na = _poly_area(pts)
+            if na < 1.0:
+                return None
+            ob_pts = orig_obb.get(bid)
+            if ob_pts:
+                oa = _poly_area(ob_pts)
+                if oa > 0 and not (0.05 * oa <= na <= 5.0 * oa):
+                    return None
+                # 反照抄闸门：逐点距离（按输入角点顺序对齐）
+                dmax = max(math.hypot(p[0] - q[0], p[1] - q[1]) for p, q in zip(pts, ob_pts))
+                if dmax < 2.0:
+                    return None
+                iou_self = _poly_iou(pts, ob_pts)
+                # 串框闸门：更像同图别的框 → 丢弃
+                for oid, opts in orig_obb.items():
+                    if oid != bid and _poly_iou(pts, opts) > iou_self:
+                        return None
+                if iou_self >= 0.95:
+                    return None
+            return [[round(x, 1), round(y, 1)] for x, y in pts]
 
         def _norm_suggest(raw, bid):
             """模型空间建议框 → 原图像素 {x1,y1,x2,y2}；不合格返回 None。"""
@@ -2833,10 +3343,24 @@ class SAMService:
         suggested_count = 0
         for b in box_reviews:
             raw = b.get("suggested_bbox")
+            raw_obb = b.get("suggested_obb")
             subs_raw = b.get("sub_bboxes")
             b["suggested_bbox"] = None
             b["sub_bboxes"] = None
-            if b["action"] == "modify" and raw is not None and suggested_count < 3:
+            if is_obb_parse:
+                # B-71 obb 分支：只认四角点建议（闸门在 _norm_suggest_obb 内）；
+                # detect 的 suggested_bbox 路径对 obb 集不生效（模板口径不同，避免混用）。
+                b["suggested_obb"] = None
+                if b["action"] == "modify" and raw_obb is not None and suggested_count < 3:
+                    nq = _norm_suggest_obb(raw_obb, b["box_id"])
+                    if nq:
+                        b["suggested_obb"] = nq
+                        suggested_count += 1
+                elif b["action"] == "split" and isinstance(subs_raw, (list, tuple)) and len(subs_raw) >= 2:
+                    subs = [nb for nb in (_norm_suggest(s, b["box_id"]) for s in subs_raw[:6]) if nb]
+                    if len(subs) >= 2:
+                        b["sub_bboxes"] = subs
+            elif b["action"] == "modify" and raw is not None and suggested_count < 3:
                 nb = _norm_suggest(raw, b["box_id"])
                 if nb:
                     # 建议框与原框几乎一样（IoU≥0.95）→ 没有修正价值，不给
@@ -2909,6 +3433,18 @@ class SAMService:
                             f"已覆盖{len(audit_dets)}个，未覆盖{len(missed)}个",
         }
 
+    def _audit_task_type(self, task_id: str) -> str:
+        """B-71：标注任务 → 数据集声明的任务类型（detect/segment/obb）。
+        解析失败一律 detect（=历史行为，不因排障信息缺失改变审核链路）。"""
+        try:
+            ds_id, _ = self._task_dataset_model(task_id)
+            if not ds_id:
+                return "detect"
+            return dataset_task(settings.DATASETS_DIR / ds_id) or "detect"
+        except Exception as e:
+            print(f"qwen audit: 解析数据集任务类型失败(按 detect): {e}")
+            return "detect"
+
     def _task_classes(self, task_id: str) -> list:
         """读取标注任务注册的类别清单（英文 code，与 labels_dict/labels 序号对齐）"""
         try:
@@ -2942,8 +3478,11 @@ class SAMService:
         if cfg.get("qwen_enabled", False):
             if labels_desc is None:
                 labels_desc = {"labels": []}
+        # B-71：按数据集 task 分流审核链路（obb 走旋转框专用一套）
+        cfg_audit = dict(cfg)
+        cfg_audit["qwen_audit_task"] = self._audit_task_type(task_id)
         audit, message = await asyncio.to_thread(
-            self.qwen_audit_detections, img_abs, boxes, labels_desc, cfg, classes
+            self.qwen_audit_detections, img_abs, boxes, labels_desc, cfg_audit, classes
         )
         if not boxes:
             # 无框图走纯查全分支（qwen_audit_detections 内部已转 _qwen_recall_only）：
@@ -3705,9 +4244,12 @@ class SAMService:
                             b["box_id"] = i
                         t_audit = time.perf_counter()
                         try:
+                            # B-71：按数据集 task 分流审核链路
+                            cfg_audit = dict(cfg)
+                            cfg_audit["qwen_audit_task"] = self._audit_task_type(bt.task_id)
                             audit, audit_msg = await asyncio.to_thread(
                                 self.qwen_audit_detections, img_abs, new_boxes,
-                                cfg.get("qwen_labels_desc"), cfg, bt.classes
+                                cfg.get("qwen_labels_desc"), cfg_audit, bt.classes
                             )
                             bt.time_audit_ms += (time.perf_counter() - t_audit) * 1000
                             if audit and audit.get("ok"):
@@ -3722,7 +4264,7 @@ class SAMService:
                                     r = rmap.get(i)
                                     if r:
                                         b["audit"] = {k: r.get(k) for k in
-                                                      ("action", "kind", "reason", "tags", "suggested_class_id", "suggested_bbox", "sub_bboxes")
+                                                      ("action", "kind", "reason", "tags", "suggested_class_id", "suggested_bbox", "suggested_obb", "sub_bboxes")
                                                       if r.get(k) is not None}
                             else:
                                 bt.audit_errors += 1
@@ -3889,6 +4431,9 @@ class SAMService:
         if ld:
             cfg = dict(cfg)
             cfg["qwen_labels_desc"] = ld
+        # B-71：按数据集 task 分流审核链路（obb 走旋转框专用一套；循环内只换 image_id）
+        cfg = dict(cfg)
+        cfg["qwen_audit_task"] = self._audit_task_type(bt.task_id)
         classes = bt.classes
         sem = asyncio.Semaphore(concurrency)
         # 全局闸门：跨批次/跨用户共享，上限来自配置（默认 16）。
@@ -3997,7 +4542,7 @@ class SAMService:
                     if r and orig_i < len(ann_boxes):
                         nb = dict(ann_boxes[orig_i])
                         nb["audit"] = {k: r.get(k) for k in
-                                       ("action", "kind", "reason", "tags", "suggested_class_id", "suggested_bbox", "sub_bboxes")
+                                       ("action", "kind", "reason", "tags", "suggested_class_id", "suggested_bbox", "suggested_obb", "sub_bboxes")
                                        if r.get(k) is not None}
                         ann_boxes[orig_i] = nb
                 ann["boxes"] = ann_boxes
