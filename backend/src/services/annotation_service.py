@@ -1362,6 +1362,78 @@ class AnnotationService:
                 logger.warning(f"backfill has_label {task_id}/{image_id} failed: {e}")
         return result
 
+    async def set_reviewed_batch(self, task_id: str, image_ids: list, reviewed: bool = True):
+        """B-67：网格审核「通过」自动批量落库 —— 逐图只改 reviewed 一个字段。
+
+        【为什么不走 save_annotation】那是全量覆盖 boxes 的路径：8000 张逐张
+        GET+POST 太重，且全量回写有框形态风险（obb/polygon 经规范化可能变形）。
+        这里直接读每图 JSON 原始内容（不经 ann_with_bbox 读取兜底，避免把补算的
+        矩形写回 obb/分割框），只改 reviewed 键后经同一写盘口 _save_image_ann 落盘
+        （strip_ann_bbox 对已干净的形态是恒等），boxes/audit/audit_meta/sample_type
+        等一律逐字节保留。
+
+        【无标注图的语义】与单图「无改动落 reviewed」路径（markReviewedAndNext →
+        save_annotation）一致：该路径对无标注图也会建 JSON（boxes=[] →
+        sample_type=background），所以这里同样建最小 JSON 并打 reviewed，
+        不发明「跳过」新语义。skipped 只收不存在/已从任务移除的 id，不报错中断。
+
+        【不做】不碰 boxes、不触发封板/训练侧逻辑、不加新存储。PG 影子库惯例
+        （save_annotation 尾部）只回填 has_label，而 reviewed 不改 has_label，
+        故无需同步。
+        """
+        task_dir = self.annotations_dir / task_id
+        task_file = task_dir / "task.json"
+        if not await asyncio.to_thread(lambda: task_file.exists()):
+            return None  # 路由层转 404
+
+        def _sync():
+            task_meta = load_json(task_file)
+            dataset_id, version = self._task_to_ds(task_meta)
+            info_by_id = {it.get("image_id"): it for it in task_meta.get("items", [])}
+            updated, skipped = 0, []
+            # 去重保序：同一 id 重复提交只写一次
+            for image_id in dict.fromkeys(image_ids):
+                info = info_by_id.get(image_id)
+                if not info:
+                    skipped.append(image_id)   # 不存在/已删除：收集不中断
+                    continue
+                p = self._image_ann_path(dataset_id, version, image_id)
+                raw = {}
+                try:
+                    if p.exists():
+                        raw = load_json(p) or {}
+                except Exception:
+                    raw = {}
+                if not isinstance(raw, dict):
+                    raw = {}
+                if raw:
+                    # 已有 JSON：只改 reviewed，其余键（含 boxes/audit）原样保留
+                    raw["reviewed"] = bool(reviewed)
+                else:
+                    # 无 JSON：照单图路径建最小结构（boxes=[] → background）
+                    raw = {
+                        "image_id": image_id,
+                        "image_path": info.get("image_path", ""),
+                        "width": info.get("width", 0),
+                        "height": info.get("height", 0),
+                        "model_id": task_meta.get("model_id", ""),
+                        "dataset_id": dataset_id,
+                        "version": version,
+                        "sample_type": self.SAMPLE_BACKGROUND,
+                        "sample_reasons": [],
+                        "boxes": [],
+                        "created_at": datetime.now().isoformat(),
+                        "ai_annotated": False,
+                        "reviewed": bool(reviewed),
+                    }
+                raw["updated_at"] = datetime.now().isoformat()
+                self._save_image_ann(dataset_id, version, image_id, raw)
+                updated += 1
+            return {"ok": True, "updated": updated, "skipped": skipped,
+                    "reviewed": bool(reviewed)}
+
+        return await asyncio.to_thread(_sync)
+
     async def clear_ai_annotations(self, task_id: str):
         """清除该任务所有 AI 预标注（批量误标过多时一键清理，便于重新标注）。
 

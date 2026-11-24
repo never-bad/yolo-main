@@ -40,6 +40,12 @@ class SaveAnnotationRequest(BaseModel):
     sample_reason: Optional[str] = None    # 覆盖时附带判据（如 manual）
     reviewed: bool = False                 # 人工复核标记：画布上编辑过标注后保存才为 True（粘性）
 
+class ReviewedBatchRequest(BaseModel):
+    # B-67：网格「通过」自动批量落库。只改 reviewed 一个字段，不碰 boxes；
+    # reviewed=false 用于撤销已落库的通过标记。
+    image_ids: List[str]
+    reviewed: bool = True
+
 @router.post("/tasks")
 async def create_annotation_task(request: CreateTaskRequest):
     """创建标注任务"""
@@ -86,6 +92,23 @@ async def save_annotation(task_id: str, image_id: str, request: SaveAnnotationRe
     except ValueError as e:
         # P1-1：标注框越界等坐标非法 → 400 拒绝落盘
         raise HTTPException(400, str(e))
+    return result
+
+@router.post("/tasks/{task_id}/reviewed-batch")
+async def set_reviewed_batch(task_id: str, request: ReviewedBatchRequest):
+    """B-67：批量设置人工复核标记（网格审核「通过」自动落库）。
+
+    逐图只改 reviewed 字段，boxes/audit 等原样保留；不存在的 id 进 skipped
+    返回不中断。单批上限 200（与批量删除同一防御口径），空批/超限 → 400。
+    """
+    if not request.image_ids:
+        raise HTTPException(400, "image_ids 不能为空")
+    if len(request.image_ids) > 200:
+        raise HTTPException(400, "单批最多 200 张，请分批提交")
+    result = await annotation_service.set_reviewed_batch(
+        task_id, request.image_ids, request.reviewed)
+    if result is None:
+        raise HTTPException(404, "Task not found")
     return result
 
 @router.get("/tasks/{task_id}/items/{image_id}")
