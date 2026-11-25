@@ -23,7 +23,7 @@ import numpy as np
 
 from src.core.settings import settings
 from src.services.device_manager import get_best_device
-from src.services.annotation_service import AnnotationService, dataset_task
+from src.services.annotation_service import AnnotationService, dataset_task, ensure_box_ids
 from src.utils.json_io import load_json, save_json_atomic
 
 
@@ -4276,6 +4276,9 @@ class SAMService:
                             {"class_id": b.get("class_id"),
                              "score": b.get("score") or b.get("confidence"),
                              "source": b.get("source", "manual"),
+                             # B-77：已有框的 box_id 原样带回（读取口已补齐），
+                             # 否则增量预标注整体覆盖保存会让存量框 id 全部漂移
+                             **({"box_id": b["box_id"]} if isinstance(b.get("box_id"), int) else {}),
                              # 已有轮廓必须带上：否则 AI 再标一次会把人工画好的分割轮廓抹掉
                              **({"polygon": b["polygon"]} if b.get("polygon") else {}),
                              # 分割目标数据里没有矩形（只存轮廓点），有才带上，避免 None 落盘
@@ -4500,11 +4503,15 @@ class SAMService:
                 # 关键：qwen_audit_detections 内部按 b["x1"]/["y1"]/["x2"]/["y2"] 取坐标
                 # （见本文件 L2111），必须传「保留原始字段」的框字典，不能重构成
                 # {"bbox": [...]}，否则每张图都会 KeyError('x1') 被计入 failed_images。
-                # 这里用浅拷贝并只补 box_id（送审序号 = valid_idx 的下标 j）。
+                # B-77：送审沿用读取口补好的稳定 box_id（不再覆写为 valid_idx 序号 j）。
+                # 覆写会使「模型回传 id=送审号」与「写回按稳定 id 查 rmap」错位：
+                # 删框后 id 不连续时结论整体写错框。qwen_audit_detections 对已带
+                # box_id 的框原样沿用（见本文件"调用方已赋值则沿用"分支），语义闭环。
                 dets = []
-                for j, orig_i in enumerate(valid_idx):
+                for orig_i in valid_idx:
                     nb = dict(boxes[orig_i])
-                    nb["box_id"] = j
+                    if not isinstance(nb.get("box_id"), int):
+                        nb["box_id"] = orig_i
                     dets.append(nb)
                 async with sem:
                     audit, msg = await _gated_audit(img_abs, dets)
@@ -4532,19 +4539,28 @@ class SAMService:
                 except (FileNotFoundError, OSError):
                     ann = dict(existing or {})  # 兼容集中式 legacy 标注
                 ann_boxes = ann.get("boxes") or []
+                # B-77：写回前给磁盘框补齐 box_id（存量 JSON 没有该字段；规则与
+                # 读取口 ensure_box_ids 完全一致 → 与送审序号/回读/classify 明细同源）。
+                # 只新增 box_id 键，坐标/obb/polygon/class_id 一律不动。
+                ann_boxes = ensure_box_ids(ann_boxes)
                 # 重跑前清掉该图所有框的旧审核结论：模型可能不再对某些框输出
                 # box_reviews，若不清会残留上一轮的假 label_error / 合规 tag。
                 ann_boxes = [{k: v for k, v in dict(b).items() if k != "audit"}
                              for b in ann_boxes]
+                # B-77：结论按「框的稳定 box_id」写回（送审时 dets 带的就是读取口
+                # 补好的 id），不再按临时序号 j 对下标——磁盘与视图下标错位时也不会写错框。
                 rmap = {r.get("box_id"): r for r in (audit.get("box_reviews") or [])}
+                id_to_i = {b.get("box_id"): i for i, b in enumerate(ann_boxes)
+                           if isinstance(b.get("box_id"), int)}
                 for j, orig_i in enumerate(valid_idx):
-                    r = rmap.get(j)
-                    if r and orig_i < len(ann_boxes):
-                        nb = dict(ann_boxes[orig_i])
+                    r = rmap.get(boxes[orig_i].get("box_id")) if orig_i < len(boxes) else None
+                    ti = id_to_i.get(boxes[orig_i].get("box_id")) if orig_i < len(boxes) else None
+                    if r is not None and ti is not None:
+                        nb = dict(ann_boxes[ti])
                         nb["audit"] = {k: r.get(k) for k in
                                        ("action", "kind", "reason", "tags", "suggested_class_id", "suggested_bbox", "suggested_obb", "sub_bboxes")
                                        if r.get(k) is not None}
-                        ann_boxes[orig_i] = nb
+                        ann_boxes[ti] = nb
                 ann["boxes"] = ann_boxes
                 ann["audit_meta"] = {
                     "missed_targets": audit.get("missed_targets") or [],
@@ -4656,6 +4672,8 @@ class SAMService:
                         t = "compliance"
                     if t:
                         types_in_img.add(t)
+                        # B-77：box_id 真实透传（_load_image_ann 读取口已给存量框
+                        # 补齐 id，与单图 GET 回读同源同值），不再全 null。
                         details.append({
                             "box_id": b.get("box_id"), "type": t, "action": action,
                             "kind": kind, "reason": au.get("reason"), "tags": tags,

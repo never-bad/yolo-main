@@ -216,10 +216,89 @@ def boxes_with_bbox(boxes: list) -> list:
 
 
 def ann_with_bbox(data: dict) -> dict:
-    """整份每图 JSON 的读取兜底"""
+    """整份每图 JSON 的读取兜底（B-77：顺带补齐缺失的 box_id，只改内存不写盘）"""
     if isinstance(data, dict) and data.get("boxes"):
-        return {**data, "boxes": boxes_with_bbox(data["boxes"])}
+        return {**data, "boxes": ensure_box_ids(boxes_with_bbox(data["boxes"]))}
     return data
+
+
+def _valid_box_id(v) -> bool:
+    """box_id 合法形态：非负整数（排除 bool）。字符串/浮点/None 一律视为缺失。"""
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def ensure_box_ids(boxes: list) -> list:
+    """B-77：读取兜底——给没有 box_id 的框按数组下标补齐（0 起）。
+
+    存量标注 JSON 没有 box_id（历史上审核送审用临时下标、落盘只带 audit），
+    classify 明细因此全 null，前端逐条采纳只能拿 reason 当键 → 同 reason 改错框。
+    这里在唯一读取口（_load_image_ann → ann_with_bbox）统一补齐：
+    - 已有合法 box_id 的框原样保留（保存时按 id 继承，增删框不漂移）；
+    - 缺 id 的框取「不与现有 id 冲突的最小非负整数」（存量整图无 id 时即数组下标，
+      与历史审核送审序号一致，旧 audit 的语义下标能对上号）；
+    - 只在内存副本上补，绝不写盘、绝不动其他字段（obb/polygon 形态不受影响）。
+    """
+    if not boxes:
+        return boxes
+    used = {b["box_id"] for b in boxes
+            if isinstance(b, dict) and _valid_box_id(b.get("box_id"))}
+    out, nxt = [], 0
+    for b in boxes:
+        if not isinstance(b, dict) or _valid_box_id(b.get("box_id")):
+            out.append(b)
+            continue
+        while nxt in used:
+            nxt += 1
+        out.append({**b, "box_id": nxt})
+        used.add(nxt)
+        nxt += 1
+    return out
+
+
+def _reinherit_box_ids(new_boxes: list, old_boxes: list) -> list:
+    """B-77：保存时把磁盘旧框的 box_id 继承回「同一个框」，防止整体重排漂移。
+
+    前端旧版本保存 payload 不带 box_id（白名单没有它），若每次保存都按下标重发，
+    删一个框就会让后面所有框的 id 前移，历史 audit / classify 明细全部对不上号。
+    继承判据（只认「没被编辑过」的框，绝不把 A 框的 id 安到 B 框头上）：
+    - 新框自带合法 box_id 且在旧框里存在 → 原样保留（新版前端显式带回）；
+    - 否则按「形态+坐标+类别全等」在旧框里找唯一匹配（detect 比 x1..y2，
+      segment 比 polygon，obb 比四角点；class_id 也比，改过类别的框不继承）；
+      唯一命中才继承，零/多候选一律不继承（交给后面按空位补新 id）。
+    """
+    if not new_boxes:
+        return new_boxes
+    def fp(b):
+        if b.get("obb"):
+            return ("obb", json.dumps(b["obb"], separators=(",", ":")), b.get("class_id"))
+        if b.get("polygon"):
+            return ("poly", json.dumps(b["polygon"], separators=(",", ":")), b.get("class_id"))
+        return ("rect", b.get("x1"), b.get("y1"), b.get("x2"), b.get("y2"), b.get("class_id"))
+    old_ids = {}          # box_id -> 旧框（合法 id 才有）
+    old_by_fp = {}        # 指纹 -> [旧框]
+    for ob in old_boxes or []:
+        if not isinstance(ob, dict):
+            continue
+        if _valid_box_id(ob.get("box_id")):
+            old_ids[ob["box_id"]] = ob
+        old_by_fp.setdefault(fp(ob), []).append(ob)
+    claimed = set()       # 已被继承占用的旧 id，防两个新框抢同一个
+    out = []
+    for nb in new_boxes:
+        bid = nb.get("box_id")
+        if _valid_box_id(bid) and bid in old_ids and bid not in claimed:
+            claimed.add(bid)
+            out.append(nb)
+            continue
+        cands = [ob for ob in old_by_fp.get(fp(nb), [])
+                 if _valid_box_id(ob.get("box_id")) and ob["box_id"] not in claimed]
+        if len(cands) == 1:
+            nb = {**nb, "box_id": cands[0]["box_id"]}
+            claimed.add(cands[0]["box_id"])
+        elif "box_id" in nb:
+            nb = {k: v for k, v in nb.items() if k != "box_id"}
+        out.append(nb)
+    return out
 
 
 def strip_ann_bbox(data: dict) -> dict:
@@ -642,7 +721,7 @@ class AnnotationService:
         return out
 
     def _normalize_boxes(self, boxes: list, classes: list, class_meta: dict,
-                         img_w: int = 0, img_h: int = 0) -> list:
+                         img_w: int = 0, img_h: int = 0, prev_boxes: list = None) -> list:
         """规范化框字段：class_id 落盘为数字索引（与 YOLO 类别号一致），并补全标签四字段。
 
         输入 class_id 兼容数字索引（classes 列表下标）或字符串（英文码/中文名/历史英文名）：
@@ -650,11 +729,20 @@ class AnnotationService:
         - 字符串 → 优先映射回 classes 下标（英文名直接命中 / 中文名经标签字典解析）
         四字段冗余存于每框（english_code/chinese_name/chinese_desc），保证 JSON 自包含、
         标签字典重排不丢语义。YOLO 导出直接用 class_id，无需再映射。
+
+        B-77：新增可选 prev_boxes（磁盘旧框，读取口已补 id）。白名单加 box_id：
+        显式带来的合法 id 保留 → 几何指纹唯一匹配继承旧 id → 都没有才按空位补新 id。
+        不传 prev_boxes 时行为 = 显式 id 保留 + 按序补号（与读取口 ensure_box_ids 同规则）。
         """
+        # 输入可能是 pydantic 模型（路由 BBox），先统一转 dict 再做 id 继承
+        raw_dicts = [r.model_dump() if hasattr(r, "model_dump") else (
+                        r.dict() if hasattr(r, "dict") else r) for r in boxes]
+        raw_dicts = _reinherit_box_ids(raw_dicts, prev_boxes or [])
         out = []
-        for raw in boxes:
-            b = raw.model_dump() if hasattr(raw, "model_dump") else (
-                    raw.dict() if hasattr(raw, "dict") else raw)
+        used_ids = {b["box_id"] for b in raw_dicts
+                    if isinstance(b, dict) and _valid_box_id(b.get("box_id"))}
+        next_id = 0
+        for b in raw_dicts:
             cid_raw = b.get("class_id", 0)
             if isinstance(cid_raw, str) and not cid_raw.isdigit():
                 # 字符串：英文名在 classes 中 → 下标；否则经标签字典中文名解析
@@ -716,6 +804,16 @@ class AnnotationService:
             audit = b.get("audit")
             if audit:
                 nb["audit"] = audit
+            # B-77：box_id 落盘（图内稳定唯一；显式/继承的 id 已在上面定好，
+            # 都没有的框按「不与已用 id 冲突的最小非负整数」补号）
+            if _valid_box_id(b.get("box_id")):
+                nb["box_id"] = b["box_id"]
+            else:
+                while next_id in used_ids:
+                    next_id += 1
+                nb["box_id"] = next_id
+                used_ids.add(next_id)
+                next_id += 1
             out.append(nb)
         # 越界坐标统一裁回图内（详见 _clamp_boxes_to_image）
         return self._clamp_boxes_to_image(out, img_w, img_h)
@@ -725,6 +823,8 @@ class AnnotationService:
         对历史英文名 JSON 兜底映射回 classes 下标，找不到保留原值（不崩）。
         """
         idx_map = {str(c).lower(): i for i, c in enumerate(classes or [])}
+        # B-77：legacy 集中式 annotations.json 不经 ann_with_bbox，这里再兜一层补 id
+        boxes = ensure_box_ids(boxes)
         out = []
         for b in boxes:
             nb = dict(ensure_box_bbox(b))
@@ -1148,8 +1248,32 @@ class AnnotationService:
         
         return await asyncio.to_thread(_get_task_items_sync)
     
-    async def get_image_annotation(self, task_id: str, image_id: str):
-        """获取单张图片的标注"""
+    # B-74：similar 是全组成员名单（视频抽帧集实测单组 1206 条、响应膨胀到
+    # 72KB），网格逐格拉框根本用不到——前端只消费 group_id/group_size
+    # （review-app.js L1079-1081），组成员由队列按 group_id 重建（L594/L676-687）。
+    # 默认只剔 similar 一键，duplicate 其余键原样透传；落盘不动。
+    @staticmethod
+    def _slim_duplicate(audit_meta: dict) -> dict:
+        """B-74：仅在响应组装层剔除 duplicate.similar（浅拷贝，不改落盘/缓存对象）。
+
+        audit_meta 无 duplicate、或 duplicate 本就没有 similar 键时原样返回，
+        保证无重复组的图响应逐字节不变。
+        """
+        dup = audit_meta.get("duplicate")
+        # 只剔「非空名单」：similar 缺失或为空数组（group_size=0 的残留形态）
+        # 时原样返回，保证这类图响应也逐字节不变。
+        if not isinstance(dup, dict) or not dup.get("similar"):
+            return audit_meta
+        slim_dup = {k: v for k, v in dup.items() if k != "similar"}
+        return {**audit_meta, "duplicate": slim_dup}
+
+    async def get_image_annotation(self, task_id: str, image_id: str, include_similar: bool = False):
+        """获取单张图片的标注。
+
+        B-74：默认剔除 audit_meta.duplicate.similar（全组成员名单，单组可达
+        上千条、几十 KB），只回摘要；include_similar=True 时返回完整名单
+        （按需获取，供确需逐条距离/精确标记的场景）。只改响应，不改落盘。
+        """
         task_dir = self.annotations_dir / task_id
         task_file = task_dir / "task.json"
         
@@ -1198,6 +1322,11 @@ class AnnotationService:
                 # 已经有框了，说明漏标已被处理：旁路结论作废
                 self.drop_recall_meta(dataset_id, image_id)
                 audit_meta = {k: v for k, v in audit_meta.items() if k != "recall_only"}
+
+            # B-74：默认瘦身——只剔 duplicate.similar，其余键（含 audit_meta
+            # 其他键、boxes）原样；include_similar=True 走原全量返回。
+            if audit_meta and not include_similar:
+                audit_meta = self._slim_duplicate(audit_meta)
 
             return {
                 "image_id": image_id,
@@ -1307,7 +1436,11 @@ class AnnotationService:
             vh = int(info.get("height") or existing.get("height") or 0)
             # 越界坐标裁回图内（不再整张图拒绝落盘）：画布留白区可以按下/松手，
             # 拖框、拖顶点、整体平移都能拖出边界，一个框越界不该让其它几十个框一起存不上。
-            norm_boxes = self._normalize_boxes(boxes, classes, class_meta, vw, vh)
+            # B-77：prev_boxes=磁盘旧框（读取口已补 id）——旧版前端 payload 不带 box_id
+            # 时按几何指纹唯一匹配继承旧 id，删框/重排不再让历史 audit 对不上号。
+            norm_boxes = self._normalize_boxes(
+                boxes, classes, class_meta, vw, vh,
+                prev_boxes=existing.get("boxes") or [])
 
             ai = ai_annotated or prev_ai
             s_type, s_reasons = self._resolve_sample_type(norm_boxes, ai, sample_type, sample_reason)

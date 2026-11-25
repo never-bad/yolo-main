@@ -29,9 +29,17 @@ class BBox(BaseModel):
     # 分割轮廓（像素坐标 [[x,y],...]）；类型放宽为 list，由服务端 clean_polygon 统一校验，
     # 避免个别坏点导致整张图的标注保存失败
     polygon: Optional[list] = None
+    # 旋转框四角点（像素坐标 [[x,y]×4]，顺时针）；与 polygon 互斥，由服务端 clean_obb 校验。
+    # B-77 顺带修复既有契约缺口：此前 BBox 漏声明 obb，pydantic 默认丢弃未声明字段，
+    # 导致一切走本路由的 obb 保存（主标注页/审核台精修/几何采纳）落盘退化为矩形。
+    # 服务层 _normalize_boxes 早已支持 obb 优先落盘，只是 HTTP 契约没把字段透传进来。
+    obb: Optional[list] = None
     confidence: Optional[float] = None  # AI 置信度（仅 AI 标注携带）
     source: Optional[str] = None        # manual | ai | ai_qwen | import
     audit: Optional[dict] = None        # L2 千问/人工审核结论，随框落盘（供问题图片检索）
+    # B-77：框的稳定唯一标识（图内 0 起整数）。前端保存时原样带回 → 增删框不漂移；
+    # 旧版前端不带 → 服务端按几何指纹唯一匹配继承磁盘旧 id（_reinherit_box_ids）。
+    box_id: Optional[int] = None
 
 class SaveAnnotationRequest(BaseModel):
     boxes: List[BBox]
@@ -112,9 +120,16 @@ async def set_reviewed_batch(task_id: str, request: ReviewedBatchRequest):
     return result
 
 @router.get("/tasks/{task_id}/items/{image_id}")
-async def get_image_annotation(task_id: str, image_id: str):
-    """获取单张图片的标注"""
-    result = await annotation_service.get_image_annotation(task_id, image_id)
+async def get_image_annotation(task_id: str, image_id: str, include_similar: bool = False):
+    """获取单张图片的标注。
+
+    B-74：默认剔除 audit_meta.duplicate.similar 全组成员名单（视频抽帧集
+    单组可达上千条、响应 30~72KB，拖慢审核台网格逐格画框），只回
+    group_id/group_size/representative/threshold/algorithm/scanned_at 摘要。
+    确需完整名单时显式带 ?include_similar=true 按需获取（返回结构与旧版全量一致）。
+    """
+    result = await annotation_service.get_image_annotation(
+        task_id, image_id, include_similar=include_similar)
     if not result:
         raise HTTPException(404, "Image not found")
     return result
