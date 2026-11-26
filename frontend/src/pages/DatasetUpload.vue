@@ -100,9 +100,10 @@
 
     <div class="card">
       <h2>数据集列表</h2>
-      <button @click="loadDatasets()" :disabled="loading" class="secondary">
+      <button @click="loadDatasets()" :disabled="loading" class="secondary"
+              title="先推进灌桶/封板（不可逆的状态推进），再拉取最新列表">
         <span v-if="loading" class="loading-spinner"></span>
-        {{ loading ? '加载中...' : '刷新' }}
+        {{ loading ? '加载中...' : '刷新列表（并推进灌桶/封板）' }}
       </button>
       <div v-if="bucketNotice" class="bucket-notice" @click="dismissBucketNotice" title="点击关闭">{{ bucketNotice }}<span class="bucket-notice-close">✕</span></div>
       <button v-else-if="bucketNoticeDismissed && bucketNoticeLast" class="bucket-notice-restore" @click="restoreBucketNotice" title="恢复最近一次灌桶/封板提示">↻ 恢复上次提示</button>
@@ -261,7 +262,7 @@
                 :disabled="exportingDataset === dataset.dataset_id + '_annotated'"
               >
                 <span v-if="exportingDataset === dataset.dataset_id + '_annotated'" class="loading-spinner"></span>
-                {{ exportingDataset === dataset.dataset_id + '_annotated' ? '导出中...' : '导出（标注后）' }}
+                {{ exportingDataset === dataset.dataset_id + '_annotated' ? '导出中...' : '导出数据集压缩包' }}
               </button>
               <button 
                 v-if="dataset.status === 'prepared'"

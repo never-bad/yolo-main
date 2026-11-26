@@ -522,7 +522,7 @@
                    标签格式由后端按数据集任务类型写（detect 5 列 / segment 多边形 / obb 四角点） -->
               <button @click="exportReviewedPackage(); moreOpen = false" :disabled="exportingReviewed || counts.reviewed === 0" :title="'只把人工复核过的图片+YOLO标签打包成 zip 下载，labels 按本数据集任务类型写（' + (isObbTask ? '旋转框四角点' : isSegTask ? '分割多边形' : '检测方框') + '），解压即可用'">
                 <span v-if="exportingReviewed" class="loading-spinner"></span>
-                {{ exportingReviewed ? '打包中...' : `导出已复核 zip（${counts.reviewed}）` }}
+                {{ exportingReviewed ? '打包中...' : `导出已复核图片包（${counts.reviewed}）` }}
               </button>
               <label class="import-label" title="导入 X-AnyLabeling 等外部工具导出的 YOLO 标注（zip 内含 labels/*.txt）">
                 <input type="file" accept=".zip" class="import-input" @change="onImportYolo" />
@@ -714,9 +714,9 @@
             <button class="danger" @click="clearCurrentBoxes" :disabled="!currentBoxes.length" title="清空本图所有标注框">
               清空本图
             </button>
-            <button @click="exportTask" :disabled="exporting" title="把本数据集已标注结果导出为 YOLO 格式（labels/*.txt）写入数据集目录">
+            <button @click="exportTask" :disabled="exporting" title="把本数据集已标注结果写成 YOLO 标签（labels/*.txt）到数据集目录，不产生下载文件；划分随封板进行">
               <span v-if="exporting" class="loading-spinner"></span>
-              {{ exporting ? '导出中...' : '导出' }}
+              {{ exporting ? '写入中...' : '写入训练标签（不下载）' }}
             </button>
           </div>
         </div>
