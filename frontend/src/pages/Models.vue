@@ -439,9 +439,6 @@
             <h4>诊断报告</h4>
             <pre v-if="modelReportText" class="report-pre">{{ modelReportText }}</pre>
             <p v-else class="empty-state">暂无训练指标，无法生成报告</p>
-            <div class="report-exec-bar">
-              <button class="primary" @click="onOneClickExecute">一键执行</button>
-            </div>
           </div>
 
           <!-- 训练配置 -->
@@ -844,11 +841,6 @@ const openModelReport = () => {
 }
 const closeModelReport = () => {
   showModelReport.value = false
-}
-
-// 一键执行（暂只添加按钮，动作待后续实现）
-const onOneClickExecute = () => {
-  showAlert('"一键执行"功能开发中，敬请期待。', '一键执行')
 }
 
 // 性能总结：根据最终指标生成自然语言评估（性能 + 可用度）
@@ -2058,13 +2050,6 @@ const doRollbackMerge = async (logIndex: number) => {
   font-weight: bold;
   color: #2c3e50;
   font-size: 0.95rem;
-}
-
-/* 诊断报告右下角的一键执行按钮 */
-.report-exec-bar {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: 0.75rem;
 }
 
 .loading-state {

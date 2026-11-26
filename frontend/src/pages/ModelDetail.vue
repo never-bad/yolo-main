@@ -596,7 +596,6 @@
             <button class="primary small" :disabled="savingLabels" @click="saveLabels">
               {{ savingLabels ? '保存中...' : '保存标签字典' }}
             </button>
-            <button class="secondary small" @click="closeLabelModal">关闭</button>
             <span v-if="labelsMsg" class="labels-msg">{{ labelsMsg }}</span>
           </div>
 
@@ -607,7 +606,7 @@
             <p v-if="descGenMsg" class="form-hint" :class="{ 'desc-gen-err': descGenErr }">{{ descGenMsg }}</p>
             <p v-if="descGenFilled.length" class="form-hint">
               已回填 {{ descGenFilled.length }} 个类别：{{ descGenFilled.join('、') }}。
-              请检查表格里的描述与 AI 提示词，可手动修改；确认无误后点「保存标签字典」生效，点「关闭」则放弃。
+              请检查表格里的描述与 AI 提示词，可手动修改；确认无误后点「保存标签字典」生效，点右上角「✕」则放弃。
             </p>
           </div>
 
@@ -696,9 +695,6 @@
               </tr>
             </tbody>
           </table>
-          <div class="set-row modal-actions">
-            <button class="secondary small" @click="mountModalOpen = false">关闭</button>
-          </div>
         </div>
       </div>
 
@@ -732,7 +728,6 @@
               <span v-if="dsImporting" class="loading-spinner"></span>
               {{ dsPreparing ? '正在准备数据...' : (dsImporting ? '上传中...' : '开始导入') }}
             </button>
-            <button class="secondary small" :disabled="dsImporting" @click="dsImportOpen = false">取消</button>
           </div>
         </div>
       </div>

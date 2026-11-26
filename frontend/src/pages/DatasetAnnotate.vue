@@ -205,14 +205,9 @@
           </div>
         </div>
         <!-- 翻页用画布两侧的 ‹ › 或键盘 ←/→，这里只留一个游标，表示当前图在筛选/搜索结果里的位置 -->
-        <!-- 游标可点击：输入序号直接跳到第 N 张（千张级任务里比连点 → 快得多） -->
-        <div
-          class="nav-pos"
-          :class="{ editing: posEditing, jumpable: !!visibleItems.length }"
-          :title="visibleItems.length ? '点击输入序号，直接跳到第 N 张' : ''"
-          @click="startPosJump"
-        >
-          <template v-if="posEditing">
+        <!-- 游标不再可点击（M1-6）：序号输入框常驻，直接输入第 N 张回车即可跳转 -->
+        <div class="nav-pos">
+          <template v-if="visibleItems.length">
             <span class="pos-text">第</span>
             <input
               ref="posInputRef"
@@ -221,14 +216,14 @@
               :style="{ width: Math.max(2, posInput.length) + 1 + 'ch' }"
               inputmode="numeric"
               autocomplete="off"
+              title="输入序号后回车，直接跳到第 N 张"
               @keydown.enter.prevent="commitPosJump(true)"
               @keydown.esc.prevent="cancelPosJump"
               @blur="onPosBlur"
             />
             <span class="pos-text">/ {{ visibleItems.length }} 张</span>
           </template>
-          <span v-else-if="visibleIdx >= 0">第 {{ visibleIdx + 1 }} / {{ visibleItems.length }} 张</span>
-          <span v-else>{{ visibleItems.length ? '当前无匹配图片（点此跳转）' : '当前无匹配图片' }}</span>
+          <span v-else>当前无匹配图片</span>
         </div>
       </div>
 
@@ -5430,28 +5425,22 @@ const nextImage = () => {
   if (p >= 0 && p < visibleItems.value.length - 1) selectImageByItem(visibleItems.value[p + 1])
 }
 
-// ===== 游标跳转：点「第 N / M 张」输入序号直达 =====
+// ===== 游标序号输入：输入第 N 张直接跳转（M1-6 后不再需要点游标进入编辑态） =====
 // 千张级任务里靠 ← / → 挪几十张太慢，直接输入序号最省事。
 // 序号口径与游标一致：可见集合（类别筛选 ∩ 文件名搜索）里的第 N 张，从 1 开始。
-const posEditing = ref(false)
 const posInput = ref('')
 const posInputRef = ref<HTMLInputElement | null>(null)
-let posJumpBase = ''   // 进入编辑时的原值，用于判断「有没有真的改过」
+let posJumpBase = ''   // 当前已提交的序号，用于判断「有没有真的改过」
 
-const startPosJump = async () => {
-  if (!visibleItems.value.length || posEditing.value) return
-  // 当前图被筛掉时游标是 -1，从 1 开始输入更符合直觉
-  posInput.value = visibleIdx.value >= 0 ? String(visibleIdx.value + 1) : ''
-  posJumpBase = posInput.value
-  posEditing.value = true
-  await nextTick()
-  posInputRef.value?.focus()
-  posInputRef.value?.select()
-}
+// 切图/筛选变化后把输入框回填成当前序号（输入框常驻，不靠点击打开）
+watch(visibleIdx, () => {
+  const v = visibleIdx.value >= 0 ? String(visibleIdx.value + 1) : ''
+  posJumpBase = v
+  posInput.value = v
+}, { immediate: true })
 
 const cancelPosJump = () => {
-  posEditing.value = false
-  posInput.value = ''
+  posInput.value = posJumpBase
 }
 
 // 失焦也算提交（输完号直接点画布/别处就跳过去），但没改动过就不动，避免误触发
@@ -5461,9 +5450,8 @@ const onPosBlur = () => {
 }
 
 // keepOnError=true（回车触发）：越界时留在输入框里并把内容选中，
-// 用户可以接着改数字，不必重新点开一次；失焦触发时则正常退出编辑态。
+// 用户可以接着改数字，不必重新聚焦；失焦触发时则恢复原序号。
 const commitPosJump = (keepOnError = false) => {
-  if (!posEditing.value) return
   const n = visibleItems.value.length
   const raw = posInput.value.trim()
   // 清空后回车/失焦 = 放弃跳转，不提示（用户就是想退出来）
@@ -5480,18 +5468,16 @@ const commitPosJump = (keepOnError = false) => {
       'info', 3500
     )
     if (keepOnError) {
-      // 留在输入框并选中内容，接着改数字即可，不必重新点开
+      // 留在输入框并选中内容，接着改数字即可
       nextTick(() => { posInputRef.value?.focus(); posInputRef.value?.select() })
       return
     }
     cancelPosJump()
     return
   }
-  posEditing.value = false
-  posInput.value = ''
   const target = parsed - 1
-  if (target === visibleIdx.value) return
-  selectImageByItem(visibleItems.value[target])
+  if (target === visibleIdx.value) { cancelPosJump(); return }
+  selectImageByItem(visibleItems.value[target])   // 切图后由 watch(visibleIdx) 回填输入框
 }
 
 const handleKeydown = (e: KeyboardEvent) => {
@@ -6113,29 +6099,15 @@ onUnmounted(() => {
 
 .nav-pos {
   padding: 0.4rem 0 0.1rem;
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
   font-size: 0.78rem;
   color: #7f8c8d;
   font-variant-numeric: tabular-nums;
 }
 
-/* 游标可点击跳转：默认只做轻微提示，避免抢列表的视觉重心 */
-.nav-pos.jumpable {
-  cursor: pointer;
-  border-radius: 4px;
-  transition: background 0.15s, color 0.15s;
-}
-.nav-pos.jumpable:hover {
-  background: #eef3f8;
-  color: #2c3e50;
-}
-.nav-pos.editing {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.25rem;
-  color: #2c3e50;
-}
 .nav-pos .pos-text {
   white-space: nowrap;
 }
