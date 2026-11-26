@@ -175,11 +175,11 @@ export const listLibraries = async (): Promise<{ libraries: ModelLibrary[] }> =>
   return data
 }
 
-export const createLibrary = async (req: Partial<ModelLibrary>): Promise<ModelLibrary> => {
-  const { data } = await api.post('/models/libraries', req)
-  return data
-}
-
+/**
+ * @deprecated 半成品，勿用。docstring 承诺的「解绑挂接模型」后端未实现
+ * （routes/models.py:167-174 只删 PG 行），且对 registry 库根调用会 404。
+ * 详见 R-02 Q4。M1 起前端无任何调用点，保留定义仅作警示。
+ */
 export const deleteLibrary = async (libraryId: string) => {
   const { data } = await api.delete(`/models/libraries/${libraryId}`)
   return data
@@ -381,14 +381,6 @@ export const rollbackMerge = async (logIndex: number = -1) => {
   return data
 }
 
-// 列出当前在役的生产模型（可按业务/算法类型过滤）
-export const listProductionModels = async (business?: string) => {
-  const { data } = await api.get('/models/production', {
-    params: { business: business || undefined }
-  })
-  return data
-}
-
 // ===== P8 半自动发布（守门员通过 → 待确认发布 → 管理员确认后为唯一生产版本） =====
 export interface PendingPublishModel extends ModelDetails {
   publish_status?: 'pending' | 'published' | string   // pending=待确认 published=已确认
@@ -422,12 +414,6 @@ export const overrideModel = async (
   options?: { business?: string; reason?: string }
 ) => {
   const { data } = await api.post(`/models/${modelId}/override`, options || {})
-  return data
-}
-
-// 将训练好的模型升级为 AI 预标注的检测模型（热切换）
-export const promoteToDetector = async (modelId: string) => {
-  const { data } = await api.post(`/models/${modelId}/promote-to-detector`)
   return data
 }
 

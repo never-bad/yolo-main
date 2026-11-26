@@ -208,9 +208,3 @@ export const setDatasetAsTestSet = async (datasetId: string, force: boolean = fa
   const { data } = await api.post(`/datasets/${datasetId}/set-as-test-set`, { force })
   return data
 }
-
-// 测试集动态增删图片后重新封板（版本号 +1，同库旧指标标 stale）
-export const resealTestSet = async (datasetId: string) => {
-  const { data } = await api.post(`/datasets/${datasetId}/reseal-test-set`)
-  return data
-}

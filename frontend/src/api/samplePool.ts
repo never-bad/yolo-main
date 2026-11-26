@@ -38,21 +38,3 @@ export const addBackgroundSamples = async (params: AddBackgroundRequest) => {
   const { data } = await api.post('/sample-pool/background', params)
   return data
 }
-
-/** 汇总样本池状态：困难样本（按模型）+ 空白样本（全局） */
-export const listSamplePool = async (): Promise<SamplePoolResult> => {
-  const { data } = await api.get('/sample-pool')
-  return data
-}
-
-/** 清空某模型的困难样本库 */
-export const clearHardPool = async (modelId: string) => {
-  const { data } = await api.delete(`/sample-pool/hard/${modelId}`)
-  return data
-}
-
-/** 清空空白样本库 */
-export const clearBackgroundPool = async () => {
-  const { data } = await api.delete('/sample-pool/background')
-  return data
-}
