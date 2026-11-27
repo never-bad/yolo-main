@@ -699,11 +699,13 @@
       </div>
 
       <!-- ---------- F. 导入新数据弹窗（留在本页，归属自动是本库） ---------- -->
-      <div v-if="dsImportOpen" class="modal-mask" @click.self="dsImportOpen = false">
+      <div v-if="dsImportOpen" class="modal-mask" @click.self="closeDsImport">
         <div class="modal-panel">
           <div class="modal-head">
             <h3>导入新数据到本算法库</h3>
-            <button class="ghost small" @click="dsImportOpen = false">✕</button>
+            <button class="ghost small" :disabled="dsImporting"
+                    :title="dsImporting ? '上传中，暂时不能关闭' : '关闭'"
+                    @click="closeDsImport">✕</button>
           </div>
           <p class="form-hint">
             归属算法库：<b>{{ model?.display_name || model?.name || modelId }}</b>
@@ -1017,6 +1019,12 @@ function openDsImportModal() {
   dsImporting.value = false
   dsPreparing.value = false
   dsImportOpen.value = true
+}
+
+// 上传/准备期间不许关闭：关闭只是卸载 DOM，请求链仍会跑完，用户会误以为已取消
+function closeDsImport() {
+  if (dsImporting.value) return
+  dsImportOpen.value = false
 }
 
 function onDsFilePick(e: Event) {
