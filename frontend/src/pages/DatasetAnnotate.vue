@@ -211,12 +211,15 @@
             <span class="pos-text">第</span>
             <input
               ref="posInputRef"
-              v-model="posInput"
+              v-model="posDisplayValue"
               class="nav-pos-input"
-              :style="{ width: Math.max(2, posInput.length) + 1 + 'ch' }"
+              :style="{ width: posInputWidth }"
               inputmode="numeric"
               autocomplete="off"
+              :placeholder="visibleIdx >= 0 ? '' : '—'"
               title="输入序号后回车，直接跳到第 N 张"
+              @focus="onPosFocus"
+              @click="onPosClick"
               @keydown.enter.prevent="commitPosJump(true)"
               @keydown.esc.prevent="cancelPosJump"
               @blur="onPosBlur"
@@ -714,9 +717,9 @@
             <button class="danger" @click="clearCurrentBoxes" :disabled="!currentBoxes.length" title="清空本图所有标注框">
               清空本图
             </button>
-            <button @click="exportTask" :disabled="exporting" title="把本数据集已标注结果写成 YOLO 标签（labels/*.txt）到数据集目录，不产生下载文件；划分随封板进行">
+            <button @click="exportTask" :disabled="exporting" title="把本数据集已标注结果导出为 YOLO 格式（labels/*.txt）写入数据集目录">
               <span v-if="exporting" class="loading-spinner"></span>
-              {{ exporting ? '写入中...' : '写入训练标签（不下载）' }}
+              {{ exporting ? '导出中...' : '导出' }}
             </button>
           </div>
         </div>
@@ -5429,8 +5432,25 @@ const nextImage = () => {
 // 千张级任务里靠 ← / → 挪几十张太慢，直接输入序号最省事。
 // 序号口径与游标一致：可见集合（类别筛选 ∩ 文件名搜索）里的第 N 张，从 1 开始。
 const posInput = ref('')
+const posEditing = ref(false)   // 编辑态才用 posInput，静止态显示派生页码
 const posInputRef = ref<HTMLInputElement | null>(null)
 let posJumpBase = ''   // 当前已提交的序号，用于判断「有没有真的改过」
+
+// 静止态显示「可见集合里当前第几张」，不依赖 posInput 是否被填过；
+// 聚焦后才切到用户输入的原始字符串，避免清空时又被派生值顶回来。
+const posDisplayValue = computed({
+  get: () => posEditing.value
+    ? posInput.value
+    : (visibleIdx.value >= 0 ? String(visibleIdx.value + 1) : ''),
+  set: (v: string) => { posInput.value = v; posEditing.value = true }
+})
+
+// 宽度按总张数位数算（55 → 2 位，4376 → 4 位），再留出 padding/边框：
+// 旧写法按 posInput.length 算，空串时只有 3ch，border-box 下内容区不足 1 位。
+const posInputWidth = computed(() => {
+  const digits = Math.max(2, String(visibleItems.value.length).length, posInput.value.length)
+  return `calc(${digits}ch + 1.1rem)`
+})
 
 // 切图/筛选变化后把输入框回填成当前序号（输入框常驻，不靠点击打开）
 watch(visibleIdx, () => {
@@ -5439,13 +5459,29 @@ watch(visibleIdx, () => {
   posInput.value = v
 }, { immediate: true })
 
+const onPosFocus = () => {
+  posEditing.value = true
+  posInput.value = posJumpBase || (visibleIdx.value >= 0 ? String(visibleIdx.value + 1) : '')
+  nextTick(() => posInputRef.value?.select())   // 进焦点全选，直接敲新序号即可覆盖
+}
+
+// 鼠标点击时浏览器会把刚选中的内容塌成光标（Esc 后输入框仍聚焦，再点不会触发 focus），
+// 这里补一次：只要落点没有拖出选区，就保持全选，省掉「先全选再输入」这一步。
+const onPosClick = (e: MouseEvent) => {
+  const el = e.target as HTMLInputElement
+  if (el.selectionStart === el.selectionEnd) el.select()
+}
+
 const cancelPosJump = () => {
   posInput.value = posJumpBase
+  posEditing.value = false
 }
 
 // 失焦也算提交（输完号直接点画布/别处就跳过去），但没改动过就不动，避免误触发
 const onPosBlur = () => {
-  if (posInput.value.trim() === posJumpBase.trim()) cancelPosJump()
+  const same = posInput.value.trim() === posJumpBase.trim()
+  posEditing.value = false
+  if (same) cancelPosJump()
   else commitPosJump(false)
 }
 
@@ -5478,6 +5514,7 @@ const commitPosJump = (keepOnError = false) => {
   const target = parsed - 1
   if (target === visibleIdx.value) { cancelPosJump(); return }
   selectImageByItem(visibleItems.value[target])   // 切图后由 watch(visibleIdx) 回填输入框
+  posEditing.value = false                        // 跳完回到静止态，显示新页码
 }
 
 const handleKeydown = (e: KeyboardEvent) => {
@@ -6112,8 +6149,9 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 .nav-pos-input {
+  box-sizing: border-box;
   padding: 0.1rem 0.3rem;
-  border: 1px solid #3498db;
+  border: 1px solid #ccd5dd;
   border-radius: 3px;
   font-size: 0.78rem;
   font-family: inherit;
@@ -6122,7 +6160,17 @@ onUnmounted(() => {
   color: #2c3e50;
   background: #fff;
   outline: none;
-  min-width: 2.5ch;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.nav-pos-input:hover {
+  border-color: #9fb3c8;
+}
+.nav-pos-input:focus {
+  border-color: #3498db;
+  box-shadow: 0 0 0 2px rgba(52, 152, 219, 0.15);
+}
+.nav-pos-input::placeholder {
+  color: #a9b4bd;
 }
 
 .image-filter {
